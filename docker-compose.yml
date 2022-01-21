@@ -40,4 +40,4 @@ services:
     volumes:
       - ./loxone_to_mongo:/usr/src/app
     links:
-      - influxdb
+      - mongodb

@@ -1,16 +1,19 @@
 extern crate chrono;
-extern crate async_std;
+extern crate mongodb;
+extern crate serde;
+extern crate tokio;
 
-use influxdb::{Client, InfluxDbWriteable};
+use mongodb::{ Client, options::ClientOptions };
 use std::net::UdpSocket;
-use std::{ str, error };
-use chrono::{ offset::TimeZone, DateTime, NaiveDateTime, Local };
-use async_std::task;
+use std::{ str, env, error };
+use chrono::serde::ts_seconds;
+use chrono::{ offset::TimeZone, DateTime, NaiveDateTime, Utc };
+use serde::{Deserialize, Serialize};
 
-
-#[derive(InfluxDbWriteable, Clone)]
+#[derive(Debug, Serialize, Deserialize)]
 struct LogLine {
-	time: DateTime<Local>,
+    #[serde(with = "ts_seconds")]
+	time: DateTime<Utc>,
 	measurement_name: String,
 	value: f32,
 	alias: String,
@@ -43,7 +46,7 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 
 	// Convert native datetime to local timezone
 	let naive_datetime = NaiveDateTime::parse_from_str(&values[0], "%Y-%m-%d %H:%M:%S")?;
-	let local_datetime: DateTime<Local> = Local.from_local_datetime(&naive_datetime).unwrap();
+	let local_datetime: DateTime<Utc> = Utc.from_local_datetime(&naive_datetime).unwrap();
 
 	let log_line = LogLine {
 		time: local_datetime,
@@ -58,19 +61,21 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 	Ok(log_line)
 }
 
-async fn store_data(db_client: &Client, log_line: &LogLine) -> Result<String, influxdb::Error>{
-		let log_line = log_line.clone();
-	    let write_result = db_client
-	        .query(log_line.into_query("measurements"))
-	        .await;
-	    write_result
-}
 
-fn main() -> std::io::Result<()> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn error::Error>> {
 	let socket = UdpSocket::bind("0.0.0.0:2000")?;
 	let mut buf = [0; 2048];
+	
+	let db_uri = env::var("MONGODB_URI")?;
+	let db_name = env::var("DB")?;
+	//let db_username = env::var("DB_USERNAME")?;
+	//let db_password = env::var("DB_PASSWORD")?;
 
-    let client = Client::new("http://influxdb:8086", "loxone").with_auth("admin", "adminadmin");
+	let client_options = ClientOptions::parse(db_uri).await?;
+	let client = Client::with_options(client_options)?;
+	let db = client.database(db_name.as_str());
+	let typed_collection = db.collection::<LogLine>("loxone");
 
 	println!("Starting to accept data.");
 	loop {
@@ -91,7 +96,6 @@ fn main() -> std::io::Result<()> {
 			}
 		};
 
-
 		println!("{:?};{:?};{:?};{:?};{:?};{:?};{:?}",
 			log_line.time,
 			log_line.measurement_name,
@@ -102,18 +106,7 @@ fn main() -> std::io::Result<()> {
 			log_line.tag3
 		);
 
-		match task::block_on(store_data(&client, &log_line)) {
-			Ok(_) => {
-				println!("Stored new log line.")
-			},
-			Err(err) => {
-				eprintln!("Falied to parse incoming data: {}", err);
-				continue;
-			}
-		}
-
-
+		typed_collection.insert_one(log_line, None).await?;
 
 	}
-
 }
