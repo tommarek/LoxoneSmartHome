@@ -1,5 +1,5 @@
 [package]
-name = "loxone_to_influx"
+name = "loxone_to_mongo"
 version = "0.1.0"
 edition = "2021"
 
@@ -7,5 +7,3 @@ edition = "2021"
 
 [dependencies]
 chrono = "0.4.19"
-influxdb = { version = "0.5.1", features = ["derive"] }
-async-std = { version = "1", features = ["attributes", "tokio1"] }

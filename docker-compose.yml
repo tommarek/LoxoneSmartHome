@@ -1,20 +1,16 @@
 version: '3'
 services:
-  influxdb:
-    image: influxdb:latest
-    container_name: influxdb
-    restart: always
+  mongodb:
+    image: mongo:latest
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: rootpassword
     ports:
-      - "8083:8083"
-      - "8086:8086"
-      - "8090:8090"
-      - "2003:2003"
-    env_file:
-      - 'env.influxdb'
+      - 27017:27017
     volumes:
       # Data persistency
-      # sudo mkdir -p /srv/docker/influxdb/data
-      - /srv/docker/influxdb/data:/var/lib/influxdb
+      # sudo mkdir -p /srv/docker/mongo/data; chown 472:472 /srv/docker/mongo/data
+      - /srv/docker/mongo/data:/var/lib/mongo
 
   grafana:
     image: grafana/grafana:latest
@@ -25,36 +21,23 @@ services:
       - 'env.grafana'
     user: "0"
     links:
-      - influxdb
+      - mongodb
     depends_on:
-      - influxdb
+      - mongodb
     volumes:
       # Data persistency
       # sudo mkdir -p /srv/docker/grafana/data; chown 472:472 /srv/docker/grafana/data
       - /srv/docker/grafana/data:/var/lib/grafana
 
-  chronograf:
-    image: chronograf:latest
-    ports:
-      - '127.0.0.1:8888:8888'
-    volumes:
-      # Data persistency
-      # sudo mkdir -p /srv/docker/chronograf/data; chown 472:472 /srv/docker/chronograf/data
-      - /srv/docker/chronograf/data:/var/lib/chronograf
-    depends_on:
-      - influxdb
-    env_file:
-      - 'env.chronograf'
-
-  loxone_to_influx:
-    build: ./loxone_to_influx
+  loxone_to_mongo:
+    build: ./loxone_to_mongo
     ports: 
       - "2000:2000/udp"
     env_file:
-      - 'env.loxone_to_influx'
+      - 'env.loxone_to_mongo'
     depends_on:
-      - influxdb
+      - mongodb
     volumes:
-      - ./loxone_to_influx:/usr/src/app
+      - ./loxone_to_mongo:/usr/src/app
     links:
       - influxdb
