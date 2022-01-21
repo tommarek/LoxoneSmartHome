@@ -1,0 +1,251 @@
+{
+	"auto_complete":
+	{
+		"selected_items":
+		[
+			[
+				"acce",
+				"acceptable_orders"
+			],
+			[
+				"Text",
+				"TextInput"
+			]
+		]
+	},
+	"buffers":
+	[
+	],
+	"build_system": "",
+	"build_system_choices":
+	[
+	],
+	"build_varint": "",
+	"command_palette":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+			[
+				"install",
+				"Package Control: Install Package"
+			],
+			[
+				"encoding",
+				"Package Control: Advanced Install Package"
+			],
+			[
+				"javsc",
+				"Set Syntax: JavaScript"
+			],
+			[
+				"folder",
+				"Project: Add Folder"
+			],
+			[
+				"instal",
+				"Package Control: Install Package"
+			],
+			[
+				"remove",
+				"Package Control: Remove Package"
+			],
+			[
+				"Package Control: lint",
+				"Package Control: Install Package"
+			],
+			[
+				"bable",
+				"Set Syntax: JavaScript (Babel)"
+			],
+			[
+				"babel",
+				"Set Syntax: JavaScript (Babel)"
+			],
+			[
+				"insta",
+				"Package Control: Install Package"
+			]
+		],
+		"width": 0.0
+	},
+	"console":
+	{
+		"height": 150.0,
+		"history":
+		[
+			"view.encoding()"
+		]
+	},
+	"distraction_free":
+	{
+		"menu_visible": true,
+		"show_minimap": false,
+		"show_open_files": false,
+		"show_tabs": false,
+		"side_bar_visible": false,
+		"status_bar_visible": false
+	},
+	"expanded_folders":
+	[
+		"/home/tom/git/loxone-db-grafana"
+	],
+	"file_history":
+	[
+		"/home/tom/Downloads/loxone bose/bose-soundtouch.xml",
+		"/home/tom/git/loxone-db-grafana/Loxone2InfluxDB.py",
+		"/home/tom/Downloads/loxone bose/desc.json",
+		"/tmp/mozilla_tom0/LASER MAREK ČEK.dxf",
+		"/tmp/mozilla_tom0/objednavka2021058423.html",
+		"/tmp/mozilla_tom0/20100191_B0179.html",
+		"/tmp/test_bask.py",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/Seznam emailových adres zákazníků 2020 - jeden radek.txt",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/zprava o novych strankach HTML.html",
+		"/tmp/mozilla_tom0/6680.NC",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/Výchozí vzor pro vyplňování odesílacího formuláře.txt",
+		"/tmp/mozilla_tom0/Crushers Resta-1.html",
+		"/mnt/t/2020/VSE/10/Plakát laser.html",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/yyyy.txt",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/xxxx.html",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/Seznam - webové stránky - kompletní.txt",
+		"/mnt/t/2020/VSE/80/Seznam zákazníků - web/zprava.html",
+		"/home/tom/SynologyDrive/resta/2020/zakladac-csv/import_only_requested_resta.csv",
+		"/home/tom/SynologyDrive/resta/2020/zakladac-csv/import_complete_sample.csv",
+		"/home/tom/git/screeps/src/decisionCase.js",
+		"/home/tom/git/screeps/src/overseer/miner.js",
+		"/home/tom/git/screeps/TODO.md",
+		"/home/tom/git/screeps/src/tasks/creeps/move.js",
+		"/home/tom/git/screeps/src/tasks/task.js",
+		"/home/tom/git/screeps/src/overseer/tasker.js",
+		"/home/tom/git/screeps/src/roomAnalyzer.js",
+		"/home/tom/.config/sublime-text-3/Packages/ESLint/ESLint.sublime-settings",
+		"/home/tom/.config/sublime-text-3/Packages/User/ESLint.sublime-settings",
+		"/home/tom/git/bodyweight-companion/BodyweightCompanion/App.js",
+		"/home/tom/Documents/CV/Domca/CV_TM_EN.tex"
+	],
+	"find":
+	{
+		"height": 38.0
+	},
+	"find_in_files":
+	{
+		"height": 0.0,
+		"where_history":
+		[
+		]
+	},
+	"find_state":
+	{
+		"case_sensitive": false,
+		"find_history":
+		[
+		],
+		"highlight": true,
+		"in_selection": false,
+		"preserve_case": false,
+		"regex": false,
+		"replace_history":
+		[
+		],
+		"reverse": false,
+		"show_context": true,
+		"use_buffer2": true,
+		"whole_word": false,
+		"wrap": true
+	},
+	"groups":
+	[
+		{
+			"sheets":
+			[
+			]
+		}
+	],
+	"incremental_find":
+	{
+		"height": 26.0
+	},
+	"input":
+	{
+		"height": 38.0
+	},
+	"layout":
+	{
+		"cells":
+		[
+			[
+				0,
+				0,
+				1,
+				1
+			]
+		],
+		"cols":
+		[
+			0.0,
+			1.0
+		],
+		"rows":
+		[
+			0.0,
+			1.0
+		]
+	},
+	"menu_visible": true,
+	"output.SublimeLinter":
+	{
+		"height": 0.0
+	},
+	"output.find_results":
+	{
+		"height": 0.0
+	},
+	"pinned_build_system": "",
+	"project": "loxone-db-grafana.sublime-project",
+	"replace":
+	{
+		"height": 48.0
+	},
+	"save_all_on_build": true,
+	"select_file":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"select_project":
+	{
+		"height": 500.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 380.0
+	},
+	"select_symbol":
+	{
+		"height": 0.0,
+		"last_filter": "",
+		"selected_items":
+		[
+		],
+		"width": 0.0
+	},
+	"selected_group": 0,
+	"settings":
+	{
+	},
+	"show_minimap": true,
+	"show_open_files": true,
+	"show_tabs": true,
+	"side_bar_visible": true,
+	"side_bar_width": 290.0,
+	"status_bar_visible": false,
+	"template_settings":
+	{
+	}
+}
