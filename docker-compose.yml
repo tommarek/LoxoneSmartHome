@@ -1,40 +1,60 @@
 version: '3'
 services:
-  # influxdb:
-  #   image: influxdb:latest
-  #   container_name: influxdb
-  #   ports:
-  #     - "8083:8083"
-  #     - "8086:8086"
-  #     - "8090:8090"
-  #     - "2003:2003"
-  #   env_file:
-  #     - 'env.influxdb'
-  #   volumes:
-  #     # Data persistency
-  #     # sudo mkdir -p /srv/docker/influxdb/data
-  #     - /srv/docker/influxdb/data:/var/lib/influxdb
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    restart: always
+    ports:
+      - "8083:8083"
+      - "8086:8086"
+      - "8090:8090"
+      - "2003:2003"
+    env_file:
+      - 'env.influxdb'
+    volumes:
+      # Data persistency
+      # sudo mkdir -p /srv/docker/influxdb/data
+      - /srv/docker/influxdb/data:/var/lib/influxdb
 
-  # grafana:
-  #   image: grafana/grafana:latest
-  #   container_name: grafana
-  #   ports:
-  #     - "3000:3000"
-  #   env_file:
-  #     - 'env.grafana'
-  #   user: "0"
-  #   links:
-  #     - influxdb
-  #   volumes:
-  #     # Data persistency
-  #     # sudo mkdir -p /srv/docker/grafana/data; chown 472:472 /srv/docker/grafana/data
-  #     - /srv/docker/grafana/data:/var/lib/grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    env_file:
+      - 'env.grafana'
+    user: "0"
+    links:
+      - influxdb
+    depends_on:
+      - influxdb
+    volumes:
+      # Data persistency
+      # sudo mkdir -p /srv/docker/grafana/data; chown 472:472 /srv/docker/grafana/data
+      - /srv/docker/grafana/data:/var/lib/grafana
 
-  loxonetoinflux:
+  chronograf:
+    image: chronograf:latest
+    ports:
+      - '127.0.0.1:8888:8888'
+    volumes:
+      # Data persistency
+      # sudo mkdir -p /srv/docker/chronograf/data; chown 472:472 /srv/docker/chronograf/data
+      - /srv/docker/chronograf/data:/var/lib/chronograf
+    depends_on:
+      - influxdb
+    env_file:
+      - 'env.chronograf'
+
+  loxone_to_influx:
     build: ./loxone_to_influx
     ports: 
-      - "2000:2000"
+      - "2000:2000/udp"
+    env_file:
+      - 'env.loxone_to_influx'
+    depends_on:
+      - influxdb
     volumes:
       - ./loxone_to_influx:/usr/src/app
-    # links:
-    #   - influxdb
+    links:
+      - influxdb

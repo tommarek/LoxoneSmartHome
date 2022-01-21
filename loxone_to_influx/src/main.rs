@@ -1,11 +1,14 @@
 extern crate chrono;
+extern crate async_std;
 
+use influxdb::{Client, InfluxDbWriteable};
 use std::net::UdpSocket;
 use std::{ str, error };
 use chrono::{ offset::TimeZone, DateTime, NaiveDateTime, Local };
-use influxdb::InfluxDbWriteable;
+use async_std::task;
 
-#[derive(InfluxDbWriteable)]
+
+#[derive(InfluxDbWriteable, Clone)]
 struct LogLine {
 	time: DateTime<Local>,
 	measurement_name: String,
@@ -18,10 +21,10 @@ struct LogLine {
 
 // boxed errors to allow mutliple erros in a fucntion
 // https://doc.rust-lang.org/rust-by-example/error/multiple_error_types/boxing_errors.html
-type Result<T> = std::result::Result<T, Box<dyn error::Error>>;
+type MyResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
 
-fn parse_data(received_data: &str) -> Result<LogLine> {
+fn parse_data(received_data: &str) -> MyResult<LogLine> {
 	let values: Vec<&str> = received_data.split(';').collect();
 	let (mut alias, mut tag1, mut tag2, mut tag3) = (String::new(), String::new(), String::new(), String::new());
 
@@ -55,10 +58,19 @@ fn parse_data(received_data: &str) -> Result<LogLine> {
 	Ok(log_line)
 }
 
+async fn store_data(db_client: &Client, log_line: &LogLine) -> Result<String, influxdb::Error>{
+		let log_line = log_line.clone();
+	    let write_result = db_client
+	        .query(log_line.into_query("measurements"))
+	        .await;
+	    write_result
+}
+
 fn main() -> std::io::Result<()> {
 	let socket = UdpSocket::bind("0.0.0.0:2000")?;
 	let mut buf = [0; 2048];
 
+    let client = Client::new("http://influxdb:8086", "loxone").with_auth("admin", "adminadmin");
 
 	println!("Starting to accept data.");
 	loop {
@@ -79,6 +91,7 @@ fn main() -> std::io::Result<()> {
 			}
 		};
 
+
 		println!("{:?};{:?};{:?};{:?};{:?};{:?};{:?}",
 			log_line.time,
 			log_line.measurement_name,
@@ -88,6 +101,19 @@ fn main() -> std::io::Result<()> {
 			log_line.tag2,
 			log_line.tag3
 		);
+
+		match task::block_on(store_data(&client, &log_line)) {
+			Ok(_) => {
+				println!("Stored new log line.")
+			},
+			Err(err) => {
+				eprintln!("Falied to parse incoming data: {}", err);
+				continue;
+			}
+		}
+
+
+
 	}
 
 }
