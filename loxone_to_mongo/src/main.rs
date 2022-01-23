@@ -69,8 +69,6 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 	
 	let db_uri = env::var("MONGODB_URI")?;
 	let db_name = env::var("DB")?;
-	//let db_username = env::var("DB_USERNAME")?;
-	//let db_password = env::var("DB_PASSWORD")?;
 
 	let client_options = ClientOptions::parse(db_uri).await?;
 	let client = Client::with_options(client_options)?;
