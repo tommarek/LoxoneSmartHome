@@ -3,7 +3,8 @@ services:
   mongodb:
     image: mongo:5.0
     env_file:
-      - 'env.mongo'
+      - ./conf/common.env
+      - ./conf/mongo.env
     ports:
       - 27017:27017
     volumes:
@@ -15,7 +16,8 @@ services:
     ports:
       - "3000:3000"
     env_file:
-      - 'env.grafana'
+      - ./conf/common.env
+      - ./conf/grafana.env
     user: "0"
     links:
       - mongodb
@@ -29,10 +31,12 @@ services:
     ports: 
       - "2000:2000/udp"
     env_file:
-      - 'env.loxone_to_mongo'
+      - ./conf/common.env
+      - ./conf/loxone_to_mongo.env
     depends_on:
       - mongodb
     volumes:
       - ./loxone_to_mongo:/usr/src/app
     links:
       - mongodb
+

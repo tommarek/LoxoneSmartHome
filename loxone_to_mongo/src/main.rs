@@ -1,4 +1,5 @@
 extern crate chrono;
+extern crate envsubst;
 extern crate mongodb;
 extern crate serde;
 extern crate tokio;
@@ -68,7 +69,10 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 	let mut buf = [0; 2048];
 	
 	let db_uri = env::var("MONGODB_URI")?;
-	let db_name = env::var("DB")?;
+	let db_name = env::var("DB_NAME")?;
+
+	println!("uri: {:?}", db_uri);
+	println!("db_name {:?}", db_name);
 
 	let client_options = ClientOptions::parse(db_uri).await?;
 	let client = Client::with_options(client_options)?;
