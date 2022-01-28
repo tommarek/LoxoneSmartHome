@@ -13,7 +13,7 @@ struct LogLine {
 	measurement_name: String,
 	value: f64,
 	room: String,
-	alias: String,
+	measurement_type: String,
 	tag1: String,
 	tag2: String,
 }
@@ -24,16 +24,16 @@ type MyResult<T> = std::result::Result<T, Box<dyn error::Error>>;
 
 
 // data structure:
-// timestamp;measurement_name;value;room_name[optional];alias[optional];tag1[optional];tag2[optional]
+// timestamp;measurement_name;value;room_name[optional];measurement_type[optional];tag1[optional];tag2[optional]
 fn parse_data(received_data: &str) -> MyResult<LogLine> {
 	let values: Vec<&str> = received_data.split(';').collect();
-	let (mut room, mut alias, mut tag1, mut tag2) = ("_".to_string(), "_".to_string(), "_".to_string(), "_".to_string());
+	let (mut room, mut measurement_type, mut tag1, mut tag2) = ("_".to_string(), "default".to_string(), "_".to_string(), "_".to_string());
 
 	if values.len() >= 4 {
 		room = (&values[3]).to_string();
 	}
 	if values.len() >= 5 {
-		alias = (&values[4]).to_string();
+		measurement_type = (&values[4]).to_string();
 	}
 	if values.len() >= 6 {
 		tag1 = (&values[5]).to_string();
@@ -50,7 +50,7 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 		timestamp: timestamp,
 		measurement_name: (&values[1]).to_string(),
 		value: (&values[2]).to_string().parse::<f64>()?,
-		alias: alias,
+		measurement_type: measurement_type,
 		room: room,
 		tag1: tag1,
 		tag2: tag2
@@ -64,15 +64,15 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 	let socket = UdpSocket::bind("0.0.0.0:2000")?;
 	let mut buf = [0; 2048];
 
-    let host = std::env::var("INFLUXDB_HOST").unwrap();
-    let org = std::env::var("INFLUXDB_ORG").unwrap();
-    let token = std::env::var("INFLUXDB_TOKEN").unwrap();
-    let bucket = std::env::var("INFLUXDB_BUCKET").unwrap();
+	let host = std::env::var("INFLUXDB_HOST").unwrap();
+	let org = std::env::var("INFLUXDB_ORG").unwrap();
+	let token = std::env::var("INFLUXDB_TOKEN").unwrap();
+	let bucket = std::env::var("INFLUXDB_BUCKET").unwrap();
 
-    // let host = "http://localhost:8086";
-    // let org = "loxone";
-    // let bucket = "loxone";
-    // let token = "0YNpYaSILBpQMxXemDuqiwNgOMVwT-pDyOz8F1-DFh8yVo-ntOSlpzEmg6qYBX356jBKrSYkrxxt5msrx-lLBw==";
+	// let host = "http://localhost:8086";
+	// let org = "loxone";
+	// let bucket = "loxone";
+	// let token = "0YNpYaSILBpQMxXemDuqiwNgOMVwT-pDyOz8F1-DFh8yVo-ntOSlpzEmg6qYBX356jBKrSYkrxxt5msrx-lLBw==";
 
 	let client = InfluxClient::builder(host.to_string(), token.to_string(), org.to_string()).build().unwrap();
 
@@ -101,17 +101,16 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 			log_line.measurement_name,
 			log_line.value,
 			log_line.room,
-			log_line.alias,
+			log_line.measurement_type,
 			log_line.tag1,
 			log_line.tag2
 		);
 
-		let measurement = Measurement::builder("lox")
+		let measurement = Measurement::builder(log_line.measurement_type)
 				.timestamp_ms(log_line.timestamp)
-				.tag("measurement_name", log_line.measurement_name)
+				.field("measurement_name", log_line.measurement_name)
 				.field("value", log_line.value)
 				.tag("room", log_line.room)
-				.tag("alias", log_line.alias)
 				.tag("tag1", log_line.tag1)
 				.tag("tag2", log_line.tag2)
 				.build()
