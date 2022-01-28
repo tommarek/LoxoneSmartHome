@@ -1,0 +1,134 @@
+extern crate chrono;
+extern crate tokio;
+extern crate influxrs;
+
+use std::net::UdpSocket;
+use std::{ str, error };
+use chrono::NaiveDateTime;
+use influxrs::{ Measurement, InfluxClient};
+
+
+struct LogLine {
+	timestamp: u128,
+	measurement_name: String,
+	value: f64,
+	room: String,
+	alias: String,
+	tag1: String,
+	tag2: String,
+}
+
+// boxed errors to allow mutliple erros in a fucntion
+// https://doc.rust-lang.org/rust-by-example/error/multiple_error_types/boxing_errors.html
+type MyResult<T> = std::result::Result<T, Box<dyn error::Error>>;
+
+
+// data structure:
+// timestamp;measurement_name;value;room_name[optional];alias[optional];tag1[optional];tag2[optional]
+fn parse_data(received_data: &str) -> MyResult<LogLine> {
+	let values: Vec<&str> = received_data.split(';').collect();
+	let (mut room, mut alias, mut tag1, mut tag2) = ("_".to_string(), "_".to_string(), "_".to_string(), "_".to_string());
+
+	if values.len() >= 4 {
+		room = (&values[3]).to_string();
+	}
+	if values.len() >= 5 {
+		alias = (&values[4]).to_string();
+	}
+	if values.len() >= 6 {
+		tag1 = (&values[5]).to_string();
+	}
+	if values.len() >= 7 {
+		tag2 = (&values[6]).to_string();
+	}
+
+	// Convert native datetime to local timezone
+	let naive_datetime = NaiveDateTime::parse_from_str(&values[0], "%Y-%m-%d %H:%M:%S")?;
+	let timestamp: u128 = naive_datetime.timestamp_millis().try_into().unwrap();
+
+	let log_line = LogLine {
+		timestamp: timestamp,
+		measurement_name: (&values[1]).to_string(),
+		value: (&values[2]).to_string().parse::<f64>()?,
+		alias: alias,
+		room: room,
+		tag1: tag1,
+		tag2: tag2
+	};
+
+	Ok(log_line)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn error::Error>> {
+	let socket = UdpSocket::bind("0.0.0.0:2000")?;
+	let mut buf = [0; 2048];
+
+    let host = std::env::var("INFLUXDB_HOST").unwrap();
+    let org = std::env::var("INFLUXDB_ORG").unwrap();
+    let token = std::env::var("INFLUXDB_TOKEN").unwrap();
+    let bucket = std::env::var("INFLUXDB_BUCKET").unwrap();
+
+    // let host = "http://localhost:8086";
+    // let org = "loxone";
+    // let bucket = "loxone";
+    // let token = "0YNpYaSILBpQMxXemDuqiwNgOMVwT-pDyOz8F1-DFh8yVo-ntOSlpzEmg6qYBX356jBKrSYkrxxt5msrx-lLBw==";
+
+	let client = InfluxClient::builder(host.to_string(), token.to_string(), org.to_string()).build().unwrap();
+
+	println!("Starting to accept data.");
+	loop {
+		let (amt, _src) = match socket.recv_from(&mut buf) {
+			Ok((amt, src)) => (amt, src),
+			Err(err) => {
+				eprintln!("Failed to receive a message: {}", err);
+				continue;
+			}
+		};
+
+		let buf = &mut buf[..amt];
+		let log_line = match parse_data(str::from_utf8(&buf).unwrap()){
+			Ok(log_line) => log_line,
+			Err(err) => {
+				eprintln!("Falied to parse incoming data: {}", err);
+				continue;
+			}
+		};
+
+
+		println!("{:?};{:?};{:?};{:?};{:?};{:?};{:?}",
+			log_line.timestamp,
+			log_line.measurement_name,
+			log_line.value,
+			log_line.room,
+			log_line.alias,
+			log_line.tag1,
+			log_line.tag2
+		);
+
+		let measurement = Measurement::builder("lox")
+				.timestamp_ms(log_line.timestamp)
+				.tag("measurement_name", log_line.measurement_name)
+				.field("value", log_line.value)
+				.tag("room", log_line.room)
+				.tag("alias", log_line.alias)
+				.tag("tag1", log_line.tag1)
+				.tag("tag2", log_line.tag2)
+				.build()
+				.unwrap();
+
+		let _response = match client
+			.write(bucket.as_str(), &[measurement])
+			.await {
+				Ok(response) => {
+					println!("Stored new log line.");
+					response
+				},
+				Err(err) => {
+					eprintln!("Falied to store incoming data: {}", err);
+					continue;
+				}
+			};
+	}
+
+}

@@ -1,42 +1,47 @@
 version: '3'
 services:
-  mongodb:
-    image: mongo:5.0
-    env_file:
-      - ./conf/common.env
-      - ./conf/mongo.env
+  influxdb:
+    image: influxdb:latest
+    container_name: influxdb
+    restart: always
     ports:
-      - 27017:27017
+      - "8083:8083"
+      - "8086:8086"
+      - "8090:8090"
+      - "2003:2003"
+    env_file:
+      - ./conf/influxdb.env
     volumes:
-      - ./mongo:/var/lib/mongo
+      - ./influxdb:/var/lib/influxdb
+      - ./conf/influxdb.conf:/etc/influxdb/influxdb.conf
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
       - "3000:3000"
+    user: '1000'
     env_file:
       - ./conf/common.env
       - ./conf/grafana.env
-    user: "0"
     links:
-      - mongodb
+      - influxdb
     depends_on:
-      - mongodb
+      - influxdb
     volumes:
       - ./grafana:/var/lib/grafana
 
-  loxone_to_mongo:
-    build: ./loxone_to_mongo
+  loxone_to_db:
+    build: ./loxone_to_db
     ports: 
       - "2000:2000/udp"
     env_file:
       - ./conf/common.env
-      - ./conf/loxone_to_mongo.env
-    depends_on:
-      - mongodb
-    volumes:
-      - ./loxone_to_mongo:/usr/src/app
+      - ./conf/loxone_to_db.env
     links:
-      - mongodb
+      - influxdb
+    depends_on:
+      - influxdb
+    volumes:
+      - ./loxone_to_db:/usr/src/app
 
