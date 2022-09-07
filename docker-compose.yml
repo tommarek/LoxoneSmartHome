@@ -33,7 +33,7 @@ services:
 
   loxone_to_db:
     build: ./loxone_to_db
-    ports: 
+    ports:
       - "2000:2000/udp"
     env_file:
       - ./conf/common.env
@@ -47,8 +47,11 @@ services:
 
   mosquitto:
     image: eclipse-mosquitto
+    hostname: mosquitto
+    container_name: mosquitto
+    restart: unless-stopped
     ports:
-      - 1883:1883
+      - 8883:8883
       - 9001:9001
     env_file:
       - ./conf/common.env
