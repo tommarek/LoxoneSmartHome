@@ -1,7 +1,7 @@
 # LoxoneSmartHome
 
-Aim of this repo is to grab data from Loxone smart home and a PHV array with Growatt battery and inverter and use the data to predict excess of solar energy.
-This information will then be sent back to loxone so it can trigger heating/cooling based on that.
+Aim of this repo is to grab data from Loxone smart home and a PHV array with Growatt battery and inverter and use it to predict excess of solar energy.
+This information will then be processed by a controlling app and heating/cooling commands will then be sent back to the Loxone server.
 
 ## Docker containers
 
