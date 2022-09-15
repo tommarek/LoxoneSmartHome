@@ -9,18 +9,20 @@ services:
       - "8086:8086"
       - "8090:8090"
       - "2003:2003"
+    user: '1026:65537'
     env_file:
       - ./conf/influxdb.env
     volumes:
-      - ./influxdb:/var/lib/influxdb
-      - ./conf/influxdb.conf:/etc/influxdb/influxdb.conf
+      - ./influxdb/influxdb/:/var/lib/influxdb/:rw
+      - ./influxdb/influxdb2/:/var/lib/influxdb2/:rw
+      - ./conf/influxdb.conf:/etc/influxdb/influxdb.conf:ro
 
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
     ports:
       - "3000:3000"
-    user: '1000'
+    user: '1026:65537'
     env_file:
       - ./conf/common.env
       - ./conf/grafana.env
@@ -33,8 +35,10 @@ services:
 
   loxone_to_db:
     build: ./loxone_to_db
+    container_name: loxone_to_db
     ports:
       - "2000:2000/udp"
+    user: '1026:65537'
     env_file:
       - ./conf/common.env
       - ./conf/loxone_to_db.env
@@ -43,7 +47,8 @@ services:
     depends_on:
       - influxdb
     volumes:
-      - ./loxone_to_db:/usr/src/app
+      - ./loxone_to_db:/usr/src/app:rw
+      - ./loxone_to_db/cache:/usr/local/cargo/registry:rw
 
   mosquitto:
     image: eclipse-mosquitto
@@ -51,11 +56,18 @@ services:
     container_name: mosquitto
     restart: unless-stopped
     ports:
-      - 8883:8883
+      - 1883:1883
       - 9001:9001
+    user: '1026:65537'
     env_file:
       - ./conf/common.env
     links:
       - grafana
     volumes:
       - ./mosquitto/:/mosquitto/:rw
+      - ./mosquitto/data/:/mosquitto/data/:rw
+      - ./mosquitto/log/:/mosquitto/log/:rw
+
+volumes:
+    cargo-cache:
+

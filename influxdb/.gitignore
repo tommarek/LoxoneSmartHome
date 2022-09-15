@@ -1,4 +1,9 @@
 # Ignore everything in this directory
 *
+influxdb/*
+influxdb2/*
+
 # Except this file
 !.gitignore
+!influxdb/
+!influxdb2/

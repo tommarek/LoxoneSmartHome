@@ -33,7 +33,7 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 		room = (&values[3]).to_string();
 	}
 	if values.len() >= 5 {
-		measurement_type = (&values[4]).to_string();
+		measurement_type = (&values[4]).trim().to_string();
 	}
 	if values.len() >= 6 {
 		tag1 = (&values[5]).to_string();
