@@ -2,9 +2,11 @@ extern crate chrono;
 extern crate tokio;
 extern crate influxrs;
 
+use chrono::{TimeZone, NaiveDateTime};
+use chrono_tz::Europe::Prague;
+use chrono_tz::UTC;
 use std::net::UdpSocket;
 use std::{ str, error };
-use chrono::NaiveDateTime;
 use influxrs::{ Measurement, InfluxClient};
 
 
@@ -42,9 +44,11 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 		tag2 = (&values[6]).to_string();
 	}
 
-	// Convert native datetime to local timezone
-	let naive_datetime = NaiveDateTime::parse_from_str(&values[0], "%Y-%m-%d %H:%M:%S")?;
-	let timestamp: u128 = naive_datetime.timestamp_millis().try_into().unwrap();
+	// Loxone sends timestamps in Local time, we need to convert it to UTC
+	let naive_datetime = NaiveDateTime::parse_from_str(&values[0], "%Y-%m-%d %H:%M:%S").unwrap();
+	let tz_aware_datetime = Prague.from_local_datetime(&naive_datetime).unwrap();
+	let utc_datetime = tz_aware_datetime.with_timezone(&UTC);
+	let timestamp: u128 = utc_datetime.timestamp_millis().try_into().unwrap();
 
 	let log_line = LogLine {
 		timestamp: timestamp,
