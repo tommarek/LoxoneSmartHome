@@ -68,6 +68,20 @@ services:
       - ./mosquitto/data/:/mosquitto/data/:rw
       - ./mosquitto/log/:/mosquitto/log/:rw
 
+  weather_scraper:
+    build: ./weather_scraper
+    container_name: weather_scraper
+    restart: unless-stopped
+    user: '1026:65537'
+    env_file:
+      - ./conf/common.env
+      - ./conf/weather_scraper.env
+    links:
+      - influxdb
+    volumes:
+      - ./weather_scraper:/usr/src/app:rw
+
+
 volumes:
     cargo-cache:
 
