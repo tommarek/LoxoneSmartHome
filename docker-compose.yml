@@ -78,9 +78,9 @@ services:
       - ./conf/weather_scraper.env
     links:
       - influxdb
+      - mosquitto
     volumes:
       - ./weather_scraper:/usr/src/app:rw
-
 
 volumes:
     cargo-cache:
