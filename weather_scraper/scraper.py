@@ -30,7 +30,7 @@ LONGITUDE = os.getenv('LONGITUDE', 17.4302361)
 
 ALADIN_URL = 'https://aladinonline.androworks.org/get_data.php?latitude={latitude}&longitude={longitude}'
 OPENWEATHERMAP_URL = 'https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&exclude=minutely,daily,alerts&appid={api_key}'
-OPENWEATHERMAP_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY', '9d47e804bf1e19fb7633f1f8f619ec49')
+OPENWEATHERMAP_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY', None)
 
 
 HourlyData = namedtuple('HourlyData', [
@@ -109,22 +109,12 @@ def save_to_inlfuxdb(write_api, measurement_name, value, timestamp):
     }])
 
 if __name__ == '__main__':
-    assert(LONGITUDE, "LONGITUDE is not set")
-    assert(LATITUDE, "LATITUDE is not set")
-    assert(INFLUXDB_HOST, "INFLUXDB_HOST is not set")
-    assert(INFLUXDB_TOKEN, "INFLUXDB_TOKEN is not set")
-    assert(INFLUXDB_ORG, "INFLUXDB_ORG is not set")
-    assert(INFLUXDB_BUCKET, "INFLUXDB_BUCKET is not set")
-
     # setup MQTT
     mqtt_client = mqtt.Client("weather_scraper")
     mqtt_client.on_connect = on_connect
     mqtt_client.on_message = on_message
 
-
     if USE_MQTT:
-        assert(MQTT_HOST, "MQTT_HOST is not set")
-        assert(MQTT_PORT, "MQTT_PORT is not set")
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
         mqtt_client.loop_start()
 
