@@ -30,6 +30,7 @@ LONGITUDE = os.getenv('LONGITUDE', 17.4302361)
 
 ALADIN_URL = 'https://aladinonline.androworks.org/get_data.php?latitude={latitude}&longitude={longitude}'
 OPENWEATHERMAP_URL = 'https://api.openweathermap.org/data/3.0/onecall?lat={latitude}&lon={longitude}&exclude=minutely,daily,alerts&units=metric&appid={api_key}'
+
 OPENWEATHERMAP_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY', None)
 
 
@@ -115,7 +116,7 @@ if __name__ == '__main__':
         mqtt_client.loop_start()
 
     # setup InfluxDB
-    influx_client = InfluxDBClient(url=INFLUXDB_HOST, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG, debug=True)
+    influx_client = InfluxDBClient(url=INFLUXDB_HOST, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG, debug=False)
     influx_write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
     get_data_fn = {

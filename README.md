@@ -21,9 +21,9 @@ Rust script that reads data pushed by Loxone server and stores them to the DB
 
 MQTT broker used to collect data from Growatt (https://github.com/otti/Growatt_ShineWiFi-S) and possibly other sensors
 
-### WeatherForecastScraper (TODO)
+### WeatherForecastScraper
 
-get the weather forecast data and store them to InfluxDB
+Gets the weather data from weather forecast services (currently Aladin and Openweathermap are supported) then publishes the entire hourly forecast to the MQQT and current weather data are stored in the influxDB for future use with the MPC system.
 
 ### Mastermind (TODO)
 
