@@ -112,7 +112,8 @@ async fn main() -> Result<(), Box<dyn error::Error>> {
 
 		let measurement = Measurement::builder(log_line.measurement_type)
 				.timestamp_ms(log_line.timestamp)
-				.field(log_line.measurement_name, log_line.value)
+				.field("measurement_name", log_line.measurement_name)
+				.field("value", log_line.value)
 				.tag("room", log_line.room)
 				.tag("tag1", log_line.tag1)
 				.tag("tag2", log_line.tag2)
