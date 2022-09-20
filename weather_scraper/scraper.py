@@ -66,7 +66,7 @@ def get_aladin_data():
 def get_openweathermap_data():
     resp = requests.get(OPENWEATHERMAP_URL.format(latitude=LATITUDE, longitude=LONGITUDE, api_key=OPENWEATHERMAP_API_KEY))
     js = resp.json()
-    return {
+    data = {
         'timestamp': js['hourly'][0]['dt'],
         'hourly': [
             HourlyData(
@@ -79,6 +79,17 @@ def get_openweathermap_data():
                 data['pressure']
             )._asdict() for data in js['hourly']]
     }
+    # update first hour forecast to current weather
+    data['hourly'][0] = HourlyData(
+        js['current']['temp'],
+        js['current'].get('rain', {}).get('1h', 0),
+        js['current']['wind_speed'],
+        js['current']['wind_deg'],
+        js['current']['clouds'],
+        js['current']['humidity'],
+        js['current']['pressure']
+    )._asdict()
+    return data
 
 def on_connect(client, userdata, flags, rc):
     print("Connected with result code "+str(rc))
