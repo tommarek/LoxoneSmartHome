@@ -20,7 +20,7 @@ MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'weather')
 
 INFLUXDB_HOST = os.getenv('INFLUXDB_HOST', '192.168.0.201:8086')
 INFLUXDB_ORG = os.getenv('INFLUXDB_ORG', 'loxone')
-INFLUXDB_BUCKET = os.getenv('INFLUXDB_BUCKET', 'loxone')
+INFLUXDB_BUCKET = os.getenv('INFLUXDB_WEATHER_BUCKET', 'weather_forecast')
 INFLUXDB_TOKEN = os.getenv('INFLUXDB_TOKEN', '7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A==')
 
 POLLING_INTERVAL = os.getenv('POLLING_INTERVAL', 3600)
@@ -137,6 +137,7 @@ if __name__ == '__main__':
                 mqtt_client.connect(MQTT_HOST, MQTT_PORT, 60)
 
         # save the weather forecast to InfluxDB
+        print('Saving data to influxDB timestamp: {}'.format(data['timestamp']))
         save_to_inlfuxdb(influx_write_api, data)
 
         time.sleep(int(POLLING_INTERVAL))
