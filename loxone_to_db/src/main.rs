@@ -38,10 +38,10 @@ fn parse_data(received_data: &str) -> MyResult<LogLine> {
 		measurement_type = (&values[4]).trim().to_string();
 	}
 	if values.len() >= 6 {
-		tag1 = (&values[5]).to_string();
+		tag1 = (&values[5]).trim().to_string();
 	}
 	if values.len() >= 7 {
-		tag2 = (&values[6]).to_string();
+		tag2 = (&values[6]).trim().to_string();
 	}
 
 	// Loxone sends timestamps in Local time, we need to convert it to UTC
