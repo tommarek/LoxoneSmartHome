@@ -136,7 +136,7 @@ def save_to_inlfuxdb(write_api, data, forecast_type):
                 "room": "outside",
                 "type": forecast_type
             },
-            "fields": {name: float(value) for name, value in data['data'][0].items()},
+            "fields": {name: float(value) for name, value in data['data'].items()},
             "time": data['timestamp']
         }],
         WritePrecision.S
@@ -198,7 +198,6 @@ if __name__ == '__main__':
                 'hourly': raw_data['hourly'],
             }
 
-        print(mqtt_data)
         if USE_MQTT:
             if mqtt_client.is_connected():
                 print("Publishing to MQTT topic {}".format(MQTT_TOPIC))
