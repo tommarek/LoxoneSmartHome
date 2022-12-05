@@ -3,7 +3,7 @@ services:
   influxdb:
     image: influxdb:latest
     container_name: influxdb
-    restart: always
+    restart: unless-stopped
     ports:
       - "8083:8083"
       - "8086:8086"
@@ -20,6 +20,7 @@ services:
   grafana:
     image: grafana/grafana:latest
     container_name: grafana
+    restart: unless-stopped
     ports:
       - "3000:3000"
     user: '1026:65537'
@@ -36,6 +37,7 @@ services:
   loxone_to_db:
     build: ./loxone_to_db
     container_name: loxone_to_db
+    restart: unless-stopped
     ports:
       - "2000:2000/udp"
     user: '1026:65537'
