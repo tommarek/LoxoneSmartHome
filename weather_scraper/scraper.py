@@ -36,6 +36,8 @@ OPENWEATHERMAP_API_KEY = os.getenv('OPENWEATHERMAP_API_KEY', None)
 
 OPEN_METEO_URL = 'https://api.open-meteo.com/v1/forecast?latitude={latitude}&longitude={longitude}&hourly={fields}&windspeed_unit=ms&timeformat=unixtime&timezone=GMT'
 OPEN_METEO_FIELDS = 'temperature_2m,relativehumidity_2m,dewpoint_2m,apparent_temperature,precipitation,rain,showers,snowfall,surface_pressure,cloudcover,cloudcover_low,cloudcover_mid,cloudcover_high,visibility,windspeed_10m,winddirection_10m,windgusts_10m,temperature_80m,shortwave_radiation,direct_radiation,diffuse_radiation,direct_normal_irradiance,terrestrial_radiation,shortwave_radiation_instant,direct_radiation_instant,diffuse_radiation_instant,direct_normal_irradiance_instant,terrestrial_radiation_instant&models=best_match&daily=sunrise,sunset,precipitation_sum,rain_sum,precipitation_hours,shortwave_radiation_sum'
+OPEN_METEO_AIR_POLUTION_URL = 'https://air-quality-api.open-meteo.com/v1/air-quality?latitude={latitude}&longitude={longitude}&hourly={fields}&timeformat=unixtime&timezone=GMT'
+OPEN_METEO_AIR_POLUTION_FIELDS = 'pm10,pm2_5,ozone,aerosol_optical_depth,uv_index'
 
 HourlyData = namedtuple('HourlyData', [
     'temp',
@@ -51,6 +53,9 @@ HourlyData = namedtuple('HourlyData', [
 def get_openmeteo_data():
     resp = requests.get(OPEN_METEO_URL.format(latitude=LATITUDE, longitude=LONGITUDE, fields=OPEN_METEO_FIELDS))
     js = resp.json()
+    resp = requests.get(OPEN_METEO_AIR_POLUTION_URL.format(latitude=LATITUDE, longitude=LONGITUDE, fields=OPEN_METEO_AIR_POLUTION_FIELDS))
+    js_air = resp.json()
+    js['hourly'].update(js_air['hourly'])
     OpenMeteoHourlyRecord = namedtuple('OpenMeteoHourlyRecord', list(js['hourly'].keys()))
     OpenMeteoDailyRecord = namedtuple('OpenMeteoDailyRecord', list(js['daily'].keys()))
     hour_now = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
