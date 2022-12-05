@@ -53,12 +53,12 @@ def get_openmeteo_data():
     js = resp.json()
     OpenMeteoHourlyRecord = namedtuple('OpenMeteoHourlyRecord', list(js['hourly'].keys()))
     OpenMeteoDailyRecord = namedtuple('OpenMeteoDailyRecord', list(js['daily'].keys()))
-    hour_now = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+    hour_now = int(datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp())
     hourly_data = {t[0]: OpenMeteoHourlyRecord(*t) for t in zip(*(js['hourly'][k] for k in js['hourly'].keys()))}
-    day_now = datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    day_now = int(datetime.datetime.now(datetime.timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
     daily_data = {t[0]: OpenMeteoDailyRecord(*t) for t in zip(*(js['daily'][k] for k in js['daily'].keys()))}
 
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    now = int(datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).timestamp())
     return {
         'source': 'openmeteo',
         'timestamp': now,
