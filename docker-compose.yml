@@ -101,6 +101,19 @@ services:
     ports:
     - '8125:8125/udp'
 
+  mqtt-loxone-bridge:
+    build: ./mqtt-loxone-bridge
+    container_name: mqtt-loxone-bridge
+    restart: unless-stopped
+    user: '1026:65537'
+    env_file:
+      - ./conf/common.env
+      - ./conf/mqtt-loxone-bridge.env
+    links:
+      - mosquitto
+    volumes:
+      - ./mqtt-loxone-bridge:/usr/src/app:rw
+
 volumes:
     cargo-cache:
 
