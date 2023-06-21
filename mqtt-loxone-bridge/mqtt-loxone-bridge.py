@@ -22,13 +22,13 @@ def on_connect(client, userdata, flags, rc):
 
 # Define the on_message callback function for the MQTT client
 def on_message(client, userdata, msg):
-    print(f"Received message on topic {msg.topic}: {msg.payload}")
+    #print(f"Received message on topic {msg.topic}: {msg.payload}")
     if msg.topic == mqtt_topic:
         data = json.loads(msg.payload)
         message = ';'.join([f"{k}={v}" for k, v in data.items()])
         udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         udp.sendto(bytes(message, "utf-8"), (loxone_host, loxone_port))
-        print(f"Message sent to Loxone server for topic {mqtt_topic}")
+        print(f"Message sent")
 
 # Set the MQTT client callbacks
 mqtt_client.on_connect = on_connect
