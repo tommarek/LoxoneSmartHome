@@ -27,7 +27,10 @@ def on_message(client, userdata, msg):
     if msg.topic in mqtt_topics:
         try:
             data = json.loads(msg.payload)
-            message = ';'.join([f"{k}={v}" for k, v in data.items()])
+            if isinstance(data, dict):
+                message = ';'.join([f"{k}={v}" for k, v in data.items()])
+            else:
+                message = f"v={data}"
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.sendto(bytes(message, "utf-8"), (loxone_host, loxone_port))
             print("Message sent")
