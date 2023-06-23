@@ -30,10 +30,10 @@ def on_message(client, userdata, msg):
             if isinstance(data, dict):
                 message = ';'.join([f"{k}={v}" for k, v in data.items()])
             else:
-                message = f"v={data}"
+                message = f"{msg.topic}={data}"
             udp = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             udp.sendto(bytes(message, "utf-8"), (loxone_host, loxone_port))
-            print("Message sent")
+            #print(f"Message {message} sent")
         except Exception as e:
             print("Error sending message:", e)
 
