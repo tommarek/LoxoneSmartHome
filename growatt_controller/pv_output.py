@@ -74,32 +74,23 @@ def calculate_daily_power(total_irradiance, day_of_year):
 
 # Fetch irradiance data from PVForecast.cz
 def fetch_irradiance_data():
-    url = "https://www.pvforecast.cz/api/?key=a4qtew&lat=49.495&lon=17.431&format=simple&type=day&number=3"
+    url = "https://www.pvforecast.cz/api/?key=a4qtew&lat=49.495&lon=17.431&format=simple&type=day&start=tomorrow"
     response = requests.get(url)
     data = response.text.split("|")
-    irradiance_today = float(data[1])
-    irradiance_tomorrow = float(data[2])
-    irradiance_day_after = float(data[3])
-    return irradiance_today, irradiance_tomorrow, irradiance_day_after
+    irradiance_tomorrow = float(data[1])
+    return irradiance_tomorrow
 
 
 # Function to calculate power output for the next three days
 def get_forecasted_power():
-    irradiance_today, irradiance_tomorrow, irradiance_day_after = (
-        fetch_irradiance_data()
-    )
+    irradiance_tomorrow = fetch_irradiance_data()
 
     unix_timestamp = int(time.time())
     day_of_year_today = calculate_day_of_year(unix_timestamp)
     day_of_year_tomorrow = (day_of_year_today + 1) % 365
-    day_of_year_day_after = (day_of_year_today + 2) % 365
 
-    total_power_today = calculate_daily_power(irradiance_today, day_of_year_today)
     total_power_tomorrow = calculate_daily_power(
         irradiance_tomorrow, day_of_year_tomorrow
     )
-    total_power_day_after = calculate_daily_power(
-        irradiance_day_after, day_of_year_day_after
-    )
 
-    return total_power_today, total_power_tomorrow, total_power_day_after
+    return total_power_tomorrow

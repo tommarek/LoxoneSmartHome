@@ -44,12 +44,10 @@ def calculate_and_schedule_next_day():
 
     # Fetch forecasted power
     forecasted_power = get_forecasted_power()
-    logging.info(
-        f"Forecasted power for today, tomorrow and day after tomorrow: {forecasted_power}"
-    )
+    logging.info(f"Forecasted power for tomorrow: {forecasted_power}")
 
     # Check if forecasted power is below the threshold
-    if forecasted_power[1] >= POWER_THRESHOLD:
+    if forecasted_power >= POWER_THRESHOLD:
         logging.info(
             f"Forecasted power is {forecasted_power}, which is above the threshold of {POWER_THRESHOLD}. Skipping battery-first scheduling."
         )
