@@ -1,9 +1,13 @@
 import schedule
+import datetime
 import time
 import logging
 import sys
 from pv_output import get_forecasted_power
-from energy_prices import fetch_energy_prices, find_cheapest_3_consecutive_hours
+from energy_prices import (
+    fetch_best_available_prices,
+    find_cheapest_x_consecutive_hours,
+)
 from battery_control import (
     configure_battery_first_with_ac_charge,
     disable_battery_first,
@@ -31,9 +35,13 @@ def calculate_and_schedule_next_day():
     schedule.clear("battery_first")
     schedule.clear("disable_battery_first")
 
-    # Fetch hourly prices for tomorrow
-    hourly_prices = fetch_energy_prices()
-    logging.info(f"Hourly prices for tomorrow: {hourly_prices}")
+    # Fetch the best available prices (IDA2 first, fallback to DAM)
+    hourly_prices = fetch_best_available_prices(
+        ida_session="2",
+        date=(datetime.datetime.now() + datetime.timedelta(days=1)).strftime(
+            "%Y-%m-%d"
+        ),
+    )
 
     # If prices cannot be fetched, skip scheduling
     if not hourly_prices:
@@ -41,6 +49,8 @@ def calculate_and_schedule_next_day():
             "Failed to retrieve energy prices. Skipping MQTT message scheduling."
         )
         return
+
+    logging.info(f"Energy prices for tomorrow: {hourly_prices}")
 
     # Fetch forecasted power
     forecasted_power = get_forecasted_power()
@@ -54,18 +64,15 @@ def calculate_and_schedule_next_day():
         return
 
     # Find the cheapest 3 consecutive hours
-    cheapest_window = find_cheapest_3_consecutive_hours(hourly_prices)
+    cheapest_window = find_cheapest_x_consecutive_hours(hourly_prices, 3)
 
     if not cheapest_window:
         logging.warning("No cheapest 3-hour window found.")
         return
 
     # Schedule battery-first mode at the start of the cheapest 3-hour window
-    start_hour = cheapest_window[0]
-    end_hour = cheapest_window[-1]
-
-    start_time = f"{start_hour:02d}:00"
-    stop_time = f"{end_hour + 1:02d}:00"  # End the slot after the last hour
+    start_time = cheapest_window[0]
+    stop_time = cheapest_window[1]
 
     logging.info(
         f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
@@ -106,7 +113,7 @@ if __name__ == "__main__":
 
     # Schedule the daily calculation and scheduling of battery control
     # schedule_daily_calculation()
-    calculate_and_schedule_next_day()  # Calculate and schedule for the first day
+    calculate_and_schedule_next_day()
 
     # Disconnect from the MQTT broker when done
     logging.info("Disconnecting from MQTT broker.")
