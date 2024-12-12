@@ -53,10 +53,11 @@ services:
       - ./loxone_to_db/cache:/usr/local/cargo/registry:rw
 
   mosquitto:
-    image: eclipse-mosquitto
+    image: eclipse-mosquitto:2
     hostname: mosquitto
     container_name: mosquitto
     restart: unless-stopped
+    command: mosquitto -c /mosquitto-no-auth.conf
     ports:
       - 1883:1883
       - 9001:9001
@@ -114,6 +115,58 @@ services:
     volumes:
       - ./mqtt-loxone-bridge:/usr/src/app:rw
 
+  teslamate:
+    image: teslamate/teslamate:edge
+    container_name: teslamate
+    restart: always
+    environment:
+      - ENCRYPTION_KEY=b2Vsdm5yZHF2cGFrc2w5ZGVucm9xbGVyZXVjYXB1ZWpyYQ== # Replace with your generated key
+      - DATABASE_USER=teslamate
+      - DATABASE_PASS=adminadmin
+      - DATABASE_NAME=teslamate
+      - DATABASE_HOST=database
+      - MQTT_HOST=mosquitto
+      - TZ=Europe/Prague  # Set your timezone
+    ports:
+      - 4000:4000
+    volumes:
+      - ./import:/opt/app/import
+    cap_drop:
+      - all
+    depends_on:
+      - database
+      - mosquitto
+
+  database:
+    image: postgres:16
+    container_name: teslamate-db
+    restart: always
+    environment:
+      - POSTGRES_USER=teslamate
+      - POSTGRES_PASSWORD=adminadmin
+      - POSTGRES_DB=teslamate
+    volumes:
+      - teslamate-db:/var/lib/postgresql/data
+
+  #teslamate-grafana:
+  #  image: teslamate/grafana:latest
+  #  container_name: teslamate-grafana
+  #  restart: always
+  #  environment:
+  #    - DATABASE_USER=teslamate
+  #    - DATABASE_PASS=adminadmin
+  #    - DATABASE_NAME=teslamate
+  #    - DATABASE_HOST=database
+  #  ports:
+  #    - 3100:3000
+  #  volumes:
+  #    - teslamate-grafana-data:/var/lib/grafana
+
 volumes:
-    cargo-cache:
+  cargo-cache:
+  teslamate-db:
+#  teslamate-grafana-data:
+  mosquitto-conf:
+  mosquitto-data:
+  mosquitto-log:
 
