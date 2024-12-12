@@ -1,3 +1,5 @@
+# energy_prices.py
+
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
@@ -41,7 +43,6 @@ def fetch_ida_prices(ida_session, date=None):
     return prices
 
 
-# Fetch energy prices data from OTE (DAM) with time intervals as tuples
 def fetch_dam_energy_prices(date=None):
     """
     Fetch energy prices data from OTE (DAM) with time intervals as tuples.
@@ -157,3 +158,21 @@ def find_cheapest_x_consecutive_hours(prices, x=2):
             cheapest_window = (start_time, end_time, avg_price)
 
     return cheapest_window
+
+
+def find_n_cheapest_hours(prices, n=8):
+    """
+    Finds the N cheapest individual hours.
+
+    Parameters:
+    - prices: dict with (start, stop) tuples as keys and prices as values.
+    - n: number of cheapest hours to find.
+
+    Returns:
+    - List of (start, stop, price) tuples sorted by price ascending.
+    """
+    sorted_prices = sorted(
+        [(start, stop, price) for (start, stop), price in prices.items()],
+        key=lambda x: x[2],
+    )
+    return sorted_prices[:n]

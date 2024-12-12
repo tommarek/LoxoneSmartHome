@@ -1,3 +1,5 @@
+# main.py
+
 import schedule
 import datetime
 import time
@@ -7,13 +9,15 @@ from pv_output import get_forecasted_power
 from energy_prices import (
     fetch_best_available_prices,
     find_cheapest_x_consecutive_hours,
+    find_n_cheapest_hours,  # Import the new function
 )
 from battery_control import (
     configure_battery_first_with_ac_charge,
+    configure_battery_first_without_ac_charge,  # Import the new function
     disable_battery_first,
     connect_mqtt,
     disconnect_mqtt,
-    set_simulate_mode,  # Import the function to control simulation mode
+    set_simulate_mode,
 )
 
 # Define the power threshold
@@ -29,11 +33,56 @@ logging.basicConfig(
 )
 
 
+def get_individual_hours_from_window(start_time, stop_time):
+    """
+    Given a start and stop time, return a list of individual (start, stop) hour tuples.
+    For example, ('14:00', '16:00') returns [('14:00', '15:00'), ('15:00', '16:00')].
+    """
+    start_dt = datetime.datetime.strptime(start_time, "%H:%M")
+    stop_dt = datetime.datetime.strptime(stop_time, "%H:%M")
+    individual_hours = []
+    current = start_dt
+    while current < stop_dt:
+        next_hour = current + datetime.timedelta(hours=1)
+        individual_hours.append(
+            (current.strftime("%H:%M"), next_hour.strftime("%H:%M"))
+        )
+        current = next_hour
+    return individual_hours
+
+
+def safe_configure_battery_first_with_ac_charge(start_time, stop_time):
+    """
+    Wrapper for configure_battery_first_with_ac_charge with exception handling.
+    """
+    try:
+        configure_battery_first_with_ac_charge(start_time, stop_time)
+    except Exception as e:
+        logging.exception(
+            "Error in configure_battery_first_with_ac_charge. Disabling battery-first mode."
+        )
+        disable_battery_first()
+
+
+def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
+    """
+    Wrapper for configure_battery_first_without_ac_charge with exception handling.
+    """
+    try:
+        configure_battery_first_without_ac_charge(start_time, stop_time)
+    except Exception as e:
+        logging.exception(
+            "Error in configure_battery_first_without_ac_charge. Disabling battery-first mode."
+        )
+        disable_battery_first()
+
+
 def calculate_and_schedule_next_day():
-    """Fetches energy prices, calculates the cheapest 3 consecutive hours, and schedules tasks."""
+    """Fetches energy prices, calculates the cheapest hours, and schedules tasks."""
     # Clear previously scheduled tasks related to battery-first and disabling (without clearing the recalculate task)
     schedule.clear("battery_first")
     schedule.clear("disable_battery_first")
+    schedule.clear("disable_charging")
 
     # Fetch the best available prices (IDA2 first, fallback to DAM)
     hourly_prices = fetch_best_available_prices(
@@ -48,6 +97,7 @@ def calculate_and_schedule_next_day():
         logging.error(
             "Failed to retrieve energy prices. Skipping MQTT message scheduling."
         )
+        disable_battery_first()
         return
 
     logging.info(f"Energy prices for tomorrow: {hourly_prices}")
@@ -63,41 +113,68 @@ def calculate_and_schedule_next_day():
         )
         return
 
-    # Find the cheapest 3 consecutive hours
-    cheapest_window = find_cheapest_x_consecutive_hours(hourly_prices, 3)
+    # Find the 2 cheapest consecutive hours
+    cheapest_consecutive = find_cheapest_x_consecutive_hours(hourly_prices, 2)
+    if not cheapest_consecutive:
+        logging.warning("No cheapest 2-hour consecutive window found.")
+    else:
+        logging.info(f"Cheapest consecutive 2-hour window: {cheapest_consecutive}")
 
-    if not cheapest_window:
-        logging.warning("No cheapest 3-hour window found.")
-        return
+    # Initialize a set to keep track of excluded hours
+    excluded_hours = set()
 
-    # Schedule battery-first mode at the start of the cheapest 3-hour window
-    start_time = cheapest_window[0]
-    stop_time = cheapest_window[1]
+    # If a cheapest consecutive window is found, determine its individual hours and exclude them
+    if cheapest_consecutive:
+        start_time, stop_time, avg_price = cheapest_consecutive
+        individual_hours = get_individual_hours_from_window(start_time, stop_time)
+        logging.info(f"Excluding individual hours: {individual_hours}")
+        for hour in individual_hours:
+            excluded_hours.add(hour)
+            # Remove these hours from hourly_prices to exclude them from the 8 cheapest
+            if hour in hourly_prices:
+                del hourly_prices[hour]
 
-    logging.info(
-        f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
-    )
-    schedule.every().day.at(start_time).do(
-        configure_battery_first_with_ac_charge, start_time, stop_time
-    ).tag("battery_first")
+    # Find the 8 cheapest individual hours from the remaining hours
+    cheapest_hours = find_n_cheapest_hours(hourly_prices, n=8)
+    logging.info(f"8 Cheapest hours (excluding consecutive hours): {cheapest_hours}")
 
-    # Schedule disabling battery-first mode at stop_time (after the 3-hour window ends)
-    logging.info(f"Scheduling disabling of battery-first mode after {stop_time}")
-    schedule.every().day.at(stop_time).do(disable_battery_first).tag(
-        "disable_battery_first"
-    )
+    # Schedule disabling charging during the 8 cheapest hours
+    for start_time, stop_time, price in cheapest_hours:
+        logging.info(
+            f"Scheduling disable charging but keep battery-first from {start_time} to {stop_time}"
+        )
+        schedule.every().day.at(start_time).do(
+            safe_configure_battery_first_without_ac_charge, start_time, stop_time
+        ).tag("disable_charging")
+
+    # Schedule enabling battery-first + AC charge during the 2 cheapest consecutive hours
+    if cheapest_consecutive:
+        start_time, stop_time, avg_price = cheapest_consecutive
+        logging.info(
+            f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
+        )
+        schedule.every().day.at(start_time).do(
+            safe_configure_battery_first_with_ac_charge, start_time, stop_time
+        ).tag("battery_first")
 
 
 def schedule_daily_calculation():
-    """Schedules the calculation and scheduling of battery and grid modes at 23:55 every day."""
-    # This job remains in place and won't be cleared by clear('battery_first') or clear('disable_battery_first')
-    logging.info("Scheduling daily calculation at 23:55.")
-    schedule.every().day.at("23:55").do(calculate_and_schedule_next_day).tag(
+    """Schedules the calculation and scheduling of battery control at 23:59 every day."""
+    # Schedule the first calculation immediately
+    calculate_and_schedule_next_day()
+
+    # This job remains in place and won't be cleared by clear tags
+    logging.info("Scheduling daily calculation at 23:59.")
+    schedule.every().day.at("23:59").do(calculate_and_schedule_next_day).tag(
         "recalculate"
     )
 
     while True:
-        schedule.run_pending()
+        try:
+            schedule.run_pending()
+        except Exception as e:
+            logging.exception("An error occurred during schedule.run_pending.")
+            disable_battery_first()
         time.sleep(60)  # Sleep for a minute to check the next scheduled task
 
 
@@ -111,10 +188,15 @@ if __name__ == "__main__":
     # Connect to the MQTT broker before starting the schedule
     connect_mqtt()
 
-    # Schedule the daily calculation and scheduling of battery control
-    # schedule_daily_calculation()
-    calculate_and_schedule_next_day()
-
-    # Disconnect from the MQTT broker when done
-    logging.info("Disconnecting from MQTT broker.")
-    disconnect_mqtt()
+    try:
+        # Schedule the daily calculation and scheduling of battery control
+        schedule_daily_calculation()
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user. Shutting down.")
+    except Exception as e:
+        logging.exception("An unexpected error occurred in the main execution.")
+        disable_battery_first()
+    finally:
+        # Disconnect from the MQTT broker when done
+        logging.info("Disconnecting from MQTT broker.")
+        disconnect_mqtt()

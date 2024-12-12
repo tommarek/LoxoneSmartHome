@@ -3,13 +3,12 @@ import logging
 import paho.mqtt.client as mqtt
 
 # MQTT broker details
-BROKER_ADDRESS = "your_broker_address"
+BROKER_ADDRESS = "192.168.0.201"
 MQTT_PORT = 1883
 
 # MQTT topics
 BATTERY_FIRST_TOPIC = "energy/solar/command/batteryfirst/set/timeslot"
 AC_CHARGE_TOPIC = "energy/solar/command/batteryfirst/set/acchargeenabled"
-DISABLE_BATTERY_FIRST_TOPIC = "energy/solar/command/batteryfirst/set/timeslot"
 
 # Global simulation flag
 SIMULATE = False  # Default: not in simulate mode
@@ -61,6 +60,22 @@ def enable_ac_charge():
     logging.info("AC charging enabled")
 
 
+def disable_ac_charge():
+    """
+    Disable AC charging.
+    """
+    if SIMULATE:
+        logging.info("[SIMULATE] Would disable AC charging.")
+        return
+
+    # Define the payload to disable AC charge
+    payload = {"value": False}
+
+    # Convert to JSON and send via MQTT
+    client.publish(AC_CHARGE_TOPIC, json.dumps(payload))
+    logging.info("AC charging disabled")
+
+
 def disable_battery_first():
     """
     Disable battery-first mode by setting enabled to False for the time slot.
@@ -78,7 +93,7 @@ def disable_battery_first():
     }
 
     # Convert to JSON and send via MQTT
-    client.publish(DISABLE_BATTERY_FIRST_TOPIC, json.dumps(payload))
+    client.publish(BATTERY_FIRST_TOPIC, json.dumps(payload))
     logging.info("Battery-first mode disabled")
 
 
@@ -88,6 +103,14 @@ def configure_battery_first_with_ac_charge(start_hour, stop_hour):
     """
     set_battery_first(start_hour, stop_hour)
     enable_ac_charge()
+
+
+def configure_battery_first_without_ac_charge(start_hour, stop_hour):
+    """
+    Set battery-first mode without enabling AC charge.
+    """
+    set_battery_first(start_hour, stop_hour)
+    disable_ac_charge()
 
 
 # Connect to the MQTT broker
