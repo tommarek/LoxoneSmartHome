@@ -148,19 +148,22 @@ services:
     volumes:
       - teslamate-db:/var/lib/postgresql/data
 
-  #teslamate-grafana:
-  #  image: teslamate/grafana:latest
-  #  container_name: teslamate-grafana
-  #  restart: always
-  #  environment:
-  #    - DATABASE_USER=teslamate
-  #    - DATABASE_PASS=adminadmin
-  #    - DATABASE_NAME=teslamate
-  #    - DATABASE_HOST=database
-  #  ports:
-  #    - 3100:3000
-  #  volumes:
-  #    - teslamate-grafana-data:/var/lib/grafana
+  growatt_controller:
+    build: ./growatt_controller
+    container_name: growatt_controller
+    restart: unless-stopped
+    user: '1026:65537'
+    env_file:
+      - ./conf/common.env
+      - ./conf/growatt_controller.env
+    links:
+      - mosquitto
+      - influxdb
+    depends_on:
+      - mosquitto
+      - influxdb
+    volumes:
+      - ./growatt_controller:/usr/src/app:rw
 
 volumes:
   cargo-cache:
