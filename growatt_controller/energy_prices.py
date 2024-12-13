@@ -58,16 +58,17 @@ def fetch_dam_energy_prices(date=None):
 
     # Fetch the data
     response = requests.get(url)
-    data = response.json()["data"]["dataLine"][1]["point"]
-
-    # Extract hourly prices and format with (start, stop) tuples
     hourly_prices = {}
-    for point in data:
-        hour = int(point["x"]) - 1
-        price = float(point["y"])
-        start_time = f"{hour:02d}:00"
-        stop_time = f"{hour + 1:02d}:00"
-        hourly_prices[(start_time, stop_time)] = price
+    if response.json()["data"]["dataLine"]:
+        data = response.json()["data"]["dataLine"][1]["point"]
+
+        # Extract hourly prices and format with (start, stop) tuples
+        for point in data:
+            hour = int(point["x"]) - 1
+            price = float(point["y"])
+            start_time = f"{hour:02d}:00"
+            stop_time = f"{hour + 1:02d}:00"
+            hourly_prices[(start_time, stop_time)] = price
 
     return hourly_prices
 
@@ -83,20 +84,21 @@ def fetch_best_available_prices(ida_session, date=None):
     Returns:
     - A dictionary with the best available prices, using (start, stop) tuples as keys.
     """
-    try:
-        logging.info(f"Attempting to fetch IDA session {ida_session} prices for {date}")
-        ida_prices = fetch_ida_prices(ida_session, date)
-        if ida_prices:
-            logging.info(f"Successfully fetched IDA session {ida_session} prices")
-            return ida_prices
-        else:
-            logging.warning(
-                f"No IDA prices available for session {ida_session} on {date}"
-            )
-    except Exception as e:
-        logging.error(
-            f"Failed to fetch IDA prices for session {ida_session} on {date}: {e}"
-        )
+    # let's not do this for now :)
+    # try:
+    #     logging.info(f"Attempting to fetch IDA session {ida_session} prices for {date}")
+    #     ida_prices = fetch_ida_prices(ida_session, date)
+    #     if ida_prices:
+    #         logging.info(f"Successfully fetched IDA session {ida_session} prices")
+    #         return ida_prices
+    #     else:
+    #         logging.warning(
+    #             f"No IDA prices available for session {ida_session} on {date}"
+    #         )
+    # except Exception as e:
+    #     logging.error(
+    #         f"Failed to fetch IDA prices for session {ida_session} on {date}: {e}"
+    #     )
 
     # Fall back to DAM if IDA is unavailable or fails
     try:

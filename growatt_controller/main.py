@@ -9,11 +9,11 @@ from pv_output import get_forecasted_power
 from energy_prices import (
     fetch_best_available_prices,
     find_cheapest_x_consecutive_hours,
-    find_n_cheapest_hours,  # Import the new function
+    find_n_cheapest_hours,
 )
 from battery_control import (
     configure_battery_first_with_ac_charge,
-    configure_battery_first_without_ac_charge,  # Import the new function
+    configure_battery_first_without_ac_charge,
     disable_battery_first,
     connect_mqtt,
     disconnect_mqtt,
@@ -51,12 +51,56 @@ def get_individual_hours_from_window(start_time, stop_time):
     return individual_hours
 
 
+def group_contiguous_hours(hours):
+    """
+    Groups contiguous hours into continuous ranges.
+
+    Parameters:
+    - hours: List of tuples [(start_time, stop_time, price), ...]
+
+    Returns:
+    - List of tuples [(group_start_time, group_end_time), ...]
+    """
+    if not hours:
+        return []
+
+    # Sort hours by start_time
+    sorted_hours = sorted(
+        hours, key=lambda x: datetime.datetime.strptime(x[0], "%H:%M")
+    )
+
+    groups = []
+    current_group_start = sorted_hours[0][0]
+    current_group_end = sorted_hours[0][1]
+
+    for hour in sorted_hours[1:]:
+        previous_end = datetime.datetime.strptime(current_group_end, "%H:%M")
+        current_start = datetime.datetime.strptime(hour[0], "%H:%M")
+
+        if current_start == previous_end:
+            # Extend the current group
+            current_group_end = hour[1]
+        else:
+            # Close the current group and start a new one
+            groups.append((current_group_start, current_group_end))
+            current_group_start = hour[0]
+            current_group_end = hour[1]
+
+    # Append the last group
+    groups.append((current_group_start, current_group_end))
+
+    return groups
+
+
 def safe_configure_battery_first_with_ac_charge(start_time, stop_time):
     """
     Wrapper for configure_battery_first_with_ac_charge with exception handling.
     """
     try:
         configure_battery_first_with_ac_charge(start_time, stop_time)
+        logging.info(
+            f"Enabled battery-first mode with AC charge from {start_time} to {stop_time}."
+        )
     except Exception as e:
         logging.exception(
             "Error in configure_battery_first_with_ac_charge. Disabling battery-first mode."
@@ -70,6 +114,9 @@ def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
     """
     try:
         configure_battery_first_without_ac_charge(start_time, stop_time)
+        logging.info(
+            f"Disabled charging but kept battery-first mode from {start_time} to {stop_time}."
+        )
     except Exception as e:
         logging.exception(
             "Error in configure_battery_first_without_ac_charge. Disabling battery-first mode."
@@ -80,13 +127,12 @@ def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
 def calculate_and_schedule_next_day():
     """Fetches energy prices, calculates the cheapest hours, and schedules tasks."""
     # Clear previously scheduled tasks related to battery-first and disabling (without clearing the recalculate task)
-    schedule.clear("battery_first")
-    schedule.clear("disable_battery_first")
-    schedule.clear("disable_charging")
+    schedule.clear("battery_first_ac_charge")
+    schedule.clear("battery_first_no_ac_charge")
 
     # Fetch the best available prices (IDA2 first, fallback to DAM)
     hourly_prices = fetch_best_available_prices(
-        ida_session="2",
+        ida_session="1",
         date=(datetime.datetime.now() + datetime.timedelta(days=1)).strftime(
             "%Y-%m-%d"
         ),
@@ -102,6 +148,10 @@ def calculate_and_schedule_next_day():
 
     logging.info(f"Energy prices for tomorrow: {hourly_prices}")
 
+    # Define the number of individual cheap hours and consecutive hours
+    num_individual_hours = 8  # Number of individual cheapest hours
+    num_consecutive_hours = 2  # Number of consecutive hours to enable
+
     # Fetch forecasted power
     forecasted_power = get_forecasted_power()
     logging.info(f"Forecasted power for tomorrow: {forecasted_power}")
@@ -113,49 +163,80 @@ def calculate_and_schedule_next_day():
         )
         return
 
-    # Find the 2 cheapest consecutive hours
-    cheapest_consecutive = find_cheapest_x_consecutive_hours(hourly_prices, 2)
+    # Step 1: Find the 8 cheapest individual hours
+    cheapest_individual_hours = find_n_cheapest_hours(
+        hourly_prices, n=num_individual_hours
+    )
+    logging.info(f"8 Cheapest individual hours: {cheapest_individual_hours}")
+
+    # Step 2: Find the 2 cheapest consecutive hours
+    cheapest_consecutive = find_cheapest_x_consecutive_hours(
+        hourly_prices, num_consecutive_hours
+    )
     if not cheapest_consecutive:
         logging.warning("No cheapest 2-hour consecutive window found.")
     else:
         logging.info(f"Cheapest consecutive 2-hour window: {cheapest_consecutive}")
 
-    # Initialize a set to keep track of excluded hours
-    excluded_hours = set()
-
-    # If a cheapest consecutive window is found, determine its individual hours and exclude them
+    # Step 3: Remove the consecutive hours from the disabling list
     if cheapest_consecutive:
-        start_time, stop_time, avg_price = cheapest_consecutive
-        individual_hours = get_individual_hours_from_window(start_time, stop_time)
-        logging.info(f"Excluding individual hours: {individual_hours}")
-        for hour in individual_hours:
-            excluded_hours.add(hour)
-            # Remove these hours from hourly_prices to exclude them from the 8 cheapest
-            if hour in hourly_prices:
-                del hourly_prices[hour]
-
-    # Find the 8 cheapest individual hours from the remaining hours
-    cheapest_hours = find_n_cheapest_hours(hourly_prices, n=8)
-    logging.info(f"8 Cheapest hours (excluding consecutive hours): {cheapest_hours}")
-
-    # Schedule disabling charging during the 8 cheapest hours
-    for start_time, stop_time, price in cheapest_hours:
-        logging.info(
-            f"Scheduling disable charging but keep battery-first from {start_time} to {stop_time}"
+        # Extract individual hours within the consecutive window
+        start_time, stop_time, _ = cheapest_consecutive
+        consecutive_individual_hours = get_individual_hours_from_window(
+            start_time, stop_time
         )
-        schedule.every().day.at(start_time).do(
-            safe_configure_battery_first_without_ac_charge, start_time, stop_time
-        ).tag("disable_charging")
+        logging.info(
+            f"Consecutive individual hours to exclude: {consecutive_individual_hours}"
+        )
 
-    # Schedule enabling battery-first + AC charge during the 2 cheapest consecutive hours
+        # Remove these hours from the disabling list
+        cheapest_individual_hours = [
+            hour
+            for hour in cheapest_individual_hours
+            if (hour[0], hour[1]) not in consecutive_individual_hours
+        ]
+        logging.info(
+            f"Cheapest individual hours after exclusion: {cheapest_individual_hours}"
+        )
+    else:
+        logging.info("Proceeding without excluding any hours.")
+
+    # Ensure we have exactly 6 disabling hours
     if cheapest_consecutive:
-        start_time, stop_time, avg_price = cheapest_consecutive
+        num_disabling_hours = 6
+    else:
+        num_disabling_hours = (
+            8  # If no consecutive window found, keep all 8 disabling hours
+        )
+
+    # Select the top `num_disabling_hours` disabling hours
+    cheapest_disabling_hours = cheapest_individual_hours[:num_disabling_hours]
+    logging.info(
+        f"{num_disabling_hours} Cheapest disabling hours: {cheapest_disabling_hours}"
+    )
+
+    # Step 4: Group the disabling hours into contiguous ranges
+    grouped_disabling_hours = group_contiguous_hours(cheapest_disabling_hours)
+    logging.info(f"Grouped disabling hours: {grouped_disabling_hours}")
+
+    # Step 5: Schedule the disabling actions
+    for group_start, group_end in grouped_disabling_hours:
+        logging.info(
+            f"Scheduling disable charging but keep battery-first from {group_start} to {group_end}"
+        )
+        schedule.every().day.at(group_start).do(
+            safe_configure_battery_first_without_ac_charge, group_start, group_end
+        ).tag("battery_first_no_ac_charge")
+
+    # Step 6: Schedule the enabling actions
+    if cheapest_consecutive:
+        start_time, stop_time, _ = cheapest_consecutive
         logging.info(
             f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
         )
         schedule.every().day.at(start_time).do(
             safe_configure_battery_first_with_ac_charge, start_time, stop_time
-        ).tag("battery_first")
+        ).tag("battery_first_ac_charge")
 
 
 def schedule_daily_calculation():
@@ -163,7 +244,7 @@ def schedule_daily_calculation():
     # Schedule the first calculation immediately
     calculate_and_schedule_next_day()
 
-    # This job remains in place and won't be cleared by clear tags
+    # Schedule the daily recalculation at 23:59
     logging.info("Scheduling daily calculation at 23:59.")
     schedule.every().day.at("23:59").do(calculate_and_schedule_next_day).tag(
         "recalculate"
@@ -195,8 +276,8 @@ if __name__ == "__main__":
         logging.info("Interrupted by user. Shutting down.")
     except Exception as e:
         logging.exception("An unexpected error occurred in the main execution.")
-        disable_battery_first()
     finally:
+        disable_battery_first()
         # Disconnect from the MQTT broker when done
         logging.info("Disconnecting from MQTT broker.")
         disconnect_mqtt()
