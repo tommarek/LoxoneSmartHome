@@ -152,16 +152,17 @@ def calculate_and_schedule_next_day():
     num_individual_hours = 8  # Number of individual cheapest hours
     num_consecutive_hours = 2  # Number of consecutive hours to enable
 
-    # Fetch forecasted power
-    forecasted_power = get_forecasted_power()
-    logging.info(f"Forecasted power for tomorrow: {forecasted_power}")
+    # TODO: not working on synology for some reason, fix it in docker
+    # # Fetch forecasted power
+    # forecasted_power = get_forecasted_power()
+    # logging.info(f"Forecasted power for tomorrow: {forecasted_power}")
 
-    # Check if forecasted power is below the threshold
-    if forecasted_power >= POWER_THRESHOLD:
-        logging.info(
-            f"Forecasted power is {forecasted_power}, which is above the threshold of {POWER_THRESHOLD}. Skipping battery-first scheduling."
-        )
-        return
+    # # Check if forecasted power is below the threshold
+    # if forecasted_power >= POWER_THRESHOLD:
+    #     logging.info(
+    #         f"Forecasted power is {forecasted_power}, which is above the threshold of {POWER_THRESHOLD}. Skipping battery-first scheduling."
+    #     )
+    #     return
 
     # Step 1: Find the 8 cheapest individual hours
     cheapest_individual_hours = find_n_cheapest_hours(
