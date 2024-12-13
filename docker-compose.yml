@@ -155,7 +155,6 @@ services:
     user: '1026:65537'
     env_file:
       - ./conf/common.env
-      - ./conf/growatt_controller.env
     links:
       - mosquitto
       - influxdb
