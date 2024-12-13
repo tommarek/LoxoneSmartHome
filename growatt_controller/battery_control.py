@@ -3,7 +3,7 @@ import logging
 import paho.mqtt.client as mqtt
 
 # MQTT broker details
-BROKER_ADDRESS = "192.168.0.201"
+BROKER_ADDRESS = "mosquitto"
 MQTT_PORT = 1883
 
 # MQTT topics
