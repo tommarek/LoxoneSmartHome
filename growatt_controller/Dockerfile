@@ -4,6 +4,15 @@ FROM python:3.9-slim
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
+# Install tzdata
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+
+# Set timezone environment variable
+ENV TZ=Europe/Prague
+
+# Configure the timezone
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
 # Copy the current directory contents into the container at /usr/src/app
 COPY . .
 

@@ -150,7 +150,7 @@ def calculate_and_schedule_next_day():
 
     # Define the number of individual cheap hours and consecutive hours
     num_individual_hours = 8  # Number of individual cheapest hours
-    num_consecutive_hours = 2  # Number of consecutive hours to enable
+    num_consecutive_hours = 3  # Number of consecutive hours to enable
 
     # TODO: not working on synology for some reason, fix it in docker
     # # Fetch forecasted power
@@ -164,13 +164,13 @@ def calculate_and_schedule_next_day():
     #     )
     #     return
 
-    # Step 1: Find the 8 cheapest individual hours
+    # Step 1: Find the cheapest individual hours
     cheapest_individual_hours = find_n_cheapest_hours(
         hourly_prices, n=num_individual_hours
     )
     logging.info(f"8 Cheapest individual hours: {cheapest_individual_hours}")
 
-    # Step 2: Find the 2 cheapest consecutive hours
+    # Step 2: Find the cheapest consecutive hours
     cheapest_consecutive = find_cheapest_x_consecutive_hours(
         hourly_prices, num_consecutive_hours
     )
