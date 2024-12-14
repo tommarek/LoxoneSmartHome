@@ -168,18 +168,24 @@ def calculate_and_schedule_next_day():
     cheapest_individual_hours = find_n_cheapest_hours(
         hourly_prices, n=num_individual_hours
     )
-    logging.info(f"8 Cheapest individual hours: {cheapest_individual_hours}")
+    logging.info(
+        f"{num_individual_hours} Cheapest individual hours: {cheapest_individual_hours}"
+    )
 
     # Step 2: Find the cheapest consecutive hours
     cheapest_consecutive = find_cheapest_x_consecutive_hours(
         hourly_prices, num_consecutive_hours
     )
     if not cheapest_consecutive:
-        logging.warning("No cheapest 2-hour consecutive window found.")
+        logging.warning(
+            f"No cheapest {num_consecutive_hours}-hour consecutive window found."
+        )
     else:
-        logging.info(f"Cheapest consecutive 2-hour window: {cheapest_consecutive}")
+        logging.info(
+            f"Cheapest consecutive {num_consecutive_hours}-hour window: {cheapest_consecutive}"
+        )
 
-    # Step 3: Remove the consecutive hours from the disabling list
+    # Step 3: Remove the consecutive hours from the cheapest hours list
     if cheapest_consecutive:
         # Extract individual hours within the consecutive window
         start_time, stop_time, _ = cheapest_consecutive
@@ -202,26 +208,16 @@ def calculate_and_schedule_next_day():
     else:
         logging.info("Proceeding without excluding any hours.")
 
-    # Ensure we have exactly 6 disabling hours
-    if cheapest_consecutive:
-        num_disabling_hours = 6
-    else:
-        num_disabling_hours = (
-            8  # If no consecutive window found, keep all 8 disabling hours
-        )
-
-    # Select the top `num_disabling_hours` disabling hours
-    cheapest_disabling_hours = cheapest_individual_hours[:num_disabling_hours]
+    # Step 4: Group the disabling hours into contiguous ranges
+    cheapest_individual_hours_groupped = group_contiguous_hours(
+        cheapest_individual_hours
+    )
     logging.info(
-        f"{num_disabling_hours} Cheapest disabling hours: {cheapest_disabling_hours}"
+        f"Grouped chepest individual hours w: {cheapest_individual_hours_groupped}"
     )
 
-    # Step 4: Group the disabling hours into contiguous ranges
-    grouped_disabling_hours = group_contiguous_hours(cheapest_disabling_hours)
-    logging.info(f"Grouped disabling hours: {grouped_disabling_hours}")
-
     # Step 5: Schedule the disabling actions
-    for group_start, group_end in grouped_disabling_hours:
+    for group_start, group_end in cheapest_individual_hours_groupped:
         logging.info(
             f"Scheduling disable charging but keep battery-first from {group_start} to {group_end}"
         )
