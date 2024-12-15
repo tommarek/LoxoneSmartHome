@@ -7,6 +7,7 @@ import logging
 import sys
 from pv_output import get_forecasted_power
 from energy_prices import (
+    categorize_prices_into_quadrants,
     fetch_best_available_prices,
     find_cheapest_x_consecutive_hours,
     find_n_cheapest_hours,
@@ -133,7 +134,7 @@ def calculate_and_schedule_next_day():
     # Fetch the best available prices (IDA2 first, fallback to DAM)
     hourly_prices = fetch_best_available_prices(
         ida_session="1",
-        date=(datetime.datetime.now() + datetime.timedelta(days=1)).strftime(
+        date=(datetime.datetime.now() + datetime.timedelta(days=0)).strftime(
             "%Y-%m-%d"
         ),
     )
@@ -165,14 +166,25 @@ def calculate_and_schedule_next_day():
     #     return
 
     # Step 1: Find the cheapest individual hours
-    cheapest_individual_hours = find_n_cheapest_hours(
-        hourly_prices, n=num_individual_hours
+    cheapest_individual_hours = set(
+        find_n_cheapest_hours(hourly_prices, n=num_individual_hours)
     )
     logging.info(
         f"{num_individual_hours} Cheapest individual hours: {cheapest_individual_hours}"
     )
 
-    # Step 2: Find the cheapest consecutive hours
+    # Step 2: Categorize prices into quadrants
+    quadrants = categorize_prices_into_quadrants(hourly_prices)
+    cheapest_quadrant_hours = set(quadrants.get("Cheapest", []))
+    logging.info(f"Cheapest quadrant hours: {cheapest_quadrant_hours}")
+
+    # merge cheapest_individual_hours and cheapest_quadrant_hours together but avoid duplicates
+    cheapest_individual_hours = cheapest_individual_hours.union(cheapest_quadrant_hours)
+    logging.info(
+        f"Combined cheapest individual and quadrant hours: {cheapest_individual_hours}"
+    )
+
+    # Step 3: Find the cheapest consecutive hours
     cheapest_consecutive = find_cheapest_x_consecutive_hours(
         hourly_prices, num_consecutive_hours
     )
@@ -185,7 +197,7 @@ def calculate_and_schedule_next_day():
             f"Cheapest consecutive {num_consecutive_hours}-hour window: {cheapest_consecutive}"
         )
 
-    # Step 3: Remove the consecutive hours from the cheapest hours list
+    # Step 4: Remove the consecutive hours from the cheapest hours list
     if cheapest_consecutive:
         # Extract individual hours within the consecutive window
         start_time, stop_time, _ = cheapest_consecutive
@@ -208,7 +220,7 @@ def calculate_and_schedule_next_day():
     else:
         logging.info("Proceeding without excluding any hours.")
 
-    # Step 4: Group the disabling hours into contiguous ranges
+    # Step 5: Group the disabling hours into contiguous ranges
     cheapest_individual_hours_groupped = group_contiguous_hours(
         cheapest_individual_hours
     )
@@ -216,7 +228,7 @@ def calculate_and_schedule_next_day():
         f"Grouped chepest individual hours w: {cheapest_individual_hours_groupped}"
     )
 
-    # Step 5: Schedule the disabling actions
+    # Step 6: Schedule the disabling actions
     for group_start, group_end in cheapest_individual_hours_groupped:
         logging.info(
             f"Scheduling disable charging but keep battery-first from {group_start} to {group_end}"
@@ -225,7 +237,7 @@ def calculate_and_schedule_next_day():
             safe_configure_battery_first_without_ac_charge, group_start, group_end
         ).tag("battery_first_no_ac_charge")
 
-    # Step 6: Schedule the enabling actions
+    # Step 7: Schedule the enabling actions
     if cheapest_consecutive:
         start_time, stop_time, _ = cheapest_consecutive
         logging.info(

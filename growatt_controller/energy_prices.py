@@ -178,3 +178,33 @@ def find_n_cheapest_hours(prices, n=8):
         key=lambda x: x[2],
     )
     return sorted_prices[:n]
+
+
+def categorize_prices_into_quadrants(hourly_prices):
+    """
+    Categorizes hourly prices into four quadrants: Cheapest, Cheap, Expensive, Most Expensive.
+
+    Parameters:
+    - hourly_prices: Dict with (start_time, stop_time) tuples as keys and prices as values.
+
+    Returns:
+    - Dict with quadrant names as keys and lists of (start_time, stop_time, price) tuples as values.
+    """
+    prices = list(hourly_prices.values())
+    min_price = min(prices)
+    max_price = max(prices)
+    interval = (max_price - min_price) / 4
+
+    quadrants = {"Cheapest": [], "Cheap": [], "Expensive": [], "Most Expensive": []}
+
+    for (start, stop), price in hourly_prices.items():
+        if price < min_price + interval:
+            quadrants["Cheapest"].append((start, stop, price))
+        elif price < min_price + 2 * interval:
+            quadrants["Cheap"].append((start, stop, price))
+        elif price < min_price + 3 * interval:
+            quadrants["Expensive"].append((start, stop, price))
+        else:
+            quadrants["Most Expensive"].append((start, stop, price))
+
+    return quadrants
