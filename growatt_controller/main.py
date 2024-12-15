@@ -126,17 +126,34 @@ def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
 
 
 def calculate_and_schedule_next_day():
-    """Fetches energy prices, calculates the cheapest hours, and schedules tasks."""
+    """Fetches energy prices, categorizes them into quadrants, and schedules tasks."""
     # Clear previously scheduled tasks related to battery-first and disabling (without clearing the recalculate task)
     schedule.clear("battery_first_ac_charge")
     schedule.clear("battery_first_no_ac_charge")
 
+    # Get current datetime
+    now = datetime.datetime.now()
+    current_time = now.time()
+
+    # Define the cutoff time
+    cutoff_time = datetime.time(23, 45)  # 23:45
+
+    # Determine whether to add 0 or 1 day based on the current time
+    if current_time < cutoff_time:
+        days_ahead = 0
+    else:
+        days_ahead = 1
+
+    # Calculate the target date
+    target_date = (now + datetime.timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+
+    logging.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"Scheduling energy prices for date: {target_date}")
+
     # Fetch the best available prices (IDA2 first, fallback to DAM)
     hourly_prices = fetch_best_available_prices(
-        ida_session="1",
-        date=(datetime.datetime.now() + datetime.timedelta(days=0)).strftime(
-            "%Y-%m-%d"
-        ),
+        ida_session="2",
+        date=target_date,
     )
 
     # If prices cannot be fetched, skip scheduling
