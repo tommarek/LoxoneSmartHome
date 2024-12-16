@@ -119,10 +119,13 @@ def fetch_best_available_prices(ida_session, date=None):
 def find_cheapest_x_consecutive_hours(prices, x=2):
     """
     Finds the X consecutive hours with the lowest total price, handling both 15-minute and hourly intervals.
-    Returns the start time, end time, and average price for the cheapest period.
+    Returns a list of tuples [(start_time, stop_time, price), ...] for the cheapest consecutive window.
     """
     intervals = list(prices.keys())
     num_intervals = len(intervals)
+
+    if num_intervals < 2:
+        raise ValueError("Not enough intervals to determine interval duration.")
 
     # Determine if we are dealing with 15-minute intervals or hourly intervals
     interval_duration = (
@@ -143,21 +146,20 @@ def find_cheapest_x_consecutive_hours(prices, x=2):
     if num_intervals < intervals_needed:
         return []  # Not enough data to find X consecutive hours
 
-    cheapest_window = None
+    cheapest_window = []
     min_price_sum = float("inf")  # Set to infinity initially
 
     # Loop through prices to find the X hours with the lowest total price
     for i in range(num_intervals - intervals_needed + 1):
-        price_sum = sum(prices[intervals[j]] for j in range(i, i + intervals_needed))
-        avg_price = price_sum / intervals_needed
+        window_intervals = intervals[i : i + intervals_needed]
+        price_sum = sum(prices[interval] for interval in window_intervals)
 
         if price_sum < min_price_sum:
             min_price_sum = price_sum
-            start_time = intervals[i][0]  # Start time of the first interval
-            end_time = intervals[i + intervals_needed - 1][
-                1
-            ]  # End time of the last interval
-            cheapest_window = (start_time, end_time, avg_price)
+            cheapest_window = [
+                (interval[0], interval[1], prices[interval])
+                for interval in window_intervals
+            ]
 
     return cheapest_window
 

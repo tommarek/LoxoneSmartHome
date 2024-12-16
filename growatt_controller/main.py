@@ -13,7 +13,8 @@ from energy_prices import (
     find_n_cheapest_hours,
 )
 from battery_control import (
-    configure_battery_first_with_ac_charge,
+    enable_ac_charge,
+    disable_ac_charge,
     configure_battery_first_without_ac_charge,
     disable_battery_first,
     connect_mqtt,
@@ -93,15 +94,13 @@ def group_contiguous_hours(hours):
     return groups
 
 
-def safe_configure_battery_first_with_ac_charge(start_time, stop_time):
+def safe_configure_ac_charging_start():
     """
-    Wrapper for configure_battery_first_with_ac_charge with exception handling.
+    Wrapper for enable_ac_charge with exception handling.
     """
     try:
-        configure_battery_first_with_ac_charge(start_time, stop_time)
-        logging.info(
-            f"Enabled battery-first mode with AC charge from {start_time} to {stop_time}."
-        )
+        enable_ac_charge()
+        logging.info("Enabled battery-first mode AC charge.")
     except Exception as e:
         logging.exception(
             "Error in configure_battery_first_with_ac_charge. Disabling battery-first mode."
@@ -109,14 +108,28 @@ def safe_configure_battery_first_with_ac_charge(start_time, stop_time):
         disable_battery_first()
 
 
-def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
+def safe_configure_ac_charging_stop():
+    """
+    Wrapper for disable_ac_charge with exception handling.
+    """
+    try:
+        disable_ac_charge()
+        logging.info("Disabled battery-first mode AC charge.")
+    except Exception as e:
+        logging.exception(
+            "Error in configure_battery_first_with_ac_charge. Disabling battery-first mode."
+        )
+        disable_battery_first()
+
+
+def safe_configure_battery_first(start_time, stop_time):
     """
     Wrapper for configure_battery_first_without_ac_charge with exception handling.
     """
     try:
         configure_battery_first_without_ac_charge(start_time, stop_time)
         logging.info(
-            f"Disabled charging but kept battery-first mode from {start_time} to {stop_time}."
+            f"Enabled battery-first mode without AC charge from {start_time} to {stop_time}."
         )
     except Exception as e:
         logging.exception(
@@ -128,8 +141,9 @@ def safe_configure_battery_first_without_ac_charge(start_time, stop_time):
 def calculate_and_schedule_next_day():
     """Fetches energy prices, categorizes them into quadrants, and schedules tasks."""
     # Clear previously scheduled tasks related to battery-first and disabling (without clearing the recalculate task)
-    schedule.clear("battery_first_ac_charge")
-    schedule.clear("battery_first_no_ac_charge")
+    schedule.clear("start_ac_charge_schedule")
+    schedule.clear("stop_ac_charge_schedule")
+    schedule.clear("battery_first_schedule")
 
     # Get current datetime
     now = datetime.datetime.now()
@@ -202,8 +216,8 @@ def calculate_and_schedule_next_day():
     )
 
     # Step 3: Find the cheapest consecutive hours
-    cheapest_consecutive = find_cheapest_x_consecutive_hours(
-        hourly_prices, num_consecutive_hours
+    cheapest_consecutive = set(
+        find_cheapest_x_consecutive_hours(hourly_prices, num_consecutive_hours)
     )
     if not cheapest_consecutive:
         logging.warning(
@@ -214,55 +228,41 @@ def calculate_and_schedule_next_day():
             f"Cheapest consecutive {num_consecutive_hours}-hour window: {cheapest_consecutive}"
         )
 
-    # Step 4: Remove the consecutive hours from the cheapest hours list
-    if cheapest_consecutive:
-        # Extract individual hours within the consecutive window
-        start_time, stop_time, _ = cheapest_consecutive
-        consecutive_individual_hours = get_individual_hours_from_window(
-            start_time, stop_time
-        )
-        logging.info(
-            f"Consecutive individual hours to exclude: {consecutive_individual_hours}"
-        )
+    # Step 4: union the cheapest_individual_hours and cheapest_consecutive together but avoid duplicates
+    cheapest_individual_hours = cheapest_individual_hours.union(cheapest_consecutive)
+    logging.info(
+        f"Combined cheapest individual and consecutive hours: {cheapest_individual_hours}"
+    )
 
-        # Remove these hours from the disabling list
-        cheapest_individual_hours = [
-            hour
-            for hour in cheapest_individual_hours
-            if (hour[0], hour[1]) not in consecutive_individual_hours
-        ]
-        logging.info(
-            f"Cheapest individual hours after exclusion: {cheapest_individual_hours}"
-        )
-    else:
-        logging.info("Proceeding without excluding any hours.")
-
-    # Step 5: Group the disabling hours into contiguous ranges
+    # Step 5: Group hours into contiguous ranges
     cheapest_individual_hours_groupped = group_contiguous_hours(
         cheapest_individual_hours
     )
     logging.info(
-        f"Grouped chepest individual hours w: {cheapest_individual_hours_groupped}"
+        f"Grouped chepest individual hours: {cheapest_individual_hours_groupped}"
     )
+    battery_charging_hours_groupped = group_contiguous_hours(cheapest_consecutive)
+    logging.info(f"Grouped battery charging hours: {battery_charging_hours_groupped}")
 
-    # Step 6: Schedule the disabling actions
+    # Step 6: Schedule batetry first without AC charging
     for group_start, group_end in cheapest_individual_hours_groupped:
-        logging.info(
-            f"Scheduling disable charging but keep battery-first from {group_start} to {group_end}"
-        )
+        logging.info(f"Scheduling battery-first mode from {group_start} to {group_end}")
         schedule.every().day.at(group_start).do(
-            safe_configure_battery_first_without_ac_charge, group_start, group_end
-        ).tag("battery_first_no_ac_charge")
+            safe_configure_battery_first, group_start, group_end
+        ).tag("battery_first_schedule")
 
-    # Step 7: Schedule the enabling actions
-    if cheapest_consecutive:
-        start_time, stop_time, _ = cheapest_consecutive
-        logging.info(
-            f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
-        )
-        schedule.every().day.at(start_time).do(
-            safe_configure_battery_first_with_ac_charge, start_time, stop_time
-        ).tag("battery_first_ac_charge")
+    # Step 7: Schedule AC charging during battery-first mode
+    if battery_charging_hours_groupped:
+        for start_time, stop_time in battery_charging_hours_groupped:
+            logging.info(
+                f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
+            )
+            schedule.every().day.at(start_time).do(
+                safe_configure_ac_charging_start, start_time, stop_time
+            ).tag("start_ac_charge_schedule")
+            schedule.every().day.at(stop_time).do(safe_configure_ac_charging_stop).tag(
+                "stop_ac_charge_schedule"
+            )
 
 
 def schedule_daily_calculation():
