@@ -254,12 +254,12 @@ def calculate_and_schedule_next_day():
     # Step 7: Schedule AC charging during battery-first mode
     if battery_charging_hours_groupped:
         for start_time, stop_time in battery_charging_hours_groupped:
-            logging.info(
-                f"Scheduling battery-first mode with AC charge from {start_time} to {stop_time}"
-            )
+            logging.info(f"Scheduling AC charge from {start_time} to {stop_time}")
+            # schedule AC battery chargin start
             schedule.every().day.at(start_time).do(
-                safe_configure_ac_charging_start, start_time, stop_time
+                safe_configure_ac_charging_start
             ).tag("start_ac_charge_schedule")
+            # schedule AC battery chargin stop
             schedule.every().day.at(stop_time).do(safe_configure_ac_charging_stop).tag(
                 "stop_ac_charge_schedule"
             )
