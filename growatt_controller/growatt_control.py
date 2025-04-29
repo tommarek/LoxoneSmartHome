@@ -1,6 +1,8 @@
 import json
 import logging
 import paho.mqtt.client as mqtt
+import datetime
+from energy_prices import fetch_best_available_prices
 
 # MQTT broker details
 BROKER_ADDRESS = "mosquitto"
@@ -9,6 +11,8 @@ MQTT_PORT = 1883
 # MQTT topics
 BATTERY_FIRST_TOPIC = "energy/solar/command/batteryfirst/set/timeslot"
 AC_CHARGE_TOPIC = "energy/solar/command/batteryfirst/set/acchargeenabled"
+EXPORT_ENABLE_TOPIC = "energy/solar/command/export/enable"
+EXPORT_DISABLE_TOPIC = "energy/solar/command/export/disable"
 
 # Global simulation flag
 SIMULATE = False  # Default: not in simulate mode
@@ -111,6 +115,32 @@ def configure_battery_first_without_ac_charge(start_hour, stop_hour):
     """
     set_battery_first(start_hour, stop_hour)
     disable_ac_charge()
+
+
+def enable_export():
+    """
+    Enable electricity export to grid.
+    """
+    if SIMULATE:
+        logging.info("[SIMULATE] Would enable electricity export to grid.")
+        return
+
+    payload = {"value": True}
+    client.publish(EXPORT_ENABLE_TOPIC, json.dumps(payload))
+    logging.info("Enabled electricity export to grid")
+
+
+def disable_export():
+    """
+    Disable electricity export to grid.
+    """
+    if SIMULATE:
+        logging.info("[SIMULATE] Would disable electricity export to grid.")
+        return
+
+    payload = {"value": False}
+    client.publish(EXPORT_DISABLE_TOPIC, json.dumps(payload))
+    logging.info("Disabled electricity export to grid")
 
 
 # Connect to the MQTT broker
