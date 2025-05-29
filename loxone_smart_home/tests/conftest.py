@@ -1,15 +1,13 @@
 """Pytest configuration and shared fixtures."""
 
 import asyncio
-from typing import AsyncGenerator, Generator
+from typing import Any, AsyncGenerator, Dict, Generator, List
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
 
 from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
 
 
 @pytest.fixture(scope="session")
@@ -32,15 +30,14 @@ def mock_settings() -> Settings:
             "LOXONE_HOST": "192.168.1.100",
         },
     ):
-        return Settings()
+        return Settings(influxdb_token="test-token")
 
 
 @pytest_asyncio.fixture
-async def mock_mqtt_client(mock_settings: Settings) -> AsyncGenerator[SharedMQTTClient, None]:
+async def mock_mqtt_client(mock_settings: Settings) -> AsyncGenerator[MagicMock, None]:
     """Create a mock MQTT client."""
-    client = SharedMQTTClient(mock_settings)
-
-    # Mock the actual MQTT client
+    client = MagicMock()
+    client.settings = mock_settings
     client.client = AsyncMock()
     client.connect = AsyncMock()
     client.disconnect = AsyncMock()
@@ -51,11 +48,10 @@ async def mock_mqtt_client(mock_settings: Settings) -> AsyncGenerator[SharedMQTT
 
 
 @pytest.fixture
-def mock_influxdb_client(mock_settings: Settings) -> SharedInfluxDBClient:
+def mock_influxdb_client(mock_settings: Settings) -> MagicMock:
     """Create a mock InfluxDB client."""
-    client = SharedInfluxDBClient(mock_settings)
-
-    # Mock the actual InfluxDB client
+    client = MagicMock()
+    client.settings = mock_settings
     client.client = MagicMock()
     client.write_api = MagicMock()
     client.write_point = AsyncMock()
@@ -72,7 +68,7 @@ def sample_udp_data() -> bytes:
 
 
 @pytest.fixture
-def sample_mqtt_message() -> dict:
+def sample_mqtt_message() -> Dict[str, Any]:
     """Sample MQTT message for testing."""
     return {
         "power": 2500.0,
@@ -83,7 +79,7 @@ def sample_mqtt_message() -> dict:
 
 
 @pytest.fixture
-def sample_weather_data() -> dict:
+def sample_weather_data() -> Dict[str, Any]:
     """Sample weather data for testing."""
     return {
         "temperature": 15.5,
@@ -97,7 +93,7 @@ def sample_weather_data() -> dict:
 
 
 @pytest.fixture
-def sample_energy_prices() -> list:
+def sample_energy_prices() -> List[Dict[str, Any]]:
     """Sample energy prices for testing."""
     return [
         {"hour": 0, "price": 2.5},

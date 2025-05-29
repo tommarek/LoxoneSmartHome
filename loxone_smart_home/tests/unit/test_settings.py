@@ -20,7 +20,7 @@ class TestSettings:
     def test_default_settings(self) -> None:
         """Test default settings values."""
         with patch.dict("os.environ", {"INFLUXDB_TOKEN": "test-token"}):
-            settings = Settings()
+            settings = Settings(influxdb_token="test-token")
 
             assert settings.log_level == "INFO"
             assert settings.mqtt_broker == "mqtt"
@@ -38,7 +38,7 @@ class TestSettings:
         }
 
         with patch.dict("os.environ", env_vars):
-            settings = Settings()
+            settings = Settings(influxdb_token="my-token")
 
             assert settings.log_level == "DEBUG"
             assert settings.mqtt_broker == "test-broker"
@@ -50,13 +50,13 @@ class TestSettings:
         """Test invalid log level validation."""
         with patch.dict("os.environ", {"LOG_LEVEL": "INVALID", "INFLUXDB_TOKEN": "test"}):
             with pytest.raises(ValidationError):
-                Settings()
+                Settings(influxdb_token="test")
 
     def test_port_validation(self) -> None:
         """Test port number validation."""
         with patch.dict("os.environ", {"MQTT_PORT": "99999", "INFLUXDB_TOKEN": "test"}):
             with pytest.raises(ValidationError):
-                Settings()
+                Settings(influxdb_token="test")
 
 
 class TestMQTTConfig:
@@ -87,7 +87,7 @@ class TestInfluxDBConfig:
     def test_required_fields(self) -> None:
         """Test required fields for InfluxDB config."""
         with pytest.raises(ValidationError):
-            InfluxDBConfig(url="http://localhost:8086", org="test")  # Missing token
+            InfluxDBConfig(url="http://localhost:8086", org="test", token="")  # Empty token
 
     def test_batch_size_validation(self) -> None:
         """Test batch size validation."""

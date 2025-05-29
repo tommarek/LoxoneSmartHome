@@ -18,17 +18,17 @@ class TestUDPListener:
     def settings(self) -> Settings:
         """Create test settings."""
         with patch.dict("os.environ", {"INFLUXDB_TOKEN": "test-token"}):
-            return Settings()
+            return Settings(influxdb_token="test-token")
 
     @pytest.fixture
-    def mock_influxdb(self, settings: Settings) -> SharedInfluxDBClient:
+    def mock_influxdb(self) -> AsyncMock:
         """Create mock InfluxDB client."""
-        client = SharedInfluxDBClient(settings)
+        client = AsyncMock()
         client.write_point = AsyncMock()
         return client
 
     @pytest.fixture
-    def udp_listener(self, mock_influxdb: SharedInfluxDBClient, settings: Settings) -> UDPListener:
+    def udp_listener(self, mock_influxdb: AsyncMock, settings: Settings) -> UDPListener:
         """Create UDP listener instance."""
         return UDPListener(mock_influxdb, settings)
 
@@ -68,8 +68,8 @@ class TestUDPListener:
         await udp_listener.process_data(data, addr)
 
         # Verify InfluxDB write was called
-        mock_influxdb.write_point.assert_called_once()
-        call_args = mock_influxdb.write_point.call_args
+        mock_influxdb.write_point.assert_called_once()  # type: ignore[attr-defined]
+        call_args = mock_influxdb.write_point.call_args  # type: ignore[attr-defined]
 
         assert call_args.kwargs["bucket"] == "loxone"
         assert call_args.kwargs["measurement"] == "sensor"  # measurement_type is the measurement
@@ -88,8 +88,8 @@ class TestUDPListener:
 
         await udp_listener.process_data(data, addr)
 
-        mock_influxdb.write_point.assert_called_once()
-        call_args = mock_influxdb.write_point.call_args
+        mock_influxdb.write_point.assert_called_once()  # type: ignore[attr-defined]
+        call_args = mock_influxdb.write_point.call_args  # type: ignore[attr-defined]
 
         assert call_args.kwargs["measurement"] == "default"  # Default measurement_type
         assert call_args.kwargs["fields"] == {"temperature": 21.5}
@@ -108,7 +108,7 @@ class TestUDPListener:
         await udp_listener.process_data(data, addr)
 
         # Should not write to InfluxDB
-        mock_influxdb.write_point.assert_not_called()
+        mock_influxdb.write_point.assert_not_called()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_process_invalid_value(
@@ -121,7 +121,7 @@ class TestUDPListener:
         await udp_listener.process_data(data, addr)
 
         # Should not write to InfluxDB
-        mock_influxdb.write_point.assert_not_called()
+        mock_influxdb.write_point.assert_not_called()  # type: ignore[attr-defined]
 
     @pytest.mark.asyncio
     async def test_timezone_conversion(
@@ -133,7 +133,7 @@ class TestUDPListener:
 
         await udp_listener.process_data(data, addr)
 
-        call_args = mock_influxdb.write_point.call_args
+        call_args = mock_influxdb.write_point.call_args  # type: ignore[attr-defined]
         timestamp = call_args.kwargs["timestamp"]
 
         # Verify timestamp is in UTC
@@ -155,7 +155,7 @@ class TestUDPListener:
 
         await udp_listener.process_data(data, addr)
 
-        call_args = mock_influxdb.write_point.call_args
+        call_args = mock_influxdb.write_point.call_args  # type: ignore[attr-defined]
         assert call_args.kwargs["fields"] == {"room_temperature": 21.5}  # Normalized
 
 

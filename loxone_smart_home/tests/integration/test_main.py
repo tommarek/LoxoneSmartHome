@@ -18,14 +18,12 @@ class TestLoxoneSmartHome:
             return LoxoneSmartHome()
 
     @pytest.mark.asyncio
-    async def test_initialize_modules(self, app: LoxoneSmartHome) -> None:
+    @patch('loxone_smart_home.utils.mqtt_client.SharedMQTTClient.connect')
+    async def test_initialize_modules(self, mock_connect: AsyncMock, app: LoxoneSmartHome) -> None:
         """Test module initialization."""
-        # Mock the MQTT client connection
-        app.mqtt_client.connect = AsyncMock()
-
         await app.initialize_modules()
 
-        app.mqtt_client.connect.assert_called_once()
+        mock_connect.assert_called_once()
 
         # Check modules are initialized based on settings
         if app.settings.modules.udp_listener_enabled:
@@ -41,27 +39,28 @@ class TestLoxoneSmartHome:
     async def test_start_modules(self, app: LoxoneSmartHome) -> None:
         """Test starting all modules."""
         # Create mock modules
-        app.udp_listener = AsyncMock()
-        app.udp_listener.run = AsyncMock()
-        app.mqtt_bridge = AsyncMock()
-        app.mqtt_bridge.run = AsyncMock()
-        app.weather_scraper = AsyncMock()
-        app.weather_scraper.run = AsyncMock()
-        app.growatt_controller = AsyncMock()
-        app.growatt_controller.run = AsyncMock()
+        with patch.object(app, 'udp_listener', AsyncMock()) as mock_udp, \
+             patch.object(app, 'mqtt_bridge', AsyncMock()) as mock_bridge, \
+             patch.object(app, 'weather_scraper', AsyncMock()) as mock_weather, \
+             patch.object(app, 'growatt_controller', AsyncMock()) as mock_growatt:
 
-        await app.start_modules()
+            mock_udp.run = AsyncMock()
+            mock_bridge.run = AsyncMock()
+            mock_weather.run = AsyncMock()
+            mock_growatt.run = AsyncMock()
 
-        # Verify tasks were created
-        assert len(app.modules) == 4
+            await app.start_modules()
+
+            # Verify tasks were created
+            assert len(app.modules) == 4
 
     @pytest.mark.asyncio
-    async def test_shutdown(self, app: LoxoneSmartHome) -> None:
+    @patch('loxone_smart_home.utils.mqtt_client.SharedMQTTClient.disconnect')
+    @patch('loxone_smart_home.utils.influxdb_client.SharedInfluxDBClient.close')
+    async def test_shutdown(
+        self, mock_influx_close: AsyncMock, mock_mqtt_disconnect: AsyncMock, app: LoxoneSmartHome
+    ) -> None:
         """Test graceful shutdown."""
-        # Mock clients
-        app.mqtt_client.disconnect = AsyncMock()
-        app.influxdb_client.close = AsyncMock()
-
         # Create a mock task
         mock_task = asyncio.create_task(asyncio.sleep(0))
         app.modules = [mock_task]
@@ -69,8 +68,8 @@ class TestLoxoneSmartHome:
         await app.shutdown()
 
         assert app.shutdown_event.is_set()
-        app.mqtt_client.disconnect.assert_called_once()
-        app.influxdb_client.close.assert_called_once()
+        mock_mqtt_disconnect.assert_called_once()
+        mock_influx_close.assert_called_once()
 
     def test_signal_handling(self, app: LoxoneSmartHome) -> None:
         """Test signal handler."""
@@ -81,32 +80,33 @@ class TestLoxoneSmartHome:
     @pytest.mark.asyncio
     async def test_run_success(self, app: LoxoneSmartHome) -> None:
         """Test successful application run."""
-        app.initialize_modules = AsyncMock()
-        app.start_modules = AsyncMock()
-        app.shutdown = AsyncMock()
+        with patch.object(app, 'initialize_modules', new_callable=AsyncMock) as mock_init, \
+             patch.object(app, 'start_modules', new_callable=AsyncMock) as mock_start:
 
-        # Set shutdown event after a short delay
-        async def set_shutdown():
-            await asyncio.sleep(0.1)
-            app.shutdown_event.set()
+            # Set shutdown event after a short delay
+            async def set_shutdown() -> None:
+                await asyncio.sleep(0.1)
+                app.shutdown_event.set()
 
-        asyncio.create_task(set_shutdown())
+            asyncio.create_task(set_shutdown())
 
-        await app.run()
+            await app.run()
 
-        app.initialize_modules.assert_called_once()
-        app.start_modules.assert_called_once()
+            mock_init.assert_called_once()
+            mock_start.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_run_with_error(self, app: LoxoneSmartHome) -> None:
         """Test application run with initialization error."""
-        app.initialize_modules = AsyncMock(side_effect=Exception("Init error"))
-        app.shutdown = AsyncMock()
+        with patch.object(app, 'initialize_modules', new_callable=AsyncMock) as mock_init, \
+             patch.object(app, 'shutdown', new_callable=AsyncMock) as mock_shutdown:
 
-        with pytest.raises(SystemExit):
-            await app.run()
+            mock_init.side_effect = Exception("Init error")
 
-        app.shutdown.assert_called_once()
+            with pytest.raises(SystemExit):
+                await app.run()
+
+            mock_shutdown.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -17,7 +17,7 @@ class TestSharedMQTTClient:
     def settings(self) -> Settings:
         """Create test settings."""
         with patch.dict("os.environ", {"INFLUXDB_TOKEN": "test-token"}):
-            return Settings()
+            return Settings(influxdb_token="test-token")
 
     @pytest.fixture
     def mqtt_client(self, settings: Settings) -> SharedMQTTClient:

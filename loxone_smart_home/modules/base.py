@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -24,7 +25,7 @@ class BaseModule(ABC):
         self.name = name
         self.mqtt_client = mqtt_client
         self.influxdb_client = influxdb_client
-        self.settings = settings or Settings()
+        self.settings = settings or Settings(influxdb_token=os.getenv("INFLUXDB_TOKEN", ""))
         self.logger = logging.getLogger(f"{__name__}.{name}")
         self._running = False
 

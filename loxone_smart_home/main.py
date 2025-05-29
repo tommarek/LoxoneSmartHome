@@ -6,6 +6,7 @@ Combines all individual services into a single async Python application.
 
 import asyncio
 import logging
+import os
 import signal
 import sys
 from typing import Any, List, Optional
@@ -27,7 +28,7 @@ class LoxoneSmartHome:
 
     def __init__(self) -> None:
         """Initialize the application."""
-        self.settings = Settings()
+        self.settings = Settings(influxdb_token=os.getenv("INFLUXDB_TOKEN", ""))
         self.setup_logging()
 
         # Shared clients

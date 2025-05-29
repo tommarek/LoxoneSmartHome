@@ -96,6 +96,9 @@ class UDPListener(BaseModule):
 
             # Write to InfluxDB
             # Note: In Rust, measurement_type is used as the measurement name
+            if self.influxdb_client is None:
+                self.logger.error("InfluxDB client not available")
+                return
             await self.influxdb_client.write_point(
                 bucket=self.settings.influxdb.bucket_loxone,
                 measurement=measurement_type,  # Use measurement_type as measurement (like Rust)

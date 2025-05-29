@@ -22,6 +22,9 @@ class MQTTBridge(BaseModule):
 
     async def start(self) -> None:
         """Start the MQTT bridge."""
+        if self.mqtt_client is None:
+            self.logger.error("MQTT client not available")
+            return
         # Subscribe to configured topics
         for topic in self.settings.loxone_bridge.bridge_topics:
             await self.mqtt_client.subscribe(topic, self.on_mqtt_message)
@@ -35,18 +38,20 @@ class MQTTBridge(BaseModule):
         self.logger.info("MQTT to Loxone bridge stopped")
 
     async def on_mqtt_message(self, topic: str, payload: str) -> None:
-        """Handle incoming MQTT messages."""
+        """Handle incoming MQTT messages and forward to Loxone."""
         try:
             # Parse JSON payload
             data = json.loads(payload)
             self.logger.debug(f"Received MQTT message on {topic}: {data}")
 
-            # Convert to key=value format for Loxone
-            message_parts = []
-            for key, value in data.items():
-                message_parts.append(f"{key}={value}")
-
-            message = " ".join(message_parts)
+            # Convert to message format for Loxone
+            if isinstance(data, dict):
+                # Convert dict to semicolon-separated key=value pairs (matching original)
+                message_parts = [f"{k}={v}" for k, v in data.items()]
+                message = ";".join(message_parts)
+            else:
+                # For non-dict data, use topic=value format
+                message = f"{topic}={data}"
 
             # Send to Loxone via UDP
             self.udp_socket.sendto(

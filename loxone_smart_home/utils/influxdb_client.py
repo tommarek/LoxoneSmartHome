@@ -81,7 +81,7 @@ class SharedInfluxDBClient:
             self.logger.error(f"Failed to write batch to InfluxDB: {e}")
             raise
 
-    async def query(self, query: str) -> List[Any]:
+    async def query(self, query: str) -> Any:
         """Execute a query against InfluxDB."""
         if not self.client:
             raise RuntimeError("InfluxDB client not connected")

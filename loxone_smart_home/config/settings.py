@@ -38,7 +38,7 @@ class InfluxDBConfig(BaseModel):
     """InfluxDB configuration."""
 
     url: str = "http://influxdb:8086"
-    token: str
+    token: str = Field(min_length=1)
     org: str = "tmarek"
 
     # Buckets
@@ -69,13 +69,23 @@ class LoxoneBridgeConfig(BaseModel):
     loxone_host: str
     loxone_udp_port: int = Field(default=4000, ge=1, le=65535)
 
-    # Topics to bridge
+    # Topics to bridge - can be comma-separated string or list
     bridge_topics: List[str] = Field(
         default_factory=lambda: [
             "energy/solar",
             "teplomer/TC",
         ]
     )
+
+    @field_validator("bridge_topics", mode="before")
+    @classmethod
+    def parse_topics(cls, v: Any) -> List[str]:
+        """Parse topics from comma-separated string or list."""
+        if isinstance(v, str):
+            return [topic.strip() for topic in v.split(",")]
+        if isinstance(v, list):
+            return v
+        return []
 
 
 class WeatherConfig(BaseModel):
@@ -178,8 +188,9 @@ class Settings(BaseSettings):
     udp_listener_host: str = "0.0.0.0"
     udp_listener_port: int = Field(default=2000, ge=1, le=65535)
 
-    loxone_host: str = "192.168.101.34"
-    loxone_udp_port: int = Field(default=4000, ge=1, le=65535)
+    loxone_host: str = Field(default="192.168.101.34", alias="LOXONE_HOST")
+    loxone_udp_port: int = Field(default=4000, ge=1, le=65535, alias="LOXONE_PORT")
+    mqtt_topics: Optional[str] = Field(default=None, alias="MQTT_TOPICS")
 
     latitude: float = Field(default=49.00642, ge=-90, le=90)
     longitude: float = Field(default=14.51994, ge=-180, le=180)
@@ -229,6 +240,12 @@ class Settings(BaseSettings):
     @property
     def loxone_bridge(self) -> LoxoneBridgeConfig:
         """Get Loxone bridge configuration."""
+        if self.mqtt_topics:
+            return LoxoneBridgeConfig(
+                loxone_host=self.loxone_host,
+                loxone_udp_port=self.loxone_udp_port,
+                bridge_topics=self.mqtt_topics,  # type: ignore[arg-type]
+            )
         return LoxoneBridgeConfig(
             loxone_host=self.loxone_host,
             loxone_udp_port=self.loxone_udp_port,
