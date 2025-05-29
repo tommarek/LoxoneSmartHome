@@ -1,0 +1,64 @@
+"""MQTT to Loxone bridge module."""
+
+import json
+import socket
+
+from loxone_smart_home.config.settings import Settings
+from loxone_smart_home.modules.base import BaseModule
+from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+
+
+class MQTTBridge(BaseModule):
+    """Bridge that forwards MQTT messages to Loxone via UDP."""
+
+    def __init__(self, mqtt_client: SharedMQTTClient, settings: Settings) -> None:
+        """Initialize the MQTT bridge."""
+        super().__init__(
+            name="MQTTBridge",
+            mqtt_client=mqtt_client,
+            settings=settings,
+        )
+        self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    async def start(self) -> None:
+        """Start the MQTT bridge."""
+        # Subscribe to configured topics
+        for topic in self.settings.loxone_bridge.bridge_topics:
+            await self.mqtt_client.subscribe(topic, self.on_mqtt_message)
+            self.logger.info(f"Subscribed to topic: {topic}")
+
+        self.logger.info("MQTT to Loxone bridge started")
+
+    async def stop(self) -> None:
+        """Stop the MQTT bridge."""
+        self.udp_socket.close()
+        self.logger.info("MQTT to Loxone bridge stopped")
+
+    async def on_mqtt_message(self, topic: str, payload: str) -> None:
+        """Handle incoming MQTT messages."""
+        try:
+            # Parse JSON payload
+            data = json.loads(payload)
+            self.logger.debug(f"Received MQTT message on {topic}: {data}")
+
+            # Convert to key=value format for Loxone
+            message_parts = []
+            for key, value in data.items():
+                message_parts.append(f"{key}={value}")
+
+            message = " ".join(message_parts)
+
+            # Send to Loxone via UDP
+            self.udp_socket.sendto(
+                message.encode("utf-8"),
+                (
+                    self.settings.loxone_bridge.loxone_host,
+                    self.settings.loxone_bridge.loxone_udp_port,
+                ),
+            )
+            self.logger.debug(f"Sent to Loxone: {message}")
+
+        except json.JSONDecodeError:
+            self.logger.error(f"Invalid JSON payload: {payload}")
+        except Exception as e:
+            self.logger.error(f"Error processing MQTT message: {e}", exc_info=True)
