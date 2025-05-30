@@ -40,6 +40,12 @@ class UDPListener(BaseModule):
             f"{self.settings.udp_listener.port}"
         )
         self.logger.info("Starting to accept data.")
+        self.logger.info(
+            f"Expected format: timestamp{self.settings.udp_listener.delimiter}measurement_name"
+            f"{self.settings.udp_listener.delimiter}value{self.settings.udp_listener.delimiter}"
+            f"room[optional]{self.settings.udp_listener.delimiter}measurement_type[optional]"
+            f"{self.settings.udp_listener.delimiter}tag1[optional]{self.settings.udp_listener.delimiter}tag2[optional]"
+        )
 
     async def stop(self) -> None:
         """Stop the UDP listener."""
@@ -111,7 +117,11 @@ class UDPListener(BaseModule):
                 timestamp=utc_time,
             )
 
-            self.logger.info("Stored new log line.")
+            # Log detailed information about what was stored
+            self.logger.info(
+                f"Stored: {measurement_type}.{measurement_name}={value} "
+                f"(room: {room_name}, from: {addr[0]}, time: {utc_time.strftime('%H:%M:%S')})"
+            )
 
         except Exception as e:
             self.logger.error(f"Failed to process incoming data: {e}", exc_info=True)
