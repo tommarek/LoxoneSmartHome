@@ -42,7 +42,6 @@ README.md
 .DS_Store
 
 # Docker
-Dockerfile
 .dockerignore
 docker-compose*.yml
 
