@@ -60,6 +60,24 @@ class GrowattController(BaseModule):
         local_date = self._get_local_now() + timedelta(days=days_ahead)
         return local_date.strftime("%Y-%m-%d")
 
+    def _log_price_table(self, hourly_prices: Dict[Tuple[str, str], float], date: str) -> None:
+        """Log hourly prices in a nice table format."""
+        eur_czk_rate = 25.0
+        
+        self.logger.info(f"Energy prices for {date}:")
+        self.logger.info("┌──────────┬────────────┬──────────────┐")
+        self.logger.info("│   Hour   │ EUR/MWh    │   CZK/kWh    │")
+        self.logger.info("├──────────┼────────────┼──────────────┤")
+        
+        # Sort hours by start time for proper display
+        sorted_hours = sorted(hourly_prices.items(), key=lambda x: x[0][0])
+        
+        for (start_hour, end_hour), price_eur_mwh in sorted_hours:
+            price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+            self.logger.info(f"│ {start_hour}-{end_hour} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │")
+        
+        self.logger.info("└──────────┴────────────┴──────────────┘")
+
     async def start(self) -> None:
         """Start the Growatt controller."""
         await self._schedule_daily_calculation()
@@ -337,6 +355,9 @@ class GrowattController(BaseModule):
             # Schedule fallback mode
             await self._schedule_fallback_mode()
             return
+
+        # Log price table for visibility
+        self._log_price_table(hourly_prices, target_date)
 
         self.logger.info(f"Energy prices for {target_date}: {len(hourly_prices)} hours")
 
