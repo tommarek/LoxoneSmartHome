@@ -253,6 +253,32 @@ class GrowattController(BaseModule):
         groups.append((current_group_start, current_group_end))
         return groups
 
+    def _group_contiguous_hours_simple(self, hours: List[Tuple[str, str, float]]) -> List[Tuple[str, str]]:
+        """Group contiguous hours into continuous ranges without price similarity check."""
+        if not hours:
+            return []
+
+        sorted_hours = sorted(hours, key=lambda x: datetime.strptime(x[0], "%H:%M"))
+
+        groups = []
+        current_group_start = sorted_hours[0][0]
+        current_group_end = sorted_hours[0][1]
+
+        for hour in sorted_hours[1:]:
+            previous_end = datetime.strptime(current_group_end, "%H:%M")
+            current_start = datetime.strptime(hour[0], "%H:%M")
+
+            # Group if contiguous (ignore price differences)
+            if current_start == previous_end:
+                current_group_end = hour[1]
+            else:
+                groups.append((current_group_start, current_group_end))
+                current_group_start = hour[0]
+                current_group_end = hour[1]
+
+        groups.append((current_group_start, current_group_end))
+        return groups
+
     async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
         """Set battery-first mode for specified time window."""
         if self.config.simulation_mode:
@@ -508,11 +534,11 @@ class GrowattController(BaseModule):
             self.logger.info(f"No hours above export price threshold ({threshold_eur_mwh:.2f} EUR/MWh = {self.config.export_price_threshold:.2f} CZK/kWh)")
             return
 
-        # Group export hours into contiguous blocks
+        # Group export hours into contiguous blocks (ignore price differences for export)
         export_hours_with_price = [
             (start, stop, hourly_prices[(start, stop)]) for start, stop in export_hours
         ]
-        export_groups = self._group_contiguous_hours(export_hours_with_price)
+        export_groups = self._group_contiguous_hours_simple(export_hours_with_price)
 
         self.logger.info(f"Found {len(export_groups)} export periods above {threshold_eur_mwh:.2f} EUR/MWh threshold")
 
