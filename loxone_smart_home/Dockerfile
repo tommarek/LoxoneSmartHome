@@ -5,8 +5,12 @@ WORKDIR /app
 COPY requirements.txt /app
 RUN pip install -r requirements.txt
 
-COPY . /app/loxone_smart_home
+# Copy the current directory contents (which is already the loxone_smart_home package)
+COPY . /app/
+
+# Add a debug step to see what we have
+RUN ls -la /app/
 
 ENV PYTHONPATH=/app
 
-CMD ["python", "-m", "loxone_smart_home.main"]
+CMD ["python", "main.py"]
