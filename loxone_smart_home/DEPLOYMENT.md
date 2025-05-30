@@ -42,7 +42,7 @@ Use the new consolidated docker-compose file:
 docker-compose down
 
 # Start with new configuration
-docker-compose -f docker-compose.new.yml up -d
+docker-compose -f docker-compose.yml up -d
 ```
 
 ### 4. Verify Deployment
