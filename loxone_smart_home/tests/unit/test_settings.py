@@ -5,7 +5,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from loxone_smart_home.config.settings import (
+from config.settings import (
     GrowattConfig,
     InfluxDBConfig,
     MQTTConfig,

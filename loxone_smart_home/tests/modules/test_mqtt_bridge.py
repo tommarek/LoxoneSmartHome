@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.mqtt_bridge import MQTTBridge
+from config.settings import Settings
+from modules.mqtt_bridge import MQTTBridge
 
 
 @pytest.fixture

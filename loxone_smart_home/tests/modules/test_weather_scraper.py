@@ -8,8 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from aiohttp import ClientSession
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.weather_scraper import HourlyData, WeatherScraper
+from config.settings import Settings
+from modules.weather_scraper import HourlyData, WeatherScraper
 
 
 @pytest.fixture

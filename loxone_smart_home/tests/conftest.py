@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytest_asyncio
 
-from loxone_smart_home.config.settings import Settings
+from config.settings import Settings
 
 
 @pytest.fixture(scope="session")

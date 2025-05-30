@@ -6,6 +6,7 @@ from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
+import zoneinfo
 
 import aiohttp
 
@@ -21,7 +22,8 @@ class EnergyPriceData:
     def __init__(self, prices: Dict[Tuple[str, str], float]) -> None:
         """Initialize energy price data."""
         self.prices = prices
-        self.timestamp = datetime.now()
+        # Use Prague timezone for energy price data
+        self.timestamp = datetime.now(zoneinfo.ZoneInfo("Europe/Prague"))
 
 
 class GrowattController(BaseModule):
@@ -45,6 +47,18 @@ class GrowattController(BaseModule):
         # Scheduled tasks
         self._scheduled_tasks: List[asyncio.Task[None]] = []
         self._daily_schedule_task: Optional[asyncio.Task[None]] = None
+        
+        # Local timezone (Prague/Czech Republic)
+        self._local_tz = zoneinfo.ZoneInfo("Europe/Prague")
+
+    def _get_local_now(self) -> datetime:
+        """Get current time in local timezone."""
+        return datetime.now(self._local_tz)
+    
+    def _get_local_date_string(self, days_ahead: int = 1) -> str:
+        """Get date string in local timezone for API calls."""
+        local_date = self._get_local_now() + timedelta(days=days_ahead)
+        return local_date.strftime("%Y-%m-%d")
 
     async def start(self) -> None:
         """Start the Growatt controller."""
@@ -74,7 +88,7 @@ class GrowattController(BaseModule):
     ) -> Dict[Tuple[str, str], float]:
         """Fetch energy prices from OTE DAM API."""
         if date is None:
-            date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
+            date = self._get_local_date_string(days_ahead=1)
 
         url = (
             "https://www.ote-cr.cz/en/short-term-markets/electricity/"
@@ -298,8 +312,8 @@ class GrowattController(BaseModule):
                 task.cancel()
         self._scheduled_tasks.clear()
 
-        # Determine target date
-        now = datetime.now()
+        # Determine target date using local time
+        now = self._get_local_now()
         current_time = now.time()
         cutoff_time = dt_time(23, 45)
 
@@ -308,7 +322,7 @@ class GrowattController(BaseModule):
         else:
             days_ahead = 1
 
-        target_date = (now + timedelta(days=days_ahead)).strftime("%Y-%m-%d")
+        target_date = self._get_local_date_string(days_ahead=days_ahead)
 
         self.logger.info(f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S')}")
         self.logger.info(f"Scheduling energy prices for date: {target_date}")
@@ -452,10 +466,10 @@ class GrowattController(BaseModule):
         """Schedule a coroutine to run at a specific time."""
         try:
             target_time = datetime.strptime(time_str, "%H:%M").time()
-            now = datetime.now()
+            now = self._get_local_now()
 
-            # Calculate next occurrence of target time
-            target_datetime = datetime.combine(now.date(), target_time)
+            # Calculate next occurrence of target time in local timezone
+            target_datetime = datetime.combine(now.date(), target_time, self._local_tz)
             if target_datetime <= now:
                 target_datetime += timedelta(days=1)
 
@@ -480,10 +494,10 @@ class GrowattController(BaseModule):
         """Run daily calculation loop."""
         while self._running:
             try:
-                # Calculate time until next 23:59
-                now = datetime.now()
+                # Calculate time until next scheduled time in local timezone
+                now = self._get_local_now()
                 target_time = dt_time(self.config.schedule_hour, self.config.schedule_minute)
-                target_datetime = datetime.combine(now.date(), target_time)
+                target_datetime = datetime.combine(now.date(), target_time, self._local_tz)
 
                 if target_datetime <= now:
                     target_datetime += timedelta(days=1)

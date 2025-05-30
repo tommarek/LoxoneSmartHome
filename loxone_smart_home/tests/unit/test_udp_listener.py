@@ -6,9 +6,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import pytz
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.udp_listener import UDPListener, UDPProtocol
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
+from config.settings import Settings
+from modules.udp_listener import UDPListener, UDPProtocol
+from utils.influxdb_client import SharedInfluxDBClient
 
 
 class TestUDPListener:

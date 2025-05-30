@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from loxone_smart_home.main import LoxoneSmartHome, main
+from main import LoxoneSmartHome, main
 
 
 class TestLoxoneSmartHome:
@@ -18,7 +18,7 @@ class TestLoxoneSmartHome:
             return LoxoneSmartHome()
 
     @pytest.mark.asyncio
-    @patch("loxone_smart_home.utils.mqtt_client.SharedMQTTClient.connect")
+    @patch("utils.mqtt_client.SharedMQTTClient.connect")
     async def test_initialize_modules(self, mock_connect: AsyncMock, app: LoxoneSmartHome) -> None:
         """Test module initialization."""
         await app.initialize_modules()
@@ -57,8 +57,8 @@ class TestLoxoneSmartHome:
             assert len(app.modules) == 4
 
     @pytest.mark.asyncio
-    @patch("loxone_smart_home.utils.mqtt_client.SharedMQTTClient.disconnect")
-    @patch("loxone_smart_home.utils.influxdb_client.SharedInfluxDBClient.close")
+    @patch("utils.mqtt_client.SharedMQTTClient.disconnect")
+    @patch("utils.influxdb_client.SharedInfluxDBClient.close")
     async def test_shutdown(
         self, mock_influx_close: AsyncMock, mock_mqtt_disconnect: AsyncMock, app: LoxoneSmartHome
     ) -> None:
@@ -117,8 +117,8 @@ class TestLoxoneSmartHome:
 @pytest.mark.asyncio
 async def test_main_entry_point() -> None:
     """Test the main entry point."""
-    with patch("loxone_smart_home.main.load_dotenv") as mock_load_dotenv:
-        with patch("loxone_smart_home.main.LoxoneSmartHome") as mock_app_class:
+    with patch("main.load_dotenv") as mock_load_dotenv:
+        with patch("main.LoxoneSmartHome") as mock_app_class:
             mock_app = AsyncMock()
             mock_app_class.return_value = mock_app
 

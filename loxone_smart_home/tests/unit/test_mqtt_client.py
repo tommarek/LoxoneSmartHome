@@ -6,8 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from asyncio_mqtt import MqttError
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from config.settings import Settings
+from utils.mqtt_client import SharedMQTTClient
 
 
 class TestSharedMQTTClient:
@@ -27,7 +27,7 @@ class TestSharedMQTTClient:
     @pytest.mark.asyncio
     async def test_connect_success(self, mqtt_client: SharedMQTTClient) -> None:
         """Test successful connection to MQTT broker."""
-        with patch("loxone_smart_home.utils.mqtt_client.Client") as mock_client_class:
+        with patch("utils.mqtt_client.Client") as mock_client_class:
             mock_client = AsyncMock()
             mock_client_class.return_value = mock_client
 
@@ -44,7 +44,7 @@ class TestSharedMQTTClient:
     @pytest.mark.asyncio
     async def test_connect_failure(self, mqtt_client: SharedMQTTClient) -> None:
         """Test connection failure handling."""
-        with patch("loxone_smart_home.utils.mqtt_client.Client") as mock_client_class:
+        with patch("utils.mqtt_client.Client") as mock_client_class:
             mock_client = AsyncMock()
             mock_client.connect.side_effect = MqttError("Connection failed")
             mock_client_class.return_value = mock_client

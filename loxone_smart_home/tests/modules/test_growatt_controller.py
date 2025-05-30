@@ -4,13 +4,14 @@ import asyncio
 import json
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
+import zoneinfo
 
 import pytest
 
-from loxone_smart_home.config.settings import GrowattConfig, Settings
-from loxone_smart_home.modules.growatt_controller import GrowattController
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from config.settings import GrowattConfig, Settings
+from modules.growatt_controller import GrowattController
+from utils.influxdb_client import SharedInfluxDBClient
+from utils.mqtt_client import SharedMQTTClient
 
 
 @pytest.fixture
@@ -380,8 +381,9 @@ async def test_schedule_at_time(growatt_controller: GrowattController) -> None:
     async def dummy_task() -> str:
         return "completed"
 
-    # Schedule for immediate execution
-    past_time = (datetime.now() - timedelta(hours=1)).strftime("%H:%M")
+    # Schedule for immediate execution using Prague timezone
+    local_tz = zoneinfo.ZoneInfo("Europe/Prague")
+    past_time = (datetime.now(local_tz) - timedelta(hours=1)).strftime("%H:%M")
 
     with patch("asyncio.sleep") as mock_sleep:
         await growatt_controller._schedule_at_time(past_time, dummy_task)
