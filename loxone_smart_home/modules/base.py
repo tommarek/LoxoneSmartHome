@@ -6,9 +6,9 @@ import os
 from abc import ABC, abstractmethod
 from typing import Optional
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from ..config.settings import Settings
+from ..utils.influxdb_client import SharedInfluxDBClient
+from ..utils.mqtt_client import SharedMQTTClient
 
 
 class BaseModule(ABC):

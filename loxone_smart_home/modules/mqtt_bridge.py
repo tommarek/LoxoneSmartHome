@@ -3,9 +3,9 @@
 import json
 import socket
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.base import BaseModule
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from ..config.settings import Settings
+from .base import BaseModule
+from ..utils.mqtt_client import SharedMQTTClient
 
 
 class MQTTBridge(BaseModule):

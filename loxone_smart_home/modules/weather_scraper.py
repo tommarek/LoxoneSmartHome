@@ -8,10 +8,10 @@ from typing import Any, Dict, List, Optional
 
 import aiohttp
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.base import BaseModule
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from ..config.settings import Settings
+from .base import BaseModule
+from ..utils.influxdb_client import SharedInfluxDBClient
+from ..utils.mqtt_client import SharedMQTTClient
 
 # Named tuple for standardized hourly data
 HourlyData = namedtuple(

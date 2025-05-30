@@ -6,9 +6,9 @@ from typing import Optional, Tuple
 
 import pytz
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.base import BaseModule
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
+from ..config.settings import Settings
+from .base import BaseModule
+from ..utils.influxdb_client import SharedInfluxDBClient
 
 
 class UDPListener(BaseModule):
