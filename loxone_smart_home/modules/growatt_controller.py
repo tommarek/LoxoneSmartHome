@@ -366,9 +366,27 @@ class GrowattController(BaseModule):
         # Union all cheap hours
         all_cheap_hours = cheapest_individual_hours.union(cheapest_consecutive)
 
-        self.logger.info(f"Cheapest individual hours: {len(cheapest_individual_hours)}")
-        self.logger.info(f"Cheapest consecutive hours: {len(cheapest_consecutive)}")
-        self.logger.info(f"Total cheap hours: {len(all_cheap_hours)}")
+        # Calculate price statistics
+        all_prices = list(hourly_prices.values())
+        min_price = min(all_prices)
+        max_price = max(all_prices)
+        avg_price = sum(all_prices) / len(all_prices)
+        
+        # Calculate average prices for selected hours
+        if cheapest_individual_hours:
+            individual_avg = sum(hourly_prices[hour] for hour in cheapest_individual_hours) / len(cheapest_individual_hours)
+        else:
+            individual_avg = 0.0
+            
+        if cheapest_consecutive:
+            consecutive_avg = sum(hourly_prices[hour] for hour in cheapest_consecutive) / len(cheapest_consecutive)
+        else:
+            consecutive_avg = 0.0
+
+        self.logger.info(f"Price analysis: min={min_price:.2f}, max={max_price:.2f}, avg={avg_price:.2f} CZK/MWh")
+        self.logger.info(f"Cheapest individual hours: {len(cheapest_individual_hours)} (avg: {individual_avg:.2f} CZK/MWh)")
+        self.logger.info(f"Cheapest consecutive hours: {len(cheapest_consecutive)} (avg: {consecutive_avg:.2f} CZK/MWh)")
+        self.logger.info(f"Total cheap hours: {len(all_cheap_hours)}, Export threshold: {self.config.export_price_threshold * 1000:.2f} CZK/MWh")
 
         # Schedule battery-first mode
         await self._schedule_battery_control(all_cheap_hours, cheapest_consecutive, hourly_prices)
@@ -412,7 +430,17 @@ class GrowattController(BaseModule):
             ac_charge_groups = self._group_contiguous_hours(ac_charge_hours)
 
             for start_time, stop_time in ac_charge_groups:
-                self.logger.info(f"Scheduling AC charge from {start_time} to {stop_time}")
+                # Calculate average price for this charging period
+                charge_prices = [
+                    price for start, stop, price in ac_charge_hours
+                    if start >= start_time and stop <= stop_time
+                ]
+                avg_charge_price = sum(charge_prices) / len(charge_prices) if charge_prices else 0.0
+
+                self.logger.info(
+                    f"Scheduling AC charge from {start_time} to {stop_time} "
+                    f"(avg price: {avg_charge_price:.2f} CZK/MWh)"
+                )
 
                 # Schedule AC charge start
                 task = asyncio.create_task(
@@ -431,14 +459,17 @@ class GrowattController(BaseModule):
 
     async def _schedule_export_control(self, hourly_prices: Dict[Tuple[str, str], float]) -> None:
         """Schedule export enable/disable based on price thresholds."""
+        # Convert threshold from CZK/kWh to CZK/MWh for comparison
+        threshold_mwh = self.config.export_price_threshold * 1000
+        
         export_hours = [
             (start, stop)
             for (start, stop), price in hourly_prices.items()
-            if price >= self.config.export_price_threshold
+            if price >= threshold_mwh
         ]
 
         if not export_hours:
-            self.logger.info("No hours above export price threshold")
+            self.logger.info(f"No hours above export price threshold ({threshold_mwh:.2f} CZK/MWh)")
             return
 
         # Group export hours into contiguous blocks
@@ -447,18 +478,30 @@ class GrowattController(BaseModule):
         ]
         export_groups = self._group_contiguous_hours(export_hours_with_price)
 
+        self.logger.info(f"Found {len(export_groups)} export periods above {threshold_mwh:.2f} CZK/MWh threshold")
+
         for group_start, group_end in export_groups:
             # Handle 24:00 edge case
             if group_end == "24:00":
                 group_end = "23:59"
 
-            self.logger.info(f"Scheduling export enable from {group_start} to {group_end}")
+            # Calculate average price for this time range
+            group_prices = [
+                price for start, stop, price in export_hours_with_price
+                if start >= group_start and stop <= (group_end if group_end != "23:59" else "24:00")
+            ]
+            avg_price = sum(group_prices) / len(group_prices) if group_prices else 0.0
 
-            # Schedule export enable
+            self.logger.info(
+                f"Scheduling export enable from {group_start} to {group_end} "
+                f"(avg price: {avg_price:.2f} CZK/MWh, threshold: {threshold_mwh:.2f})"
+            )
+
+            # Schedule export enable at start
             task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
             self._scheduled_tasks.append(task)
 
-            # Schedule export disable
+            # Schedule export disable at end  
             task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
             self._scheduled_tasks.append(task)
 
