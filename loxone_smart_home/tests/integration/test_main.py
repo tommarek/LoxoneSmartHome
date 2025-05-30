@@ -84,9 +84,7 @@ class TestLoxoneSmartHome:
         """Test successful application run."""
         with patch.object(
             app, "initialize_modules", new_callable=AsyncMock
-        ) as mock_init, patch.object(
-            app, "start_modules", new_callable=AsyncMock
-        ) as mock_start:
+        ) as mock_init, patch.object(app, "start_modules", new_callable=AsyncMock) as mock_start:
             # Set shutdown event after a short delay
             async def set_shutdown() -> None:
                 await asyncio.sleep(0.1)

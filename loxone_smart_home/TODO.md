@@ -38,11 +38,15 @@
   - MQTT publishing and InfluxDB storage
   - Comprehensive test suite with 11 test cases
 
-- [ ] Integrate Growatt controller module
-  - Current: Basic structure created
-  - TODO: Implement energy price scraping from OTE
-  - TODO: Implement battery control logic
-  - TODO: Implement scheduling and optimization algorithms
+- [x] Integrate Growatt controller module ✅
+  - Implemented async energy price fetching from OTE DAM API
+  - Implemented battery control logic with MQTT commands
+  - Implemented scheduling with asyncio (replaces schedule library)
+  - Added price analysis algorithms (quadrants, cheapest hours)
+  - Added export control based on price thresholds
+  - Comprehensive test suite with 16 tests
+  - Full configuration support via Pydantic settings
+  - Note: PV forecasting removed per user request
 
 ### Type Safety
 - [x] Fix remaining mypy type errors in tests ✅

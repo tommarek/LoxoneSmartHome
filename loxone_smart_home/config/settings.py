@@ -120,11 +120,7 @@ class GrowattConfig(BaseModel):
 
     # API endpoints
     ote_dam_url: str = (
-        "https://www.ote-cr.cz/en/short-term-markets/electricity/" "day-ahead-market-results"
-    )
-    ote_intraday_url: str = (
-        "https://www.ote-cr.cz/en/short-term-markets/electricity/"
-        "intraday-electricity-market/continuous-intraday-market-results"
+        "https://www.ote-cr.cz/en/short-term-markets/electricity/day-ahead-market/@@chart-data"
     )
 
     # Control parameters
@@ -133,21 +129,30 @@ class GrowattConfig(BaseModel):
     min_soc: float = Field(default=20.0, ge=0, le=100)  # %
     max_soc: float = Field(default=90.0, ge=0, le=100)  # %
 
-    # Price thresholds
-    export_limit_price: float = 2.5  # CZK/kWh
-    charge_price_percentile: float = Field(
-        default=25.0, ge=0, le=100
-    )  # Charge during cheapest 25% of hours
+    # Price thresholds and control parameters
+    export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
+    battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
+    individual_cheapest_hours: int = Field(default=6, ge=1, le=24)  # Individual cheap hours
+
+    # MQTT topics for Growatt control
+    battery_first_topic: str = "energy/solar/command/batteryfirst/set/timeslot"
+    ac_charge_topic: str = "energy/solar/command/batteryfirst/set/acchargeenabled"
+    export_enable_topic: str = "energy/solar/command/export/enable"
+    export_disable_topic: str = "energy/solar/command/export/disable"
 
     # Scheduling
-    schedule_hour: int = Field(default=15, ge=0, le=23)
-    schedule_minute: int = Field(default=0, ge=0, le=59)
+    schedule_hour: int = Field(default=23, ge=0, le=23)  # Daily calculation hour
+    schedule_minute: int = Field(default=59, ge=0, le=59)  # Daily calculation minute
 
     # Simulation mode
     simulation_mode: bool = False
 
     # Device IDs
     device_serial: Optional[str] = None
+
+    # Retry settings
+    max_retries: int = Field(default=3, ge=1)
+    retry_delay: int = Field(default=60, ge=1)  # seconds
 
     @field_validator("max_soc")
     @classmethod
