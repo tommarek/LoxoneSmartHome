@@ -1,15 +1,40 @@
 #!/bin/bash
 
-sudo mkdir -p /srv/docker/grafana/data
+# Loxone Smart Home - Deployment Script
+
+echo "🏠 Starting Loxone Smart Home system..."
+
+# Build and start all services
+echo "Building consolidated service..."
+docker-compose build loxone_smart_home
+
+echo "Starting all services..."
 docker-compose up -d
-sudo chown -R 472:472 /srv/docker/grafana/data
 
-echo "Grafana: http://127.0.0.1:3000 - admin/admin"
+# Wait a moment for services to start
+sleep 5
 
-echo
-echo "Current database list"
-curl -G http://localhost:8086/query?pretty=true --data-urlencode "db=glances" --data-urlencode "q=SHOW DATABASES"
+# Check service status
+echo ""
+echo "📊 Service Status:"
+docker-compose ps
 
-echo
-echo "Create a new database ?"
-echo "curl -XPOST 'http://localhost:8086/query' --data-urlencode 'q=CREATE DATABASE mydb'"
+# Show access information
+echo ""
+echo "🌐 Access Information:"
+echo "  Grafana:  http://localhost:3000 (admin/adminadmin)"
+echo "  InfluxDB: http://localhost:8086"
+echo ""
+
+# Check logs for any immediate issues
+echo "📝 Recent logs from consolidated service:"
+docker-compose logs --tail=10 loxone_smart_home
+
+echo ""
+echo "✅ Deployment complete!"
+echo ""
+echo "💡 Useful commands:"
+echo "  View logs:        docker-compose logs -f loxone_smart_home"
+echo "  Check status:     docker-compose ps"
+echo "  Stop services:    docker-compose down"
+echo "  Restart service:  docker-compose restart loxone_smart_home"

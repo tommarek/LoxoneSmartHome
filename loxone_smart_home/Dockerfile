@@ -7,6 +7,4 @@ RUN pip install -r requirements.txt
 
 COPY . /app
 
-# Set the working directory to where main.py is located
-
 CMD ["python", "main.py"]

@@ -1,105 +1,36 @@
-# TODO - Loxone Smart Home Consolidation
+# TODO - Loxone Smart Home
 
-## Completed ✅
+## Current Priority 🎯
 
-- [x] Create new branch for Python consolidation
-- [x] Create directory structure for consolidated Python app
-- [x] Set up requirements.txt with all dependencies
-- [x] Create main.py with async architecture
-- [x] Set up virtual environment
-- [x] Create requirements-dev.txt
-- [x] Create test structure and initial tests
-- [x] Fix all flake8 linting issues
-- [x] Fix all mypy type checking issues ✅
-- [x] Fix all test mock assignment issues ✅
+### Loxone Control Integration
+- [ ] Implement ability to control charging/discharging/export from Loxone
+  - [ ] Design MQTT topic structure for Loxone commands
+  - [ ] Add MQTT subscribers for incoming control commands
+  - [ ] Implement override logic for automated scheduling
+  - [ ] Add manual mode vs automatic mode switching
+  - [ ] Handle conflicts between manual commands and price-based automation
+  - [ ] Add status feedback to Loxone (current mode, battery state, etc.)
+  - [ ] Create configuration for control topics and override behavior
+  - [ ] Add comprehensive testing for control logic
+  - [ ] Update documentation with control API
 
-## In Progress 🚧
+## Implementation Notes
 
-### Code Migration
-- [x] Migrate UDP listener (loxone_to_db) from Rust to Python ✅
-  - Implemented exact parsing logic from Rust code
-  - Matches field names, defaults, and behavior
-  - Handles timezone conversion (Prague to UTC)
-  - Normalizes measurement names (lowercase, spaces to underscores)
-  - All tests passing
+### Command Structure (Proposed)
+- `loxone/growatt/charge/enable` - Manual charge enable/disable
+- `loxone/growatt/discharge/enable` - Manual discharge control  
+- `loxone/growatt/export/enable` - Manual export control
+- `loxone/growatt/mode` - Switch between "auto" and "manual" modes
+- `loxone/growatt/status` - Status feedback to Loxone
 
-- [x] Integrate MQTT-Loxone bridge functionality ✅
-  - Implemented complete message conversion (JSON to semicolon-separated key=value)
-  - Matches exact behavior of original mqtt-loxone-bridge.py
-  - Comprehensive test suite with 11 test cases
-  - Proper error handling and configuration support
-  - UDP forwarding to Loxone verified through testing
+### Override Logic
+- Manual commands should temporarily override automated scheduling
+- Need timeout mechanism to return to automatic mode
+- Preserve safety limits (battery protection, grid constraints)
+- Log all manual interventions for audit trail
 
-- [x] Integrate weather scraper module ✅
-  - Implemented OpenMeteo API with air quality data
-  - Implemented Aladin weather API integration
-  - Implemented OpenWeatherMap API support
-  - Data transformation with standardized HourlyData format
-  - MQTT publishing and InfluxDB storage
-  - Comprehensive test suite with 11 test cases
-
-- [x] Integrate Growatt controller module ✅
-  - Implemented async energy price fetching from OTE DAM API
-  - Implemented battery control logic with MQTT commands
-  - Implemented scheduling with asyncio (replaces schedule library)
-  - Added price analysis algorithms (quadrants, cheapest hours)
-  - Added export control based on price thresholds
-  - Comprehensive test suite with 16 tests
-  - Full configuration support via Pydantic settings
-  - Note: PV forecasting removed per user request
-
-### Type Safety
-- [x] Fix remaining mypy type errors in tests ✅
-  - Fixed AsyncMock type assignments
-  - Added proper type stubs for test fixtures
-  - Fixed Settings constructor calls with missing influxdb_token
-  - All 22 source files now pass strict mypy checking
-
-### Deployment
-- [x] Create Dockerfile for consolidated app ✅
-  - Multi-stage build for optimized image size
-  - Non-root user for security
-  - Health check included
-- [x] Update docker-compose.yml to use new consolidated service ✅
-  - Replaced loxone_to_db, mqtt-loxone-bridge, weather_scraper, growatt_controller
-  - Single consolidated service with all modules
-  - Environment-based configuration
-- [x] Remove old service definitions from docker-compose.yml ✅
-  - Cleaned up old service definitions
-  - Kept essential services (influxdb, grafana, mosquitto, telegraf, teslamate)
-
-## Future Enhancements 🔮
-
-### Performance
-- [ ] Add connection pooling for database writes
-- [ ] Implement batch processing for UDP messages
-- [ ] Add metrics/monitoring with Prometheus
-
-### Features
-- [ ] Add web API for configuration management
-- [ ] Add health check endpoints
-- [ ] Implement graceful reload for configuration changes
-- [ ] Add support for multiple Loxone systems
-
-### Testing
-- [ ] Add integration tests with real MQTT broker
-- [ ] Add integration tests with real InfluxDB
-- [ ] Add performance/load tests
-- [ ] Achieve >90% test coverage
-
-### Documentation
-- [ ] Create comprehensive API documentation
-- [ ] Add deployment guide
-- [ ] Create configuration examples
-- [ ] Add troubleshooting guide
-
-## Known Issues 🐛
-
-1. **Energy price scraping**: Web scraping logic needs to be tested with actual OTE website
-
-## Dependencies to Consider 📦
-
-- Consider using `httpx` instead of `requests` for async HTTP calls
-- Consider `aiofiles` for async file operations if needed
-- Consider `structlog` for structured logging
-- Consider `tenacity` for retry logic
+### Safety Considerations
+- Validate all incoming commands
+- Implement rate limiting for control messages
+- Maintain battery protection regardless of control source
+- Add emergency stop functionality

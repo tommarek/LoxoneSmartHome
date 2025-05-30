@@ -35,14 +35,12 @@ docker build -t loxone_smart_home ./loxone_smart_home
 
 ### 3. Deploy with Docker Compose
 
-Use the new consolidated docker-compose file:
+Deploy the consolidated service:
 
 ```bash
-# Stop old services
-docker-compose down
-
-# Start with new configuration
-docker-compose -f docker-compose.yml up -d
+# Build and start the service
+docker-compose build loxone_smart_home
+docker-compose up -d
 ```
 
 ### 4. Verify Deployment
@@ -50,17 +48,17 @@ docker-compose -f docker-compose.yml up -d
 Check that all services are running:
 
 ```bash
-docker-compose -f docker-compose.new.yml ps
+docker-compose ps
 ```
 
 Check logs:
 
 ```bash
 # All services
-docker-compose -f docker-compose.new.yml logs -f
+docker-compose logs -f
 
 # Just the consolidated service
-docker-compose -f docker-compose.new.yml logs -f loxone_smart_home
+docker-compose logs -f loxone_smart_home
 ```
 
 ### 5. Health Checks
@@ -118,7 +116,7 @@ To migrate:
 ## Troubleshooting
 
 ### Service won't start
-- Check logs: `docker-compose -f docker-compose.new.yml logs loxone_smart_home`
+- Check logs: `docker-compose logs loxone_smart_home`
 - Verify environment variables in `.env`
 - Ensure InfluxDB token is valid
 
@@ -205,5 +203,5 @@ git pull
 docker build -t loxone_smart_home ./loxone_smart_home
 
 # Restart service
-docker-compose -f docker-compose.new.yml up -d loxone_smart_home
+docker-compose up -d loxone_smart_home
 ```
