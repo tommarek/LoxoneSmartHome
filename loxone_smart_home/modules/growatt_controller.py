@@ -485,21 +485,29 @@ class GrowattController(BaseModule):
             ac_charge_groups = self._group_contiguous_hours(ac_charge_hours)
 
             for start_time, stop_time in ac_charge_groups:
-                # Calculate average price for this charging period
+                # Calculate price statistics for this charging period
                 charge_prices = [
                     price for start, stop, price in ac_charge_hours
                     if start >= start_time and stop <= stop_time
                 ]
-                avg_charge_price = sum(charge_prices) / len(charge_prices) if charge_prices else 0.0
+                if charge_prices:
+                    min_charge_price = min(charge_prices)
+                    max_charge_price = max(charge_prices)
+                    avg_charge_price = sum(charge_prices) / len(charge_prices)
 
-                # Convert to CZK/kWh for display
-                eur_czk_rate = 25.0
-                avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
-                
-                self.logger.info(
-                    f"Scheduling AC charge from {start_time} to {stop_time} "
-                    f"(avg price: {avg_charge_price:.2f} EUR/MWh = {avg_charge_price_czk_kwh:.2f} CZK/kWh)"
-                )
+                    # Convert to CZK/kWh for display
+                    eur_czk_rate = 25.0
+                    min_charge_price_czk_kwh = min_charge_price * eur_czk_rate / 1000
+                    max_charge_price_czk_kwh = max_charge_price * eur_czk_rate / 1000
+                    avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
+                    
+                    self.logger.info(
+                        f"Scheduling AC charge from {start_time} to {stop_time} "
+                        f"(min: {min_charge_price:.2f}, avg: {avg_charge_price:.2f}, max: {max_charge_price:.2f} EUR/MWh = "
+                        f"{min_charge_price_czk_kwh:.2f}-{avg_charge_price_czk_kwh:.2f}-{max_charge_price_czk_kwh:.2f} CZK/kWh)"
+                    )
+                else:
+                    self.logger.info(f"Scheduling AC charge from {start_time} to {stop_time} (no price data)")
 
                 # Schedule AC charge start
                 task = asyncio.create_task(
@@ -547,20 +555,28 @@ class GrowattController(BaseModule):
             if group_end == "24:00":
                 group_end = "23:59"
 
-            # Calculate average price for this time range
+            # Calculate price statistics for this time range
             group_prices = [
                 price for start, stop, price in export_hours_with_price
                 if start >= group_start and stop <= (group_end if group_end != "23:59" else "24:00")
             ]
-            avg_price = sum(group_prices) / len(group_prices) if group_prices else 0.0
-
-            # Convert average price to CZK/kWh for display
-            avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
-            
-            self.logger.info(
-                f"Scheduling export enable from {group_start} to {group_end} "
-                f"(avg price: {avg_price:.2f} EUR/MWh = {avg_price_czk_kwh:.2f} CZK/kWh, threshold: {self.config.export_price_threshold:.2f} CZK/kWh)"
-            )
+            if group_prices:
+                min_price = min(group_prices)
+                max_price = max(group_prices)
+                avg_price = sum(group_prices) / len(group_prices)
+                
+                # Convert prices to CZK/kWh for display
+                min_price_czk_kwh = min_price * eur_czk_rate / 1000
+                max_price_czk_kwh = max_price * eur_czk_rate / 1000
+                avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
+                
+                self.logger.info(
+                    f"Scheduling export enable from {group_start} to {group_end} "
+                    f"(min: {min_price:.2f}, avg: {avg_price:.2f}, max: {max_price:.2f} EUR/MWh = "
+                    f"{min_price_czk_kwh:.2f}-{avg_price_czk_kwh:.2f}-{max_price_czk_kwh:.2f} CZK/kWh, threshold: {self.config.export_price_threshold:.2f})"
+                )
+            else:
+                self.logger.info(f"Scheduling export enable from {group_start} to {group_end} (no price data)")
 
             # Schedule export enable at start
             task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
