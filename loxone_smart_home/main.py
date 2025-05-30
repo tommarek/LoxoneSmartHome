@@ -14,13 +14,13 @@ from typing import Any, List, Optional
 import colorlog
 from dotenv import load_dotenv
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.growatt_controller import GrowattController
-from loxone_smart_home.modules.mqtt_bridge import MQTTBridge
-from loxone_smart_home.modules.udp_listener import UDPListener
-from loxone_smart_home.modules.weather_scraper import WeatherScraper
-from loxone_smart_home.utils.influxdb_client import SharedInfluxDBClient
-from loxone_smart_home.utils.mqtt_client import SharedMQTTClient
+from config.settings import Settings
+from modules.growatt_controller import GrowattController
+from modules.mqtt_bridge import MQTTBridge
+from modules.udp_listener import UDPListener
+from modules.weather_scraper import WeatherScraper
+from utils.influxdb_client import SharedInfluxDBClient
+from utils.mqtt_client import SharedMQTTClient
 
 
 class LoxoneSmartHome:

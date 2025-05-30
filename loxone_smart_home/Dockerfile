@@ -5,10 +5,9 @@ WORKDIR /app
 COPY requirements.txt /app
 RUN pip install -r requirements.txt
 
-# Create the package structure that the imports expect
-RUN mkdir -p /app/loxone_smart_home
-COPY . /app/loxone_smart_home/
+COPY . /app
 
-ENV PYTHONPATH=/app
+# Set the working directory to where main.py is located
+WORKDIR /app
 
-CMD ["sh", "-c", "export PYTHONPATH=/app && python -c 'import loxone_smart_home; print(\"Package found!\")' && python -m loxone_smart_home.main"]
+CMD ["python", "main.py"]
