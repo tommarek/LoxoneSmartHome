@@ -36,8 +36,8 @@ WORKDIR /app
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy application code
-COPY --chown=loxone:loxone . /app/
+# Copy application code to create proper Python package structure
+COPY --chown=loxone:loxone . /app/loxone_smart_home/
 
 # Set environment variables
 ENV PATH="/opt/venv/bin:$PATH"
