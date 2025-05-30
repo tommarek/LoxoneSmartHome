@@ -9,11 +9,6 @@ RUN pip install -r requirements.txt
 RUN mkdir -p /app/loxone_smart_home
 COPY . /app/loxone_smart_home/
 
-# Debug what we actually have
-RUN ls -la /app/
-RUN ls -la /app/loxone_smart_home/
-RUN python -c "import sys; print('Python path:', sys.path)"
-
 ENV PYTHONPATH=/app
 
-CMD ["python", "-m", "loxone_smart_home.main"]
+CMD ["sh", "-c", "export PYTHONPATH=/app && python -c 'import loxone_smart_home; print(\"Package found!\")' && python -m loxone_smart_home.main"]
