@@ -414,11 +414,6 @@ class GrowattController(BaseModule):
 
         # Union all cheap hours
         all_cheap_hours = cheapest_individual_hours.union(cheapest_consecutive)
-        
-        # Debug: log the constituent sets
-        self.logger.info(f"Cheapest individual hours set: {sorted(list(cheapest_individual_hours))}")
-        self.logger.info(f"Cheapest consecutive hours set: {sorted(list(cheapest_consecutive))}")
-        self.logger.info(f"All cheap hours combined: {sorted(list(all_cheap_hours))}")
 
         # Calculate price statistics
         all_prices = list(hourly_prices.values())
@@ -474,14 +469,7 @@ class GrowattController(BaseModule):
         battery_first_hours = [
             (start, stop, hourly_prices[(start, stop)]) for start, stop in all_cheap_hours
         ]
-        
-        # Debug: log the input hours
-        self.logger.info(f"Battery-first input hours: {[(start, stop) for start, stop, _ in battery_first_hours]}")
-        
         battery_first_groups = self._group_contiguous_hours_simple(battery_first_hours)
-        
-        # Debug: log the grouped output
-        self.logger.info(f"Battery-first grouped: {battery_first_groups}")
 
         # Schedule battery-first mode for each block
         for group_start, group_end in battery_first_groups:
@@ -496,14 +484,7 @@ class GrowattController(BaseModule):
             ac_charge_hours = [
                 (start, stop, hourly_prices[(start, stop)]) for start, stop in cheapest_consecutive
             ]
-            
-            # Debug: log the input hours
-            self.logger.info(f"AC charge input hours: {[(start, stop) for start, stop, _ in ac_charge_hours]}")
-            
             ac_charge_groups = self._group_contiguous_hours_simple(ac_charge_hours)
-            
-            # Debug: log the grouped output
-            self.logger.info(f"AC charge grouped: {ac_charge_groups}")
 
             for start_time, stop_time in ac_charge_groups:
                 # Calculate price statistics for this charging period
