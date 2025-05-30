@@ -383,10 +383,18 @@ class GrowattController(BaseModule):
         else:
             consecutive_avg = 0.0
 
-        self.logger.info(f"Price analysis: min={min_price:.2f}, max={max_price:.2f}, avg={avg_price:.2f} CZK/MWh")
-        self.logger.info(f"Cheapest individual hours: {len(cheapest_individual_hours)} (avg: {individual_avg:.2f} CZK/MWh)")
-        self.logger.info(f"Cheapest consecutive hours: {len(cheapest_consecutive)} (avg: {consecutive_avg:.2f} CZK/MWh)")
-        self.logger.info(f"Total cheap hours: {len(all_cheap_hours)}, Export threshold: {self.config.export_price_threshold * 1000:.2f} CZK/MWh")
+        # Convert prices to CZK/kWh for display
+        eur_czk_rate = 25.0
+        min_price_czk = min_price * eur_czk_rate / 1000
+        max_price_czk = max_price * eur_czk_rate / 1000
+        avg_price_czk = avg_price * eur_czk_rate / 1000
+        individual_avg_czk = individual_avg * eur_czk_rate / 1000
+        consecutive_avg_czk = consecutive_avg * eur_czk_rate / 1000
+        
+        self.logger.info(f"Price analysis: min={min_price:.2f} EUR/MWh ({min_price_czk:.3f} CZK/kWh), max={max_price:.2f} EUR/MWh ({max_price_czk:.3f} CZK/kWh), avg={avg_price:.2f} EUR/MWh ({avg_price_czk:.3f} CZK/kWh)")
+        self.logger.info(f"Cheapest individual hours: {len(cheapest_individual_hours)} (avg: {individual_avg:.2f} EUR/MWh = {individual_avg_czk:.3f} CZK/kWh)")
+        self.logger.info(f"Cheapest consecutive hours: {len(cheapest_consecutive)} (avg: {consecutive_avg:.2f} EUR/MWh = {consecutive_avg_czk:.3f} CZK/kWh)")
+        self.logger.info(f"Total cheap hours: {len(all_cheap_hours)}, Export threshold: {self.config.export_price_threshold:.2f} CZK/kWh")
 
         # Schedule battery-first mode
         await self._schedule_battery_control(all_cheap_hours, cheapest_consecutive, hourly_prices)
@@ -437,9 +445,13 @@ class GrowattController(BaseModule):
                 ]
                 avg_charge_price = sum(charge_prices) / len(charge_prices) if charge_prices else 0.0
 
+                # Convert to CZK/kWh for display
+                eur_czk_rate = 25.0
+                avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
+                
                 self.logger.info(
                     f"Scheduling AC charge from {start_time} to {stop_time} "
-                    f"(avg price: {avg_charge_price:.2f} CZK/MWh)"
+                    f"(avg price: {avg_charge_price:.2f} EUR/MWh = {avg_charge_price_czk_kwh:.2f} CZK/kWh)"
                 )
 
                 # Schedule AC charge start
@@ -459,17 +471,20 @@ class GrowattController(BaseModule):
 
     async def _schedule_export_control(self, hourly_prices: Dict[Tuple[str, str], float]) -> None:
         """Schedule export enable/disable based on price thresholds."""
-        # Convert threshold from CZK/kWh to CZK/MWh for comparison
-        threshold_mwh = self.config.export_price_threshold * 1000
+        # Convert threshold from CZK/kWh to EUR/MWh for comparison with API data
+        # API prices are in EUR/MWh, threshold is in CZK/kWh
+        # 1 EUR = 25 CZK, 1 MWh = 1000 kWh
+        eur_czk_rate = 25.0
+        threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
         
         export_hours = [
             (start, stop)
             for (start, stop), price in hourly_prices.items()
-            if price >= threshold_mwh
+            if price >= threshold_eur_mwh
         ]
 
         if not export_hours:
-            self.logger.info(f"No hours above export price threshold ({threshold_mwh:.2f} CZK/MWh)")
+            self.logger.info(f"No hours above export price threshold ({threshold_eur_mwh:.2f} EUR/MWh = {self.config.export_price_threshold:.2f} CZK/kWh)")
             return
 
         # Group export hours into contiguous blocks
@@ -478,7 +493,7 @@ class GrowattController(BaseModule):
         ]
         export_groups = self._group_contiguous_hours(export_hours_with_price)
 
-        self.logger.info(f"Found {len(export_groups)} export periods above {threshold_mwh:.2f} CZK/MWh threshold")
+        self.logger.info(f"Found {len(export_groups)} export periods above {threshold_eur_mwh:.2f} EUR/MWh threshold")
 
         for group_start, group_end in export_groups:
             # Handle 24:00 edge case
@@ -492,9 +507,12 @@ class GrowattController(BaseModule):
             ]
             avg_price = sum(group_prices) / len(group_prices) if group_prices else 0.0
 
+            # Convert average price to CZK/kWh for display
+            avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
+            
             self.logger.info(
                 f"Scheduling export enable from {group_start} to {group_end} "
-                f"(avg price: {avg_price:.2f} CZK/MWh, threshold: {threshold_mwh:.2f})"
+                f"(avg price: {avg_price:.2f} EUR/MWh = {avg_price_czk_kwh:.2f} CZK/kWh, threshold: {self.config.export_price_threshold:.2f} CZK/kWh)"
             )
 
             # Schedule export enable at start
