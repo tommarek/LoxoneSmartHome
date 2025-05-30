@@ -335,7 +335,8 @@ class GrowattController(BaseModule):
         payload = {"value": True}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
-        self.logger.info("Enabled electricity export to grid")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"Enabled electricity export to grid at {current_time}")
 
     async def _disable_export(self) -> None:
         """Disable electricity export to grid."""
@@ -346,7 +347,8 @@ class GrowattController(BaseModule):
         payload = {"value": False}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
-        self.logger.info("Disabled electricity export to grid")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"Disabled electricity export to grid at {current_time}")
 
     async def _calculate_and_schedule_next_day(self) -> None:
         """Calculate energy prices and schedule battery control for next day."""
