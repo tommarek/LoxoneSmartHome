@@ -469,7 +469,7 @@ class GrowattController(BaseModule):
         battery_first_hours = [
             (start, stop, hourly_prices[(start, stop)]) for start, stop in all_cheap_hours
         ]
-        battery_first_groups = self._group_contiguous_hours(battery_first_hours)
+        battery_first_groups = self._group_contiguous_hours_simple(battery_first_hours)
 
         # Schedule battery-first mode for each block
         for group_start, group_end in battery_first_groups:
@@ -484,7 +484,7 @@ class GrowattController(BaseModule):
             ac_charge_hours = [
                 (start, stop, hourly_prices[(start, stop)]) for start, stop in cheapest_consecutive
             ]
-            ac_charge_groups = self._group_contiguous_hours(ac_charge_hours)
+            ac_charge_groups = self._group_contiguous_hours_simple(ac_charge_hours)
 
             for start_time, stop_time in ac_charge_groups:
                 # Calculate price statistics for this charging period
