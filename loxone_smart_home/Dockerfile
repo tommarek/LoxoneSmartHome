@@ -36,23 +36,24 @@ WORKDIR /app
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Copy application code
-COPY --chown=loxone:loxone . /app/
+# Create the package directory
+RUN mkdir -p /app/loxone_smart_home
+
+# Copy application code to create proper package structure  
+COPY --chown=loxone:loxone . /app/loxone_smart_home/
 
 # Set environment variables
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
 
 # Switch to non-root user
 USER loxone
-
-# Set working directory to the app directory
-WORKDIR /app
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 2000)); s.close()"
 
-# Run the application directly
-CMD ["python", "main.py"]
+# Run the application as a module
+CMD ["python", "-m", "loxone_smart_home.main"]
