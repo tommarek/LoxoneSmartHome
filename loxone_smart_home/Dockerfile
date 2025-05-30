@@ -36,11 +36,8 @@ WORKDIR /app
 # Copy virtual environment from builder
 COPY --from=builder /opt/venv /opt/venv
 
-# Create app structure
-RUN mkdir -p /app/loxone_smart_home
-
-# Copy application code into the loxone_smart_home directory
-COPY --chown=loxone:loxone . /app/loxone_smart_home/
+# Copy application code
+COPY --chown=loxone:loxone . /app/
 
 # Set environment variables
 ENV PATH="/opt/venv/bin:$PATH"
