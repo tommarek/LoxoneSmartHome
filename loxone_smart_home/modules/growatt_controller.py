@@ -9,10 +9,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 
-from ..config.settings import Settings
-from .base import BaseModule
-from ..utils.influxdb_client import SharedInfluxDBClient
-from ..utils.mqtt_client import SharedMQTTClient
+from config.settings import Settings
+from modules.base import BaseModule
+from utils.influxdb_client import SharedInfluxDBClient
+from utils.mqtt_client import SharedMQTTClient
 
 
 class EnergyPriceData:

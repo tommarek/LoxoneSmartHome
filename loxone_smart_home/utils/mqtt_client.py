@@ -6,7 +6,7 @@ from typing import Any, Callable, Dict, Optional, Union
 
 from asyncio_mqtt import Client, MqttError
 
-from ..config.settings import Settings
+from config.settings import Settings
 
 
 class SharedMQTTClient:

@@ -3,9 +3,9 @@
 import json
 import socket
 
-from ..config.settings import Settings
-from .base import BaseModule
-from ..utils.mqtt_client import SharedMQTTClient
+from config.settings import Settings
+from modules.base import BaseModule
+from utils.mqtt_client import SharedMQTTClient
 
 
 class MQTTBridge(BaseModule):
