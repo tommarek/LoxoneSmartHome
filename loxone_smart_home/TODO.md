@@ -56,9 +56,17 @@
   - All 22 source files now pass strict mypy checking
 
 ### Deployment
-- [ ] Create Dockerfile for consolidated app
-- [ ] Update docker-compose.yml to use new consolidated service
-- [ ] Remove old service definitions from docker-compose.yml
+- [x] Create Dockerfile for consolidated app ✅
+  - Multi-stage build for optimized image size
+  - Non-root user for security
+  - Health check included
+- [x] Update docker-compose.yml to use new consolidated service ✅
+  - Replaced loxone_to_db, mqtt-loxone-bridge, weather_scraper, growatt_controller
+  - Single consolidated service with all modules
+  - Environment-based configuration
+- [x] Remove old service definitions from docker-compose.yml ✅
+  - Cleaned up old service definitions
+  - Kept essential services (influxdb, grafana, mosquitto, telegraf, teslamate)
 
 ## Future Enhancements 🔮
 
