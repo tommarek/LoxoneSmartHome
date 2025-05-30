@@ -1,7 +1,7 @@
 """Test the UDP listener module."""
 
 from datetime import datetime
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytz
@@ -50,7 +50,7 @@ class TestUDPListener:
     @pytest.mark.asyncio
     async def test_stop(self, udp_listener: UDPListener) -> None:
         """Test stopping the UDP listener."""
-        mock_transport = AsyncMock()
+        mock_transport = MagicMock()
         udp_listener.transport = mock_transport
 
         await udp_listener.stop()

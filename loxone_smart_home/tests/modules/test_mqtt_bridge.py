@@ -52,9 +52,7 @@ def mqtt_bridge(
 
 
 @pytest.mark.asyncio
-async def test_mqtt_bridge_init(
-    mock_mqtt_client: MagicMock, mock_settings: Settings
-) -> None:
+async def test_mqtt_bridge_init(mock_mqtt_client: MagicMock, mock_settings: Settings) -> None:
     """Test MQTT bridge initialization."""
     with patch("socket.socket") as mock_socket_class:
         mock_socket_instance = MagicMock()

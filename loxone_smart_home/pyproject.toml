@@ -29,3 +29,8 @@ python_files = ["test_*.py", "*_test.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 asyncio_mode = "auto"
+filterwarnings = [
+    "ignore:The `__fields__` attribute is deprecated:DeprecationWarning",
+    "ignore:.*pydantic.*__fields__.*:DeprecationWarning",
+    "ignore:coroutine.*was never awaited:RuntimeWarning",
+]

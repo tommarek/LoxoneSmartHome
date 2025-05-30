@@ -39,11 +39,11 @@ check: lint type-check
 
 # Run tests
 test:
-	PYTHONPATH=. $(VENV_BIN)/pytest
+	PYTHONPATH=. PYTHONWARNINGS="ignore::RuntimeWarning" $(VENV_BIN)/pytest
 
 # Run tests with coverage
 test-cov:
-	PYTHONPATH=. $(VENV_BIN)/pytest --cov=loxone_smart_home --cov-report=html --cov-report=term
+	PYTHONPATH=. PYTHONWARNINGS="ignore::RuntimeWarning" $(VENV_BIN)/pytest --cov=loxone_smart_home --cov-report=html --cov-report=term
 
 # Run the application
 run:

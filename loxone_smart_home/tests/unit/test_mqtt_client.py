@@ -31,11 +31,15 @@ class TestSharedMQTTClient:
             mock_client = AsyncMock()
             mock_client_class.return_value = mock_client
 
-            await mqtt_client.connect()
+            # Patch the _read_messages method to prevent it from running
+            with patch.object(mqtt_client, "_read_messages", new_callable=AsyncMock):
+                await mqtt_client.connect()
 
-            assert mqtt_client.client is not None
-            mock_client.connect.assert_called_once()
-            assert mqtt_client._running is True
+                assert mqtt_client.client is not None
+                mock_client.connect.assert_called_once()
+                assert mqtt_client._running is True
+                # Verify _read_messages task was created
+                assert mqtt_client._read_task is not None
 
     @pytest.mark.asyncio
     async def test_connect_failure(self, mqtt_client: SharedMQTTClient) -> None:
@@ -53,7 +57,12 @@ class TestSharedMQTTClient:
         """Test disconnection from MQTT broker."""
         mqtt_client.client = AsyncMock()
         mqtt_client._running = True
-        mqtt_client._read_task = asyncio.create_task(asyncio.sleep(0))
+
+        # Create a task that completes immediately
+        async def dummy_task() -> None:
+            pass
+
+        mqtt_client._read_task = asyncio.create_task(dummy_task())
 
         await mqtt_client.disconnect()
 

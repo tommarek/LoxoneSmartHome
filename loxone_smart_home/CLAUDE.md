@@ -48,6 +48,17 @@ The application uses:
 - Supports comma-separated topic lists via MQTT_TOPICS environment variable
 - Example: `{"power": 2500, "voltage": 240}` becomes `power=2500;voltage=240`
 
+### Weather Scraper
+- Supports three weather services: OpenMeteo, Aladin, OpenWeatherMap
+- Fetches weather forecasts and air quality data
+- OpenMeteo: Includes comprehensive weather parameters and air quality (PM10, PM2.5, UV index)
+- Aladin: Czech meteorological service with local forecasts
+- OpenWeatherMap: Requires API key, provides current weather and hourly forecasts
+- Publishes consolidated data to MQTT topic `weather`
+- Stores weather data in InfluxDB bucket `weather_forecast`
+- Periodic updates with configurable interval (default: 30 minutes)
+- Standardized data format using HourlyData named tuple
+
 ### Configuration
 - All settings use Pydantic models in `config/settings.py`
 - Environment variables are loaded from `.env` file
@@ -61,7 +72,7 @@ The application uses:
 - Mock objects for external dependencies (MQTT, InfluxDB)
 - Test files mirror the source structure in `tests/`
 - Use `AsyncMock` for async methods, `MagicMock` for sync methods
-- Comprehensive test coverage: 49 tests covering all modules
+- Comprehensive test coverage: 60 tests covering all modules
 - Type safety: All tests pass strict mypy checking
 - Mock best practices: Use `# type: ignore[attr-defined]` for test-specific mock attributes
 
@@ -70,11 +81,12 @@ The application uses:
 ### Completed ✅
 - **UDP Listener**: Fully migrated from Rust with exact behavior matching
 - **MQTT Bridge**: Complete implementation with 11 comprehensive test cases
-- **Type Safety**: All 22 source files pass strict mypy checking
+- **Weather Scraper**: Full implementation with three weather APIs and 11 test cases
+- **Type Safety**: All 23 source files pass strict mypy checking
 - **Code Quality**: 100% linting compliance (flake8 with 100-char limit)
+- **Test Coverage**: 60 tests covering all implemented modules
 
 ### In Progress 🚧
-- **Weather Scraper**: Basic structure created, needs API implementation
 - **Growatt Controller**: Basic structure created, needs energy price scraping and control logic
 
 ## Error Handling

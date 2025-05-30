@@ -91,10 +91,13 @@ class LoxoneBridgeConfig(BaseModel):
 class WeatherConfig(BaseModel):
     """Weather scraper configuration."""
 
+    # Service selection
+    weather_service: str = Field(default="openmeteo", pattern="^(openmeteo|aladin|openweathermap)$")
+
     # API endpoints
     openmeteo_url: str = "https://api.open-meteo.com/v1/forecast"
     aladin_url_base: str = "http://www.nts2.cz:443/meteo/aladin/"
-    openweathermap_url: str = "https://api.openweathermap.org/data/2.5/forecast"
+    openweathermap_url: str = "https://api.openweathermap.org/data/2.5/onecall"
 
     # API keys
     openweathermap_api_key: Optional[str] = None
@@ -195,6 +198,7 @@ class Settings(BaseSettings):
     latitude: float = Field(default=49.00642, ge=-90, le=90)
     longitude: float = Field(default=14.51994, ge=-180, le=180)
     openweathermap_api_key: Optional[str] = None
+    weather_service: str = Field(default="openmeteo", alias="USE_SERVICE")
 
     growatt_device_serial: Optional[str] = None
     growatt_simulation_mode: bool = False
@@ -255,6 +259,7 @@ class Settings(BaseSettings):
     def weather(self) -> WeatherConfig:
         """Get weather configuration."""
         return WeatherConfig(
+            weather_service=self.weather_service,
             latitude=self.latitude,
             longitude=self.longitude,
             openweathermap_api_key=self.openweathermap_api_key,

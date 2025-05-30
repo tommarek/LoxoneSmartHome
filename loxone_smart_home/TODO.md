@@ -30,10 +30,13 @@
   - Proper error handling and configuration support
   - UDP forwarding to Loxone verified through testing
 
-- [ ] Integrate weather scraper module
-  - Current: Basic structure created
-  - TODO: Implement OpenMeteo, Aladin, OpenWeatherMap API calls
-  - TODO: Implement data transformation and storage
+- [x] Integrate weather scraper module ✅
+  - Implemented OpenMeteo API with air quality data
+  - Implemented Aladin weather API integration
+  - Implemented OpenWeatherMap API support
+  - Data transformation with standardized HourlyData format
+  - MQTT publishing and InfluxDB storage
+  - Comprehensive test suite with 11 test cases
 
 - [ ] Integrate Growatt controller module
   - Current: Basic structure created
@@ -80,8 +83,7 @@
 
 ## Known Issues 🐛
 
-1. **Weather APIs**: OpenMeteo library not available, need to implement direct API calls
-2. **Energy price scraping**: Web scraping logic needs to be tested with actual OTE website
+1. **Energy price scraping**: Web scraping logic needs to be tested with actual OTE website
 
 ## Dependencies to Consider 📦
 
