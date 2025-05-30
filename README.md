@@ -1,30 +1,92 @@
 # LoxoneSmartHome
 
-Aim of this repo is to grab data from Loxone smart home and a PHV array with Growatt battery and inverter and use it to predict excess of solar energy.
-This information will then be processed by a controlling app and heating/cooling commands will then be sent back to the Loxone server.
+Consolidated smart home automation system that integrates Loxone Miniserver with solar energy management, weather forecasting, and comprehensive data visualization.
 
-## Docker containers
+## Overview
 
-### Grafana
+This project consolidates multiple services into a single, efficient Python application that:
+- Collects data from Loxone smart home system
+- Manages Growatt solar battery based on electricity prices
+- Provides weather forecasting and monitoring
+- Visualizes all data through Grafana dashboards
 
-Grafana service connected to influxdb database that displays relevant data
+## Architecture
 
-### InfluxDB
+### Core Service: `loxone_smart_home`
 
-Database used by all the services to store data
+A single consolidated Python service that replaces the previous separate containers:
 
-### Loxone2DB
+- **UDP Listener Module** (formerly loxone_to_db)
+  - Receives sensor data from Loxone on UDP port 2000
+  - Stores data in InfluxDB with proper timestamps and tags
+  
+- **MQTT-Loxone Bridge Module** (formerly mqtt-loxone-bridge)
+  - Forwards MQTT messages to Loxone via UDP
+  - Configurable topic filtering
+  
+- **Weather Scraper Module** (formerly weather_scraper)
+  - Fetches forecasts from OpenMeteo, Aladin, and OpenWeatherMap
+  - Publishes to MQTT and stores in InfluxDB
+  
+- **Growatt Controller Module** (formerly growatt_controller)
+  - Fetches day-ahead electricity prices
+  - Optimizes battery charging schedule
+  - Controls export based on price thresholds
 
-Rust script that reads data pushed by Loxone server and stores them to the DB
+### Supporting Services
 
-### Mosquitto
+- **Grafana** - Data visualization and dashboards
+- **InfluxDB** - Time series database for all metrics
+- **Mosquitto** - MQTT broker for device communication
+- **Telegraf** - Additional metrics collection
+- **TeslaMate** - Tesla vehicle tracking (optional)
 
-MQTT broker used to collect data from Growatt (https://github.com/otti/Growatt_ShineWiFi-S) and possibly other sensors
+## Quick Start
 
-### WeatherForecastScraper
+1. **Setup Environment**
+   ```bash
+   cd loxone_smart_home
+   cp .env.production .env
+   # Edit .env if needed
+   ```
 
-Gets the weather data from weather forecast services (currently Aladin and Openweathermap are supported) then publishes the entire hourly forecast to the MQQT and current weather data are stored in the influxDB for future use with the MPC system.
+2. **Deploy**
+   ```bash
+   docker-compose build loxone_smart_home
+   docker-compose up -d
+   ```
 
-### Mastermind (TODO)
+3. **Access**
+   - Grafana: http://localhost:3000 (admin/adminadmin)
+   - InfluxDB: http://localhost:8086
 
-Python application that will read data from the InfluxDB and sends the heating/cooling commands to the Loxone server.
+## Configuration
+
+Key environment variables:
+- `LOXONE_HOST` - IP address of your Loxone Miniserver
+- `INFLUXDB_TOKEN` - Authentication token for InfluxDB
+- `MQTT_TOPICS` - Comma-separated list of topics to forward to Loxone
+- `UDP_LISTENER_PORT` - Port for receiving Loxone data (default: 2000)
+- `GROWATT_EXPORT_PRICE_THRESHOLD` - Price above which to enable grid export
+
+See [.env.example](loxone_smart_home/.env.example) for all options.
+
+## Data Flow
+
+```
+Loxone Miniserver → UDP:2000 → loxone_smart_home → InfluxDB → Grafana
+                                        ↓
+MQTT Broker ← ← ← ← ← ← ← ← ← ← ← ← ← ↓
+     ↓                                 ↓
+Growatt Inverter              Weather APIs
+```
+
+## Documentation
+
+- [Deployment Guide](loxone_smart_home/DEPLOYMENT.md) - Detailed deployment instructions
+- [Quick Start](QUICKSTART.md) - Get up and running quickly
+- [Development Guide](loxone_smart_home/README.md) - For developers
+
+## License
+
+This project is licensed under the MIT License.

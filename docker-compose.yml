@@ -34,23 +34,62 @@ services:
     volumes:
       - ./grafana:/var/lib/grafana
 
-  loxone_to_db:
-    build: ./loxone_to_db
-    container_name: loxone_to_db
+  # Consolidated Loxone Smart Home service
+  loxone_smart_home:
+    build: ./loxone_smart_home
+    container_name: loxone_smart_home
     restart: unless-stopped
     ports:
-      - "2000:2000/udp"
+      - "2000:2000/udp"  # UDP listener port
     user: '1026:65537'
+    environment:
+      # General settings
+      - LOG_LEVEL=INFO
+      
+      # Module enable/disable
+      - UDP_LISTENER_ENABLED=true
+      - MQTT_BRIDGE_ENABLED=true
+      - WEATHER_SCRAPER_ENABLED=true
+      - GROWATT_CONTROLLER_ENABLED=true
+      
+      # MQTT settings
+      - MQTT_BROKER=mosquitto
+      - MQTT_PORT=1883
+      
+      # InfluxDB settings
+      - INFLUXDB_HOST=http://influxdb:8086
+      - INFLUXDB_ORG=loxone
+      - INFLUXDB_BUCKET=loxone
+      
+      # UDP Listener settings
+      - UDP_LISTENER_HOST=0.0.0.0
+      - UDP_LISTENER_PORT=2000
+      
+      # Loxone Bridge settings
+      - LOXONE_HOST=${LOXONE_HOST:-192.168.0.200}
+      - LOXONE_PORT=4000
+      - MQTT_TOPICS=energy/solar,teplomer/TC,teplomer/RH,teslamate/cars/1/+
+      
+      # Weather settings
+      - USE_SERVICE=openmeteo
+      - LATITUDE=${LATITUDE:-49.4949522}
+      - LONGITUDE=${LONGITUDE:-17.4302361}
+      - OPENWEATHERMAP_API_KEY=${OPENWEATHERMAP_API_KEY:-}
+      
+      # Growatt settings
+      - GROWATT_SIMULATION_MODE=${GROWATT_SIMULATION_MODE:-false}
     env_file:
       - ./conf/common.env
-      - ./conf/loxone_to_db.env
+      - ./conf/influxdb.env
     links:
       - influxdb
+      - mosquitto
     depends_on:
       - influxdb
+      - mosquitto
     volumes:
-      - ./loxone_to_db:/usr/src/app:rw
-      - ./loxone_to_db/cache:/usr/local/cargo/registry:rw
+      - ./loxone_smart_home:/app:ro  # Read-only for security
+      - ./loxone_smart_home/.env:/app/.env:ro  # Environment file
 
   mosquitto:
     image: eclipse-mosquitto:2
@@ -71,20 +110,6 @@ services:
       - ./mosquitto/data/:/mosquitto/data/:rw
       - ./mosquitto/log/:/mosquitto/log/:rw
 
-  weather_scraper:
-    build: ./weather_scraper
-    container_name: weather_scraper
-    restart: unless-stopped
-    user: '1026:65537'
-    env_file:
-      - ./conf/common.env
-      - ./conf/weather_scraper.env
-    links:
-      - influxdb
-      - mosquitto
-    volumes:
-      - ./weather_scraper:/usr/src/app:rw
-
   telegraf:
     image: telegraf:latest
     hostname: telegraf
@@ -101,19 +126,6 @@ services:
       - mosquitto
     ports:
     - '8125:8125/udp'
-
-  mqtt-loxone-bridge:
-    build: ./mqtt-loxone-bridge
-    container_name: mqtt-loxone-bridge
-    restart: unless-stopped
-    user: '1026:65537'
-    env_file:
-      - ./conf/common.env
-      - ./conf/mqtt-loxone-bridge.env
-    links:
-      - mosquitto
-    volumes:
-      - ./mqtt-loxone-bridge:/usr/src/app:rw
 
   teslamate:
     image: teslamate/teslamate:edge
@@ -147,22 +159,6 @@ services:
       - POSTGRES_DB=teslamate
     volumes:
       - teslamate-db:/var/lib/postgresql/data
-
-  growatt_controller:
-    build: ./growatt_controller
-    container_name: growatt_controller
-    restart: unless-stopped
-    user: '1026:65537'
-    env_file:
-      - ./conf/common.env
-    links:
-      - mosquitto
-      - influxdb
-    depends_on:
-      - mosquitto
-      - influxdb
-    volumes:
-      - ./growatt_controller:/usr/src/app:rw
 
 volumes:
   cargo-cache:
