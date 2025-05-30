@@ -43,6 +43,7 @@ COPY --chown=loxone:loxone . .
 ENV PATH="/opt/venv/bin:$PATH"
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONPATH=/app
 
 # Switch to non-root user
 USER loxone
@@ -52,4 +53,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD python -c "import socket; s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(('127.0.0.1', 2000)); s.close()"
 
 # Run the application
-CMD ["python", "-m", "loxone_smart_home.main"]
+CMD ["python", "main.py"]
