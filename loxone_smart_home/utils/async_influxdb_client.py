@@ -184,8 +184,8 @@ class AsyncInfluxDBClient:
         for attempt in range(max_retries):
             try:
                 client = await self._get_client()
-                async with client.write_api() as write_api:
-                    await write_api.write(bucket=bucket, record=points)
+                write_api = client.write_api()
+                await write_api.write(bucket=bucket, record=points)
 
                 self.writes_completed += len(points)
                 self.logger.debug(f"Wrote {len(points)} points to {bucket}")
