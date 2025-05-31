@@ -139,4 +139,7 @@ def configure_module_logger(
     logger.addHandler(handler)
     logger.setLevel(getattr(logging, log_level.upper()))
 
+    # Prevent propagation to root logger to avoid duplicate messages
+    logger.propagate = False
+
     return logger
