@@ -48,6 +48,9 @@ class GrowattController(BaseModule):
         self._scheduled_tasks: List[asyncio.Task[None]] = []
         self._daily_schedule_task: Optional[asyncio.Task[None]] = None
         
+        # Track scheduled periods for startup state sync
+        self._scheduled_periods: List[Tuple[str, str, str]] = []
+        
         # Local timezone (Prague/Czech Republic)
         self._local_tz = zoneinfo.ZoneInfo("Europe/Prague")
 
@@ -82,6 +85,10 @@ class GrowattController(BaseModule):
         """Start the Growatt controller."""
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
+        
+        # Check and apply current state based on active time periods
+        # This happens after scheduling so we have the periods available
+        await self._apply_current_state()
 
     async def stop(self) -> None:
         """Stop the Growatt controller."""
@@ -100,6 +107,44 @@ class GrowattController(BaseModule):
             self.logger.error(f"Error disabling battery first on shutdown: {e}")
 
         self.logger.info("Growatt controller stopped")
+
+    async def _apply_current_state(self) -> None:
+        """Apply the appropriate state based on current time and scheduled periods."""
+        current_time = self._get_local_now()
+        current_hour = current_time.strftime("%H:%M")
+        
+        self.logger.info(f"Checking current state at {current_hour} for immediate application...")
+        
+        # We need to track scheduled periods to check if we're in one
+        # This will be populated by the scheduling methods
+        if not hasattr(self, '_scheduled_periods'):
+            self.logger.info("No scheduled periods found yet, skipping startup state sync")
+            return
+            
+        # Check battery-first periods
+        for period_type, start, end in self._scheduled_periods:
+            start_time = datetime.strptime(start, "%H:%M").time()
+            end_time = datetime.strptime(end, "%H:%M").time()
+            current_time_only = current_time.time()
+            
+            # Handle periods that don't cross midnight
+            if start_time <= end_time:
+                in_period = start_time <= current_time_only < end_time
+            else:
+                # Handle periods that cross midnight
+                in_period = current_time_only >= start_time or current_time_only < end_time
+                
+            if in_period:
+                self.logger.info(f"Currently in {period_type} period ({start}-{end}), applying state...")
+                
+                if period_type == "battery_first":
+                    await self._set_battery_first(start, end)
+                elif period_type == "ac_charge":
+                    await self._enable_ac_charge()
+                elif period_type == "export":
+                    await self._enable_export()
+                    
+        self.logger.info("Startup state synchronization complete")
 
     async def _fetch_dam_energy_prices(
         self, date: Optional[str] = None
@@ -282,8 +327,9 @@ class GrowattController(BaseModule):
     async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
         """Set battery-first mode for specified time window."""
         if self.config.simulation_mode:
+            current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
-                f"[SIMULATE] Would set battery-first mode from {start_hour} to {stop_hour}"
+                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (simulated at {current_time})"
             )
             return
 
@@ -291,64 +337,73 @@ class GrowattController(BaseModule):
 
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-        self.logger.info(f"Battery-first mode scheduled from {start_hour} to {stop_hour}")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (action at {current_time}) → Topic: {self.config.battery_first_topic}")
 
     async def _enable_ac_charge(self) -> None:
         """Enable AC charging during battery-first mode."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would enable AC charging")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⚡ [SIMULATE] AC CHARGING ENABLED (simulated at {current_time})")
             return
 
         payload = {"value": True}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
-        self.logger.info("AC charging enabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"⚡ AC CHARGING ENABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
 
     async def _disable_ac_charge(self) -> None:
         """Disable AC charging."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable AC charging")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
             return
 
         payload = {"value": False}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
-        self.logger.info("AC charging disabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
 
     async def _disable_battery_first(self) -> None:
         """Disable battery-first mode."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable battery-first mode")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})")
             return
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-        self.logger.info("Battery-first mode disabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → Topic: {self.config.battery_first_topic}")
 
     async def _enable_export(self) -> None:
         """Enable electricity export to grid."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would enable electricity export to grid")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⬆️ [SIMULATE] EXPORT ENABLED (simulated at {current_time})")
             return
 
         payload = {"value": True}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"Enabled electricity export to grid at {current_time}")
+        self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {self.config.export_enable_topic}")
 
     async def _disable_export(self) -> None:
         """Disable electricity export to grid."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable electricity export to grid")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
             return
 
         payload = {"value": False}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"Disabled electricity export to grid at {current_time}")
+        self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {self.config.export_disable_topic}")
 
     async def _calculate_and_schedule_next_day(self) -> None:
         """Calculate energy prices and schedule battery control for next day."""
@@ -357,6 +412,9 @@ class GrowattController(BaseModule):
             if not task.done():
                 task.cancel()
         self._scheduled_tasks.clear()
+        
+        # Clear scheduled periods for new schedule
+        self._scheduled_periods.clear()
 
         # Determine target date using local time
         now = self._get_local_now()
@@ -469,11 +527,12 @@ class GrowattController(BaseModule):
         battery_first_hours = [
             (start, stop, hourly_prices[(start, stop)]) for start, stop in all_cheap_hours
         ]
-        battery_first_groups = self._group_contiguous_hours(battery_first_hours)
+        battery_first_groups = self._group_contiguous_hours_simple(battery_first_hours)
 
         # Schedule battery-first mode for each block
         for group_start, group_end in battery_first_groups:
             self.logger.info(f"Scheduling battery-first mode from {group_start} to {group_end}")
+            self._scheduled_periods.append(("battery_first", group_start, group_end))
             task = asyncio.create_task(
                 self._schedule_at_time(group_start, self._set_battery_first, group_start, group_end)
             )
@@ -484,7 +543,7 @@ class GrowattController(BaseModule):
             ac_charge_hours = [
                 (start, stop, hourly_prices[(start, stop)]) for start, stop in cheapest_consecutive
             ]
-            ac_charge_groups = self._group_contiguous_hours(ac_charge_hours)
+            ac_charge_groups = self._group_contiguous_hours_simple(ac_charge_hours)
 
             for start_time, stop_time in ac_charge_groups:
                 # Calculate price statistics for this charging period
@@ -510,6 +569,9 @@ class GrowattController(BaseModule):
                     )
                 else:
                     self.logger.info(f"Scheduling AC charge from {start_time} to {stop_time} (no price data)")
+
+                # Track AC charge period
+                self._scheduled_periods.append(("ac_charge", start_time, stop_time))
 
                 # Schedule AC charge start
                 task = asyncio.create_task(
@@ -579,6 +641,9 @@ class GrowattController(BaseModule):
                 )
             else:
                 self.logger.info(f"Scheduling export enable from {group_start} to {group_end} (no price data)")
+
+            # Track export period
+            self._scheduled_periods.append(("export", group_start, group_end))
 
             # Schedule export enable at start
             task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
