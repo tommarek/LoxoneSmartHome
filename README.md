@@ -90,6 +90,7 @@ Growatt Inverter              Weather APIs
 - [Deployment Guide](loxone_smart_home/DEPLOYMENT.md) - Detailed deployment instructions
 - [Quick Start](QUICKSTART.md) - Get up and running quickly
 - [Development Guide](loxone_smart_home/README.md) - For developers
+- [TODO List](TODO.md) - Planned features and improvements
 
 ## License
 

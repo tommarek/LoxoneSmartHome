@@ -2,6 +2,33 @@
 
 ## Current Priority 🎯
 
+### Async Operation & Resource Management
+- [ ] Improve async operation and shared resource handling
+  - [ ] Ensure thread-safe access to shared MQTT client
+  - [ ] Implement connection pooling for InfluxDB client
+  - [ ] Add proper async locks for critical sections
+  - [ ] Handle concurrent writes from multiple modules (UDP, Weather, Growatt)
+  - [ ] Implement retry logic with exponential backoff
+  - [ ] Add connection health monitoring
+  
+- [ ] Database write optimization
+  - [ ] Implement write buffer with batch processing
+  - [ ] Configure optimal batch sizes for performance
+  - [ ] Add write queue with priority handling
+  - [ ] Monitor and log write performance metrics
+  - [ ] Handle backpressure when database is slow
+
+### Logging Improvements
+- [ ] Show timestamps in local timezone (Europe/Prague) instead of UTC
+  - [ ] Update all logger formatters to use local timezone
+  - [ ] Make timezone configurable via settings
+  - [ ] Ensure consistency across all modules
+  
+- [ ] Define service names for better log identification
+  - [ ] Add service prefix to all log messages (e.g., [UDP], [MQTT], [WEATHER], [GROWATT])
+  - [ ] Use consistent service naming convention
+  - [ ] Make it easy to filter logs by service
+
 ### Loxone Control Integration
 - [ ] Implement ability to control charging/discharging/export from Loxone
   - [ ] Design MQTT topic structure for Loxone commands
