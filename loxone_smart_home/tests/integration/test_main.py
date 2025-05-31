@@ -18,22 +18,31 @@ class TestLoxoneSmartHome:
             return LoxoneSmartHome()
 
     @pytest.mark.asyncio
-    @patch("utils.mqtt_client.SharedMQTTClient.connect")
-    async def test_initialize_modules(self, mock_connect: AsyncMock, app: LoxoneSmartHome) -> None:
+    @patch("utils.async_mqtt_client.AsyncMQTTClient._connect_with_retry")
+    @patch("utils.async_influxdb_client.AsyncInfluxDBClient._initialize_pool")
+    async def test_initialize_modules(
+        self, mock_influx_start: AsyncMock, mock_connect: AsyncMock, app: LoxoneSmartHome
+    ) -> None:
         """Test module initialization."""
-        await app.initialize_modules()
+        try:
+            await app.initialize_modules()
 
-        mock_connect.assert_called_once()
+            mock_connect.assert_called_once()
+            mock_influx_start.assert_called_once()
 
-        # Check modules are initialized based on settings
-        if app.settings.modules.udp_listener_enabled:
-            assert app.udp_listener is not None
-        if app.settings.modules.mqtt_bridge_enabled:
-            assert app.mqtt_bridge is not None
-        if app.settings.modules.weather_scraper_enabled:
-            assert app.weather_scraper is not None
-        if app.settings.modules.growatt_controller_enabled:
-            assert app.growatt_controller is not None
+            # Check modules are initialized based on settings
+            if app.settings.modules.udp_listener_enabled:
+                assert app.udp_listener is not None
+            if app.settings.modules.mqtt_bridge_enabled:
+                assert app.mqtt_bridge is not None
+            if app.settings.modules.weather_scraper_enabled:
+                assert app.weather_scraper is not None
+            if app.settings.modules.growatt_controller_enabled:
+                assert app.growatt_controller is not None
+        finally:
+            # Clean up the clients
+            await app.mqtt_client.disconnect()
+            await app.influxdb_client.stop()
 
     @pytest.mark.asyncio
     async def test_start_modules(self, app: LoxoneSmartHome) -> None:
@@ -57,8 +66,8 @@ class TestLoxoneSmartHome:
             assert len(app.modules) == 4
 
     @pytest.mark.asyncio
-    @patch("utils.mqtt_client.SharedMQTTClient.disconnect")
-    @patch("utils.influxdb_client.SharedInfluxDBClient.close")
+    @patch("utils.async_mqtt_client.AsyncMQTTClient.disconnect")
+    @patch("utils.async_influxdb_client.AsyncInfluxDBClient.stop")
     async def test_shutdown(
         self, mock_influx_close: AsyncMock, mock_mqtt_disconnect: AsyncMock, app: LoxoneSmartHome
     ) -> None:

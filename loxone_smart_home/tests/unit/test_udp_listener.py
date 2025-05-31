@@ -8,7 +8,7 @@ import pytz
 
 from config.settings import Settings
 from modules.udp_listener import UDPListener, UDPProtocol
-from utils.influxdb_client import SharedInfluxDBClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
 
 
 class TestUDPListener:
@@ -59,7 +59,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_process_valid_data(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test processing valid UDP data."""
         data = b"2024-01-15 10:30:00;temperature;21.5;living_room;sensor;tag1_value;tag2_value"
@@ -80,7 +80,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_process_minimal_data(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test processing minimal UDP data (only required fields)."""
         data = b"2024-01-15 10:30:00;temperature;21.5"
@@ -99,7 +99,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_process_invalid_data_format(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test processing invalid data format."""
         data = b"invalid;data"  # Not enough fields
@@ -112,7 +112,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_process_invalid_value(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test processing data with invalid numeric value."""
         data = b"2024-01-15 10:30:00;temperature;not_a_number"
@@ -125,7 +125,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_timezone_conversion(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test proper timezone conversion from Prague to UTC."""
         data = b"2024-01-15 10:30:00;temperature;21.5"
@@ -147,7 +147,7 @@ class TestUDPListener:
 
     @pytest.mark.asyncio
     async def test_measurement_name_normalization(
-        self, udp_listener: UDPListener, mock_influxdb: SharedInfluxDBClient
+        self, udp_listener: UDPListener, mock_influxdb: AsyncInfluxDBClient
     ) -> None:
         """Test measurement name normalization (spaces to underscores, lowercase)."""
         data = b"2024-01-15 10:30:00;Room Temperature;21.5;living_room;sensor"

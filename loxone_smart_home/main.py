@@ -19,8 +19,9 @@ from modules.growatt_controller import GrowattController
 from modules.mqtt_bridge import MQTTBridge
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
-from utils.influxdb_client import SharedInfluxDBClient
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
+from utils.logging import TimezoneAwareFormatter
 
 
 class LoxoneSmartHome:
@@ -32,8 +33,8 @@ class LoxoneSmartHome:
         self.setup_logging()
 
         # Shared clients
-        self.mqtt_client = SharedMQTTClient(self.settings)
-        self.influxdb_client = SharedInfluxDBClient(self.settings)
+        self.mqtt_client = AsyncMQTTClient(self.settings)
+        self.influxdb_client = AsyncInfluxDBClient(self.settings)
 
         # Modules
         self.modules: List[asyncio.Task[None]] = []
@@ -46,12 +47,13 @@ class LoxoneSmartHome:
         self.shutdown_event = asyncio.Event()
 
     def setup_logging(self) -> None:
-        """Configure colored logging."""
+        """Configure colored logging with timezone support."""
         handler = colorlog.StreamHandler()
         handler.setFormatter(
-            colorlog.ColoredFormatter(
-                "%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            TimezoneAwareFormatter(
+                fmt="%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
+                timezone=self.settings.log_timezone,
                 log_colors={
                     "DEBUG": "cyan",
                     "INFO": "green",
@@ -73,6 +75,9 @@ class LoxoneSmartHome:
         # Initialize shared clients
         await self.mqtt_client.connect()
         logger.info("MQTT client connected")
+
+        await self.influxdb_client.start()
+        logger.info("InfluxDB client started")
 
         # Initialize modules based on configuration
         if self.settings.modules.udp_listener_enabled:
@@ -137,7 +142,7 @@ class LoxoneSmartHome:
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()
-        await self.influxdb_client.close()
+        await self.influxdb_client.stop()
 
         logger.info("Shutdown complete")
 

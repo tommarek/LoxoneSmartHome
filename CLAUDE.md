@@ -27,10 +27,11 @@ make format
 ## Architecture
 
 The application uses:
-- **asyncio** for concurrent operations
+- **asyncio** for concurrent operations with thread-safe resource management
 - **Pydantic** for configuration validation
-- **Shared clients** for MQTT and InfluxDB connections
+- **Async shared clients** with connection pooling and retry logic
 - **Modular design** with base classes in `modules/base.py`
+- **Background task management** for connection monitoring and data buffering
 
 ## Key Implementation Details
 
@@ -59,6 +60,29 @@ The application uses:
 - Periodic updates with configurable interval (default: 30 minutes)
 - Standardized data format using HourlyData named tuple
 
+### Growatt Controller
+- Energy price-based battery management with DAM market integration
+- Timezone-aware scheduling (Europe/Prague) for automated control
+- Battery-first mode scheduling during cheapest electricity hours
+- Export control during high-price periods above configurable threshold
+- Startup state synchronization to apply correct mode on service restart
+- Enhanced logging with price analysis (EUR/MWh to CZK/kWh conversion)
+- Contiguous hour grouping for optimal battery charging/discharging periods
+- Simulation mode for testing without actual hardware control
+
+### Async Resource Management
+- **AsyncMQTTClient**: Thread-safe MQTT operations with automatic reconnection
+  - Publish queue for reliable message delivery
+  - Background tasks for connection monitoring and message processing
+  - Exponential backoff retry logic with configurable timeouts
+  - Concurrent callback execution with proper error handling
+- **AsyncInfluxDBClient**: Connection pooling with batch processing
+  - 5-connection pool for optimal database performance
+  - Write buffer (5000 points) with 1-second flush intervals
+  - Automatic batching by bucket for efficient writes
+  - Retry logic with exponential backoff for failed writes
+  - Background flush loop with graceful shutdown handling
+
 ### Configuration
 - All settings use Pydantic models in `config/settings.py`
 - Environment variables are loaded from `.env` file
@@ -72,9 +96,10 @@ The application uses:
 - Mock objects for external dependencies (MQTT, InfluxDB)
 - Test files mirror the source structure in `tests/`
 - Use `AsyncMock` for async methods, `MagicMock` for sync methods
-- Comprehensive test coverage: 60 tests covering all modules
+- Comprehensive test coverage: 76 tests covering all modules
 - Type safety: All tests pass strict mypy checking
 - Mock best practices: Use `# type: ignore[attr-defined]` for test-specific mock attributes
+- Clean async test execution with proper resource cleanup
 
 ## Module Status
 
@@ -82,12 +107,15 @@ The application uses:
 - **UDP Listener**: Fully migrated from Rust with exact behavior matching
 - **MQTT Bridge**: Complete implementation with 11 comprehensive test cases
 - **Weather Scraper**: Full implementation with three weather APIs and 11 test cases
-- **Type Safety**: All 23 source files pass strict mypy checking
+- **Growatt Controller**: Complete energy price-based battery management system
+- **Async Resource Management**: Thread-safe MQTT and InfluxDB clients with connection pooling
+- **Type Safety**: All source files pass strict mypy checking
 - **Code Quality**: 100% linting compliance (flake8 with 100-char limit)
-- **Test Coverage**: 60 tests covering all implemented modules
+- **Test Coverage**: 76 tests covering all implemented modules with clean async execution
 
-### In Progress 🚧
-- **Growatt Controller**: Basic structure created, needs energy price scraping and control logic
+### Next Phase 🎯
+- **Logging Improvements**: Local timezone timestamps and service-specific prefixes
+- **Loxone Control Integration**: MQTT command structure for manual override controls
 
 ## Error Handling
 
@@ -95,3 +123,14 @@ The application uses:
 - Configuration validation with descriptive error messages
 - Graceful degradation when services are unavailable
 - Proper exception logging with context information
+- Robust async task cleanup with graceful shutdown
+- Connection retry logic with exponential backoff
+- Background task management with proper cancellation handling
+
+## Performance Features
+
+- **Connection Pooling**: 5-connection InfluxDB pool for optimal throughput
+- **Batch Processing**: 5000-point write buffer with 1-second flush intervals
+- **Concurrent Operations**: Thread-safe access to shared resources across modules
+- **Resource Optimization**: Automatic reconnection and health monitoring
+- **Memory Management**: Proper cleanup of async tasks and connections

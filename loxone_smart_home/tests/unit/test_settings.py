@@ -5,13 +5,7 @@ from unittest.mock import patch
 import pytest
 from pydantic import ValidationError
 
-from config.settings import (
-    GrowattConfig,
-    InfluxDBConfig,
-    MQTTConfig,
-    Settings,
-    WeatherConfig,
-)
+from config.settings import GrowattConfig, InfluxDBConfig, MQTTConfig, Settings, WeatherConfig
 
 
 class TestSettings:

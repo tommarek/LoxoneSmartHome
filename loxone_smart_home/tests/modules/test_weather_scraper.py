@@ -27,13 +27,18 @@ def mock_settings() -> Settings:
     settings.weather.retry_delay = 60
     settings.mqtt.topic_weather = "weather"
     settings.influxdb.bucket_weather = "weather_forecast"
+    # Add logging configuration
+    settings.log_level = "INFO"
+    settings.log_timezone = "Europe/Prague"
     return settings
 
 
 @pytest.fixture
 def mock_mqtt_client() -> MagicMock:
     """Create mock MQTT client."""
-    client = MagicMock()
+    from utils.async_mqtt_client import AsyncMQTTClient
+
+    client = MagicMock(spec=AsyncMQTTClient)
     client.publish = AsyncMock()
     return client
 
@@ -41,7 +46,9 @@ def mock_mqtt_client() -> MagicMock:
 @pytest.fixture
 def mock_influxdb_client() -> MagicMock:
     """Create mock InfluxDB client."""
-    client = MagicMock()
+    from utils.async_influxdb_client import AsyncInfluxDBClient
+
+    client = MagicMock(spec=AsyncInfluxDBClient)
     client.write_point = AsyncMock()
     return client
 

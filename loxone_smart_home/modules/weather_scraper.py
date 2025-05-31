@@ -10,8 +10,8 @@ import aiohttp
 
 from config.settings import Settings
 from modules.base import BaseModule
-from utils.influxdb_client import SharedInfluxDBClient
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 # Named tuple for standardized hourly data
 HourlyData = namedtuple(
@@ -33,13 +33,14 @@ class WeatherScraper(BaseModule):
 
     def __init__(
         self,
-        mqtt_client: Optional[SharedMQTTClient],
-        influxdb_client: Optional[SharedInfluxDBClient],
+        mqtt_client: Optional[AsyncMQTTClient],
+        influxdb_client: Optional[AsyncInfluxDBClient],
         settings: Settings,
     ) -> None:
         """Initialize the weather scraper."""
         super().__init__(
             name="WeatherScraper",
+            service_name="WEATHER",
             mqtt_client=mqtt_client,
             influxdb_client=influxdb_client,
             settings=settings,

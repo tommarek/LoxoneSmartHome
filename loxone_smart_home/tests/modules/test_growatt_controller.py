@@ -2,22 +2,22 @@
 
 import asyncio
 import json
+import zoneinfo
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
-import zoneinfo
 
 import pytest
 
 from config.settings import GrowattConfig, Settings
 from modules.growatt_controller import GrowattController
-from utils.influxdb_client import SharedInfluxDBClient
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 
 @pytest.fixture
 def mock_mqtt_client() -> AsyncMock:
     """Create a mock MQTT client."""
-    client = AsyncMock(spec=SharedMQTTClient)
+    client = AsyncMock(spec=AsyncMQTTClient)
     client.publish = AsyncMock()
     return client
 
@@ -25,7 +25,7 @@ def mock_mqtt_client() -> AsyncMock:
 @pytest.fixture
 def mock_influxdb_client() -> AsyncMock:
     """Create a mock InfluxDB client."""
-    client = AsyncMock(spec=SharedInfluxDBClient)
+    client = AsyncMock(spec=AsyncInfluxDBClient)
     return client
 
 
@@ -41,6 +41,9 @@ def mock_settings() -> Settings:
         schedule_hour=23,
         schedule_minute=59,
     )
+    # Add logging configuration
+    settings.log_level = "INFO"
+    settings.log_timezone = "Europe/Prague"
     return settings
 
 
@@ -243,6 +246,9 @@ async def test_simulation_mode(
     """Test that MQTT commands are not sent in simulation mode."""
     settings = MagicMock(spec=Settings)
     settings.growatt = GrowattConfig(simulation_mode=True)
+    # Add logging configuration
+    settings.log_level = "INFO"
+    settings.log_timezone = "Europe/Prague"
 
     controller = GrowattController(mock_mqtt_client, mock_influxdb_client, settings)
 
@@ -298,11 +304,11 @@ async def test_schedule_export_control(
 ) -> None:
     """Test export control scheduling."""
     hourly_prices = {
-        ("00:00", "01:00"): 1.0,
-        ("01:00", "02:00"): 2.0,
-        ("02:00", "03:00"): 3.0,  # Above threshold
-        ("03:00", "04:00"): 3.5,  # Above threshold
-        ("04:00", "05:00"): 1.5,
+        ("00:00", "01:00"): 80.0,
+        ("01:00", "02:00"): 90.0,
+        ("02:00", "03:00"): 120.0,  # Above threshold
+        ("03:00", "04:00"): 130.0,  # Above threshold
+        ("04:00", "05:00"): 85.0,
     }
 
     with patch.object(growatt_controller, "_schedule_at_time") as mock_schedule:
