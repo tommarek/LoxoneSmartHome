@@ -8,16 +8,17 @@ import pytz
 
 from config.settings import Settings
 from modules.base import BaseModule
-from utils.influxdb_client import SharedInfluxDBClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
 
 
 class UDPListener(BaseModule):
     """UDP Listener that receives data from Loxone and stores it in InfluxDB."""
 
-    def __init__(self, influxdb_client: SharedInfluxDBClient, settings: Settings) -> None:
+    def __init__(self, influxdb_client: AsyncInfluxDBClient, settings: Settings) -> None:
         """Initialize the UDP listener."""
         super().__init__(
             name="UDPListener",
+            service_name="UDP",
             influxdb_client=influxdb_client,
             settings=settings,
         )

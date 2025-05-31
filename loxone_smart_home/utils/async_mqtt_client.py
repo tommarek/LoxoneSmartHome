@@ -100,13 +100,13 @@ class AsyncMQTTClient:
             return  # Already disconnected
         self._running = False
 
-        # Cancel background tasks
+        # Cancel background tasks and wait for completion
         for task in [self._read_task, self._publish_task, self._reconnect_task]:
             if task and not task.done():
                 task.cancel()
                 try:
-                    await task
-                except asyncio.CancelledError:
+                    await asyncio.wait_for(task, timeout=1.0)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
                     pass
                 except Exception:
                     pass  # Ignore other exceptions during cleanup
@@ -119,6 +119,11 @@ class AsyncMQTTClient:
                     self._connected = False
         except Exception:
             pass  # Ignore exceptions during disconnect
+
+        # Reset task references
+        self._read_task = None
+        self._publish_task = None
+        self._reconnect_task = None
 
         self.logger.info(
             f"Disconnected from MQTT broker. "

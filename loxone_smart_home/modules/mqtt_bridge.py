@@ -5,16 +5,17 @@ import socket
 
 from config.settings import Settings
 from modules.base import BaseModule
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 
 class MQTTBridge(BaseModule):
     """Bridge that forwards MQTT messages to Loxone via UDP."""
 
-    def __init__(self, mqtt_client: SharedMQTTClient, settings: Settings) -> None:
+    def __init__(self, mqtt_client: AsyncMQTTClient, settings: Settings) -> None:
         """Initialize the MQTT bridge."""
         super().__init__(
             name="MQTTBridge",
+            service_name="BRIDGE",
             mqtt_client=mqtt_client,
             settings=settings,
         )

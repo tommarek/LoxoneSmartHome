@@ -21,6 +21,7 @@ from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
+from utils.logging import TimezoneAwareFormatter
 
 
 class LoxoneSmartHome:
@@ -46,12 +47,13 @@ class LoxoneSmartHome:
         self.shutdown_event = asyncio.Event()
 
     def setup_logging(self) -> None:
-        """Configure colored logging."""
+        """Configure colored logging with timezone support."""
         handler = colorlog.StreamHandler()
         handler.setFormatter(
-            colorlog.ColoredFormatter(
-                "%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+            TimezoneAwareFormatter(
+                fmt="%(log_color)s%(asctime)s - %(name)s - %(levelname)s - %(message)s",
                 datefmt="%Y-%m-%d %H:%M:%S",
+                timezone=self.settings.log_timezone,
                 log_colors={
                     "DEBUG": "cyan",
                     "INFO": "green",

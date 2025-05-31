@@ -21,13 +21,18 @@ def mock_settings() -> Settings:
     ]
     settings.loxone_bridge.loxone_host = "192.168.101.34"
     settings.loxone_bridge.loxone_udp_port = 4000
+    # Add logging configuration
+    settings.log_level = "INFO"
+    settings.log_timezone = "Europe/Prague"
     return settings
 
 
 @pytest.fixture
 def mock_mqtt_client() -> MagicMock:
     """Create mock MQTT client."""
-    client = MagicMock()
+    from utils.async_mqtt_client import AsyncMQTTClient
+
+    client = MagicMock(spec=AsyncMQTTClient)
     client.subscribe = AsyncMock()
     return client
 

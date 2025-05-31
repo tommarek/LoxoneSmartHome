@@ -175,6 +175,7 @@ class Settings(BaseSettings):
 
     # General settings
     log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
+    log_timezone: str = Field(default="Europe/Prague", description="Timezone for log timestamps")
 
     # Module configuration
     udp_listener_enabled: bool = True
