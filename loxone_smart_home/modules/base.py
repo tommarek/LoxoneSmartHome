@@ -7,8 +7,8 @@ from abc import ABC, abstractmethod
 from typing import Optional
 
 from config.settings import Settings
-from utils.influxdb_client import SharedInfluxDBClient
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 
 class BaseModule(ABC):
@@ -17,8 +17,8 @@ class BaseModule(ABC):
     def __init__(
         self,
         name: str,
-        mqtt_client: Optional[SharedMQTTClient] = None,
-        influxdb_client: Optional[SharedInfluxDBClient] = None,
+        mqtt_client: Optional[AsyncMQTTClient] = None,
+        influxdb_client: Optional[AsyncInfluxDBClient] = None,
         settings: Optional[Settings] = None,
     ) -> None:
         """Initialize the base module."""

@@ -40,11 +40,11 @@ class UDPListener(BaseModule):
             f"{self.settings.udp_listener.port}"
         )
         self.logger.info("Starting to accept data.")
+        delim = self.settings.udp_listener.delimiter
         self.logger.info(
-            f"Expected format: timestamp{self.settings.udp_listener.delimiter}measurement_name"
-            f"{self.settings.udp_listener.delimiter}value{self.settings.udp_listener.delimiter}"
-            f"room[optional]{self.settings.udp_listener.delimiter}measurement_type[optional]"
-            f"{self.settings.udp_listener.delimiter}tag1[optional]{self.settings.udp_listener.delimiter}tag2[optional]"
+            f"Expected format: timestamp{delim}measurement_name{delim}value{delim}"
+            f"room[optional]{delim}measurement_type[optional]{delim}"
+            f"tag1[optional]{delim}tag2[optional]"
         )
 
     async def stop(self) -> None:

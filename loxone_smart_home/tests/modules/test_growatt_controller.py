@@ -2,9 +2,9 @@
 
 import asyncio
 import json
+import zoneinfo
 from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
-import zoneinfo
 
 import pytest
 
@@ -298,11 +298,11 @@ async def test_schedule_export_control(
 ) -> None:
     """Test export control scheduling."""
     hourly_prices = {
-        ("00:00", "01:00"): 1.0,
-        ("01:00", "02:00"): 2.0,
-        ("02:00", "03:00"): 3.0,  # Above threshold
-        ("03:00", "04:00"): 3.5,  # Above threshold
-        ("04:00", "05:00"): 1.5,
+        ("00:00", "01:00"): 80.0,
+        ("01:00", "02:00"): 90.0,
+        ("02:00", "03:00"): 120.0,  # Above threshold
+        ("03:00", "04:00"): 130.0,  # Above threshold
+        ("04:00", "05:00"): 85.0,
     }
 
     with patch.object(growatt_controller, "_schedule_at_time") as mock_schedule:

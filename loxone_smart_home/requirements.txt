@@ -4,7 +4,7 @@ aiohttp==3.9.1
 python-dotenv==1.0.0
 
 # Database
-influxdb-client==1.38.0
+influxdb-client[async]==1.38.0
 
 # MQTT
 paho-mqtt==1.6.1

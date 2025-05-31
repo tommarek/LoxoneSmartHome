@@ -2,11 +2,11 @@
 
 import asyncio
 import json
+import zoneinfo
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
-import zoneinfo
 
 import aiohttp
 
@@ -47,17 +47,17 @@ class GrowattController(BaseModule):
         # Scheduled tasks
         self._scheduled_tasks: List[asyncio.Task[None]] = []
         self._daily_schedule_task: Optional[asyncio.Task[None]] = None
-        
+
         # Track scheduled periods for startup state sync
         self._scheduled_periods: List[Tuple[str, str, str]] = []
-        
+
         # Local timezone (Prague/Czech Republic)
         self._local_tz = zoneinfo.ZoneInfo("Europe/Prague")
 
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
         return datetime.now(self._local_tz)
-    
+
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
         local_date = self._get_local_now() + timedelta(days=days_ahead)
@@ -66,26 +66,28 @@ class GrowattController(BaseModule):
     def _log_price_table(self, hourly_prices: Dict[Tuple[str, str], float], date: str) -> None:
         """Log hourly prices in a nice table format."""
         eur_czk_rate = 25.0
-        
+
         self.logger.info(f"Energy prices for {date}:")
         self.logger.info("┌──────────┬────────────┬──────────────┐")
         self.logger.info("│   Hour   │ EUR/MWh    │   CZK/kWh    │")
         self.logger.info("├──────────┼────────────┼──────────────┤")
-        
+
         # Sort hours by start time for proper display
         sorted_hours = sorted(hourly_prices.items(), key=lambda x: x[0][0])
-        
+
         for (start_hour, end_hour), price_eur_mwh in sorted_hours:
             price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
-            self.logger.info(f"│ {start_hour}-{end_hour} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │")
-        
+            self.logger.info(
+                f"│ {start_hour}-{end_hour} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │"
+            )
+
         self.logger.info("└──────────┴────────────┴──────────────┘")
 
     async def start(self) -> None:
         """Start the Growatt controller."""
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
-        
+
         # Check and apply current state based on active time periods
         # This happens after scheduling so we have the periods available
         await self._apply_current_state()
@@ -112,38 +114,40 @@ class GrowattController(BaseModule):
         """Apply the appropriate state based on current time and scheduled periods."""
         current_time = self._get_local_now()
         current_hour = current_time.strftime("%H:%M")
-        
+
         self.logger.info(f"Checking current state at {current_hour} for immediate application...")
-        
+
         # We need to track scheduled periods to check if we're in one
         # This will be populated by the scheduling methods
-        if not hasattr(self, '_scheduled_periods'):
+        if not hasattr(self, "_scheduled_periods"):
             self.logger.info("No scheduled periods found yet, skipping startup state sync")
             return
-            
+
         # Check battery-first periods
         for period_type, start, end in self._scheduled_periods:
             start_time = datetime.strptime(start, "%H:%M").time()
             end_time = datetime.strptime(end, "%H:%M").time()
             current_time_only = current_time.time()
-            
+
             # Handle periods that don't cross midnight
             if start_time <= end_time:
                 in_period = start_time <= current_time_only < end_time
             else:
                 # Handle periods that cross midnight
                 in_period = current_time_only >= start_time or current_time_only < end_time
-                
+
             if in_period:
-                self.logger.info(f"Currently in {period_type} period ({start}-{end}), applying state...")
-                
+                self.logger.info(
+                    f"Currently in {period_type} period ({start}-{end}), applying state..."
+                )
+
                 if period_type == "battery_first":
                     await self._set_battery_first(start, end)
                 elif period_type == "ac_charge":
                     await self._enable_ac_charge()
                 elif period_type == "export":
                     await self._enable_export()
-                    
+
         self.logger.info("Startup state synchronization complete")
 
     async def _fetch_dam_energy_prices(
@@ -252,7 +256,10 @@ class GrowattController(BaseModule):
         interval = (max_price - min_price) / 4
 
         quadrants: Dict[str, List[Tuple[str, str, float]]] = {
-            "Cheapest": [], "Cheap": [], "Expensive": [], "Most Expensive": []
+            "Cheapest": [],
+            "Cheap": [],
+            "Expensive": [],
+            "Most Expensive": [],
         }
 
         for (start, stop), price in prices.items():
@@ -298,7 +305,9 @@ class GrowattController(BaseModule):
         groups.append((current_group_start, current_group_end))
         return groups
 
-    def _group_contiguous_hours_simple(self, hours: List[Tuple[str, str, float]]) -> List[Tuple[str, str]]:
+    def _group_contiguous_hours_simple(
+        self, hours: List[Tuple[str, str, float]]
+    ) -> List[Tuple[str, str]]:
         """Group contiguous hours into continuous ranges without price similarity check."""
         if not hours:
             return []
@@ -329,7 +338,8 @@ class GrowattController(BaseModule):
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
-                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (simulated at {current_time})"
+                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} "
+                f"(simulated at {current_time})"
             )
             return
 
@@ -338,7 +348,10 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (action at {current_time}) → Topic: {self.config.battery_first_topic}")
+        self.logger.info(
+            f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} "
+            f"(action at {current_time}) → Topic: {self.config.battery_first_topic}"
+        )
 
     async def _enable_ac_charge(self) -> None:
         """Enable AC charging during battery-first mode."""
@@ -351,7 +364,9 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"⚡ AC CHARGING ENABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
+        self.logger.info(
+            f"⚡ AC CHARGING ENABLED at {current_time} → Topic: {self.config.ac_charge_topic}"
+        )
 
     async def _disable_ac_charge(self) -> None:
         """Disable AC charging."""
@@ -364,20 +379,27 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
+        self.logger.info(
+            f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {self.config.ac_charge_topic}"
+        )
 
     async def _disable_battery_first(self) -> None:
         """Disable battery-first mode."""
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})")
+            self.logger.info(
+                f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → Topic: {self.config.battery_first_topic}")
+        self.logger.info(
+            f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → "
+            f"Topic: {self.config.battery_first_topic}"
+        )
 
     async def _enable_export(self) -> None:
         """Enable electricity export to grid."""
@@ -390,7 +412,9 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {self.config.export_enable_topic}")
+        self.logger.info(
+            f"⬆️ EXPORT ENABLED at {current_time} → Topic: {self.config.export_enable_topic}"
+        )
 
     async def _disable_export(self) -> None:
         """Disable electricity export to grid."""
@@ -403,7 +427,9 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {self.config.export_disable_topic}")
+        self.logger.info(
+            f"⬇️ EXPORT DISABLED at {current_time} → Topic: {self.config.export_disable_topic}"
+        )
 
     async def _calculate_and_schedule_next_day(self) -> None:
         """Calculate energy prices and schedule battery control for next day."""
@@ -412,7 +438,7 @@ class GrowattController(BaseModule):
             if not task.done():
                 task.cancel()
         self._scheduled_tasks.clear()
-        
+
         # Clear scheduled periods for new schedule
         self._scheduled_periods.clear()
 
@@ -478,15 +504,19 @@ class GrowattController(BaseModule):
         min_price = min(all_prices)
         max_price = max(all_prices)
         avg_price = sum(all_prices) / len(all_prices)
-        
+
         # Calculate average prices for selected hours
         if cheapest_individual_hours:
-            individual_avg = sum(hourly_prices[hour] for hour in cheapest_individual_hours) / len(cheapest_individual_hours)
+            individual_avg = sum(hourly_prices[hour] for hour in cheapest_individual_hours) / len(
+                cheapest_individual_hours
+            )
         else:
             individual_avg = 0.0
-            
+
         if cheapest_consecutive:
-            consecutive_avg = sum(hourly_prices[hour] for hour in cheapest_consecutive) / len(cheapest_consecutive)
+            consecutive_avg = sum(hourly_prices[hour] for hour in cheapest_consecutive) / len(
+                cheapest_consecutive
+            )
         else:
             consecutive_avg = 0.0
 
@@ -497,11 +527,24 @@ class GrowattController(BaseModule):
         avg_price_czk = avg_price * eur_czk_rate / 1000
         individual_avg_czk = individual_avg * eur_czk_rate / 1000
         consecutive_avg_czk = consecutive_avg * eur_czk_rate / 1000
-        
-        self.logger.info(f"Price analysis: min={min_price:.2f} EUR/MWh ({min_price_czk:.3f} CZK/kWh), max={max_price:.2f} EUR/MWh ({max_price_czk:.3f} CZK/kWh), avg={avg_price:.2f} EUR/MWh ({avg_price_czk:.3f} CZK/kWh)")
-        self.logger.info(f"Cheapest individual hours: {len(cheapest_individual_hours)} (avg: {individual_avg:.2f} EUR/MWh = {individual_avg_czk:.3f} CZK/kWh)")
-        self.logger.info(f"Cheapest consecutive hours: {len(cheapest_consecutive)} (avg: {consecutive_avg:.2f} EUR/MWh = {consecutive_avg_czk:.3f} CZK/kWh)")
-        self.logger.info(f"Total cheap hours: {len(all_cheap_hours)}, Export threshold: {self.config.export_price_threshold:.2f} CZK/kWh")
+
+        self.logger.info(
+            f"Price analysis: min={min_price:.2f} EUR/MWh ({min_price_czk:.3f} CZK/kWh), "
+            f"max={max_price:.2f} EUR/MWh ({max_price_czk:.3f} CZK/kWh), "
+            f"avg={avg_price:.2f} EUR/MWh ({avg_price_czk:.3f} CZK/kWh)"
+        )
+        self.logger.info(
+            f"Cheapest individual hours: {len(cheapest_individual_hours)} "
+            f"(avg: {individual_avg:.2f} EUR/MWh = {individual_avg_czk:.3f} CZK/kWh)"
+        )
+        self.logger.info(
+            f"Cheapest consecutive hours: {len(cheapest_consecutive)} "
+            f"(avg: {consecutive_avg:.2f} EUR/MWh = {consecutive_avg_czk:.3f} CZK/kWh)"
+        )
+        self.logger.info(
+            f"Total cheap hours: {len(all_cheap_hours)}, "
+            f"Export threshold: {self.config.export_price_threshold:.2f} CZK/kWh"
+        )
 
         # Schedule battery-first mode
         await self._schedule_battery_control(all_cheap_hours, cheapest_consecutive, hourly_prices)
@@ -548,7 +591,8 @@ class GrowattController(BaseModule):
             for start_time, stop_time in ac_charge_groups:
                 # Calculate price statistics for this charging period
                 charge_prices = [
-                    price for start, stop, price in ac_charge_hours
+                    price
+                    for start, stop, price in ac_charge_hours
                     if start >= start_time and stop <= stop_time
                 ]
                 if charge_prices:
@@ -561,14 +605,18 @@ class GrowattController(BaseModule):
                     min_charge_price_czk_kwh = min_charge_price * eur_czk_rate / 1000
                     max_charge_price_czk_kwh = max_charge_price * eur_czk_rate / 1000
                     avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
-                    
+
                     self.logger.info(
                         f"Scheduling AC charge from {start_time} to {stop_time} "
-                        f"(min: {min_charge_price:.2f}, avg: {avg_charge_price:.2f}, max: {max_charge_price:.2f} EUR/MWh = "
-                        f"{min_charge_price_czk_kwh:.2f}-{avg_charge_price_czk_kwh:.2f}-{max_charge_price_czk_kwh:.2f} CZK/kWh)"
+                        f"(min: {min_charge_price:.2f}, avg: {avg_charge_price:.2f}, "
+                        f"max: {max_charge_price:.2f} EUR/MWh = "
+                        f"{min_charge_price_czk_kwh:.2f}-{avg_charge_price_czk_kwh:.2f}-"
+                        f"{max_charge_price_czk_kwh:.2f} CZK/kWh)"
                     )
                 else:
-                    self.logger.info(f"Scheduling AC charge from {start_time} to {stop_time} (no price data)")
+                    self.logger.info(
+                        f"Scheduling AC charge from {start_time} to {stop_time} (no price data)"
+                    )
 
                 # Track AC charge period
                 self._scheduled_periods.append(("ac_charge", start_time, stop_time))
@@ -595,7 +643,7 @@ class GrowattController(BaseModule):
         # 1 EUR = 25 CZK, 1 MWh = 1000 kWh
         eur_czk_rate = 25.0
         threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
-        
+
         export_hours = [
             (start, stop)
             for (start, stop), price in hourly_prices.items()
@@ -603,7 +651,11 @@ class GrowattController(BaseModule):
         ]
 
         if not export_hours:
-            self.logger.info(f"No hours above export price threshold ({threshold_eur_mwh:.2f} EUR/MWh = {self.config.export_price_threshold:.2f} CZK/kWh)")
+            self.logger.info(
+                f"No hours above export price threshold "
+                f"({threshold_eur_mwh:.2f} EUR/MWh = "
+                f"{self.config.export_price_threshold:.2f} CZK/kWh)"
+            )
             return
 
         # Group export hours into contiguous blocks (ignore price differences for export)
@@ -612,7 +664,10 @@ class GrowattController(BaseModule):
         ]
         export_groups = self._group_contiguous_hours_simple(export_hours_with_price)
 
-        self.logger.info(f"Found {len(export_groups)} export periods above {threshold_eur_mwh:.2f} EUR/MWh threshold")
+        self.logger.info(
+            f"Found {len(export_groups)} export periods above "
+            f"{threshold_eur_mwh:.2f} EUR/MWh threshold"
+        )
 
         for group_start, group_end in export_groups:
             # Handle 24:00 edge case
@@ -621,26 +676,32 @@ class GrowattController(BaseModule):
 
             # Calculate price statistics for this time range
             group_prices = [
-                price for start, stop, price in export_hours_with_price
+                price
+                for start, stop, price in export_hours_with_price
                 if start >= group_start and stop <= (group_end if group_end != "23:59" else "24:00")
             ]
             if group_prices:
                 min_price = min(group_prices)
                 max_price = max(group_prices)
                 avg_price = sum(group_prices) / len(group_prices)
-                
+
                 # Convert prices to CZK/kWh for display
                 min_price_czk_kwh = min_price * eur_czk_rate / 1000
                 max_price_czk_kwh = max_price * eur_czk_rate / 1000
                 avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
-                
+
                 self.logger.info(
                     f"Scheduling export enable from {group_start} to {group_end} "
-                    f"(min: {min_price:.2f}, avg: {avg_price:.2f}, max: {max_price:.2f} EUR/MWh = "
-                    f"{min_price_czk_kwh:.2f}-{avg_price_czk_kwh:.2f}-{max_price_czk_kwh:.2f} CZK/kWh, threshold: {self.config.export_price_threshold:.2f})"
+                    f"(min: {min_price:.2f}, avg: {avg_price:.2f}, "
+                    f"max: {max_price:.2f} EUR/MWh = "
+                    f"{min_price_czk_kwh:.2f}-{avg_price_czk_kwh:.2f}-"
+                    f"{max_price_czk_kwh:.2f} CZK/kWh, "
+                    f"threshold: {self.config.export_price_threshold:.2f})"
                 )
             else:
-                self.logger.info(f"Scheduling export enable from {group_start} to {group_end} (no price data)")
+                self.logger.info(
+                    f"Scheduling export enable from {group_start} to {group_end} (no price data)"
+                )
 
             # Track export period
             self._scheduled_periods.append(("export", group_start, group_end))
@@ -649,7 +710,7 @@ class GrowattController(BaseModule):
             task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
             self._scheduled_tasks.append(task)
 
-            # Schedule export disable at end  
+            # Schedule export disable at end
             task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
             self._scheduled_tasks.append(task)
 

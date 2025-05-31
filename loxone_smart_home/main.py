@@ -19,8 +19,8 @@ from modules.growatt_controller import GrowattController
 from modules.mqtt_bridge import MQTTBridge
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
-from utils.influxdb_client import SharedInfluxDBClient
-from utils.mqtt_client import SharedMQTTClient
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 
 class LoxoneSmartHome:
@@ -32,8 +32,8 @@ class LoxoneSmartHome:
         self.setup_logging()
 
         # Shared clients
-        self.mqtt_client = SharedMQTTClient(self.settings)
-        self.influxdb_client = SharedInfluxDBClient(self.settings)
+        self.mqtt_client = AsyncMQTTClient(self.settings)
+        self.influxdb_client = AsyncInfluxDBClient(self.settings)
 
         # Modules
         self.modules: List[asyncio.Task[None]] = []
@@ -73,6 +73,9 @@ class LoxoneSmartHome:
         # Initialize shared clients
         await self.mqtt_client.connect()
         logger.info("MQTT client connected")
+
+        await self.influxdb_client.start()
+        logger.info("InfluxDB client started")
 
         # Initialize modules based on configuration
         if self.settings.modules.udp_listener_enabled:
@@ -137,7 +140,7 @@ class LoxoneSmartHome:
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()
-        await self.influxdb_client.close()
+        await self.influxdb_client.stop()
 
         logger.info("Shutdown complete")
 
