@@ -282,8 +282,9 @@ class GrowattController(BaseModule):
     async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
         """Set battery-first mode for specified time window."""
         if self.config.simulation_mode:
+            current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
-                f"[SIMULATE] Would set battery-first mode from {start_hour} to {stop_hour}"
+                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (simulated at {current_time})"
             )
             return
 
@@ -291,64 +292,73 @@ class GrowattController(BaseModule):
 
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-        self.logger.info(f"Battery-first mode scheduled from {start_hour} to {stop_hour}")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} (action at {current_time}) → Topic: {self.config.battery_first_topic}")
 
     async def _enable_ac_charge(self) -> None:
         """Enable AC charging during battery-first mode."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would enable AC charging")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⚡ [SIMULATE] AC CHARGING ENABLED (simulated at {current_time})")
             return
 
         payload = {"value": True}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
-        self.logger.info("AC charging enabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"⚡ AC CHARGING ENABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
 
     async def _disable_ac_charge(self) -> None:
         """Disable AC charging."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable AC charging")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
             return
 
         payload = {"value": False}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
-        self.logger.info("AC charging disabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {self.config.ac_charge_topic}")
 
     async def _disable_battery_first(self) -> None:
         """Disable battery-first mode."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable battery-first mode")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})")
             return
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-        self.logger.info("Battery-first mode disabled")
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        self.logger.info(f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → Topic: {self.config.battery_first_topic}")
 
     async def _enable_export(self) -> None:
         """Enable electricity export to grid."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would enable electricity export to grid")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⬆️ [SIMULATE] EXPORT ENABLED (simulated at {current_time})")
             return
 
         payload = {"value": True}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"Enabled electricity export to grid at {current_time}")
+        self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {self.config.export_enable_topic}")
 
     async def _disable_export(self) -> None:
         """Disable electricity export to grid."""
         if self.config.simulation_mode:
-            self.logger.info("[SIMULATE] Would disable electricity export to grid")
+            current_time = self._get_local_now().strftime("%H:%M:%S")
+            self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
             return
 
         payload = {"value": False}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"Disabled electricity export to grid at {current_time}")
+        self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {self.config.export_disable_topic}")
 
     async def _calculate_and_schedule_next_day(self) -> None:
         """Calculate energy prices and schedule battery control for next day."""
