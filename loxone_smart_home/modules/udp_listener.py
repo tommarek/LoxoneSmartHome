@@ -1,8 +1,9 @@
 """UDP Listener module - receives data from Loxone and stores in InfluxDB."""
 
 import asyncio
+from collections import defaultdict
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import pytz
 
@@ -26,6 +27,16 @@ class UDPListener(BaseModule):
         self.protocol: Optional[asyncio.DatagramProtocol] = None
         self.buffer_size = 2048  # Match Rust implementation
 
+        # Statistics for periodic logging
+        self.stats_lock = asyncio.Lock()
+        self.packet_count = 0
+        self.error_count = 0
+        self.measurement_counts: Dict[str, int] = defaultdict(int)
+        self.room_counts: Dict[str, int] = defaultdict(int)
+        self.last_stats_log = datetime.now()
+        self.stats_interval = 60  # Log stats every 60 seconds
+        self._stats_task: Optional[asyncio.Task[None]] = None
+
     async def start(self) -> None:
         """Start the UDP listener."""
         loop = asyncio.get_event_loop()
@@ -48,10 +59,23 @@ class UDPListener(BaseModule):
             f"tag1[optional]{delim}tag2[optional]"
         )
 
+        # Start statistics logging task
+        self._stats_task = asyncio.create_task(self._stats_logger())
+
     async def stop(self) -> None:
         """Stop the UDP listener."""
+        # Stop statistics task
+        if self._stats_task and not self._stats_task.done():
+            self._stats_task.cancel()
+            try:
+                await self._stats_task
+            except asyncio.CancelledError:
+                pass
+
         if self.transport:
             self.transport.close()
+            # Log final statistics
+            await self._log_statistics(final=True)
             self.logger.info("UDP listener stopped")
 
     async def process_data(self, data: bytes, addr: Tuple[str, int]) -> None:
@@ -66,6 +90,8 @@ class UDPListener(BaseModule):
 
             if len(parts) < 3:
                 self.logger.error(f"Failed to parse incoming data: not enough fields in {message}")
+                async with self.stats_lock:
+                    self.error_count += 1
                 return
 
             # Required fields
@@ -77,6 +103,8 @@ class UDPListener(BaseModule):
                 value = float(parts[2])
             except ValueError as e:
                 self.logger.error(f"Failed to parse incoming data: invalid value {parts[2]}: {e}")
+                async with self.stats_lock:
+                    self.error_count += 1
                 return
 
             # Optional fields with defaults matching Rust
@@ -93,6 +121,8 @@ class UDPListener(BaseModule):
                 utc_time = local_time.astimezone(pytz.UTC)
             except Exception as e:
                 self.logger.error(f"Failed to parse timestamp {timestamp_str}: {e}")
+                async with self.stats_lock:
+                    self.error_count += 1
                 return
 
             # Log the parsed data (matching Rust debug output)
@@ -118,14 +148,75 @@ class UDPListener(BaseModule):
                 timestamp=utc_time,
             )
 
-            # Log detailed information about what was stored
-            self.logger.info(
+            # Update statistics instead of logging each packet
+            async with self.stats_lock:
+                self.packet_count += 1
+                self.measurement_counts[f"{measurement_type}.{measurement_name}"] += 1
+                self.room_counts[room_name] += 1
+
+            # Log detailed information only at DEBUG level
+            self.logger.debug(
                 f"Stored: {measurement_type}.{measurement_name}={value} "
                 f"(room: {room_name}, from: {addr[0]}, time: {utc_time.strftime('%H:%M:%S')})"
             )
 
         except Exception as e:
             self.logger.error(f"Failed to process incoming data: {e}", exc_info=True)
+            async with self.stats_lock:
+                self.error_count += 1
+
+    async def _stats_logger(self) -> None:
+        """Periodically log statistics summary."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.stats_interval)
+                await self._log_statistics()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in stats logger: {e}")
+
+    async def _log_statistics(self, final: bool = False) -> None:
+        """Log current statistics."""
+        async with self.stats_lock:
+            if self.packet_count == 0 and not final:
+                return  # No activity to report
+
+            # Calculate time since last log
+            now = datetime.now()
+            time_elapsed = (now - self.last_stats_log).total_seconds()
+            rate = self.packet_count / time_elapsed if time_elapsed > 0 else 0
+
+            status = "Final" if final else "Periodic"
+            self.logger.info(
+                f"{status} UDP Stats: {self.packet_count} packets processed "
+                f"({rate:.1f}/sec), {self.error_count} errors"
+            )
+
+            # Log top 5 most active measurements
+            if self.measurement_counts:
+                top_measurements = sorted(
+                    self.measurement_counts.items(), key=lambda x: x[1], reverse=True
+                )[:5]
+                measurement_summary = ", ".join(
+                    [f"{name}({count})" for name, count in top_measurements]
+                )
+                self.logger.info(f"Top measurements: {measurement_summary}")
+
+            # Log room distribution if more than one room
+            if len(self.room_counts) > 1:
+                room_summary = ", ".join(
+                    [f"{room}({count})" for room, count in self.room_counts.items()]
+                )
+                self.logger.info(f"Room distribution: {room_summary}")
+
+            if not final:
+                # Reset counters for next period
+                self.packet_count = 0
+                self.error_count = 0
+                self.measurement_counts.clear()
+                self.room_counts.clear()
+                self.last_stats_log = now
 
 
 class UDPProtocol(asyncio.DatagramProtocol):

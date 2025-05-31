@@ -86,9 +86,6 @@ class GrowattController(BaseModule):
 
     async def start(self) -> None:
         """Start the Growatt controller."""
-        # Subscribe to control topics from Loxone
-        await self._setup_control_subscribers()
-
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
 
