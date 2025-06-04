@@ -1,0 +1,30 @@
+# Core Dependencies (compatible with Python 3.13)
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+influxdb-client[async]>=1.40.0
+asyncio-mqtt>=0.16.0
+aiohttp>=3.9.0
+pandas>=2.2.0
+numpy>=1.26.0
+pytz>=2023.3
+
+# Machine Learning Dependencies
+scikit-learn==1.3.2          # For ML models
+xgboost==2.0.3               # For gradient boosting models
+lightgbm==4.1.0              # Alternative gradient boosting
+tensorflow==2.15.0           # For deep learning models (optional)
+statsmodels==0.14.1          # For time series analysis
+prophet==1.1.5               # For time series forecasting
+joblib==1.3.2                # For model persistence
+
+# Optimization Dependencies
+cvxpy==1.4.1                 # For convex optimization
+pyomo==6.7.0                 # For mixed-integer optimization
+gekko==1.0.6                 # For dynamic optimization
+optuna==3.5.0                # For hyperparameter tuning
+
+# Additional ML/Data Dependencies
+scipy==1.11.4                # Scientific computing
+pvlib==0.10.3                # For PV system modeling
+kalman==0.1.14               # For Kalman filtering

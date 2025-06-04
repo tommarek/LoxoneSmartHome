@@ -1,0 +1,94 @@
+2025-06-04 21:31:17,288 - __main__ - INFO - Loading settings...
+2025-06-04 21:31:17,290 - __main__ - ERROR - Pipeline test failed: 6 validation errors for PEMSSettings
+influxdb_url
+  Extra inputs are not permitted [type=extra_forbidden, input_value='http://192.168.0.201:8086', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_token
+  Extra inputs are not permitted [type=extra_forbidden, input_value='7HrEuj8kzOS1f-0mjU_GT4hS...QezDh132utLbXi-IL8h9A==', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_org
+  Extra inputs are not permitted [type=extra_forbidden, input_value='loxone', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_historical
+  Extra inputs are not permitted [type=extra_forbidden, input_value='loxone', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_predictions
+  Extra inputs are not permitted [type=extra_forbidden, input_value='predictions', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_optimization
+  Extra inputs are not permitted [type=extra_forbidden, input_value='optimization', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+Traceback (most recent call last):
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/test_full_pipeline.py", line 37, in test_full_pipeline
+    settings = Settings(
+        influxdb={
+    ...<4 lines>...
+        }
+    )
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic_settings/main.py", line 176, in __init__
+    super().__init__(
+    ~~~~~~~~~~~~~~~~^
+        **__pydantic_self__._settings_build_values(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<26 lines>...
+        )
+        ^
+    )
+    ^
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic/main.py", line 253, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 6 validation errors for PEMSSettings
+influxdb_url
+  Extra inputs are not permitted [type=extra_forbidden, input_value='http://192.168.0.201:8086', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_token
+  Extra inputs are not permitted [type=extra_forbidden, input_value='7HrEuj8kzOS1f-0mjU_GT4hS...QezDh132utLbXi-IL8h9A==', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_org
+  Extra inputs are not permitted [type=extra_forbidden, input_value='loxone', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_historical
+  Extra inputs are not permitted [type=extra_forbidden, input_value='loxone', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_predictions
+  Extra inputs are not permitted [type=extra_forbidden, input_value='predictions', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+influxdb_bucket_optimization
+  Extra inputs are not permitted [type=extra_forbidden, input_value='optimization', input_type=str]
+    For further information visit https://errors.pydantic.dev/2.11/v/extra_forbidden
+2025-06-04 21:31:33,621 - __main__ - INFO - Loading settings...
+2025-06-04 21:31:33,622 - __main__ - ERROR - Pipeline test failed: 1 validation error for InfluxDBSettings
+token
+  Field required [type=missing, input_value={}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.11/v/missing
+Traceback (most recent call last):
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/test_full_pipeline.py", line 37, in test_full_pipeline
+    settings = Settings()
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic_settings/main.py", line 176, in __init__
+    super().__init__(
+    ~~~~~~~~~~~~~~~~^
+        **__pydantic_self__._settings_build_values(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<26 lines>...
+        )
+        ^
+    )
+    ^
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic/main.py", line 253, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic_settings/main.py", line 176, in __init__
+    super().__init__(
+    ~~~~~~~~~~~~~~~~^
+        **__pydantic_self__._settings_build_values(
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<26 lines>...
+        )
+        ^
+    )
+    ^
+  File "/Users/tommarek/git/LoxoneSmartHome/pems_v2/venv/lib/python3.13/site-packages/pydantic/main.py", line 253, in __init__
+    validated_self = self.__pydantic_validator__.validate_python(data, self_instance=self)
+pydantic_core._pydantic_core.ValidationError: 1 validation error for InfluxDBSettings
+token
+  Field required [type=missing, input_value={}, input_type=dict]
+    For further information visit https://errors.pydantic.dev/2.11/v/missing
