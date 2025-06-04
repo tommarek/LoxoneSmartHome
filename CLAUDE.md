@@ -8,21 +8,36 @@ This is a consolidated Python service that combines multiple smart home automati
 
 ## Development Commands
 
-Before making any commits, run these commands to ensure code quality:
+**ALWAYS use the virtual environment and Makefile for all development tasks:**
 
 ```bash
-# Run all tests
-make test
+# Set up development environment (first time only)
+make setup
 
-# Run linting (flake8 with 100 char line limit)
-make lint
+# Activate virtual environment (required for all development)
+source venv/bin/activate
 
-# Run type checking (mypy in strict mode)
-make type-check
+# Run all tests (use Makefile targets)
+make test-basic      # Basic structure and import tests
+make test-extraction # Data extraction tests  
+make test-relay      # Relay analysis tests
+make test            # Full test suite with coverage
 
-# Format code automatically
-make format
+# Code quality (ALWAYS run before commits)
+make lint-fix        # Auto-fix formatting and imports
+make lint           # Check for remaining issues
+make type-check     # Run mypy type checking
+
+# Clean up
+make clean          # Remove build artifacts
+make clean-analysis # Remove analysis outputs
 ```
+
+**Development Rules:**
+- **NEVER** install packages globally - always use the virtual environment
+- **ALWAYS** use Makefile targets instead of direct tool calls
+- **ALWAYS** run `make lint-fix` before commits to maintain code quality
+- **ALWAYS** ensure all tests pass before committing changes
 
 ## Architecture
 
@@ -112,6 +127,15 @@ The application uses:
 - **Type Safety**: All source files pass strict mypy checking
 - **Code Quality**: 100% linting compliance (flake8 with 100-char limit)
 - **Test Coverage**: 76 tests covering all implemented modules with clean async execution
+
+### PEMS v2 Status 🎯
+- **Phase 1 Complete ✅**: Data Analysis & Feature Engineering
+  - Data extraction for all energy sources (PV, rooms, weather, battery, EV, prices)
+  - Room power configuration with actual measurements (18.12 kW total)
+  - Complete feature engineering pipeline for ML models
+  - Data validation and quality assessment
+  - Professional development setup (venv, Makefile, linting)
+- **Phase 2 Next**: ML Model Development (PV predictor, thermal models, load predictor)
 
 ### Next Phase 🎯
 - **Logging Improvements**: Local timezone timestamps and service-specific prefixes
