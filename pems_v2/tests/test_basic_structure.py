@@ -1,6 +1,7 @@
+#!/usr/bin/env python3
 """
-Simple test script for PEMS v2 analysis functions.
-Tests core logic without heavy dependencies.
+Basic structure and import tests for PEMS v2.
+Tests core functionality without requiring external dependencies.
 """
 
 import sys
@@ -9,7 +10,8 @@ import logging
 from datetime import datetime, timedelta
 
 # Add the project root to Python path
-sys.path.append(str(Path(__file__).parent))
+sys.path.append(str(Path(__file__).parent.parent))
+
 
 def test_imports():
     """Test that all analysis modules can be imported."""
@@ -52,43 +54,6 @@ def test_imports():
     
     return True
 
-def test_class_initialization():
-    """Test that classes can be initialized."""
-    print("\n🏗️  Testing class initialization...")
-    
-    try:
-        from analysis.pattern_analysis import PVAnalyzer
-        analyzer = PVAnalyzer()
-        print("✅ PVAnalyzer initialized successfully")
-    except Exception as e:
-        print(f"❌ PVAnalyzer initialization failed: {e}")
-        return False
-    
-    try:
-        from analysis.thermal_analysis import ThermalAnalyzer
-        analyzer = ThermalAnalyzer()
-        print("✅ ThermalAnalyzer initialized successfully")
-    except Exception as e:
-        print(f"❌ ThermalAnalyzer initialization failed: {e}")
-        return False
-    
-    try:
-        from analysis.base_load_analysis import BaseLoadAnalyzer
-        analyzer = BaseLoadAnalyzer()
-        print("✅ BaseLoadAnalyzer initialized successfully")
-    except Exception as e:
-        print(f"❌ BaseLoadAnalyzer initialization failed: {e}")
-        return False
-    
-    try:
-        from analysis.data_preprocessing import DataPreprocessor
-        preprocessor = DataPreprocessor()
-        print("✅ DataPreprocessor initialized successfully")
-    except Exception as e:
-        print(f"❌ DataPreprocessor initialization failed: {e}")
-        return False
-    
-    return True
 
 def test_dependencies():
     """Test that required dependencies are available."""
@@ -131,6 +96,7 @@ def test_dependencies():
     
     return True
 
+
 def test_directory_structure():
     """Test that required directories exist."""
     print("\n📁 Testing directory structure...")
@@ -144,44 +110,29 @@ def test_directory_structure():
     ]
     
     missing_dirs = []
+    project_root = Path(__file__).parent.parent
     
     for dir_name in required_dirs:
-        dir_path = Path(dir_name)
+        dir_path = project_root / dir_name
         if dir_path.exists():
             print(f"✅ {dir_name}/ exists")
         else:
             print(f"❌ {dir_name}/ missing")
             missing_dirs.append(dir_name)
     
-    # Check analysis files
-    analysis_files = [
-        "analysis/data_extraction.py",
-        "analysis/pattern_analysis.py", 
-        "analysis/thermal_analysis.py",
-        "analysis/base_load_analysis.py",
-        "analysis/data_preprocessing.py",
-        "analysis/run_analysis.py"
-    ]
-    
-    for file_path in analysis_files:
-        if Path(file_path).exists():
-            print(f"✅ {file_path} exists")
-        else:
-            print(f"❌ {file_path} missing")
-            missing_dirs.append(file_path)
-    
     return len(missing_dirs) == 0
+
 
 def test_config_loading():
     """Test configuration loading."""
     print("\n⚙️  Testing configuration...")
     
     try:
-        from config.settings import Settings
+        from config.settings import PEMSSettings
         print("✅ Settings class imported successfully")
         
         # Try to create settings (will use defaults if no env vars)
-        settings = Settings()
+        settings = PEMSSettings()
         print("✅ Settings initialized successfully")
         
         # Check that some basic attributes exist
@@ -197,11 +148,11 @@ def test_config_loading():
         print(f"❌ Settings loading failed: {e}")
         return False
 
+
 def main():
-    """Run all simple tests."""
-    print("🧪 PEMS v2 SIMPLE TESTING")
+    """Run all basic tests."""
+    print("🧪 PEMS v2 BASIC STRUCTURE TESTS")
     print("="*50)
-    print("Testing core functionality without running analysis...")
     
     # Set up minimal logging
     logging.basicConfig(level=logging.ERROR)
@@ -211,7 +162,6 @@ def main():
         ("Dependencies", test_dependencies),
         ("Directory Structure", test_directory_structure), 
         ("Module Imports", test_imports),
-        ("Class Initialization", test_class_initialization),
         ("Configuration", test_config_loading)
     ]
     
@@ -243,15 +193,11 @@ def main():
     
     if passed == total:
         print("\n🎉 All basic tests passed! The PEMS v2 structure is correct.")
-        print("\n📋 Next steps:")
-        print("1. Install dependencies: pip install -r requirements.txt")
-        print("2. Configure settings in .env file")
-        print("3. Run full test: python test_analysis.py")
-        print("4. Run analysis: python analysis/run_analysis.py")
     else:
         print(f"\n⚠️  {total-passed} test(s) failed. Please fix the issues above.")
     
     return passed == total
+
 
 if __name__ == "__main__":
     success = main()

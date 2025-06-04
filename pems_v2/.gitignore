@@ -55,6 +55,23 @@ data/
 models/trained/
 logs/
 
+# Analysis outputs
+analysis/results/*.json
+analysis/reports/*.txt
+analysis/figures/*.png
+*.log
+*_analysis.log
+test_*.log
+
+# Generated parquet files
+*.parquet
+
+# Temporary analysis files
+data/raw/*.parquet
+data/processed/*.parquet
+data/features/*.parquet
+data/test_output/
+
 # Environment
 .env
 .env.local

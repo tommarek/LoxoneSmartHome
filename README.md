@@ -2,6 +2,12 @@
 
 Consolidated smart home automation system that integrates Loxone Miniserver with solar energy management, weather forecasting, and comprehensive data visualization.
 
+## Project Structure
+
+This repository contains two applications:
+1. **`loxone_smart_home`** - Current production system (v1)
+2. **`pems_v2`** - Next-generation Predictive Energy Management System (v2) - in development
+
 ## Overview
 
 This project consolidates multiple services into a single, efficient Python application that:
@@ -43,6 +49,8 @@ A single consolidated Python service that replaces the previous separate contain
 
 ## Quick Start
 
+### Running the Current System (v1)
+
 1. **Setup Environment**
    ```bash
    cd loxone_smart_home
@@ -59,6 +67,35 @@ A single consolidated Python service that replaces the previous separate contain
 3. **Access**
    - Grafana: http://localhost:3000 (admin/adminadmin)
    - InfluxDB: http://localhost:8086
+
+### Running PEMS v2 (Development)
+
+1. **Setup PEMS Environment**
+   ```bash
+   cd pems_v2
+   cp .env.example .env
+   # Edit .env as needed
+   ```
+
+2. **Run in Development Mode**
+   ```bash
+   # Run alongside existing system
+   docker-compose -f docker-compose.pems.yml up -d
+   
+   # Or run locally for development
+   cd pems_v2
+   python -m venv venv
+   source venv/bin/activate  # or venv\Scripts\activate on Windows
+   pip install -r requirements.txt
+   python main.py
+   ```
+
+3. **Both Systems Together**
+   ```bash
+   # Start all services including both v1 and v2
+   docker-compose up -d
+   docker-compose -f docker-compose.pems.yml up -d
+   ```
 
 ## Configuration
 
