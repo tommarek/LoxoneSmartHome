@@ -45,7 +45,7 @@ class PEMSApplication:
         self.settings = settings
         self.tasks: List[asyncio.Task] = []
         self._shutdown_event = asyncio.Event()
-        
+
         # These will be initialized in setup()
         self.influxdb_client = None  # type: Optional[AsyncInfluxDBClient]
         self.mqtt_client = None  # type: Optional[AsyncMQTTClient]
@@ -54,21 +54,21 @@ class PEMSApplication:
     async def setup(self) -> None:
         """Set up the application components."""
         logger.info("Setting up PEMS v2...")
-        
+
         # TODO: Initialize database client
         # self.influxdb_client = AsyncInfluxDBClient(self.settings.influxdb)
-        
+
         # TODO: Initialize MQTT client
         # self.mqtt_client = AsyncMQTTClient(self.settings.mqtt)
-        
+
         # TODO: Initialize ML models
         # pv_predictor = PVPredictor(self.settings.pv_prediction)
         # load_predictor = LoadPredictor(self.settings.load_prediction)
         # thermal_model = ThermalModel(self.settings.thermal)
-        
+
         # TODO: Initialize optimization engine
         # optimizer = EnergyOptimizer(self.settings.optimization)
-        
+
         # TODO: Initialize main controller
         # self.energy_controller = EnergyController(
         #     settings=self.settings,
@@ -79,48 +79,48 @@ class PEMSApplication:
         #     thermal_model=thermal_model,
         #     optimizer=optimizer
         # )
-        
+
         logger.info("PEMS v2 setup complete")
 
     async def start(self) -> None:
         """Start the application."""
         logger.info("Starting PEMS v2...")
-        
+
         # TODO: Start the energy controller
         # if self.energy_controller:
         #     task = asyncio.create_task(self.energy_controller.run())
         #     self.tasks.append(task)
-        
+
         logger.info("PEMS v2 started successfully")
 
     async def shutdown(self) -> None:
         """Shut down the application gracefully."""
         logger.info("Shutting down PEMS v2...")
-        
+
         # Signal shutdown
         self._shutdown_event.set()
-        
+
         # Cancel all tasks
         for task in self.tasks:
             task.cancel()
-        
+
         # Wait for tasks to complete
         if self.tasks:
             await asyncio.gather(*self.tasks, return_exceptions=True)
-        
+
         # TODO: Close connections
         # if self.mqtt_client:
         #     await self.mqtt_client.close()
         # if self.influxdb_client:
         #     await self.influxdb_client.close()
-        
+
         logger.info("PEMS v2 shutdown complete")
 
     async def run(self) -> None:
         """Run the application until shutdown."""
         await self.setup()
         await self.start()
-        
+
         # Wait for shutdown signal
         await self._shutdown_event.wait()
 
@@ -135,10 +135,10 @@ async def create_application():
     """Create and manage the PEMS application lifecycle."""
     # TODO: Load settings
     # settings = PEMSSettings()
-    
+
     # For now, create a placeholder
     app = PEMSApplication(None)  # type: ignore
-    
+
     try:
         yield app
     finally:
@@ -149,14 +149,14 @@ async def main():
     """Main entry point."""
     # Set up logging
     setup_logging()
-    
+
     logger.info("Starting Predictive Energy Management System v2")
-    
+
     async with create_application() as app:
         # Set up signal handlers
         for sig in (signal.SIGTERM, signal.SIGINT):
             signal.signal(sig, app.handle_signal)
-        
+
         try:
             await app.run()
         except asyncio.CancelledError:
