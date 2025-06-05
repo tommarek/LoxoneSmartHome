@@ -131,7 +131,7 @@ def test_config_loading():
     print("\n⚙️  Testing configuration...")
 
     try:
-        from config.settings import PEMSSettings, InfluxDBSettings
+        from config.settings import InfluxDBSettings, PEMSSettings
 
         print("✅ Settings class imported successfully")
 

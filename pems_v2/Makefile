@@ -1,4 +1,4 @@
-.PHONY: help setup install install-dev test lint type-check format clean run test-extraction clean-analysis run-analysis run-relay-analysis
+.PHONY: help setup install install-dev test lint lint-check type-check format clean run test-extraction clean-analysis run-analysis run-relay-analysis
 
 help:
 	@echo "Available commands:"
@@ -9,9 +9,10 @@ help:
 	@echo "  make test-extraction - Test data extraction from InfluxDB"
 	@echo "  make test-relay   - Test relay analysis functionality"
 	@echo "  make test         - Run all tests with coverage"
-	@echo "  make lint         - Run flake8 linter"
-	@echo "  make type-check   - Run mypy type checker"
-	@echo "  make format       - Format code with black and isort"
+	@echo "  make lint         - Format code and run all linting (black, isort, flake8, mypy)"
+	@echo "  make lint-check   - Check code quality without making changes"
+	@echo "  make type-check   - Run mypy type checker only"
+	@echo "  make format       - Format code with black and isort only"
 	@echo "  make clean        - Remove build artifacts"
 	@echo "  make clean-analysis - Remove analysis outputs and data files"
 	@echo "  make run          - Run the PEMS application"
@@ -43,21 +44,27 @@ test:
 	pytest -v --cov=pems_v2 --cov-report=term-missing tests/
 
 lint:
+	@echo "🔧 Formatting code with black..."
+	black .
+	@echo "🔧 Organizing imports with isort..."
+	isort .
+	@echo "🔍 Running flake8 linter..."
 	flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
 	flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+	@echo "📝 Running mypy type checker..."
+	-mypy --strict --explicit-package-bases . || echo "⚠️  Type checking found issues (expected during development)"
+	@echo "✅ Linting complete!"
 
-lint-fix:
-	black .
-	isort .
-	flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-
-lint-strict:
+lint-check:
+	@echo "🔍 Checking code formatting (no changes)..."
 	black --check .
 	isort --check-only .
-	mypy --strict .
+	flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+	flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
+	mypy --strict --explicit-package-bases .
 
 type-check:
-	mypy --strict pems_v2/
+	mypy --strict --explicit-package-bases .
 
 format:
 	black .
