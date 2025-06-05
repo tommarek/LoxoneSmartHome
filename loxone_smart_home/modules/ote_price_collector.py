@@ -263,10 +263,7 @@ class OTEPriceCollector(BaseModule):
         if not self._session:
             raise RuntimeError("HTTP session not initialized")
 
-        url = (
-            f"{self.base_url}?report_date={date_str}"
-            f"&time_resolution={self.time_resolution}"
-        )
+        url = f"{self.base_url}?report_date={date_str}" f"&time_resolution={self.time_resolution}"
 
         # Use headers to appear more like a regular browser
         headers = {
@@ -375,56 +372,35 @@ class OTEPriceCollector(BaseModule):
                 timestamp=utc_timestamp,
             )
 
-    async def _update_today_and_tomorrow(self) -> None:
-        """Update prices for today and tomorrow."""
-        now = datetime.now(self._local_tz)
-
-        # Update today's prices
-        today_str = now.strftime("%Y-%m-%d")
-        today_prices = await self._fetch_prices_for_date(today_str)
-        if today_prices:
-            await self._store_prices(today_prices, today_str)
-            self.logger.info(f"Updated prices for today ({today_str}): {len(today_prices)} hours")
-
-        # Update tomorrow's prices (usually available after 2 PM)
-        if now.hour >= 14:
-            tomorrow = now + timedelta(days=1)
-            tomorrow_str = tomorrow.strftime("%Y-%m-%d")
-            tomorrow_prices = await self._fetch_prices_for_date(tomorrow_str)
-            if tomorrow_prices:
-                await self._store_prices(tomorrow_prices, tomorrow_str)
-                self.logger.info(
-                    f"Updated prices for tomorrow ({tomorrow_str}): {len(tomorrow_prices)} hours"
-                )
-
     async def _daily_update_loop(self) -> None:
-        """Run daily updates."""
+        """Run daily updates with smart retry logic."""
         while self._running:
             try:
-                # Calculate time until configured update time
+                # Calculate time until first check hour
                 now = datetime.now(self._local_tz)
-                target_time = now.replace(
-                    hour=self.settings.ote.update_hour,
-                    minute=self.settings.ote.update_minute,
+                first_check_time = now.replace(
+                    hour=self.settings.ote.first_check_hour,
+                    minute=0,
                     second=0,
                     microsecond=0,
                 )
 
-                if target_time <= now:
-                    # If it's already past update time, schedule for tomorrow
-                    target_time += timedelta(days=1)
+                if first_check_time <= now:
+                    # If it's already past first check time, schedule for tomorrow
+                    first_check_time += timedelta(days=1)
 
-                delay = (target_time - now).total_seconds()
+                delay = (first_check_time - now).total_seconds()
 
                 self.logger.info(
-                    f"Next daily update scheduled in {delay/3600:.1f} hours at {target_time}"
+                    f"Next daily price check cycle starts in {delay/3600:.1f} hours "
+                    f"at {first_check_time}"
                 )
 
-                # Wait until scheduled time
+                # Wait until first check time
                 await asyncio.sleep(delay)
 
-                # Perform the update
-                await self._update_today_and_tomorrow()
+                # Start smart retry cycle for tomorrow's prices
+                await self._smart_price_update_cycle()
 
                 # Also check if we need to fill any gaps
                 await self._check_and_fill_gaps()
@@ -435,6 +411,80 @@ class OTEPriceCollector(BaseModule):
                 self.logger.error(f"Error in daily update loop: {e}", exc_info=True)
                 # Wait an hour before retrying
                 await asyncio.sleep(3600)
+
+    async def _smart_price_update_cycle(self) -> None:
+        """Smart retry cycle that checks for tomorrow's prices every hour until found."""
+        now = datetime.now(self._local_tz)
+
+        # Always update today's prices first
+        today_str = now.strftime("%Y-%m-%d")
+        today_prices = await self._fetch_prices_for_date(today_str)
+        if today_prices:
+            await self._store_prices(today_prices, today_str)
+            self.logger.info(f"Updated prices for today ({today_str}): {len(today_prices)} hours")
+
+        # Start checking for tomorrow's prices
+        tomorrow = now + timedelta(days=1)
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+
+        current_hour = now.hour
+        max_hour = self.settings.ote.max_check_hour
+
+        self.logger.info(
+            f"Starting smart price check cycle for tomorrow ({tomorrow_str}) "
+            f"from {current_hour}:00 until {max_hour}:00"
+        )
+
+        while current_hour <= max_hour and self._running:
+            try:
+                self.logger.info(f"Checking for tomorrow's prices at {current_hour}:00...")
+
+                # Try to fetch tomorrow's prices
+                tomorrow_prices = await self._fetch_prices_for_date(tomorrow_str)
+
+                if tomorrow_prices:
+                    # Success! Store the prices and exit the cycle
+                    await self._store_prices(tomorrow_prices, tomorrow_str)
+                    self.logger.info(
+                        f"✅ Successfully got tomorrow's prices ({tomorrow_str}) "
+                        f"at {current_hour}:00: {len(tomorrow_prices)} hours"
+                    )
+                    return
+                else:
+                    # No data yet, try again next hour
+                    self.logger.info(
+                        f"❌ Tomorrow's prices not available yet at {current_hour}:00, "
+                        f"will retry at {current_hour + 1}:00"
+                    )
+
+                # Wait until next hour (or exit if max hour reached)
+                if current_hour < max_hour:
+                    next_check = now.replace(
+                        hour=current_hour + 1, minute=0, second=0, microsecond=0
+                    )
+                    delay = (next_check - datetime.now(self._local_tz)).total_seconds()
+
+                    if delay > 0:
+                        self.logger.info(f"Waiting {delay/60:.0f} minutes until next check...")
+                        await asyncio.sleep(delay)
+
+                    current_hour += 1
+                else:
+                    break
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error checking prices at {current_hour}:00: {e}")
+                current_hour += 1
+                # Still try next hour despite error
+                await asyncio.sleep(3600)
+
+        # If we get here, we couldn't get tomorrow's prices within the time window
+        self.logger.warning(
+            f"⚠️ Could not retrieve tomorrow's prices ({tomorrow_str}) "
+            f"within check window (2-{max_hour} PM). Will try again tomorrow."
+        )
 
     async def _check_and_fill_gaps(self) -> None:
         """Check for gaps in the data and fill them."""

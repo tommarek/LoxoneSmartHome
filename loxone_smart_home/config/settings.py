@@ -122,9 +122,9 @@ class OTEConfig(BaseModel):
     base_url: str = "https://www.ote-cr.cz/cs/kratkodobe-trhy/elektrina/denni-trh/@@chart-data"
     time_resolution: str = "PT60M"  # 60-minute resolution
 
-    # Update schedule
-    update_hour: int = Field(default=15, ge=0, le=23)  # 3 PM daily update
-    update_minute: int = Field(default=0, ge=0, le=59)
+    # Update schedule (smart retry starting at 2 PM, then hourly until data found)
+    first_check_hour: int = Field(default=14, ge=0, le=23)  # Start checking at 2 PM
+    max_check_hour: int = Field(default=18, ge=0, le=23)  # Stop checking at 6 PM
 
     # Historical data
     load_historical_days: int = Field(default=1095, ge=1)  # 3 years = 1095 days
@@ -238,6 +238,8 @@ class Settings(BaseSettings):
     ote_error_delay: Optional[float] = Field(default=None, ge=1.0)
     ote_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
     ote_load_historical_days: Optional[int] = Field(default=None, ge=1)
+    ote_first_check_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    ote_max_check_hour: Optional[int] = Field(default=None, ge=0, le=23)
 
     @property
     def modules(self) -> ModuleConfig:
@@ -317,4 +319,6 @@ class Settings(BaseSettings):
             error_delay=self.ote_error_delay or 5.0,
             max_retries=self.ote_max_retries or 3,
             load_historical_days=self.ote_load_historical_days or 1095,
+            first_check_hour=self.ote_first_check_hour or 14,
+            max_check_hour=self.ote_max_check_hour or 18,
         )
