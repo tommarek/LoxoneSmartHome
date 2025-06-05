@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from config.settings import Settings
 from modules.growatt_controller import GrowattController
 from modules.mqtt_bridge import MQTTBridge
+from modules.ote_price_collector import OTEPriceCollector
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -42,6 +43,7 @@ class LoxoneSmartHome:
         self.mqtt_bridge: Optional[MQTTBridge] = None
         self.weather_scraper: Optional[WeatherScraper] = None
         self.growatt_controller: Optional[GrowattController] = None
+        self.ote_collector: Optional[OTEPriceCollector] = None
 
         # Shutdown event
         self.shutdown_event = asyncio.Event()
@@ -100,6 +102,10 @@ class LoxoneSmartHome:
             )
             logger.info("Growatt Controller module initialized")
 
+        if self.settings.ote_collector_enabled:
+            self.ote_collector = OTEPriceCollector(self.influxdb_client, self.settings)
+            logger.info("OTE Price Collector module initialized")
+
     async def start_modules(self) -> None:
         """Start all enabled modules."""
         logger = logging.getLogger(__name__)
@@ -127,6 +133,12 @@ class LoxoneSmartHome:
             task = asyncio.create_task(self.growatt_controller.run(self.shutdown_event))
             self.modules.append(task)
             logger.info("Growatt Controller started")
+
+        # Start OTE Price Collector
+        if self.ote_collector:
+            task = asyncio.create_task(self.ote_collector.run(self.shutdown_event))
+            self.modules.append(task)
+            logger.info("OTE Price Collector started")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""
