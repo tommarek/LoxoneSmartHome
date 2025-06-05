@@ -312,8 +312,8 @@ class Settings(BaseSettings):
         )
 
     @property
-    def ote(self) -> OTEConfig:
-        """Get OTE configuration."""
+    def ote_collector(self) -> OTEConfig:
+        """Get OTE collector configuration."""
         return OTEConfig(
             request_delay=self.ote_request_delay or 1.0,
             error_delay=self.ote_error_delay or 5.0,
