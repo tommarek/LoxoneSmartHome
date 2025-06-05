@@ -51,6 +51,7 @@ services:
       - MQTT_BRIDGE_ENABLED=true
       - WEATHER_SCRAPER_ENABLED=true
       - GROWATT_CONTROLLER_ENABLED=true
+      - OTE_COLLECTOR_ENABLED=true
       
       # MQTT settings
       - MQTT_BROKER=mosquitto
