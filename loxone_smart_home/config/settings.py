@@ -115,6 +115,29 @@ class WeatherConfig(BaseModel):
     retry_delay: int = Field(default=60, ge=1)  # seconds
 
 
+class OTEConfig(BaseModel):
+    """OTE price collector configuration."""
+
+    # API endpoint
+    base_url: str = "https://www.ote-cr.cz/cs/kratkodobe-trhy/elektrina/denni-trh/@@chart-data"
+    time_resolution: str = "PT60M"  # 60-minute resolution
+
+    # Update schedule (smart retry starting at 2 PM, then hourly until data found)
+    first_check_hour: int = Field(default=14, ge=0, le=23)  # Start checking at 2 PM
+    max_check_hour: int = Field(default=18, ge=0, le=23)  # Stop checking at 6 PM
+
+    # Historical data
+    load_historical_days: int = Field(default=1095, ge=1)  # 3 years = 1095 days
+
+    # Rate limiting
+    request_delay: float = Field(default=1.0, ge=0.1)  # Delay between requests in seconds
+    error_delay: float = Field(default=5.0, ge=1.0)  # Delay after errors
+    max_retries: int = Field(default=3, ge=1, le=10)  # Max retries per request
+
+    # EUR to CZK conversion rate (approximate, could be made dynamic)
+    eur_czk_rate: float = Field(default=25.0, gt=0)
+
+
 class GrowattConfig(BaseModel):
     """Growatt controller configuration."""
 
@@ -182,6 +205,7 @@ class Settings(BaseSettings):
     mqtt_bridge_enabled: bool = True
     weather_scraper_enabled: bool = True
     growatt_controller_enabled: bool = True
+    ote_collector_enabled: bool = True
 
     # Service configurations
     mqtt_broker: str = "mqtt"
@@ -208,6 +232,14 @@ class Settings(BaseSettings):
 
     growatt_device_serial: Optional[str] = None
     growatt_simulation_mode: bool = False
+
+    # OTE Price Collector settings (optional overrides)
+    ote_request_delay: Optional[float] = Field(default=None, ge=0.1)
+    ote_error_delay: Optional[float] = Field(default=None, ge=1.0)
+    ote_max_retries: Optional[int] = Field(default=None, ge=1, le=10)
+    ote_load_historical_days: Optional[int] = Field(default=None, ge=1)
+    ote_first_check_hour: Optional[int] = Field(default=None, ge=0, le=23)
+    ote_max_check_hour: Optional[int] = Field(default=None, ge=0, le=23)
 
     @property
     def modules(self) -> ModuleConfig:
@@ -277,4 +309,16 @@ class Settings(BaseSettings):
         return GrowattConfig(
             device_serial=self.growatt_device_serial,
             simulation_mode=self.growatt_simulation_mode,
+        )
+
+    @property
+    def ote_collector(self) -> OTEConfig:
+        """Get OTE collector configuration."""
+        return OTEConfig(
+            request_delay=self.ote_request_delay or 1.0,
+            error_delay=self.ote_error_delay or 5.0,
+            max_retries=self.ote_max_retries or 3,
+            load_historical_days=self.ote_load_historical_days or 1095,
+            first_check_hour=self.ote_first_check_hour or 14,
+            max_check_hour=self.ote_max_check_hour or 18,
         )
