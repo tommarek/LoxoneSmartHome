@@ -3,72 +3,552 @@
 ## Overview
 Implement a comprehensive predictive energy management system that replaces the current Growatt controller with an ML-based optimizer for heating, battery, and EV charging control.
 
-## Phase 1: Data Analysis & Feature Engineering (COMPLETED ✅)
+# TODO.md - PEMS v2 Phase 1 Completion Tasks
 
-### 1.1 Completed Tasks ✅
-- ✅ **Data Extraction Module**: Complete implementation with all energy data sources
-  - Solar/PV data with proper field mapping
-  - Room temperature and heating status data  
-  - Weather data including sun elevation calculations
-  - Energy consumption breakdown by category (heating, appliances, etc.)
-  - Battery charge/discharge data extraction
-  - EV charging data extraction (when available)
-  - Energy price data integration
-- ✅ **Data Validation & Quality**: Comprehensive validation pipeline
-  - Data completeness validation across all required sources
-  - Quality thresholds and gap detection
-  - Missing data reporting and recommendations
-- ✅ **Room Configuration**: Centralized energy configuration system
-  - Actual room power ratings from heating analysis (18.12 kW total)
-  - Room zones and thermal characteristics
-  - System parameters (battery, PV, grid limits)
-- ✅ **Feature Engineering**: Complete ML feature pipeline
-  - PV prediction features (weather correlations, solar geometry)
-  - Thermal features for each room (temperature dynamics, heating patterns)
-  - Energy management features (consumption patterns, grid interactions)
-  - Feature scaling and importance calculation
-- ✅ **Code Quality**: Professional development standards
-  - Makefile with comprehensive linting and testing targets
-  - Black code formatting and isort import organization  
-  - Virtual environment setup for dependency management
-  - Comprehensive test suite (Phase 1: 5/5 tests passing)
+## Overview
+This document provides detailed implementation instructions for completing Phase 1 of the PEMS v2 project. Each task includes specific requirements, code examples, and expected outputs.
 
-### 1.2 Remaining Quality Tasks for Phase 1
-- 🔧 **Fix remaining linting issues**: 134 total issues to resolve
-  - Remove 45 unused imports (F401)
-  - Fix 34 long lines (E501) - wrap to 100 characters
-  - Address 12 complex functions (C901) - consider refactoring
-  - Add type annotations for strict mypy compliance (180 errors)
-- 🔧 **Update Makefile type-check target**: Fix path to check current directory instead of non-existent pems_v2/
+---
 
-## Technologies & Libraries Required
+## 1. Create Visualization Module 🎨
 
-### Core Dependencies
-```bash
-# Add to requirements.txt
-scikit-learn==1.3.2          # For ML models
-xgboost==2.0.3               # For gradient boosting models
-lightgbm==4.1.0              # Alternative gradient boosting
-tensorflow==2.15.0           # For deep learning models (optional)
-cvxpy==1.4.1                 # For convex optimization
-pyomo==6.7.0                 # For mixed-integer optimization
-gekko==1.0.6                 # For dynamic optimization
-statsmodels==0.14.1          # For time series analysis
-prophet==1.1.5               # For time series forecasting
-pandas==2.1.4                # Already included
-numpy==1.26.2                # Already included
-joblib==1.3.2                # For model persistence
-optuna==3.5.0                # For hyperparameter tuning
+### Task: Implement `analysis/visualization.py`
+
+**File Location**: `pems_v2/analysis/visualization.py`
+
+**Implementation Requirements**:
+
+```python
+"""
+Visualization utilities for PEMS v2 data analysis.
+Creates interactive dashboards and static plots for analysis results.
+"""
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
+import pandas as pd
+import numpy as np
+from typing import Dict, Any, List, Optional
+from pathlib import Path
+
+class AnalysisVisualizer:
+    """Create visualizations for analysis results."""
+    
+    def __init__(self, output_dir: str = "analysis/figures"):
+        """Initialize visualizer with output directory."""
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Set style
+        plt.style.use('seaborn-v0_8-darkgrid')
+        sns.set_palette("husl")
+        
+    def plot_pv_analysis_dashboard(self, 
+                                   pv_data: pd.DataFrame, 
+                                   analysis_results: Dict[str, Any],
+                                   save_path: Optional[str] = None) -> go.Figure:
+        """
+        Create interactive PV analysis dashboard.
+        
+        Required subplots:
+        1. Daily PV production profile with confidence bands
+        2. Seasonal patterns (box plots by month)
+        3. Weather correlation scatter plots
+        4. Performance ratio time series
+        5. Battery cycling patterns
+        6. Self-consumption analysis
+        """
+        # Implementation here...
+        
+    def plot_thermal_analysis(self,
+                             room_name: str,
+                             room_data: pd.DataFrame,
+                             thermal_params: Dict[str, Any],
+                             save_path: Optional[str] = None) -> plt.Figure:
+        """
+        Create thermal analysis visualization for a room.
+        
+        Required plots:
+        1. Temperature and heating state over time
+        2. Heat-up and cool-down curves with fitted models
+        3. Temperature distribution histogram
+        4. Thermal parameters summary table
+        """
+        # Implementation here...
+        
+    def plot_relay_patterns(self,
+                           relay_data: pd.DataFrame,
+                           analysis_results: Dict[str, Any],
+                           save_path: Optional[str] = None) -> go.Figure:
+        """
+        Create relay pattern visualization.
+        
+        Required visualizations:
+        1. Relay state timeline for each room
+        2. Duty cycle comparison bar chart
+        3. Energy consumption by room (stacked area)
+        4. Switching frequency heatmap
+        """
+        # Implementation here...
+        
+    def plot_base_load_analysis(self,
+                               base_load_data: pd.DataFrame,
+                               analysis_results: Dict[str, Any],
+                               save_path: Optional[str] = None) -> go.Figure:
+        """
+        Create base load analysis dashboard.
+        
+        Required plots:
+        1. Daily load profiles (weekday vs weekend)
+        2. Load duration curve
+        3. Clustering results visualization
+        4. Anomaly detection results
+        """
+        # Implementation here...
+        
+    def create_analysis_summary_report(self,
+                                     all_results: Dict[str, Any],
+                                     save_path: str = "analysis_summary.html") -> None:
+        """
+        Create comprehensive HTML report with all analysis results.
+        Include navigation, interactive plots, and key findings.
+        """
+        # Implementation here...
 ```
 
-### Development Dependencies
-```bash
-# Add to requirements-dev.txt
-jupyter==1.0.0               # For data analysis notebooks
-matplotlib==3.8.2            # For visualization during development
-seaborn==0.13.0             # For statistical plots
-plotly==5.18.0              # For interactive plots
+**Expected Output**:
+- Interactive Plotly dashboards saved as HTML
+- Static matplotlib figures saved as PNG
+- Combined HTML report with all visualizations
+
+---
+
+## 2. Complete Pattern Analysis Methods 📊
+
+### Task: Implement missing methods in `analysis/pattern_analysis.py`
+
+**Methods to implement**:
+
+```python
+def _analyze_temperature_efficiency(self, merged_data: pd.DataFrame) -> Dict[str, float]:
+    """
+    Analyze PV efficiency vs temperature relationship.
+    
+    Steps:
+    1. Filter for meaningful production periods (PV > 100W)
+    2. Bin temperature data into 5°C ranges
+    3. Calculate average efficiency for each bin
+    4. Fit polynomial model to efficiency curve
+    5. Find optimal temperature for maximum efficiency
+    
+    Returns:
+        {
+            'optimal_temp': 25.0,  # °C
+            'temp_coefficient': -0.004,  # efficiency loss per °C
+            'r_squared': 0.85,
+            'efficiency_curve': {...}  # temp -> efficiency mapping
+        }
+    """
+    # Implementation here...
+
+def _detect_production_anomalies(self, pv_data: pd.DataFrame) -> pd.DataFrame:
+    """
+    Detect anomalies in PV production (snow, shading, faults).
+    
+    Methods to use:
+    1. Compare actual vs clear-sky model
+    2. Use isolation forest for multivariate anomaly detection
+    3. Pattern matching for specific anomaly types:
+       - Snow: Sudden drop to near-zero during daylight
+       - Partial shading: Reduced production in specific hours
+       - Inverter issues: Clipping or unusual patterns
+    
+    Returns DataFrame with columns:
+    - timestamp
+    - anomaly_type
+    - severity (0-1)
+    - confidence (0-1)
+    """
+    # Implementation here...
+
+def _extract_seasonal_profiles(self, pv_data: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    Extract detailed seasonal production profiles.
+    
+    For each season:
+    1. Calculate hourly percentiles (10, 25, 50, 75, 90)
+    2. Identify typical clear-sky days
+    3. Calculate variability metrics
+    4. Create uncertainty bands
+    
+    Returns:
+        {
+            'winter': DataFrame with hourly statistics,
+            'spring': DataFrame with hourly statistics,
+            'summer': DataFrame with hourly statistics,
+            'autumn': DataFrame with hourly statistics
+        }
+    """
+    # Implementation here...
 ```
+
+---
+
+## 3. Complete Thermal Analysis Methods 🌡️
+
+### Task: Fix incomplete methods in `analysis/thermal_analysis.py`
+
+**Methods to complete**:
+
+```python
+def _estimate_rc_parameters(self,
+                           heatup_params: Dict,
+                           cooldown_params: Dict,
+                           room_df: pd.DataFrame,
+                           weather_df: pd.DataFrame) -> Dict[str, float]:
+    """
+    Estimate thermal resistance and capacitance.
+    
+    Use energy balance equation:
+    C * dT/dt = (T_out - T_in)/R + P_heating - P_losses
+    
+    Steps:
+    1. Use cooldown periods to estimate R (no heating)
+    2. Use heatup periods to estimate C (known heating power)
+    3. Validate with cross-validation on different periods
+    4. Account for solar gains and internal gains
+    
+    Returns:
+        {
+            'R': 0.005,  # Thermal resistance [K/W]
+            'C': 5e6,    # Thermal capacitance [J/K]
+            'tau': 25200,  # Time constant [seconds]
+            'UA': 200,   # Heat loss coefficient [W/K]
+            'confidence': 0.92  # Model fit confidence
+        }
+    """
+    # Implementation here...
+
+def _analyze_room_coupling(self, room_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """
+    Analyze heat transfer between adjacent rooms.
+    
+    Steps:
+    1. Calculate cross-correlation between room temperatures
+    2. Identify lead/lag relationships
+    3. Estimate inter-room heat transfer coefficients
+    4. Build room adjacency matrix
+    5. Validate with physical layout if available
+    
+    Returns:
+        {
+            'coupling_matrix': pd.DataFrame,  # Room-to-room heat transfer
+            'strongest_couples': [...],  # List of strongly coupled room pairs
+            'heat_flow_directions': {...},  # Dominant heat flow patterns
+            'validation_metrics': {...}
+        }
+    """
+    # Implementation here...
+```
+
+---
+
+## 4. Create Jupyter Notebooks 📓
+
+### Task: Implement analysis notebooks in `analysis/notebooks/`
+
+**Required Notebooks**:
+
+### 4.1 `01_data_exploration.ipynb`
+
+```python
+"""
+# Data Exploration Notebook
+
+## Objectives:
+1. Load and inspect all data sources
+2. Check data quality and completeness
+3. Identify missing data patterns
+4. Visualize data distributions
+5. Document data issues and cleaning needs
+
+## Sections:
+1. Data Loading
+2. Data Quality Assessment
+3. Missing Data Analysis
+4. Statistical Summaries
+5. Time Series Visualization
+6. Correlation Analysis
+7. Recommendations
+"""
+```
+
+### 4.2 `02_pv_production_analysis.ipynb`
+
+```python
+"""
+# PV Production Analysis
+
+## Objectives:
+1. Analyze daily and seasonal production patterns
+2. Correlate with weather conditions
+3. Calculate system efficiency metrics
+4. Identify anomalies and degradation
+5. Create production forecasting features
+
+## Key Visualizations:
+- Daily production curves by season
+- Clear sky vs actual production
+- Temperature efficiency analysis
+- Weather correlation heatmaps
+- Anomaly detection results
+"""
+```
+
+### 4.3 `03_heating_patterns.ipynb`
+
+```python
+"""
+# Heating Relay Pattern Analysis
+
+## Objectives:
+1. Analyze relay switching patterns
+2. Calculate room-specific duty cycles
+3. Identify heating schedules
+4. Optimize switching frequency
+5. Calculate energy consumption by zone
+
+## Key Analyses:
+- Duty cycle statistics by room
+- Switching frequency optimization
+- Peak demand analysis
+- Zone coordination opportunities
+- Cost optimization potential
+"""
+```
+
+**Each notebook should include**:
+- Markdown documentation
+- Interactive widgets for date selection
+- Exportable visualizations
+- Summary statistics tables
+- Actionable insights section
+
+---
+
+## 5. Fix Data Preprocessing Integration 🔧
+
+### Task: Integrate preprocessing into main pipeline
+
+**File**: `analysis/run_analysis.py`
+
+**Add to `_preprocess_all_data()` method**:
+
+```python
+def _preprocess_all_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
+    """Enhanced preprocessing with full integration."""
+    
+    processed = {}
+    
+    # Initialize components
+    validator = DataValidator()
+    outlier_detector = OutlierDetector()
+    gap_filler = GapFiller()
+    
+    # Process each dataset
+    for data_type, df in data.items():
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            # 1. Validate
+            validation_result = validator.validate_data(df, data_type)
+            self.logger.info(f"{data_type} validation: {validation_result}")
+            
+            # 2. Detect outliers
+            outliers = outlier_detector.detect_statistical_outliers(df)
+            df_clean = df[~outliers]
+            
+            # 3. Fill gaps
+            df_filled = gap_filler.fill_gaps(df_clean, method='adaptive')
+            
+            # 4. Type-specific processing
+            df_processed = self.preprocessor.process_dataset(df_filled, data_type)
+            
+            processed[data_type] = df_processed
+            
+    return processed
+```
+
+---
+
+## 6. Fix Code Issues 🐛
+
+### Task 6.1: Fix `main.py` imports and placeholders
+
+```python
+# Replace placeholder imports with actual implementations
+from modules.predictors.pv_predictor import PVPredictor
+from modules.predictors.load_predictor import LoadPredictor
+from modules.predictors.thermal_model import ThermalModel
+from modules.optimization.optimizer import EnergyOptimizer
+from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
+```
+
+### Task 6.2: Implement empty module files
+
+**Create base classes in each module directory**:
+
+`modules/predictors/pv_predictor.py`:
+```python
+"""PV production predictor using ML models."""
+class PVPredictor:
+    def __init__(self, config):
+        self.config = config
+    
+    def predict(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Predict PV production for given features."""
+        # TODO: Implement in Phase 2
+        raise NotImplementedError("PV prediction will be implemented in Phase 2")
+```
+
+### Task 6.3: Fix hardcoded values
+
+**In `pattern_analysis.py`**, replace:
+```python
+# OLD
+latitude=49.4949522  # Default to Prague coordinates
+
+# NEW - Get from settings
+latitude = self.settings.location.latitude if hasattr(self, 'settings') else 49.4949522
+```
+
+---
+
+## 7. Complete Documentation 📚
+
+### Task: Add comprehensive docstrings and create API documentation
+
+**Required Documentation**:
+
+1. **Method Docstrings** - Add to all incomplete methods:
+```python
+def method_name(self, param1: type, param2: type) -> return_type:
+    """
+    Brief description of what the method does.
+    
+    Args:
+        param1: Description of parameter 1
+        param2: Description of parameter 2
+        
+    Returns:
+        Description of return value
+        
+    Raises:
+        ExceptionType: When this exception occurs
+        
+    Example:
+        >>> analyzer = ThermalAnalyzer()
+        >>> result = analyzer.method_name(data, config)
+    """
+```
+
+2. **Data Schema Documentation** - Create `docs/data_schema.md`:
+```markdown
+# PEMS v2 Data Schema
+
+## InfluxDB Measurements
+
+### Relay Data
+- Measurement: `relay`
+- Tags: `room`, `tag1=heating`
+- Fields: `value` (0 or 1)
+- Frequency: 5-minute intervals
+
+### Temperature Data
+- Measurement: `temperature`
+- Tags: `room`
+- Fields: `value` (°C)
+- Frequency: 5-minute intervals
+
+[Continue for all data types...]
+```
+
+3. **Feature Dictionary** - Create `docs/feature_dictionary.md`:
+```markdown
+# Feature Dictionary
+
+## PV Features
+| Feature Name | Description | Unit | Range |
+|-------------|-------------|------|-------|
+| pv_power | Instantaneous PV power | W | 0-10000 |
+| sun_elevation | Solar elevation angle | degrees | 0-90 |
+[Continue for all features...]
+```
+
+---
+
+## 8. Testing Requirements 🧪
+
+### Task: Create integration tests
+
+**File**: `tests/test_analysis_pipeline.py`
+
+```python
+"""Integration tests for complete analysis pipeline."""
+
+import pytest
+import asyncio
+from datetime import datetime, timedelta
+from analysis.run_analysis import AnalysisPipeline
+
+@pytest.mark.asyncio
+async def test_full_pipeline():
+    """Test complete analysis pipeline with sample data."""
+    # Test implementation...
+    
+@pytest.mark.asyncio
+async def test_visualization_generation():
+    """Test that all visualizations are created correctly."""
+    # Test implementation...
+```
+
+---
+
+## Execution Order 🎯
+
+1. **Day 1-2**: Complete visualization module
+2. **Day 3-4**: Fix pattern and thermal analysis methods
+3. **Day 5-7**: Create all Jupyter notebooks
+4. **Day 8**: Fix preprocessing integration and code issues
+5. **Day 9**: Complete documentation
+6. **Day 10**: Testing and final integration
+
+## Success Criteria ✅
+
+- [ ] All visualization methods implemented and tested
+- [ ] Pattern analysis methods complete with proper algorithms
+- [ ] Thermal analysis provides accurate RC parameters
+- [ ] All 7 Jupyter notebooks created and documented
+- [ ] Preprocessing fully integrated into pipeline
+- [ ] No placeholder code or TODO comments remain
+- [ ] Documentation complete for all modules
+- [ ] Integration tests pass
+- [ ] Analysis pipeline runs end-to-end without errors
+- [ ] HTML report generated with all visualizations
+
+## Notes for Implementation 💡
+
+1. Use existing data in `data/raw/` for testing
+2. Refer to relay analysis implementation as a pattern
+3. Ensure all timestamps are timezone-aware
+4. Use logging extensively for debugging
+5. Create sample outputs in `analysis/results/`
+6. Test with both small (1 day) and large (2 year) datasets
+7. Optimize for performance on 2-year datasets
+8. Follow existing code style and patterns
+
 
 ## Phase 2: ML Model Development (Week 2)
 
