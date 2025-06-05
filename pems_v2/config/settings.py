@@ -12,10 +12,17 @@ class InfluxDBSettings(BaseSettings):
 
     url: str = Field(default="http://localhost:8086", env="INFLUXDB_URL")
     token: SecretStr = Field(..., env="INFLUXDB_TOKEN")
-    org: str = Field(default="smart_home", env="INFLUXDB_ORG")
-    bucket_historical: str = Field(default="smart_home", env="INFLUXDB_BUCKET_HISTORICAL")
-    bucket_predictions: str = Field(default="predictions", env="INFLUXDB_BUCKET_PREDICTIONS")
-    bucket_optimization: str = Field(default="optimization", env="INFLUXDB_BUCKET_OPTIMIZATION")
+    org: str = Field(default="loxone", env="INFLUXDB_ORG")
+    bucket_historical: str = Field(default="loxone", env="INFLUXDB_BUCKET_HISTORICAL")
+    bucket_loxone: str = Field(default="loxone", env="INFLUXDB_BUCKET_LOXONE")
+    bucket_weather: str = Field(default="weather_forecast", env="INFLUXDB_BUCKET_WEATHER")
+    bucket_solar: str = Field(default="loxone", env="INFLUXDB_BUCKET_SOLAR")
+    bucket_predictions: str = Field(
+        default="predictions", env="INFLUXDB_BUCKET_PREDICTIONS"
+    )
+    bucket_optimization: str = Field(
+        default="optimization", env="INFLUXDB_BUCKET_OPTIMIZATION"
+    )
 
     class Config:
         env_prefix = "INFLUXDB_"
@@ -40,7 +47,9 @@ class PVPredictionSettings(BaseSettings):
     model_path: str = Field(default="models/pv_predictor.pkl", env="PV_MODEL_PATH")
     update_interval: int = Field(default=3600, env="PV_UPDATE_INTERVAL")  # seconds
     horizon_hours: int = Field(default=48, env="PV_HORIZON_HOURS")
-    confidence_levels: List[float] = Field(default=[0.1, 0.5, 0.9], env="PV_CONFIDENCE_LEVELS")
+    confidence_levels: List[float] = Field(
+        default=[0.1, 0.5, 0.9], env="PV_CONFIDENCE_LEVELS"
+    )
 
     class Config:
         env_prefix = "PV_"
@@ -49,9 +58,15 @@ class PVPredictionSettings(BaseSettings):
 class ThermalSettings(BaseSettings):
     """Thermal model configuration."""
 
-    rooms: Dict[str, Dict[str, float]] = Field(default_factory=dict, env="THERMAL_ROOMS")
-    default_setpoint_day: float = Field(default=21.0, env="THERMAL_DEFAULT_SETPOINT_DAY")
-    default_setpoint_night: float = Field(default=19.0, env="THERMAL_DEFAULT_SETPOINT_NIGHT")
+    rooms: Dict[str, Dict[str, float]] = Field(
+        default_factory=dict, env="THERMAL_ROOMS"
+    )
+    default_setpoint_day: float = Field(
+        default=21.0, env="THERMAL_DEFAULT_SETPOINT_DAY"
+    )
+    default_setpoint_night: float = Field(
+        default=19.0, env="THERMAL_DEFAULT_SETPOINT_NIGHT"
+    )
     comfort_band: float = Field(default=0.5, env="THERMAL_COMFORT_BAND")  # ±°C
 
     class Config:
@@ -69,7 +84,9 @@ class OptimizationSettings(BaseSettings):
 
     # Objective weights
     cost_weight: float = Field(default=1.0, env="OPT_COST_WEIGHT")
-    self_consumption_weight: float = Field(default=0.3, env="OPT_SELF_CONSUMPTION_WEIGHT")
+    self_consumption_weight: float = Field(
+        default=0.3, env="OPT_SELF_CONSUMPTION_WEIGHT"
+    )
     peak_shaving_weight: float = Field(default=0.1, env="OPT_PEAK_SHAVING_WEIGHT")
     comfort_weight: float = Field(default=0.5, env="OPT_COMFORT_WEIGHT")
 
@@ -110,7 +127,9 @@ class PEMSSettings(BaseSettings):
     advisory_mode: bool = Field(default=False, env="PEMS_ADVISORY_MODE")
 
     # Update intervals
-    optimization_interval: int = Field(default=3600, env="PEMS_OPTIMIZATION_INTERVAL")  # seconds
+    optimization_interval: int = Field(
+        default=3600, env="PEMS_OPTIMIZATION_INTERVAL"
+    )  # seconds
     control_interval: int = Field(default=300, env="PEMS_CONTROL_INTERVAL")  # seconds
 
     # Sub-configurations
