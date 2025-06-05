@@ -3,17 +3,16 @@
 Test script to verify Phase 1 fixes are working correctly.
 """
 
-import logging
 import sys
 from pathlib import Path
-
-# Add the current directory to Python path
-sys.path.insert(0, str(Path(__file__).parent))
 
 from analysis.data_extraction import DataExtractor
 from analysis.feature_engineering import FeatureEngineer
 from config.energy_settings import ROOM_CONFIG, get_room_power, get_total_heating_power
 from config.settings import PEMSSettings
+
+# Add the current directory to Python path
+sys.path.insert(0, str(Path(__file__).parent))
 
 
 def test_room_configuration():
@@ -55,7 +54,7 @@ def test_data_extraction_imports():
         empty_data = {}
         validation_result = extractor.validate_data_completeness(empty_data)
 
-        assert validation_result["is_complete"] == False
+        assert validation_result["is_complete"] is False
         assert len(validation_result["missing_required"]) > 0
 
         print("✓ Data extraction validation working correctly")

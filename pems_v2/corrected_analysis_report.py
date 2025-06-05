@@ -11,11 +11,9 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-import pandas as pd
+from test_relay_analysis import RelayAnalyzer
 
 sys.path.append(str(Path(__file__).parent))
-
-from test_relay_analysis import RelayAnalyzer
 
 
 async def generate_corrected_report():
@@ -33,9 +31,9 @@ async def generate_corrected_report():
     end_date = datetime.now()
     start_date = end_date - timedelta(days=730)  # 2 years
 
-    logger.info(
-        f"Extracting 2-year relay data: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-    )
+    start_str = start_date.strftime("%Y-%m-%d")
+    end_str = end_date.strftime("%Y-%m-%d")
+    logger.info(f"Extracting 2-year relay data: {start_str} to {end_str}")
 
     relay_data = await analyzer.extract_relay_data(start_date, end_date)
 
@@ -48,7 +46,10 @@ async def generate_corrected_report():
             "CORRECTED PEMS V2 - 2 YEAR RELAY-BASED HEATING ANALYSIS",
             "=" * 80,
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Analysis Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+            (
+                f"Analysis Period: {start_date.strftime('%Y-%m-%d')} "
+                f"to {end_date.strftime('%Y-%m-%d')}"
+            ),
             "",
             "RELAY SYSTEM UNDERSTANDING",
             "-" * 30,
@@ -67,7 +68,10 @@ async def generate_corrected_report():
             [
                 f"• Total Heating Energy (2 years): {summary['total_energy_kwh']:.1f} kWh",
                 f"• Annual heating estimate: {summary['total_energy_kwh']/2:.1f} kWh/year",
-                f"• System utilization: {summary['system_utilization_percent']:.1f}% of theoretical maximum",
+                (
+                    f"• System utilization: {summary['system_utilization_percent']:.1f}% "
+                    "of theoretical maximum"
+                ),
                 f"• Total relay records analyzed: {len(relay_data):,}",
                 "",
                 "ROOM POWER RATINGS & PERFORMANCE",
@@ -86,7 +90,8 @@ async def generate_corrected_report():
             switches = stats["total_switches"]
 
             report_lines.append(
-                f"• {room:20s}: {rating:4.1f}kW rated, {energy:6.1f}kWh consumed, {duty:5.1f}% duty, {switches:4.0f} switches"
+                f"• {room:20s}: {rating:4.1f}kW rated, {energy:6.1f}kWh consumed, "
+                f"{duty:5.1f}% duty, {switches:4.0f} switches"
             )
 
         report_lines.extend(
@@ -94,9 +99,21 @@ async def generate_corrected_report():
                 "",
                 "KEY RELAY INSIGHTS",
                 "-" * 30,
-                f"• Most energy: {max(rooms.items(), key=lambda x: x[1]['total_energy_kwh'])[0]} ({max(x['total_energy_kwh'] for x in rooms.values()):.1f} kWh)",
-                f"• Highest duty cycle: {max(rooms.items(), key=lambda x: x[1]['duty_cycle_percent'])[0]} ({max(x['duty_cycle_percent'] for x in rooms.values()):.1f}%)",
-                f"• Most switching: {max(rooms.items(), key=lambda x: x[1]['total_switches'])[0]} ({max(x['total_switches'] for x in rooms.values()):.0f} switches)",
+                (
+                    f"• Most energy: "
+                    f"{max(rooms.items(), key=lambda x: x[1]['total_energy_kwh'])[0]} "
+                    f"({max(x['total_energy_kwh'] for x in rooms.values()):.1f} kWh)"
+                ),
+                (
+                    f"• Highest duty cycle: "
+                    f"{max(rooms.items(), key=lambda x: x[1]['duty_cycle_percent'])[0]} "
+                    f"({max(x['duty_cycle_percent'] for x in rooms.values()):.1f}%)"
+                ),
+                (
+                    f"• Most switching: "
+                    f"{max(rooms.items(), key=lambda x: x[1]['total_switches'])[0]} "
+                    f"({max(x['total_switches'] for x in rooms.values()):.0f} switches)"
+                ),
                 "",
                 "SYSTEM EFFICIENCY OBSERVATIONS",
                 "-" * 30,

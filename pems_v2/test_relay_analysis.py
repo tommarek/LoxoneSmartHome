@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
-import pytz
 from influxdb_client import InfluxDBClient
 
 # Add the current directory to the path
@@ -26,7 +25,10 @@ class RelayAnalyzer:
 
         # InfluxDB configuration
         self.url = "http://192.168.0.201:8086"
-        self.token = "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A=="
+        self.token = (
+            "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1"
+            "QezDh132utLbXi-IL8h9A=="
+        )
         self.org = "loxone"
         self.bucket = "loxone"
 
@@ -65,7 +67,8 @@ class RelayAnalyzer:
         query = f"""
         from(bucket: "{self.bucket}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r._measurement == "relay" and r.tag1 == "heating" and r.room != "kuchyne")
+          |> filter(fn: (r) => r._measurement == "relay" and r.tag1 == "heating" and
+                                     r.room != "kuchyne")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
           |> keep(columns: ["_time", "_value", "room"])
         """
@@ -200,29 +203,35 @@ class RelayAnalyzer:
 
         # Summary
         summary = analysis_results["summary"]
-        print(f"\nSYSTEM SUMMARY:")
+        print("\nSYSTEM SUMMARY:")
         print(f"Total Energy Consumed: {summary['total_energy_kwh']:.1f} kWh")
         print(f"Analysis Period: {summary['analysis_period_hours']:.0f} hours")
         print(f"Total System Capacity: {summary['total_system_capacity_kw']:.1f} kW")
         print(f"System Utilization: {summary['system_utilization_percent']:.1f}%")
 
         # Room-by-room analysis
-        print(f"\nROOM-BY-ROOM RELAY ANALYSIS:")
+        print("\nROOM-BY-ROOM RELAY ANALYSIS:")
         print("-" * 80)
-        print(
-            f"{'Room':<20} {'Duty%':<8} {'Switches':<10} {'Energy(kWh)':<12} {'Rating(kW)':<12} {'Efficiency':<10}"
+        header = (
+            f"{'Room':<20} {'Duty%':<8} {'Switches':<10} "
+            f"{'Energy(kWh)':<12} {'Rating(kW)':<12} {'Efficiency':<10}"
         )
+        print(header)
         print("-" * 80)
 
         for room, stats in analysis_results["rooms"].items():
+            duty = stats["duty_cycle_percent"]
+            switches = stats["total_switches"]
+            energy = stats["total_energy_kwh"]
+            rating = stats["power_rating_kw"]
+            efficiency = stats["energy_efficiency_ratio"]
             print(
-                f"{room:<20} {stats['duty_cycle_percent']:<8.1f} {stats['total_switches']:<10.0f} "
-                f"{stats['total_energy_kwh']:<12.1f} {stats['power_rating_kw']:<12.1f} "
-                f"{stats['energy_efficiency_ratio']:<10.3f}"
+                f"{room:<20} {duty:<8.1f} {switches:<10.0f} "
+                f"{energy:<12.1f} {rating:<12.1f} {efficiency:<10.3f}"
             )
 
         # Insights
-        print(f"\nRELAY SYSTEM INSIGHTS:")
+        print("\nRELAY SYSTEM INSIGHTS:")
         print("-" * 40)
 
         rooms = analysis_results["rooms"]
@@ -231,25 +240,28 @@ class RelayAnalyzer:
         top_consumers = sorted(rooms.items(), key=lambda x: x[1]["total_energy_kwh"], reverse=True)[
             :3
         ]
-        print(f"Top Energy Consumers:")
+        print("Top Energy Consumers:")
         for room, stats in top_consumers:
-            print(
-                f"  {room}: {stats['total_energy_kwh']:.1f} kWh ({stats['duty_cycle_percent']:.1f}% duty cycle)"
-            )
+            energy = stats["total_energy_kwh"]
+            duty = stats["duty_cycle_percent"]
+            print(f"  {room}: {energy:.1f} kWh ({duty:.1f}% duty cycle)")
 
         # Most active relays (highest switching)
         active_relays = sorted(rooms.items(), key=lambda x: x[1]["total_switches"], reverse=True)[
             :3
         ]
-        print(f"\nMost Active Relays:")
+        print("\nMost Active Relays:")
         for room, stats in active_relays:
+            avg_on = stats["avg_on_minutes"]
+            avg_off = stats["avg_off_minutes"]
             print(
-                f"  {room}: {stats['total_switches']:.0f} switches (avg {stats['avg_on_minutes']:.1f}min on, {stats['avg_off_minutes']:.1f}min off)"
+                f"  {room}: {stats['total_switches']:.0f} switches "
+                f"(avg {avg_on:.1f}min on, {avg_off:.1f}min off)"
             )
 
         # Efficiency analysis
         high_efficiency = {k: v for k, v in rooms.items() if v["energy_efficiency_ratio"] > 0.1}
-        print(f"\nHigh Demand Rooms (>10% of capacity utilized):")
+        print("\nHigh Demand Rooms (>10% of capacity utilized):")
         for room, stats in high_efficiency.items():
             print(f"  {room}: {stats['energy_efficiency_ratio']*100:.1f}% utilization")
 
@@ -279,9 +291,9 @@ async def test_relay_analysis():
         end_date = datetime.now()
         start_date = end_date - timedelta(days=30)
 
-        logger.info(
-            f"Analyzing relay data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-        )
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        logger.info(f"Analyzing relay data from {start_str} to {end_str}")
 
         # Extract relay data
         relay_data = await analyzer.extract_relay_data(start_date, end_date)
@@ -296,13 +308,13 @@ async def test_relay_analysis():
             return False
 
         # Show sample relay data
-        print(f"\n📊 RELAY DATA SAMPLE:")
+        print("\n📊 RELAY DATA SAMPLE:")
         print(f"Total records: {len(relay_data)}")
         print(f"Rooms with relays: {len(relay_data['room'].unique())}")
         print(f"Date range: {relay_data.index.min()} to {relay_data.index.max()}")
 
         # Show relay state distribution
-        print(f"\nRelay State Distribution:")
+        print("\nRelay State Distribution:")
         for room in sorted(relay_data["room"].unique()):
             room_data = relay_data[relay_data["room"] == room]
             on_pct = room_data["relay_state"].mean() * 100

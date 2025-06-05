@@ -8,21 +8,18 @@ Extracts historical data from InfluxDB for analysis:
 - Handle missing data interpolation
 """
 
-import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import pytz
 from influxdb_client import InfluxDBClient
-from influxdb_client.client.flux_table import FluxTable
 
 from config.energy_settings import (
     CONSUMPTION_CATEGORIES,
     DATA_QUALITY_THRESHOLDS,
-    ROOM_CONFIG,
     get_room_power,
 )
 from config.settings import PEMSSettings as Settings
@@ -78,9 +75,9 @@ class DataExtractor:
         from(bucket: "solar")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "solar")
-          |> filter(fn: (r) => r["_field"] == "InputPower" or 
-                              r["_field"] == "INVPowerToLocalLoad" or 
-                              r["_field"] == "ACPowerToUser" or 
+          |> filter(fn: (r) => r["_field"] == "InputPower" or
+                              r["_field"] == "INVPowerToLocalLoad" or
+                              r["_field"] == "ACPowerToUser" or
                               r["_field"] == "ACPowerToGrid" or
                               r["_field"] == "ChargePower" or
                               r["_field"] == "SOC")
@@ -163,8 +160,10 @@ class DataExtractor:
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_historical}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "temperature" or r["_measurement"] == "heating")
-          |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "temperature" or r["_field"] == "setpoint" or r["_field"] == "state")
+          |> filter(fn: (r) => r["_measurement"] == "temperature" or
+                      r["_measurement"] == "heating")
+          |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "temperature" or
+                      r["_field"] == "setpoint" or r["_field"] == "state")
           |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
         """
 
@@ -245,7 +244,7 @@ class DataExtractor:
         from(bucket: "{self.settings.influxdb.bucket_historical}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "current_weather")
-          |> filter(fn: (r) => r["_field"] == "sun_elevation" or 
+          |> filter(fn: (r) => r["_field"] == "sun_elevation" or
                               r["_field"] == "temperature" or
                               r["_field"] == "humidity" or
                               r["_field"] == "wind_speed" or
@@ -322,7 +321,8 @@ class DataExtractor:
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_historical}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "energy_prices" or r["_measurement"] == "electricity_prices")
+          |> filter(fn: (r) => r["_measurement"] == "energy_prices" or
+                      r["_measurement"] == "electricity_prices")
           |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
         """
 
@@ -381,7 +381,7 @@ class DataExtractor:
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_historical}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "relay" or 
+          |> filter(fn: (r) => r["_measurement"] == "relay" or
                               r["_measurement"] == "power" or
                               r["_measurement"] == "energy")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
@@ -466,7 +466,8 @@ class DataExtractor:
             df_consumption = pd.DataFrame()
 
         self.logger.info(
-            f"Extracted {len(df_consumption)} energy consumption points with categories: {list(consumption_data.keys())}"
+            f"Extracted {len(df_consumption)} energy consumption points "
+            f"with categories: {list(consumption_data.keys())}"
         )
         return df_consumption
 
@@ -489,8 +490,8 @@ class DataExtractor:
         from(bucket: "solar")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "solar")
-          |> filter(fn: (r) => r["_field"] == "ChargePower" or 
-                              r["_field"] == "DischargePower" or 
+          |> filter(fn: (r) => r["_field"] == "ChargePower" or
+                              r["_field"] == "DischargePower" or
                               r["_field"] == "SOC" or
                               r["_field"] == "BatteryVoltage" or
                               r["_field"] == "BatteryCurrent")
@@ -568,11 +569,11 @@ class DataExtractor:
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_historical}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "ev_charger" or 
+          |> filter(fn: (r) => r["_measurement"] == "ev_charger" or
                               r["_measurement"] == "wallbox" or
                               r["_measurement"] == "car_charging")
-          |> filter(fn: (r) => r["_field"] == "power" or 
-                              r["_field"] == "energy" or 
+          |> filter(fn: (r) => r["_field"] == "power" or
+                              r["_field"] == "energy" or
                               r["_field"] == "connected" or
                               r["_field"] == "charging_state")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
@@ -744,7 +745,8 @@ class DataExtractor:
                 missing_pct = quality_report["missing_percentage"]
                 if missing_pct > DATA_QUALITY_THRESHOLDS["max_missing_percentage"]:
                     validation_results["recommendations"].append(
-                        f"{source}: High missing data ({missing_pct:.1f}%) - consider data interpolation"
+                        f"{source}: High missing data ({missing_pct:.1f}%) - "
+                        "consider data interpolation"
                     )
 
                 # Check for large time gaps
@@ -754,7 +756,8 @@ class DataExtractor:
                     )
                     if max_gap > DATA_QUALITY_THRESHOLDS["max_gap_hours"]:
                         validation_results["recommendations"].append(
-                            f"{source}: Large time gaps found (max {max_gap:.1f}h) - check data collection"
+                            f"{source}: Large time gaps found (max {max_gap:.1f}h) - "
+                            "check data collection"
                         )
 
         # Add feature-specific recommendations

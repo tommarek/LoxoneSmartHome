@@ -8,11 +8,11 @@ Analyzes thermal dynamics per room:
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
-from scipy import optimize, signal
+from scipy import optimize
 from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -313,7 +313,7 @@ class ThermalAnalyzer:
                 tau = self._fit_exponential_response(time_minutes, temp_evolution)
                 if tau > 0 and tau < 10 * 60:  # Between 0 and 10 hours (in minutes)
                     time_constants.append(tau)
-            except:
+            except Exception:
                 continue
 
         if time_constants:
@@ -350,7 +350,7 @@ class ThermalAnalyzer:
                 bounds=([T_initial - 5, T_initial - 5, 10], [T_initial + 5, T_initial + 5, 600]),
             )
             return popt[2]  # Return tau
-        except:
+        except Exception:
             raise ValueError("Exponential fitting failed")
 
     def _calculate_heat_loss_coefficient(self, data: pd.DataFrame) -> Dict[str, Any]:

@@ -6,7 +6,6 @@ Tests core functionality without requiring external dependencies.
 
 import logging
 import sys
-from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add the project root to Python path
@@ -20,6 +19,7 @@ def test_imports():
     try:
         from analysis.pattern_analysis import PVAnalyzer
 
+        assert PVAnalyzer is not None  # Use the import
         print("✅ PVAnalyzer imported successfully")
     except Exception as e:
         print(f"❌ PVAnalyzer import failed: {e}")
@@ -28,6 +28,7 @@ def test_imports():
     try:
         from analysis.thermal_analysis import ThermalAnalyzer
 
+        assert ThermalAnalyzer is not None  # Use the import
         print("✅ ThermalAnalyzer imported successfully")
     except Exception as e:
         print(f"❌ ThermalAnalyzer import failed: {e}")
@@ -36,6 +37,7 @@ def test_imports():
     try:
         from analysis.base_load_analysis import BaseLoadAnalyzer
 
+        assert BaseLoadAnalyzer is not None  # Use the import
         print("✅ BaseLoadAnalyzer imported successfully")
     except Exception as e:
         print(f"❌ BaseLoadAnalyzer import failed: {e}")
@@ -44,6 +46,7 @@ def test_imports():
     try:
         from analysis.data_preprocessing import DataValidator
 
+        assert DataValidator is not None  # Use the import
         print("✅ DataValidator imported successfully")
     except Exception as e:
         print(f"❌ DataValidator import failed: {e}")
@@ -52,6 +55,7 @@ def test_imports():
     try:
         from analysis.data_extraction import DataExtractor
 
+        assert DataExtractor is not None  # Use the import
         print("✅ DataExtractor imported successfully")
     except Exception as e:
         print(f"❌ DataExtractor import failed: {e}")
@@ -69,6 +73,7 @@ def test_dependencies():
     try:
         import pandas as pd
 
+        assert pd is not None  # Use the import
         print("✅ pandas available")
     except ImportError:
         print("❌ pandas not available")
@@ -77,6 +82,7 @@ def test_dependencies():
     try:
         import numpy as np
 
+        assert np is not None  # Use the import
         print("✅ numpy available")
     except ImportError:
         print("❌ numpy not available")
@@ -85,6 +91,7 @@ def test_dependencies():
     try:
         import scipy
 
+        assert scipy is not None  # Use the import
         print("✅ scipy available")
     except ImportError:
         print("❌ scipy not available")
@@ -93,6 +100,7 @@ def test_dependencies():
     try:
         import sklearn
 
+        assert sklearn is not None  # Use the import
         print("✅ scikit-learn available")
     except ImportError:
         print("❌ scikit-learn not available")
@@ -133,6 +141,7 @@ def test_config_loading():
     try:
         from config.settings import InfluxDBSettings, PEMSSettings
 
+        assert PEMSSettings is not None  # Use the import
         print("✅ Settings class imported successfully")
 
         # Test InfluxDB settings directly with dummy token (no env loading)

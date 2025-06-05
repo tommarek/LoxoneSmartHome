@@ -58,10 +58,19 @@ pems_v2/
 
 ## Development
 
-For development setup:
+**Always use the virtual environment and Makefile for all development:**
+
 ```bash
-pip install -r requirements-dev.txt
+# Set up development environment (first time only)
+make setup
+
+# Activate virtual environment (required for all development)
+source venv/bin/activate
+
+# Run tests
 make test
+
+# Code quality (runs black, isort, flake8)
 make lint
 ```
 

@@ -6,7 +6,7 @@ Tests actual data processing and feature engineering with sample data.
 
 import logging
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -406,7 +406,7 @@ def test_data_integration():
                 missing_pct = df.isnull().sum().sum() / df.size * 100
                 missing_data[data_type] = missing_pct
 
-        print(f"   ✓ Missing data percentages:")
+        print("   ✓ Missing data percentages:")
         for data_type, missing_pct in missing_data.items():
             print(f"     - {data_type}: {missing_pct:.1f}%")
 
@@ -419,13 +419,15 @@ def test_data_integration():
         assert weather_data["temperature"].min() > -50, "Temperature should be reasonable"
         assert weather_data["sun_elevation"].min() >= 0, "Sun elevation should be non-negative"
 
-        print(f"   ✓ Value ranges validated:")
+        print("   ✓ Value ranges validated:")
         print(
-            f"     - PV power: {pv_data['InputPower'].min():.0f} - {pv_data['InputPower'].max():.0f} W"
+            f"     - PV power: {pv_data['InputPower'].min():.0f} - "
+            f"{pv_data['InputPower'].max():.0f} W"
         )
         print(f"     - SOC: {pv_data['SOC'].min():.1f} - {pv_data['SOC'].max():.1f} %")
         print(
-            f"     - Temperature: {weather_data['temperature'].min():.1f} - {weather_data['temperature'].max():.1f} °C"
+            f"     - Temperature: {weather_data['temperature'].min():.1f} - "
+            f"{weather_data['temperature'].max():.1f} °C"
         )
 
         return True

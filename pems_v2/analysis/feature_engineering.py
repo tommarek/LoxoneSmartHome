@@ -10,8 +10,7 @@ Creates features for ML models from analyzed data:
 
 import logging
 import math
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd

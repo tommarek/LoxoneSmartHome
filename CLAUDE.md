@@ -24,9 +24,8 @@ make test-relay      # Relay analysis tests
 make test            # Full test suite with coverage
 
 # Code quality (ALWAYS run before commits)
-make lint-fix        # Auto-fix formatting and imports
-make lint           # Check for remaining issues
-make type-check     # Run mypy type checking
+make lint           # Format code and run all linting (black, isort, flake8)
+make lint-check     # Check code quality without making changes (for CI)
 
 # Clean up
 make clean          # Remove build artifacts
@@ -36,7 +35,7 @@ make clean-analysis # Remove analysis outputs
 **Development Rules:**
 - **NEVER** install packages globally - always use the virtual environment
 - **ALWAYS** use Makefile targets instead of direct tool calls
-- **ALWAYS** run `make lint-fix` before commits to maintain code quality
+- **ALWAYS** run `make lint` before commits to maintain code quality
 - **ALWAYS** ensure all tests pass before committing changes
 
 ## Architecture

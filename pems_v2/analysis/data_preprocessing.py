@@ -6,7 +6,7 @@ for preparing data for analysis and ML model training.
 """
 
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
@@ -88,7 +88,8 @@ class DataValidator:
 
                 if min_temp < -20 or max_temp > 50:
                     validation_results["warnings"].append(
-                        f"Temperature range for {room_name}.{col} seems unusual: {min_temp:.1f}°C to {max_temp:.1f}°C"
+                        f"Temperature range for {room_name}.{col} seems unusual: "
+                        f"{min_temp:.1f}°C to {max_temp:.1f}°C"
                     )
 
                 # Check for constant temperatures (sensor issues)

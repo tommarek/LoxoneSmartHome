@@ -18,14 +18,14 @@ from typing import Any, Dict
 
 import pandas as pd
 
-# Add the parent directory to the path so we can import from other modules
-sys.path.append(str(Path(__file__).parent.parent))
-
 from analysis.base_load_analysis import BaseLoadAnalyzer
 from analysis.data_extraction import DataExtractor
 from analysis.pattern_analysis import PVAnalyzer
 from analysis.thermal_analysis import ThermalAnalyzer
 from config.settings import PEMSSettings as Settings
+
+# Add the parent directory to the path so we can import from other modules
+sys.path.append(str(Path(__file__).parent.parent))
 
 
 class DataPreprocessor:
@@ -179,7 +179,10 @@ class DataPreprocessor:
             "original_missing_percentage": round(original_missing_pct, 2),
             "clean_missing_percentage": round(clean_missing_pct, 2),
             "time_gaps": time_gaps[:10],  # First 10 gaps
-            "cleaning_summary": f"Cleaned {len(original_df)} -> {len(clean_df)} records, missing data: {original_missing_pct:.1f}% -> {clean_missing_pct:.1f}%",
+            "cleaning_summary": (
+                f"Cleaned {len(original_df)} -> {len(clean_df)} records, "
+                f"missing data: {original_missing_pct:.1f}% -> {clean_missing_pct:.1f}%"
+            ),
         }
 
 
@@ -217,7 +220,10 @@ class AnalysisVisualizer:
                         f"• Total Energy Generated: {stats.get('total_energy_kwh', 0):.1f} kWh",
                         f"• Maximum Power: {stats.get('max_power', 0):.1f} W",
                         f"• Capacity Factor: {stats.get('capacity_factor', 0)*100:.1f}%",
-                        f"• Peak Production Months: {', '.join(map(str, stats.get('peak_months', [])))}",
+                        (
+                            f"• Peak Production Months: "
+                            f"{', '.join(map(str, stats.get('peak_months', [])))}"
+                        ),
                     ]
                 )
 
@@ -227,8 +233,9 @@ class AnalysisVisualizer:
             ):
                 strongest = pv_results["weather_correlations"]["strongest_positive"]
                 if strongest:
+                    correlation_val = strongest[1]["correlation"]
                     report_lines.append(
-                        f"• Strongest Weather Correlation: {strongest[0]} ({strongest[1]['correlation']:.3f})"
+                        f"• Strongest Weather Correlation: {strongest[0]} ({correlation_val:.3f})"
                     )
 
             report_lines.append("")
@@ -285,7 +292,10 @@ class AnalysisVisualizer:
                     [
                         f"• Mean Base Load: {stats.get('mean_base_load', 0):.1f} W",
                         f"• Total Base Load Energy: {stats.get('total_energy_kwh', 0):.1f} kWh",
-                        f"• Base Load Percentage: {stats.get('base_load_percentage', 0):.1f}% of total consumption",
+                        (
+                            f"• Base Load Percentage: {stats.get('base_load_percentage', 0):.1f}% "
+                            "of total consumption"
+                        ),
                         f"• Peak Hour: {stats.get('peak_hour', 'N/A')}:00",
                         f"• Load Factor: {stats.get('base_load_factor', 0):.3f}",
                     ]
@@ -296,9 +306,8 @@ class AnalysisVisualizer:
                 and "weekday_vs_weekend" in base_load_results["time_patterns"]
             ):
                 pattern = base_load_results["time_patterns"]["weekday_vs_weekend"]
-                report_lines.append(
-                    f"• Weekend vs Weekday: {pattern.get('weekend_increase', 0):.1f}% higher on weekends"
-                )
+                weekend_inc = pattern.get("weekend_increase", 0)
+                report_lines.append(f"• Weekend vs Weekday: {weekend_inc:.1f}% higher on weekends")
 
             report_lines.append("")
 
@@ -526,12 +535,12 @@ class AnalysisPipeline:
                     f"  Records: {report['total_records']} -> {report['clean_records']}"
                 )
                 if report["date_range"][0] and report["date_range"][1]:
-                    self.logger.info(
-                        f"  Date range: {report['date_range'][0].strftime('%Y-%m-%d')} to {report['date_range'][1].strftime('%Y-%m-%d')}"
-                    )
-                self.logger.info(
-                    f"  Missing data: {report['original_missing_percentage']}% -> {report['clean_missing_percentage']}%"
-                )
+                    start_date = report["date_range"][0].strftime("%Y-%m-%d")
+                    end_date = report["date_range"][1].strftime("%Y-%m-%d")
+                    self.logger.info(f"  Date range: {start_date} to {end_date}")
+                orig_missing = report["original_missing_percentage"]
+                clean_missing = report["clean_missing_percentage"]
+                self.logger.info(f"  Missing data: {orig_missing}% -> {clean_missing}%")
                 self.logger.info(f"  Time gaps: {len(report['time_gaps'])}")
                 self.logger.info("")
 

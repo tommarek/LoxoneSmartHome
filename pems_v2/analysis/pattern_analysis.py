@@ -9,13 +9,11 @@ Analyzes PV production patterns:
 """
 
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict
 
 import numpy as np
 import pandas as pd
 from scipy import stats
-from sklearn.decomposition import PCA
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
@@ -318,9 +316,10 @@ class PVAnalyzer:
             return {"warning": "No clear sky conditions found in data"}
 
         # Calculate clear sky index (actual vs expected for clear conditions)
-        clear_sky_max = clear_sky_data.groupby(
-            [clear_sky_data.index.month, clear_sky_data.index.hour]
-        )["pv_power"].quantile(0.95)
+        # clear_sky_max is calculated but not used in current implementation
+        # clear_sky_max = clear_sky_data.groupby(
+        #     [clear_sky_data.index.month, clear_sky_data.index.hour]
+        # )["pv_power"].quantile(0.95)
 
         analysis = {
             "clear_sky_records": len(clear_sky_data),
@@ -341,7 +340,10 @@ class PVAnalyzer:
         """Analyze PV efficiency patterns."""
         if "temperature" not in data.columns or "solar_elevation" not in data.columns:
             return {
-                "warning": "Insufficient data for efficiency analysis (need temperature and solar elevation)"
+                "warning": (
+                    "Insufficient data for efficiency analysis "
+                    "(need temperature and solar elevation)"
+                )
             }
 
         # Filter for meaningful solar conditions

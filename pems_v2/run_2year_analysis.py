@@ -9,14 +9,12 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Add the current directory to the path
-sys.path.append(str(Path(__file__).parent))
-
 from test_fixed_analysis import LoxoneDataExtractor
 
-from analysis.base_load_analysis import BaseLoadAnalyzer
-from analysis.pattern_analysis import PVAnalyzer
+# Add the current directory to the path
 from analysis.thermal_analysis import ThermalAnalyzer
+
+sys.path.append(str(Path(__file__).parent))
 
 
 async def run_2year_analysis():
@@ -191,7 +189,10 @@ async def run_2year_analysis():
             "PEMS V2 - 2 YEAR HISTORICAL DATA ANALYSIS REPORT",
             "=" * 80,
             f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"Analysis Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}",
+            (
+                f"Analysis Period: {start_date.strftime('%Y-%m-%d')} "
+                f"to {end_date.strftime('%Y-%m-%d')}"
+            ),
             f"Total Days Analyzed: {(end_date - start_date).days}",
             "",
             "DATA EXTRACTION SUMMARY",

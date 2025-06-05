@@ -9,12 +9,10 @@ Analyzes non-controllable load patterns:
 """
 
 import logging
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
-from scipy import stats
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from sklearn.ensemble import IsolationForest, RandomForestRegressor
@@ -22,7 +20,6 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.arima.model import ARIMA
 from statsmodels.tsa.seasonal import STL
 
 
@@ -436,7 +433,10 @@ class BaseLoadAnalyzer:
 
         if len(daily_profiles) < 30:  # Need at least 30 days
             return {
-                "warning": "Insufficient data for load profile analysis (need at least 30 complete days)"
+                "warning": (
+                    "Insufficient data for load profile analysis "
+                    "(need at least 30 complete days)"
+                )
             }
 
         profiles_array = np.array(daily_profiles)
@@ -474,7 +474,8 @@ class BaseLoadAnalyzer:
 
         # PCA for dimensionality reduction and visualization
         pca = PCA(n_components=2)
-        profiles_pca = pca.fit_transform(profiles_normalized)
+        # profiles_pca = pca.fit_transform(profiles_normalized)
+        pca.fit(profiles_normalized)
 
         return {
             "clustering": {

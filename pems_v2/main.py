@@ -11,7 +11,7 @@ import logging
 import signal
 import sys
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List
 
 from config.settings import PEMSSettings
 from utils.logging import setup_logging

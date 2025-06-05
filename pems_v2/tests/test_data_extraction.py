@@ -9,11 +9,11 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-# Add the project root to Python path
-sys.path.append(str(Path(__file__).parent.parent))
-
 from analysis.data_extraction import DataExtractor
 from config.settings import PEMSSettings
+
+# Add the project root to Python path
+sys.path.append(str(Path(__file__).parent.parent))
 
 
 async def test_data_extraction():
@@ -32,7 +32,10 @@ async def test_data_extraction():
         settings = PEMSSettings(
             influxdb={
                 "url": "http://192.168.0.201:8086",
-                "token": "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1QezDh132utLbXi-IL8h9A==",
+                "token": (
+                    "7HrEuj8kzOS1f-0mjU_GT4hS_9gHfdjUT6j5QAM22oDg0z44DsxmiveTGMqTa0Zl1"
+                    "QezDh132utLbXi-IL8h9A=="
+                ),
                 "org": "loxone",
                 "bucket_historical": "loxone",
             }

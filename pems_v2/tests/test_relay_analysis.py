@@ -4,6 +4,7 @@ Test relay-based heating analysis - the core functionality for your Loxone syste
 """
 
 import asyncio
+import importlib.util
 import logging
 import sys
 from datetime import datetime, timedelta
@@ -12,11 +13,7 @@ from pathlib import Path
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-# Import the main relay analyzer from root directory
-sys.path.append(str(Path(__file__).parent.parent))
-
 # Import the RelayAnalyzer class from the main relay analysis script
-import importlib.util
 
 spec = importlib.util.spec_from_file_location(
     "relay_analyzer", Path(__file__).parent.parent / "test_relay_analysis.py"
@@ -44,9 +41,9 @@ async def test_relay_analysis():
         end_date = datetime.now()
         start_date = end_date - timedelta(days=30)
 
-        logger.info(
-            f"Analyzing relay data from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-        )
+        start_str = start_date.strftime("%Y-%m-%d")
+        end_str = end_date.strftime("%Y-%m-%d")
+        logger.info(f"Analyzing relay data from {start_str} to {end_str}")
 
         # Extract relay data
         logger.info("Extracting relay data...")
@@ -85,7 +82,8 @@ async def test_relay_analysis():
             power = room_stats["power_rating_kw"]
 
             print(
-                f"{room_name:20s}: {energy:6.1f} kWh, {duty:5.1f}% duty, {power:4.1f}kW, {switches:4.0f} switches"
+                f"{room_name:20s}: {energy:6.1f} kWh, {duty:5.1f}% duty, "
+                f"{power:4.1f}kW, {switches:4.0f} switches"
             )
 
         # Save results
