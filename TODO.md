@@ -10,7 +10,6 @@ Phase 1 has been successfully completed! All data analysis components and featur
 - ✅ **Pattern Analysis**: PV export policy detection, relay patterns, thermal analysis
 - ✅ **Feature Engineering**: 100+ features including relay and price features
 - ✅ **Visualization**: Comprehensive dashboards and analysis plots
-- ✅ **Jupyter Notebooks**: Analysis workflows for PV, weather, and features
 - ✅ **Data Validation**: Quality checks and completeness validation
 
 ### Key Files Updated:
@@ -20,11 +19,6 @@ Phase 1 has been successfully completed! All data analysis components and featur
 - `analysis/feature_engineering.py`: Added relay and price feature methods
 - `analysis/visualization.py`: Added 4 new visualization methods
 - `analysis/run_analysis.py`: Integrated validation and relay analysis
-
-### Analysis Notebooks Created:
-- `02_pv_production_analysis.ipynb`: PV system analysis with export impact
-- `06_weather_correlation.ipynb`: Weather-energy correlation analysis
-- `07_feature_selection.ipynb`: Advanced feature engineering for ML
 
 ---
 
@@ -569,6 +563,11 @@ async def test_visualization_generation():
 
 
 ## Phase 2: ML Model Development (Week 2)
+
+### 2.0 Fixes from Phase 1
+- The EV charging has nod ata in the database -- it's just a load that is connected there. No specific timestamps sayin when we were chaging historically (in `data_exctraction.py`)
+- `extract_battery_data()` and `extract_energy_consumption()` seems to be duplicated with `exctract_pv_data()` I'm not satyin it's wrong but probably redundant (in `data_exctraction.py`)
+- Create the notebooks in analysis folder for each operation we're doing as those from phase 1.4 were removed. Think hard about which notebooks to create and how to name them. Take inspiration in phase 1.4. Make sure they work properly
 
 ### 2.1 Create Model Infrastructure
 
