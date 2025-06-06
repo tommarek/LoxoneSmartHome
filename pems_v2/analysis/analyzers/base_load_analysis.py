@@ -237,8 +237,13 @@ class BaseLoadAnalyzer:
                     target_index, method="nearest"
                 )
 
-                # Assume 1kW per room when heating is on (adjust based on your system)
-                heating_power = heating_aligned.fillna(0) * 1000  # 1kW per room
+                # Use actual room power rating from configuration
+                from config.energy_settings import get_room_power
+
+                room_power_kw = get_room_power(room_name)
+                heating_power = (
+                    heating_aligned.fillna(0) * room_power_kw * 1000
+                )  # Convert kW to W
 
                 if total_heating is None:
                     total_heating = heating_power

@@ -25,8 +25,8 @@ from pathlib import Path
 # Add the current directory to the path
 sys.path.append(str(Path(__file__).parent))
 
+from analysis.core.visualization import AnalysisVisualizer
 from analysis.run_analysis import AnalysisPipeline
-from analysis.visualization import AnalysisVisualizer
 from config.settings import PEMSSettings
 
 

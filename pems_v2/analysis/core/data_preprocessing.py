@@ -10,6 +10,10 @@ from typing import Any, Dict, List
 
 import numpy as np
 import pandas as pd
+# Import Loxone adapter for field standardization
+from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
+                                           LoxoneFieldAdapter)
+from config.energy_settings import ROOM_CONFIG
 from scipy import stats
 
 
@@ -368,18 +372,16 @@ class RelayDataProcessor:
         """Initialize the relay data processor."""
         self.logger = logging.getLogger(f"{__name__}.RelayDataProcessor")
 
-        # Room power ratings (kW) - update these based on your actual system
+        # Import room power ratings from configuration
+        from config.energy_settings import ROOM_CONFIG
+
         self.room_power_ratings = {
-            "living_room": 4.8,
-            "kitchen": 3.2,
-            "bedroom_1": 2.4,
-            "bedroom_2": 2.0,
-            "bathroom": 1.5,
-            "office": 2.2,
-            "guest_room": 1.8,
-            "hallway": 0.8,
-            # Add all 16 rooms with their actual power ratings
+            room_name: config["power_kw"]
+            for room_name, config in ROOM_CONFIG["rooms"].items()
         }
+        self.logger.info(
+            f"Loaded power ratings for {len(self.room_power_ratings)} rooms from energy_settings.py"
+        )
 
     def process_relay_data(self, relay_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
         """
@@ -1000,3 +1002,402 @@ class PVDataProcessor:
         }
 
         return analysis
+
+
+class DataPreprocessor:
+    """Main data preprocessing coordinator."""
+
+    def __init__(self):
+        """Initialize the preprocessor."""
+        self.logger = logging.getLogger(f"{__name__}.DataPreprocessor")
+        self.quality_report = {}
+
+        # Initialize sub-processors
+        self.validator = DataValidator()
+        self.outlier_detector = OutlierDetector()
+        self.gap_filler = GapFiller()
+        self.relay_processor = RelayDataProcessor()
+        self.pv_processor = PVDataProcessor()
+        self.loxone_processor = LoxoneDataProcessor()
+
+    def process_dataset(self, df: pd.DataFrame, data_type: str) -> pd.DataFrame:
+        """Process and clean a dataset."""
+        if df.empty:
+            self.logger.warning(f"Empty dataset for {data_type}")
+            return df
+
+        self.logger.info(f"Processing {data_type} dataset with {len(df)} records")
+
+        # Remove duplicates
+        df_clean = df.loc[~df.index.duplicated(keep="first")]
+
+        # Handle missing values based on data type
+        if data_type == "pv":
+            df_clean = self._clean_pv_data(df_clean)
+        elif data_type.startswith("room") or "temperature" in data_type:
+            df_clean = self._clean_temperature_data(df_clean)
+        elif data_type == "weather":
+            df_clean = self._clean_weather_data(df_clean)
+        elif data_type.startswith("relay"):
+            df_clean = self._clean_relay_data(df_clean)
+        else:
+            df_clean = self._general_cleaning(df_clean)
+
+        # Generate quality report
+        self.quality_report[data_type] = self._generate_quality_report(
+            df, df_clean, data_type
+        )
+
+        self.logger.info(
+            f"Processed {data_type}: {len(df_clean)} clean records from {len(df)} original"
+        )
+        return df_clean
+
+    def _clean_pv_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean PV production data."""
+        df_clean = df.copy()
+
+        # Set negative values to 0 (no negative production)
+        numeric_cols = df_clean.select_dtypes(include=["number"]).columns
+        for col in numeric_cols:
+            df_clean[col] = df_clean[col].clip(lower=0)
+
+        # Fill missing values during nighttime with 0
+        night_hours = [22, 23, 0, 1, 2, 3, 4, 5]
+        night_mask = df_clean.index.hour.isin(night_hours)
+
+        for col in numeric_cols:
+            df_clean.loc[night_mask, col] = df_clean.loc[night_mask, col].fillna(0)
+            # Interpolate remaining missing values during daylight
+            df_clean[col] = df_clean[col].interpolate(method="linear", limit=6)
+
+        return df_clean
+
+    def _clean_temperature_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean temperature data."""
+        df_clean = df.copy()
+
+        # Remove obviously wrong temperature values
+        temp_cols = [col for col in df_clean.columns if "temp" in col.lower()]
+        for col in temp_cols:
+            df_clean[col] = df_clean[col].where(
+                (df_clean[col] >= -10) & (df_clean[col] <= 50)
+            )
+
+        # Interpolate missing values
+        for col in df_clean.select_dtypes(include=["number"]).columns:
+            df_clean[col] = df_clean[col].interpolate(method="linear", limit=12)
+
+        return df_clean
+
+    def _clean_weather_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean weather data."""
+        df_clean = df.copy()
+
+        # Forward fill then interpolate
+        df_clean = df_clean.fillna(method="ffill").fillna(method="bfill")
+        df_clean = df_clean.interpolate(method="linear", limit=6)
+
+        return df_clean
+
+    def _clean_relay_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Clean relay state data."""
+        df_clean = df.copy()
+
+        # Relay data should be 0 or 1
+        for col in df_clean.select_dtypes(include=["number"]).columns:
+            df_clean[col] = df_clean[col].round().clip(0, 1)
+
+        return df_clean
+
+    def _general_cleaning(self, df: pd.DataFrame) -> pd.DataFrame:
+        """General data cleaning."""
+        df_clean = df.copy()
+
+        # Basic interpolation for numeric columns
+        for col in df_clean.select_dtypes(include=["number"]).columns:
+            df_clean[col] = df_clean[col].interpolate(method="linear", limit=6)
+
+        return df_clean
+
+    def _generate_quality_report(
+        self, original_df: pd.DataFrame, clean_df: pd.DataFrame, data_type: str
+    ) -> dict:
+        """Generate data quality report."""
+        if original_df.empty:
+            return {
+                "total_records": 0,
+                "clean_records": 0,
+                "date_range": (None, None),
+                "original_missing_percentage": 100,
+                "clean_missing_percentage": 100,
+                "time_gaps": [],
+                "cleaning_summary": "No data available",
+            }
+
+        # Calculate missing data percentage
+        original_missing = original_df.isnull().sum().sum()
+        original_total = original_df.size
+        original_missing_pct = (
+            (original_missing / original_total * 100) if original_total > 0 else 100
+        )
+
+        clean_missing = clean_df.isnull().sum().sum()
+        clean_total = clean_df.size
+        clean_missing_pct = (
+            (clean_missing / clean_total * 100) if clean_total > 0 else 100
+        )
+
+        # Find significant time gaps (>2 hours)
+        time_gaps = []
+        if not clean_df.index.empty:
+            time_diffs = clean_df.index.to_series().diff()
+            large_gaps = time_diffs[time_diffs > pd.Timedelta(hours=2)]
+            time_gaps = [
+                (gap_time, gap_duration)
+                for gap_time, gap_duration in large_gaps.items()
+            ]
+
+        return {
+            "total_records": len(original_df),
+            "clean_records": len(clean_df),
+            "date_range": (
+                (original_df.index.min(), original_df.index.max())
+                if not original_df.index.empty
+                else (None, None)
+            ),
+            "original_missing_percentage": round(original_missing_pct, 2),
+            "clean_missing_percentage": round(clean_missing_pct, 2),
+            "time_gaps": time_gaps[:10],  # First 10 gaps
+            "cleaning_summary": (
+                f"Cleaned {len(original_df)} -> {len(clean_df)} records, "
+                f"missing data: {original_missing_pct:.1f}% -> {clean_missing_pct:.1f}%"
+            ),
+        }
+
+
+class LoxoneDataProcessor:
+    """Enhanced data preprocessing specifically for Loxone system integration."""
+
+    def __init__(self):
+        """Initialize the Loxone data processor."""
+        self.logger = logging.getLogger(f"{__name__}.LoxoneDataProcessor")
+        self.loxone_adapter = LoxoneFieldAdapter()
+
+    def process_loxone_room_data(
+        self, room_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Process room data with Loxone field standardization.
+
+        Args:
+            room_data: Dictionary with room names as keys, raw DataFrames as values
+
+        Returns:
+            Dictionary with standardized room data
+        """
+        if not room_data:
+            return {}
+
+        processed_rooms = {}
+
+        for room_name, room_df in room_data.items():
+            if room_df.empty:
+                continue
+
+            try:
+                # Standardize Loxone field names
+                standardized_df = self.loxone_adapter.standardize_room_data(
+                    room_df, room_name
+                )
+
+                if not standardized_df.empty:
+                    processed_rooms[room_name] = standardized_df
+                    self.logger.info(
+                        f"Processed room {room_name}: {len(standardized_df)} records"
+                    )
+                else:
+                    self.logger.warning(
+                        f"No valid data after processing room {room_name}"
+                    )
+
+            except Exception as e:
+                self.logger.error(f"Failed to process room {room_name}: {e}")
+
+        return processed_rooms
+
+    def process_loxone_relay_data(
+        self, relay_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, pd.DataFrame]:
+        """
+        Process relay data with power calculations and state standardization.
+
+        Args:
+            relay_data: Dictionary with room relay DataFrames
+
+        Returns:
+            Dictionary with processed relay data including power calculations
+        """
+        if not relay_data:
+            return {}
+
+        processed_relays = {}
+
+        for room_name, relay_df in relay_data.items():
+            if relay_df.empty:
+                continue
+
+            try:
+                processed_df = pd.DataFrame(index=relay_df.index)
+
+                # Find relay state column (typically the room name)
+                relay_col = None
+                for col in relay_df.columns:
+                    if room_name.lower() in col.lower() or any(
+                        keyword in col.lower()
+                        for keyword in ["state", "relay", "heating"]
+                    ):
+                        relay_col = col
+                        break
+
+                if relay_col is None:
+                    # Use first column as fallback
+                    relay_col = relay_df.columns[0]
+
+                # Standardize relay state (0/1)
+                processed_df["relay_state"] = (relay_df[relay_col] > 0.5).astype(int)
+
+                # Add power calculations using room configuration
+                standard_room_name = self.loxone_adapter.standardize_room_name(
+                    room_name
+                )
+                power_rating = self.loxone_adapter._get_room_power_rating(
+                    standard_room_name
+                )
+
+                processed_df["power_kw"] = processed_df["relay_state"] * power_rating
+                processed_df["power_w"] = processed_df["power_kw"] * 1000
+
+                processed_relays[room_name] = processed_df
+                self.logger.info(
+                    f"Processed relay {room_name}: {len(processed_df)} records, {power_rating} kW"
+                )
+
+            except Exception as e:
+                self.logger.error(f"Failed to process relay {room_name}: {e}")
+
+        return processed_relays
+
+    def process_loxone_weather_data(self, weather_data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Process weather data including Loxone solar fields.
+
+        Args:
+            weather_data: Raw weather DataFrame
+
+        Returns:
+            Standardized weather DataFrame
+        """
+        if weather_data.empty:
+            return pd.DataFrame()
+
+        try:
+            # Use Loxone adapter to standardize weather fields
+            standardized_weather = self.loxone_adapter.standardize_weather_data(
+                weather_data
+            )
+
+            self.logger.info(
+                f"Processed weather data: {len(standardized_weather)} records"
+            )
+
+            # Log available solar fields
+            solar_fields = ["sun_elevation", "sun_direction", "solar_irradiance"]
+            available_solar = [
+                f for f in solar_fields if f in standardized_weather.columns
+            ]
+            if available_solar:
+                self.logger.info(f"Available Loxone solar fields: {available_solar}")
+
+            return standardized_weather
+
+        except Exception as e:
+            self.logger.error(f"Failed to process weather data: {e}")
+            return pd.DataFrame()
+
+    def validate_loxone_data_integration(
+        self,
+        room_data: Dict[str, pd.DataFrame],
+        relay_data: Dict[str, pd.DataFrame],
+        weather_data: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        """
+        Validate that Loxone data integration is working correctly.
+
+        Args:
+            room_data: Processed room data
+            relay_data: Processed relay data
+            weather_data: Processed weather data
+
+        Returns:
+            Validation report dictionary
+        """
+        validation_report = {
+            "rooms": {},
+            "relays": {},
+            "weather": {},
+            "integration_status": "unknown",
+        }
+
+        # Validate room data
+        for room_name, room_df in room_data.items():
+            validation_report["rooms"][room_name] = {
+                "records": len(room_df),
+                "has_temperature": "temperature" in room_df.columns,
+                "has_humidity": "humidity" in room_df.columns,
+                "data_quality": room_df.isnull().sum().sum() / room_df.size * 100
+                if not room_df.empty
+                else 100,
+            }
+
+        # Validate relay data
+        for room_name, relay_df in relay_data.items():
+            validation_report["relays"][room_name] = {
+                "records": len(relay_df),
+                "has_relay_state": "relay_state" in relay_df.columns,
+                "has_power_calc": "power_kw" in relay_df.columns,
+                "duty_cycle": relay_df.get("relay_state", pd.Series([0])).mean() * 100,
+            }
+
+        # Validate weather data
+        if not weather_data.empty:
+            validation_report["weather"] = {
+                "records": len(weather_data),
+                "has_temperature": "temperature" in weather_data.columns,
+                "has_solar_fields": any(
+                    field in weather_data.columns
+                    for field in ["sun_elevation", "sun_direction", "solar_irradiance"]
+                ),
+                "data_quality": weather_data.isnull().sum().sum()
+                / weather_data.size
+                * 100,
+            }
+
+        # Overall integration status
+        rooms_ok = len(validation_report["rooms"]) > 0
+        relays_ok = len(validation_report["relays"]) > 0
+        weather_ok = len(validation_report["weather"]) > 0
+
+        if rooms_ok and relays_ok and weather_ok:
+            validation_report["integration_status"] = "excellent"
+        elif rooms_ok and (relays_ok or weather_ok):
+            validation_report["integration_status"] = "good"
+        elif rooms_ok or relays_ok or weather_ok:
+            validation_report["integration_status"] = "partial"
+        else:
+            validation_report["integration_status"] = "failed"
+
+        self.logger.info(
+            f"Loxone integration status: {validation_report['integration_status']}"
+        )
+        return validation_report

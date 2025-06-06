@@ -795,24 +795,15 @@ class AnalysisVisualizer:
         fig.update_xaxes(tickangle=45, row=2, col=1)
         fig.update_yaxes(title_text="Duty Cycle (%)", row=2, col=1)
 
-        # 3. Energy Consumption by Room (assuming 2kW per relay)
-        room_power_ratings = {
-            "living_room": 4.8,
-            "kitchen": 3.2,
-            "bedroom_1": 2.4,
-            "bedroom_2": 2.0,
-            "bathroom": 1.5,
-            "office": 2.2,
-            "guest_room": 1.8,
-            "hallway": 0.8,
-        }
+        # Use power ratings from configuration
+        from config.energy_settings import get_room_power
 
         energy_consumption = {}
         for room in rooms:
             if room in relay_data.columns:
                 # Extract room name from column
                 room_name = room.lower().replace("relay_", "").replace("_heating", "")
-                power_rating = room_power_ratings.get(room_name, 2.0)  # Default 2kW
+                power_rating = get_room_power(room_name)  # Get from config
 
                 # Calculate energy (assuming 5-min intervals)
                 energy_kwh = (
@@ -849,7 +840,7 @@ class AnalysisVisualizer:
                     room_name = (
                         room.lower().replace("relay_", "").replace("_heating", "")
                     )
-                    power_rating = room_power_ratings.get(room_name, 2.0)
+                    power_rating = get_room_power(room_name)
                     total_power += (relay_data[room] > 0) * power_rating
 
             hourly_avg = total_power.groupby(total_power.index.hour).mean()

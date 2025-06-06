@@ -17,7 +17,7 @@ def test_imports():
     print("🔬 Testing module imports...")
 
     try:
-        from analysis.pattern_analysis import PVAnalyzer
+        from analysis.analyzers.pattern_analysis import PVAnalyzer
 
         assert PVAnalyzer is not None  # Use the import
         print("✅ PVAnalyzer imported successfully")
@@ -26,7 +26,7 @@ def test_imports():
         return False
 
     try:
-        from analysis.thermal_analysis import ThermalAnalyzer
+        from analysis.analyzers.thermal_analysis import ThermalAnalyzer
 
         assert ThermalAnalyzer is not None  # Use the import
         print("✅ ThermalAnalyzer imported successfully")
@@ -35,7 +35,7 @@ def test_imports():
         return False
 
     try:
-        from analysis.base_load_analysis import BaseLoadAnalyzer
+        from analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
 
         assert BaseLoadAnalyzer is not None  # Use the import
         print("✅ BaseLoadAnalyzer imported successfully")
@@ -44,7 +44,7 @@ def test_imports():
         return False
 
     try:
-        from analysis.data_preprocessing import DataValidator
+        from analysis.core.data_preprocessing import DataValidator
 
         assert DataValidator is not None  # Use the import
         print("✅ DataValidator imported successfully")
@@ -53,7 +53,7 @@ def test_imports():
         return False
 
     try:
-        from analysis.data_extraction import DataExtractor
+        from analysis.core.data_extraction import DataExtractor
 
         assert DataExtractor is not None  # Use the import
         print("✅ DataExtractor imported successfully")

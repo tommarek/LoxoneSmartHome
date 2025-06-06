@@ -1,23 +1,32 @@
 """
 Thermal Dynamics Analysis for PEMS v2.
 
-Analyzes thermal dynamics per room:
+Analyzes thermal dynamics per room with Loxone integration:
 1. Calculate thermal parameters (heat-up rate, cool-down rate, time constant)
 2. Use system identification (ARX model, state-space model)
 3. Account for solar gains, internal gains, adjacent room heat transfer
+4. Handle Loxone field naming conventions and data structure
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
+# Import Loxone adapter for field standardization
+from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
+                                           LoxoneFieldAdapter)
 from scipy import optimize
 from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
-from config.energy_settings import get_room_power
+try:
+    from config.energy_settings import get_room_power
+except ImportError:
+    # Fallback if config not available
+    def get_room_power(room_name: str) -> float:
+        return LoxoneFieldAdapter._get_room_power_rating(room_name)
 
 
 class ThermalAnalyzer:
@@ -26,37 +35,63 @@ class ThermalAnalyzer:
     def __init__(self):
         """Initialize the thermal analyzer."""
         self.logger = logging.getLogger(f"{__name__}.ThermalAnalyzer")
+        self.loxone_integrator = LoxoneDataIntegrator()
 
     def analyze_room_dynamics(
-        self, room_data: Dict[str, pd.DataFrame], weather_data: pd.DataFrame
+        self,
+        room_data: Dict[str, pd.DataFrame],
+        weather_data: pd.DataFrame,
+        relay_data: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> Dict[str, Any]:
         """
-        Analyze thermal dynamics for all rooms.
+        Analyze thermal dynamics for all rooms with Loxone integration.
 
         Args:
-            room_data: Dictionary of room DataFrames with temperature data
+            room_data: Dictionary of room DataFrames with Loxone temperature data
             weather_data: Weather data with outdoor temperature
+            relay_data: Optional relay state data for heating period detection
 
         Returns:
             Dictionary with thermal analysis results for each room
         """
-        self.logger.info("Starting thermal dynamics analysis")
+        self.logger.info("Starting thermal dynamics analysis with Loxone integration")
 
         if not room_data:
             self.logger.warning("No room data provided")
             return {}
 
+        # Prepare data using Loxone integrator if relay data is provided
+        if relay_data is not None:
+            self.logger.info("Preparing thermal analysis data with relay integration")
+            (
+                standardized_rooms,
+                standardized_weather,
+            ) = self.loxone_integrator.prepare_thermal_analysis_data(
+                room_data, relay_data, weather_data
+            )
+        else:
+            # Standardize room data without relay integration
+            self.logger.info("Standardizing room data without relay integration")
+            standardized_rooms = {}
+            for room_name, room_df in room_data.items():
+                standardized_rooms[
+                    room_name
+                ] = LoxoneFieldAdapter.standardize_room_data(room_df, room_name)
+            standardized_weather = LoxoneFieldAdapter.standardize_weather_data(
+                weather_data
+            )
+
         results = {}
 
-        # Analyze each room individually
-        for room_name, room_df in room_data.items():
+        # Analyze each room individually using standardized data
+        for room_name, room_df in standardized_rooms.items():
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
 
             try:
                 # Store room name for power calculations
                 self._current_room_name = room_name
                 room_results = self._analyze_single_room(
-                    room_df, weather_data, room_name
+                    room_df, standardized_weather, room_name
                 )
                 results[room_name] = room_results
             except Exception as e:
@@ -65,7 +100,7 @@ class ThermalAnalyzer:
 
         # Analyze room coupling (heat transfer between rooms)
         if len(results) > 1:
-            results["room_coupling"] = self._analyze_room_coupling(room_data)
+            results["room_coupling"] = self._analyze_room_coupling(standardized_rooms)
 
         self.logger.info("Thermal dynamics analysis completed")
         return results
@@ -583,6 +618,16 @@ class ThermalAnalyzer:
 
         self.logger.info("Starting enhanced RC parameter estimation for relay system")
         results = {}
+
+        # Ensure we have the expected column names for RC analysis
+        # The data should already be prepared by _merge_room_weather_data
+        expected_cols = ["room_temp", "heating_on"]
+        missing_cols = [col for col in expected_cols if col not in data.columns]
+
+        if missing_cols:
+            return {
+                "warning": f"Missing required columns for RC estimation: {missing_cols}"
+            }
 
         # Method 1: Cooldown Analysis (Relay OFF periods)
         cooldown_results = self._analyze_cooldown_periods(data)

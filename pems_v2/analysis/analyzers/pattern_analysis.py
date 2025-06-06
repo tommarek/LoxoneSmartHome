@@ -1,18 +1,22 @@
 """
 PV Production Pattern Analysis for PEMS v2.
 
-Analyzes PV production patterns:
+Analyzes PV production patterns with Loxone integration:
 1. Correlate with weather data (solar radiation, cloud cover, temperature)
 2. Identify seasonal patterns using STL decomposition
 3. Create feature engineering pipeline
 4. Test models for production forecasting
+5. Handle Loxone field naming conventions
 """
 
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
+# Import Loxone adapter
+from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
+                                           LoxoneFieldAdapter)
 from scipy import stats
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.linear_model import LinearRegression
@@ -28,6 +32,7 @@ class PVAnalyzer:
     def __init__(self):
         """Initialize the PV analyzer."""
         self.logger = logging.getLogger(f"{__name__}.PVAnalyzer")
+        self.loxone_adapter = LoxoneFieldAdapter()
 
     def analyze_pv_production(
         self, pv_data: pd.DataFrame, weather_data: pd.DataFrame
@@ -113,6 +118,24 @@ class PVAnalyzer:
         self.logger.info("PV production analysis completed")
         return results
 
+    def _get_loxone_field(
+        self, df: pd.DataFrame, field_type: str, room_name: str = None
+    ) -> Optional[str]:
+        """
+        Find Loxone field name for a given type.
+
+        Args:
+            df: DataFrame to search in
+            field_type: Type of field ('temperature', 'humidity', 'relay', etc.)
+            room_name: Optional room name for room-specific fields
+
+        Returns:
+            Column name if found, None otherwise
+        """
+        return self.loxone_adapter._find_field(
+            df.columns.tolist(), field_type, room_name
+        )
+
     def _merge_pv_weather_data(
         self, pv_data: pd.DataFrame, weather_data: pd.DataFrame
     ) -> pd.DataFrame:
@@ -143,11 +166,24 @@ class PVAnalyzer:
 
         # Merge with weather data
         if not weather_data.empty:
+            # Standardize weather data to include Loxone solar fields
+            standardized_weather = LoxoneFieldAdapter.standardize_weather_data(
+                weather_data
+            )
+
             # Resample weather data to match PV data frequency
-            weather_resampled = weather_data.resample("15min").interpolate(
+            weather_resampled = standardized_weather.resample("15min").interpolate(
                 method="linear"
             )
             merged = pv_clean.join(weather_resampled, how="inner")
+
+            # Log available solar fields from Loxone
+            solar_fields = ["sun_elevation", "sun_direction", "solar_irradiance"]
+            available_solar = [f for f in solar_fields if f in merged.columns]
+            if available_solar:
+                self.logger.info(
+                    f"Enhanced weather data with Loxone solar fields: {available_solar}"
+                )
         else:
             merged = pv_clean
             self.logger.warning("No weather data available for merge")
@@ -888,6 +924,7 @@ class RelayPatternAnalyzer:
     def __init__(self):
         """Initialize the relay pattern analyzer."""
         self.logger = logging.getLogger(f"{__name__}.RelayPatternAnalyzer")
+        self.loxone_integrator = LoxoneDataIntegrator()
 
     def analyze_relay_patterns(
         self,
@@ -909,31 +946,45 @@ class RelayPatternAnalyzer:
         if not relay_data:
             return {"error": "No relay data provided"}
 
+        # Standardize relay data using Loxone adapter
+        self.logger.info("Standardizing relay data for analysis")
+        standardized_relay_data = self.loxone_integrator.prepare_relay_analysis_data(
+            relay_data
+        )
+
         results = {}
 
         # Peak demand analysis
-        results["peak_demand"] = self._analyze_peak_demand_patterns(relay_data)
+        results["peak_demand"] = self._analyze_peak_demand_patterns(
+            standardized_relay_data
+        )
 
         # Relay coordination opportunities
-        results["coordination"] = self._analyze_relay_coordination(relay_data)
+        results["coordination"] = self._analyze_relay_coordination(
+            standardized_relay_data
+        )
 
         # Switching pattern analysis
-        results["switching_patterns"] = self._analyze_switching_patterns(relay_data)
+        results["switching_patterns"] = self._analyze_switching_patterns(
+            standardized_relay_data
+        )
 
         # Weather correlation analysis
         if weather_data is not None and not weather_data.empty:
             results["weather_correlation"] = self._analyze_weather_correlation(
-                relay_data, weather_data
+                standardized_relay_data, weather_data
             )
 
         # Economic optimization opportunities
         if price_data is not None and not price_data.empty:
             results["economic_optimization"] = self._analyze_economic_patterns(
-                relay_data, price_data
+                standardized_relay_data, price_data
             )
 
         # Load distribution analysis
-        results["load_distribution"] = self._analyze_load_distribution(relay_data)
+        results["load_distribution"] = self._analyze_load_distribution(
+            standardized_relay_data
+        )
 
         return results
 
@@ -1187,6 +1238,112 @@ class RelayPatternAnalyzer:
 
         return economic_analysis
 
+    def _analyze_switching_patterns(
+        self, relay_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Any]:
+        """Analyze relay switching patterns."""
+        if not relay_data:
+            return {"warning": "No relay data for switching analysis"}
+
+        switching_analysis = {}
+
+        for room_name, relay_df in relay_data.items():
+            if relay_df.empty or "relay_state" not in relay_df.columns:
+                continue
+
+            relay_states = relay_df["relay_state"]
+
+            # Calculate switching events
+            switches = relay_states.diff().abs()
+            total_switches = switches.sum()
+
+            # Calculate switching frequency (switches per day)
+            days = (relay_states.index[-1] - relay_states.index[0]).days
+            switch_frequency = total_switches / max(days, 1)
+
+            # Analyze switching patterns by hour
+            hourly_switches = switches.groupby(switches.index.hour).sum()
+
+            switching_analysis[room_name] = {
+                "total_switches": total_switches,
+                "switches_per_day": switch_frequency,
+                "peak_switching_hour": hourly_switches.idxmax()
+                if not hourly_switches.empty
+                else None,
+                "hourly_pattern": hourly_switches.to_dict(),
+            }
+
+        return switching_analysis
+
+    def _analyze_weather_correlation(
+        self, relay_data: Dict[str, pd.DataFrame], weather_data: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """Analyze correlation between relay usage and weather."""
+        if weather_data.empty:
+            return {"warning": "No weather data for correlation analysis"}
+
+        correlations = {}
+
+        # Calculate total heating power
+        total_heating = pd.Series(0, index=weather_data.index)
+        for room_name, relay_df in relay_data.items():
+            if not relay_df.empty and "power_kw" in relay_df.columns:
+                room_power = (
+                    relay_df["power_kw"]
+                    .reindex(weather_data.index, method="nearest")
+                    .fillna(0)
+                )
+                total_heating += room_power
+
+        if total_heating.sum() > 0 and "temperature" in weather_data.columns:
+            # Calculate correlation with outdoor temperature
+            temp_correlation = total_heating.corr(weather_data["temperature"])
+            correlations["temperature_correlation"] = temp_correlation
+
+            # Analyze heating response by temperature bins
+            temp_bins = pd.cut(weather_data["temperature"], bins=10)
+            heating_by_temp = total_heating.groupby(temp_bins).mean()
+            correlations["heating_response_by_temp"] = heating_by_temp.to_dict()
+
+        return correlations
+
+    def _analyze_load_distribution(
+        self, relay_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Any]:
+        """Analyze load distribution across rooms."""
+        if not relay_data:
+            return {"warning": "No relay data for load distribution analysis"}
+
+        distribution = {}
+        total_energy = 0
+
+        for room_name, relay_df in relay_data.items():
+            if relay_df.empty or "power_kw" not in relay_df.columns:
+                continue
+
+            # Calculate energy consumption (assuming 5-minute intervals)
+            room_energy = (relay_df["power_kw"] * (5 / 60)).sum()  # kWh
+            distribution[room_name] = room_energy
+            total_energy += room_energy
+
+        # Calculate percentages
+        if total_energy > 0:
+            for room in distribution:
+                distribution[room] = {
+                    "energy_kwh": distribution[room],
+                    "percentage": (distribution[room] / total_energy) * 100,
+                }
+
+        return {
+            "room_distribution": distribution,
+            "total_energy_kwh": total_energy,
+            "most_consuming_room": max(
+                distribution.keys(), key=lambda x: distribution[x]["energy_kwh"]
+            )
+            if distribution
+            else None,
+        }
+
     # Helper methods
     def _calculate_total_system_load(
         self, relay_data: Dict[str, pd.DataFrame]
@@ -1194,17 +1351,7 @@ class RelayPatternAnalyzer:
         """Calculate total system power load from all relays."""
         total_load = None
 
-        # Room power ratings (should match RelayDataProcessor)
-        room_power_ratings = {
-            "living_room": 4800,
-            "kitchen": 3200,
-            "bedroom_1": 2400,
-            "bedroom_2": 2000,
-            "bathroom": 1500,
-            "office": 2200,
-            "guest_room": 1800,
-            "hallway": 800,
-        }
+        # Power ratings are now handled by LoxoneFieldAdapter
 
         for room_name, room_df in relay_data.items():
             if room_df.empty:
@@ -1215,7 +1362,10 @@ class RelayPatternAnalyzer:
                 continue
 
             # Get power rating for this room
-            power_rating = room_power_ratings.get(room_name, 2000)  # Default 2kW
+            standard_room_name = LoxoneFieldAdapter.standardize_room_name(room_name)
+            power_rating = (
+                LoxoneFieldAdapter._get_room_power_rating(standard_room_name) * 1000
+            )  # Convert kW to W
 
             # Calculate power consumption
             room_power = room_df[relay_col] * power_rating

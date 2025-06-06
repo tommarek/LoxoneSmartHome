@@ -13,7 +13,7 @@ import pandas as pd
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
-from analysis.data_extraction import DataExtractor
+from analysis.core.data_extraction import DataExtractor
 from config.settings import PEMSSettings
 
 

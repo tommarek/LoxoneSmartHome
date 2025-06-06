@@ -7,7 +7,11 @@ ROOM_CONFIG = {
     "rooms": {
         "hosti": {"power_kw": 2.02, "volume_m3": 75.67852925, "zone": "living"},
         "chodba_dole": {"power_kw": 1.8, "volume_m3": 50.055, "zone": "circulation"},
-        "chodba_nahore": {"power_kw": 1.2, "volume_m3": 53.55708977, "zone": "circulation"},
+        "chodba_nahore": {
+            "power_kw": 1.2,
+            "volume_m3": 53.55708977,
+            "zone": "circulation",
+        },
         "koupelna_dole": {"power_kw": 0.47, "volume_m3": 15.87374, "zone": "wet"},
         "koupelna_nahore": {"power_kw": 0.62, "volume_m3": 21.86725157, "zone": "wet"},
         "loznice": {"power_kw": 1.2, "volume_m3": 34.84, "zone": "sleeping"},
@@ -19,7 +23,11 @@ ROOM_CONFIG = {
         "satna_dole": {"power_kw": 0.82, "volume_m3": 23.79915, "zone": "storage"},
         "satna_nahore": {"power_kw": 0.56, "volume_m3": 31.5675, "zone": "storage"},
         "spajz": {"power_kw": 0.46, "volume_m3": 15.2337, "zone": "storage"},
-        "technicka_mistnost": {"power_kw": 0.82, "volume_m3": 27.34875, "zone": "utility"},
+        "technicka_mistnost": {
+            "power_kw": 0.82,
+            "volume_m3": 27.34875,
+            "zone": "utility",
+        },
         "zadveri": {"power_kw": 0.82, "volume_m3": 23.3325, "zone": "circulation"},
         "zachod": {"power_kw": 0.22, "volume_m3": 7.630824, "zone": "wet"},
         # Note: kuchyne excluded from heating relay data as per Flux query filter
