@@ -132,10 +132,14 @@ class BaseLoadAnalyzer:
             if pv_power_cols:
                 pv_power = pv_data[pv_power_cols[0]]
                 # Resample to match consumption data frequency
-                pv_resampled = pv_power.resample(total_consumption.index.freq or "15T").mean()
+                pv_resampled = pv_power.resample(
+                    total_consumption.index.freq or "15T"
+                ).mean()
 
                 # Self-consumption = min(PV_production, total_consumption)
-                pv_aligned = pv_resampled.reindex(base_load_data.index, method="nearest")
+                pv_aligned = pv_resampled.reindex(
+                    base_load_data.index, method="nearest"
+                )
                 pv_self_consumption = np.minimum(
                     pv_aligned.fillna(0), base_load_data["total_consumption"]
                 )
@@ -144,7 +148,9 @@ class BaseLoadAnalyzer:
                 base_load_data["base_load"] -= pv_self_consumption
 
         # Subtract heating consumption
-        heating_consumption = self._estimate_heating_consumption(room_data, base_load_data.index)
+        heating_consumption = self._estimate_heating_consumption(
+            room_data, base_load_data.index
+        )
         if heating_consumption is not None:
             base_load_data["heating_consumption"] = heating_consumption
             base_load_data["base_load"] -= heating_consumption
@@ -158,21 +164,29 @@ class BaseLoadAnalyzer:
             ]
             if ev_cols:
                 ev_power = ev_data[ev_cols[0]]
-                ev_resampled = ev_power.resample(total_consumption.index.freq or "15T").mean()
-                ev_aligned = ev_resampled.reindex(base_load_data.index, method="nearest")
+                ev_resampled = ev_power.resample(
+                    total_consumption.index.freq or "15T"
+                ).mean()
+                ev_aligned = ev_resampled.reindex(
+                    base_load_data.index, method="nearest"
+                )
 
                 base_load_data["ev_consumption"] = ev_aligned.fillna(0)
                 base_load_data["base_load"] -= ev_aligned.fillna(0)
 
         # Subtract battery consumption (charging losses)
         if battery_data is not None and not battery_data.empty:
-            battery_cols = [col for col in battery_data.columns if "power" in col.lower()]
+            battery_cols = [
+                col for col in battery_data.columns if "power" in col.lower()
+            ]
             if battery_cols:
                 battery_power = battery_data[battery_cols[0]]
                 battery_resampled = battery_power.resample(
                     total_consumption.index.freq or "15T"
                 ).mean()
-                battery_aligned = battery_resampled.reindex(base_load_data.index, method="nearest")
+                battery_aligned = battery_resampled.reindex(
+                    base_load_data.index, method="nearest"
+                )
 
                 # Only subtract when battery is charging (positive power)
                 battery_charging = np.maximum(battery_aligned.fillna(0), 0)
@@ -207,15 +221,21 @@ class BaseLoadAnalyzer:
             heating_cols = [
                 col
                 for col in room_df.columns
-                if any(keyword in col.lower() for keyword in ["heating", "heat", "state"])
+                if any(
+                    keyword in col.lower() for keyword in ["heating", "heat", "state"]
+                )
             ]
 
             if heating_cols:
                 heating_status = room_df[heating_cols[0]]
 
                 # Resample to target frequency
-                heating_resampled = heating_status.resample(target_index.freq or "15T").mean()
-                heating_aligned = heating_resampled.reindex(target_index, method="nearest")
+                heating_resampled = heating_status.resample(
+                    target_index.freq or "15T"
+                ).mean()
+                heating_aligned = heating_resampled.reindex(
+                    target_index, method="nearest"
+                )
 
                 # Assume 1kW per room when heating is on (adjust based on your system)
                 heating_power = heating_aligned.fillna(0) * 1000  # 1kW per room
@@ -227,7 +247,9 @@ class BaseLoadAnalyzer:
 
         return total_heating
 
-    def _calculate_base_load_stats(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _calculate_base_load_stats(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Calculate basic base load statistics."""
         base_load = base_load_data["base_load"]
 
@@ -238,8 +260,11 @@ class BaseLoadAnalyzer:
             "min_base_load": base_load.min(),
             "max_base_load": base_load.max(),
             "std_base_load": base_load.std(),
-            "total_energy_kwh": (base_load.sum() * 0.25) / 1000,  # 15-min intervals to kWh
-            "base_load_factor": base_load.mean() / base_load.max() if base_load.max() > 0 else 0,
+            "total_energy_kwh": (base_load.sum() * 0.25)
+            / 1000,  # 15-min intervals to kWh
+            "base_load_factor": base_load.mean() / base_load.max()
+            if base_load.max() > 0
+            else 0,
         }
 
         # Percentage of total consumption
@@ -276,7 +301,9 @@ class BaseLoadAnalyzer:
                 "peak_load": hourly_avg.max(),
                 "minimum_load": hourly_avg.min(),
                 "peak_to_minimum_ratio": (
-                    hourly_avg.max() / hourly_avg.min() if hourly_avg.min() > 0 else float("inf")
+                    hourly_avg.max() / hourly_avg.min()
+                    if hourly_avg.min() > 0
+                    else float("inf")
                 ),
             }
         )
@@ -290,7 +317,9 @@ class BaseLoadAnalyzer:
         patterns = {}
 
         # Hourly patterns
-        hourly_profile = base_load.groupby(base_load.index.hour).agg(["mean", "std", "min", "max"])
+        hourly_profile = base_load.groupby(base_load.index.hour).agg(
+            ["mean", "std", "min", "max"]
+        )
         patterns["hourly_profile"] = hourly_profile.to_dict()
 
         # Weekday vs weekend patterns
@@ -305,18 +334,32 @@ class BaseLoadAnalyzer:
                 if weekday_load.mean() > 0
                 else 0
             ),
-            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour).mean().idxmax(),
-            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour).mean().idxmax(),
+            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour)
+            .mean()
+            .idxmax(),
+            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour)
+            .mean()
+            .idxmax(),
         }
 
         # Day of week patterns
         daily_profile = base_load.groupby(base_load.index.weekday).agg(["mean", "std"])
-        day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+        day_names = [
+            "Monday",
+            "Tuesday",
+            "Wednesday",
+            "Thursday",
+            "Friday",
+            "Saturday",
+            "Sunday",
+        ]
         daily_profile.index = day_names
         patterns["daily_profile"] = daily_profile.to_dict()
 
         # Monthly patterns
-        monthly_profile = base_load.groupby(base_load.index.month).agg(["mean", "std", "sum"])
+        monthly_profile = base_load.groupby(base_load.index.month).agg(
+            ["mean", "std", "sum"]
+        )
         patterns["monthly_profile"] = monthly_profile.to_dict()
 
         # Identify peak and off-peak periods
@@ -330,17 +373,23 @@ class BaseLoadAnalyzer:
             "peak_hours": peak_hours,
             "off_peak_hours": off_peak_hours,
             "peak_load_avg": hourly_mean[peak_hours].mean() if peak_hours else None,
-            "off_peak_load_avg": hourly_mean[off_peak_hours].mean() if off_peak_hours else None,
+            "off_peak_load_avg": hourly_mean[off_peak_hours].mean()
+            if off_peak_hours
+            else None,
         }
 
         return patterns
 
-    def _analyze_seasonal_patterns(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _analyze_seasonal_patterns(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Analyze seasonal patterns using decomposition."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 365 * 24 * 4:  # Less than 1 year of 15-min data
-            return {"warning": "Insufficient data for seasonal analysis (need at least 1 year)"}
+            return {
+                "warning": "Insufficient data for seasonal analysis (need at least 1 year)"
+            }
 
         try:
             # Resample to daily data for seasonal analysis
@@ -353,11 +402,13 @@ class BaseLoadAnalyzer:
             seasonal_analysis = {
                 "seasonal_strength": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var()),
-                "trend_strength": 1 - (result.resid.var() / (result.trend + result.resid).var()),
+                "trend_strength": 1
+                - (result.resid.var() / (result.trend + result.resid).var()),
                 "has_strong_seasonal": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var())
                 > 0.6,
-                "has_strong_trend": 1 - (result.resid.var() / (result.trend + result.resid).var())
+                "has_strong_trend": 1
+                - (result.resid.var() / (result.trend + result.resid).var())
                 > 0.6,
             }
 
@@ -375,9 +426,15 @@ class BaseLoadAnalyzer:
                 if not season_data.empty:
                     seasonal_profiles[season] = {
                         "mean_load": season_data.mean(),
-                        "peak_hour": season_data.groupby(season_data.index.hour).mean().idxmax(),
-                        "peak_load": season_data.groupby(season_data.index.hour).mean().max(),
-                        "min_load": season_data.groupby(season_data.index.hour).mean().min(),
+                        "peak_hour": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .idxmax(),
+                        "peak_load": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .max(),
+                        "min_load": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .min(),
                     }
 
             seasonal_analysis["seasonal_profiles"] = seasonal_profiles
@@ -385,10 +442,12 @@ class BaseLoadAnalyzer:
             # Find highest and lowest consumption seasons
             if seasonal_profiles:
                 highest_season = max(
-                    seasonal_profiles.keys(), key=lambda s: seasonal_profiles[s]["mean_load"]
+                    seasonal_profiles.keys(),
+                    key=lambda s: seasonal_profiles[s]["mean_load"],
                 )
                 lowest_season = min(
-                    seasonal_profiles.keys(), key=lambda s: seasonal_profiles[s]["mean_load"]
+                    seasonal_profiles.keys(),
+                    key=lambda s: seasonal_profiles[s]["mean_load"],
                 )
 
                 seasonal_analysis.update(
@@ -494,7 +553,9 @@ class BaseLoadAnalyzer:
     def _find_optimal_clusters(self, data: np.ndarray, max_k: int = 10) -> int:
         """Find optimal number of clusters using elbow method."""
         inertias = []
-        k_range = range(2, min(max_k + 1, len(data) // 5))  # Ensure reasonable cluster sizes
+        k_range = range(
+            2, min(max_k + 1, len(data) // 5)
+        )  # Ensure reasonable cluster sizes
 
         for k in k_range:
             kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -509,7 +570,9 @@ class BaseLoadAnalyzer:
         delta_deltas = np.diff(deltas)
 
         if len(delta_deltas) > 0:
-            elbow_idx = np.argmax(delta_deltas) + 2  # +2 because of double diff and 0-indexing
+            elbow_idx = (
+                np.argmax(delta_deltas) + 2
+            )  # +2 because of double diff and 0-indexing
             return k_range[elbow_idx] if elbow_idx < len(k_range) else k_range[-1]
         else:
             return 3  # Default
@@ -529,13 +592,17 @@ class BaseLoadAnalyzer:
         lower_bound = Q1 - 1.5 * IQR
         upper_bound = Q3 + 1.5 * IQR
 
-        statistical_anomalies = base_load[(base_load < lower_bound) | (base_load > upper_bound)]
+        statistical_anomalies = base_load[
+            (base_load < lower_bound) | (base_load > upper_bound)
+        ]
 
         # Isolation Forest for more sophisticated anomaly detection
         if len(base_load) > 200:
             try:
                 # Prepare features for anomaly detection
-                features = base_load_data[["base_load", "hour", "weekday", "month"]].copy()
+                features = base_load_data[
+                    ["base_load", "hour", "weekday", "month"]
+                ].copy()
                 features["hour_sin"] = np.sin(2 * np.pi * features["hour"] / 24)
                 features["hour_cos"] = np.cos(2 * np.pi * features["hour"] / 24)
                 features["weekday_sin"] = np.sin(2 * np.pi * features["weekday"] / 7)
@@ -577,8 +644,12 @@ class BaseLoadAnalyzer:
             },
             "ml_anomalies": {
                 "count": len(ml_anomalies),
-                "percentage": len(ml_anomalies) / len(base_load) * 100 if len(base_load) > 0 else 0,
-                "sample_dates": ml_anomalies.index[:10].tolist() if not ml_anomalies.empty else [],
+                "percentage": len(ml_anomalies) / len(base_load) * 100
+                if len(base_load) > 0
+                else 0,
+                "sample_dates": ml_anomalies.index[:10].tolist()
+                if not ml_anomalies.empty
+                else [],
             },
             "low_consumption_events": {
                 "count": len(low_consumption_anomalies),
@@ -592,12 +663,16 @@ class BaseLoadAnalyzer:
             },
         }
 
-    def _evaluate_prediction_models(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _evaluate_prediction_models(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Evaluate different prediction models for base load."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 200:
-            return {"warning": "Insufficient data for model evaluation (need at least 200 records)"}
+            return {
+                "warning": "Insufficient data for model evaluation (need at least 200 records)"
+            }
 
         # Prepare features
         features = base_load_data[["hour", "weekday", "month"]].copy()
@@ -615,8 +690,12 @@ class BaseLoadAnalyzer:
             features[f"load_lag_{lag}"] = base_load.shift(lag)
 
         # Add rolling statistics
-        features["load_rolling_mean_24"] = base_load.rolling(window=24, min_periods=1).mean()
-        features["load_rolling_std_24"] = base_load.rolling(window=24, min_periods=1).std()
+        features["load_rolling_mean_24"] = base_load.rolling(
+            window=24, min_periods=1
+        ).mean()
+        features["load_rolling_std_24"] = base_load.rolling(
+            window=24, min_periods=1
+        ).std()
 
         # Remove original categorical features
         features = features.drop(["hour", "weekday", "month"], axis=1)
@@ -664,7 +743,10 @@ class BaseLoadAnalyzer:
                     scores["r2"].append(r2_score(y_test, y_pred))
 
                     # MAPE calculation with handling for zero values
-                    mape = np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1))) * 100
+                    mape = (
+                        np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1)))
+                        * 100
+                    )
                     scores["mape"].append(mape)
 
                 results[name] = {
@@ -681,9 +763,13 @@ class BaseLoadAnalyzer:
                 # Feature importance for Random Forest
                 if name == "Random Forest":
                     model.fit(X_scaled, y_clean)
-                    feature_importance = dict(zip(X_clean.columns, model.feature_importances_))
+                    feature_importance = dict(
+                        zip(X_clean.columns, model.feature_importances_)
+                    )
                     sorted_importance = dict(
-                        sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
+                        sorted(
+                            feature_importance.items(), key=lambda x: x[1], reverse=True
+                        )
                     )
                     results[name]["feature_importance"] = sorted_importance
 
@@ -695,7 +781,10 @@ class BaseLoadAnalyzer:
         valid_models = {k: v for k, v in results.items() if "error" not in v}
         if valid_models:
             best_model = min(valid_models.items(), key=lambda x: x[1]["mean_mae"])
-            results["best_model"] = {"name": best_model[0], "performance": best_model[1]}
+            results["best_model"] = {
+                "name": best_model[0],
+                "performance": best_model[1],
+            }
 
         # Simple persistence model for comparison
         persistence_mae = mean_absolute_error(y_clean.iloc[1:], y_clean.iloc[:-1])
@@ -706,7 +795,9 @@ class BaseLoadAnalyzer:
 
         return results
 
-    def _analyze_energy_efficiency(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _analyze_energy_efficiency(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Analyze energy efficiency patterns."""
         base_load = base_load_data["base_load"]
 
@@ -747,11 +838,15 @@ class BaseLoadAnalyzer:
                 {
                     "most_efficient_days": {
                         "mean_consumption": most_efficient_days.mean(),
-                        "sample_dates": most_efficient_days.index.strftime("%Y-%m-%d").tolist(),
+                        "sample_dates": most_efficient_days.index.strftime(
+                            "%Y-%m-%d"
+                        ).tolist(),
                     },
                     "least_efficient_days": {
                         "mean_consumption": least_efficient_days.mean(),
-                        "sample_dates": least_efficient_days.index.strftime("%Y-%m-%d").tolist(),
+                        "sample_dates": least_efficient_days.index.strftime(
+                            "%Y-%m-%d"
+                        ).tolist(),
                     },
                     "efficiency_ratio": (
                         least_efficient_days.mean() / most_efficient_days.mean()
@@ -770,7 +865,9 @@ class BaseLoadAnalyzer:
                 "mean_night_consumption": night_consumption.mean(),
                 "min_night_consumption": night_consumption.min(),
                 "night_load_factor": (
-                    night_consumption.mean() / base_load.mean() if base_load.mean() > 0 else 0
+                    night_consumption.mean() / base_load.mean()
+                    if base_load.mean() > 0
+                    else 0
                 ),
             }
 
@@ -833,7 +930,9 @@ class BaseLoadAnalyzer:
             if z_score < -1.5:  # Lower threshold for low consumption
                 current_low_streak.append(idx)
             else:
-                if len(current_low_streak) >= 48:  # At least 12 hours of low consumption
+                if (
+                    len(current_low_streak) >= 48
+                ):  # At least 12 hours of low consumption
                     consecutive_low.append(
                         {
                             "start": current_low_streak[0],
@@ -860,14 +959,18 @@ class BaseLoadAnalyzer:
                 "count": len(high_consumption_events),
                 "sample_dates": high_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    high_consumption_events.mean() if not high_consumption_events.empty else None
+                    high_consumption_events.mean()
+                    if not high_consumption_events.empty
+                    else None
                 ),
             },
             "low_consumption_events": {
                 "count": len(low_consumption_events),
                 "sample_dates": low_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    low_consumption_events.mean() if not low_consumption_events.empty else None
+                    low_consumption_events.mean()
+                    if not low_consumption_events.empty
+                    else None
                 ),
             },
             "consecutive_high_consumption": {

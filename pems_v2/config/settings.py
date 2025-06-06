@@ -15,7 +15,9 @@ class InfluxDBSettings(BaseSettings):
     org: str = Field(default="loxone", env="INFLUXDB_ORG")
     bucket_historical: str = Field(default="loxone", env="INFLUXDB_BUCKET_HISTORICAL")
     bucket_loxone: str = Field(default="loxone", env="INFLUXDB_BUCKET_LOXONE")
-    bucket_weather: str = Field(default="weather_forecast", env="INFLUXDB_BUCKET_WEATHER")
+    bucket_weather: str = Field(
+        default="weather_forecast", env="INFLUXDB_BUCKET_WEATHER"
+    )
     bucket_solar: str = Field(default="loxone", env="INFLUXDB_BUCKET_SOLAR")
     bucket_predictions: str = Field(
         default="predictions", env="INFLUXDB_BUCKET_PREDICTIONS"

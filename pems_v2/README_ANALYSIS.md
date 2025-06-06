@@ -179,7 +179,7 @@ Update `.env` file:
 INFLUXDB_URL=http://your-server:8086
 INFLUXDB_TOKEN=your-token
 INFLUXDB_ORG=your-org
-INFLUXDB_BUCKET_HISTORICAL=your-bucket
+INFLUXDB_bucket_solar=your-bucket
 ```
 
 ## 📚 Analysis Components

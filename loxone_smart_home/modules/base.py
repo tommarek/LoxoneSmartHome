@@ -27,11 +27,16 @@ class BaseModule(ABC):
         self.service_name = service_name
         self.mqtt_client = mqtt_client
         self.influxdb_client = influxdb_client
-        self.settings = settings or Settings(influxdb_token=os.getenv("INFLUXDB_TOKEN", ""))
+        self.settings = settings or Settings(
+            influxdb_token=os.getenv("INFLUXDB_TOKEN", "")
+        )
 
         # Configure service-specific logger
         self.logger = configure_module_logger(
-            f"{__name__}.{name}", service_name, self.settings.log_timezone, self.settings.log_level
+            f"{__name__}.{name}",
+            service_name,
+            self.settings.log_timezone,
+            self.settings.log_level,
         )
         self._running = False
 

@@ -5,7 +5,6 @@ import logging
 from typing import Any, Callable, Dict, Optional, Set
 
 from asyncio_mqtt import Client, MqttError
-
 from config.settings import Settings
 
 
@@ -85,12 +84,14 @@ class AsyncMQTTClient:
                 if attempt < max_retries - 1:
                     wait_time = min(2**attempt, 30)  # Max 30s wait
                     self.logger.warning(
-                        f"Failed to connect to MQTT broker, " f"retrying in {wait_time}s: {e}"
+                        f"Failed to connect to MQTT broker, "
+                        f"retrying in {wait_time}s: {e}"
                     )
                     await asyncio.sleep(wait_time)
                 else:
                     self.logger.error(
-                        f"Failed to connect to MQTT broker after " f"{max_retries} attempts: {e}"
+                        f"Failed to connect to MQTT broker after "
+                        f"{max_retries} attempts: {e}"
                     )
                     raise
 
@@ -132,7 +133,9 @@ class AsyncMQTTClient:
             f"reconnects={self.reconnect_attempts}"
         )
 
-    async def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 1) -> None:
+    async def publish(
+        self, topic: str, payload: Any, retain: bool = False, qos: int = 1
+    ) -> None:
         """Queue a message for publishing with reliability."""
         await self.publish_queue.put((topic, payload, retain))
 
@@ -180,7 +183,8 @@ class AsyncMQTTClient:
                     await asyncio.sleep(0.5)
                 else:
                     self.logger.error(
-                        f"Failed to publish to {topic} after " f"{max_retries} attempts: {e}"
+                        f"Failed to publish to {topic} after "
+                        f"{max_retries} attempts: {e}"
                     )
 
     async def subscribe(self, topic: str, callback: Callable[[str, Any], Any]) -> None:
@@ -195,7 +199,9 @@ class AsyncMQTTClient:
 
             self.subscribers[topic].add(callback)
 
-    async def unsubscribe(self, topic: str, callback: Optional[Callable] = None) -> None:
+    async def unsubscribe(
+        self, topic: str, callback: Optional[Callable] = None
+    ) -> None:
         """Unsubscribe from a topic."""
         async with self.subscribers_lock:
             if topic in self.subscribers:
@@ -249,7 +255,9 @@ class AsyncMQTTClient:
         if callbacks:
             tasks = []
             for callback in callbacks:
-                task = asyncio.create_task(self._execute_callback(callback, topic, payload))
+                task = asyncio.create_task(
+                    self._execute_callback(callback, topic, payload)
+                )
                 tasks.append(task)
 
             # Wait for all callbacks to complete
@@ -258,9 +266,13 @@ class AsyncMQTTClient:
             # Log any errors
             for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    self.logger.error(f"Error in callback {callbacks[i]} for {topic}: {result}")
+                    self.logger.error(
+                        f"Error in callback {callbacks[i]} for {topic}: {result}"
+                    )
 
-    async def _execute_callback(self, callback: Callable, topic: str, payload: str) -> None:
+    async def _execute_callback(
+        self, callback: Callable, topic: str, payload: str
+    ) -> None:
         """Execute a callback safely."""
         try:
             if asyncio.iscoroutinefunction(callback):
@@ -270,7 +282,9 @@ class AsyncMQTTClient:
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, callback, topic, payload)
         except Exception as e:
-            self.logger.error(f"Error executing callback for {topic}: {e}", exc_info=True)
+            self.logger.error(
+                f"Error executing callback for {topic}: {e}", exc_info=True
+            )
             raise
 
     async def _monitor_connection(self) -> None:

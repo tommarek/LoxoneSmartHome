@@ -4,7 +4,6 @@ import asyncio
 from unittest.mock import AsyncMock, patch
 
 import pytest
-
 from main import LoxoneSmartHome, main
 
 
@@ -21,7 +20,10 @@ class TestLoxoneSmartHome:
     @patch("utils.async_mqtt_client.AsyncMQTTClient._connect_with_retry")
     @patch("utils.async_influxdb_client.AsyncInfluxDBClient._initialize_pool")
     async def test_initialize_modules(
-        self, mock_influx_start: AsyncMock, mock_connect: AsyncMock, app: LoxoneSmartHome
+        self,
+        mock_influx_start: AsyncMock,
+        mock_connect: AsyncMock,
+        app: LoxoneSmartHome,
     ) -> None:
         """Test module initialization."""
         try:
@@ -69,7 +71,10 @@ class TestLoxoneSmartHome:
     @patch("utils.async_mqtt_client.AsyncMQTTClient.disconnect")
     @patch("utils.async_influxdb_client.AsyncInfluxDBClient.stop")
     async def test_shutdown(
-        self, mock_influx_close: AsyncMock, mock_mqtt_disconnect: AsyncMock, app: LoxoneSmartHome
+        self,
+        mock_influx_close: AsyncMock,
+        mock_mqtt_disconnect: AsyncMock,
+        app: LoxoneSmartHome,
     ) -> None:
         """Test graceful shutdown."""
         # Create a mock task
@@ -93,7 +98,9 @@ class TestLoxoneSmartHome:
         """Test successful application run."""
         with patch.object(
             app, "initialize_modules", new_callable=AsyncMock
-        ) as mock_init, patch.object(app, "start_modules", new_callable=AsyncMock) as mock_start:
+        ) as mock_init, patch.object(
+            app, "start_modules", new_callable=AsyncMock
+        ) as mock_start:
             # Set shutdown event after a short delay
             async def set_shutdown() -> None:
                 await asyncio.sleep(0.1)
@@ -114,7 +121,9 @@ class TestLoxoneSmartHome:
         """Test application run with initialization error."""
         with patch.object(
             app, "initialize_modules", new_callable=AsyncMock
-        ) as mock_init, patch.object(app, "shutdown", new_callable=AsyncMock) as mock_shutdown:
+        ) as mock_init, patch.object(
+            app, "shutdown", new_callable=AsyncMock
+        ) as mock_shutdown:
             mock_init.side_effect = Exception("Init error")
 
             with pytest.raises(SystemExit):

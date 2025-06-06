@@ -6,7 +6,6 @@ from datetime import datetime
 from typing import Dict, Optional, Tuple
 
 import pytz
-
 from config.settings import Settings
 from modules.base import BaseModule
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -15,7 +14,9 @@ from utils.async_influxdb_client import AsyncInfluxDBClient
 class UDPListener(BaseModule):
     """UDP Listener that receives data from Loxone and stores it in InfluxDB."""
 
-    def __init__(self, influxdb_client: AsyncInfluxDBClient, settings: Settings) -> None:
+    def __init__(
+        self, influxdb_client: AsyncInfluxDBClient, settings: Settings
+    ) -> None:
         """Initialize the UDP listener."""
         super().__init__(
             name="UDPListener",
@@ -89,7 +90,9 @@ class UDPListener(BaseModule):
             parts = message.split(self.settings.udp_listener.delimiter)
 
             if len(parts) < 3:
-                self.logger.error(f"Failed to parse incoming data: not enough fields in {message}")
+                self.logger.error(
+                    f"Failed to parse incoming data: not enough fields in {message}"
+                )
                 async with self.stats_lock:
                     self.error_count += 1
                 return
@@ -102,7 +105,9 @@ class UDPListener(BaseModule):
             try:
                 value = float(parts[2])
             except ValueError as e:
-                self.logger.error(f"Failed to parse incoming data: invalid value {parts[2]}: {e}")
+                self.logger.error(
+                    f"Failed to parse incoming data: invalid value {parts[2]}: {e}"
+                )
                 async with self.stats_lock:
                     self.error_count += 1
                 return
@@ -139,7 +144,9 @@ class UDPListener(BaseModule):
             await self.influxdb_client.write_point(
                 bucket=self.settings.influxdb.bucket_loxone,
                 measurement=measurement_type,  # Use measurement_type as measurement (like Rust)
-                fields={measurement_name: value},  # measurement_name becomes the field name
+                fields={
+                    measurement_name: value
+                },  # measurement_name becomes the field name
                 tags={
                     "room": room_name,
                     "tag1": tag1,

@@ -61,12 +61,16 @@ class DataValidator:
 
         return validation_results
 
-    def validate_temperature_data(self, df: pd.DataFrame, room_name: str) -> Dict[str, Any]:
+    def validate_temperature_data(
+        self, df: pd.DataFrame, room_name: str
+    ) -> Dict[str, Any]:
         """Validate room temperature data."""
         validation_results = {"valid": True, "warnings": [], "errors": []}
 
         if df.empty:
-            validation_results["errors"].append(f"Temperature data for {room_name} is empty")
+            validation_results["errors"].append(
+                f"Temperature data for {room_name} is empty"
+            )
             validation_results["valid"] = False
             return validation_results
 
@@ -77,7 +81,9 @@ class DataValidator:
             if any(keyword in col.lower() for keyword in ["temp", "temperature"])
         ]
         if not temp_cols:
-            validation_results["errors"].append(f"No temperature columns found for {room_name}")
+            validation_results["errors"].append(
+                f"No temperature columns found for {room_name}"
+            )
             validation_results["valid"] = False
 
         # Check for reasonable temperature ranges
@@ -108,7 +114,9 @@ class OutlierDetector:
         """Initialize the outlier detector."""
         self.logger = logging.getLogger(f"{__name__}.OutlierDetector")
 
-    def detect_statistical_outliers(self, series: pd.Series, method: str = "iqr") -> pd.Series:
+    def detect_statistical_outliers(
+        self, series: pd.Series, method: str = "iqr"
+    ) -> pd.Series:
         """Detect outliers using statistical methods."""
         if method == "iqr":
             Q1 = series.quantile(0.25)
@@ -161,11 +169,17 @@ class GapFiller:
         for column in df_filled.columns:
             if df_filled[column].dtype in ["float64", "int64"]:
                 if method == "adaptive":
-                    df_filled[column] = self._adaptive_fill(df_filled[column], max_gap_hours)
+                    df_filled[column] = self._adaptive_fill(
+                        df_filled[column], max_gap_hours
+                    )
                 elif method == "interpolate":
-                    df_filled[column] = self._interpolate_fill(df_filled[column], max_gap_hours)
+                    df_filled[column] = self._interpolate_fill(
+                        df_filled[column], max_gap_hours
+                    )
                 elif method == "seasonal":
-                    df_filled[column] = self._seasonal_fill(df_filled[column], max_gap_hours)
+                    df_filled[column] = self._seasonal_fill(
+                        df_filled[column], max_gap_hours
+                    )
 
         return df_filled
 
@@ -205,15 +219,17 @@ class GapFiller:
 
                 # Choose filling method based on gap characteristics
                 if gap_hours <= 1:  # Short gaps: linear interpolation
-                    filled_series.loc[gap_mask] = series.loc[gap_start:gap_end].interpolate(
-                        method="linear"
-                    )
+                    filled_series.loc[gap_mask] = series.loc[
+                        gap_start:gap_end
+                    ].interpolate(method="linear")
                 elif gap_hours <= 3:  # Medium gaps: spline interpolation
-                    filled_series.loc[gap_mask] = series.loc[gap_start:gap_end].interpolate(
-                        method="spline", order=2
-                    )
+                    filled_series.loc[gap_mask] = series.loc[
+                        gap_start:gap_end
+                    ].interpolate(method="spline", order=2)
                 else:  # Longer gaps: seasonal decomposition approach
-                    filled_series.loc[gap_mask] = self._seasonal_fill_gap(series, gap_mask)
+                    filled_series.loc[gap_mask] = self._seasonal_fill_gap(
+                        series, gap_mask
+                    )
 
         return filled_series
 
@@ -296,10 +312,18 @@ class FeatureEngineer:
         # Cyclical encoding for better ML performance
         features_df["hour_sin"] = np.sin(2 * np.pi * features_df["hour"] / 24)
         features_df["hour_cos"] = np.cos(2 * np.pi * features_df["hour"] / 24)
-        features_df["day_of_week_sin"] = np.sin(2 * np.pi * features_df["day_of_week"] / 7)
-        features_df["day_of_week_cos"] = np.cos(2 * np.pi * features_df["day_of_week"] / 7)
-        features_df["day_of_year_sin"] = np.sin(2 * np.pi * features_df["day_of_year"] / 365)
-        features_df["day_of_year_cos"] = np.cos(2 * np.pi * features_df["day_of_year"] / 365)
+        features_df["day_of_week_sin"] = np.sin(
+            2 * np.pi * features_df["day_of_week"] / 7
+        )
+        features_df["day_of_week_cos"] = np.cos(
+            2 * np.pi * features_df["day_of_week"] / 7
+        )
+        features_df["day_of_year_sin"] = np.sin(
+            2 * np.pi * features_df["day_of_year"] / 365
+        )
+        features_df["day_of_year_cos"] = np.cos(
+            2 * np.pi * features_df["day_of_year"] / 365
+        )
 
         return features_df
 
@@ -335,3 +359,644 @@ class FeatureEngineer:
             )
 
         return features_df
+
+
+class RelayDataProcessor:
+    """Enhanced data preprocessing specifically for relay-controlled heating systems."""
+
+    def __init__(self):
+        """Initialize the relay data processor."""
+        self.logger = logging.getLogger(f"{__name__}.RelayDataProcessor")
+
+        # Room power ratings (kW) - update these based on your actual system
+        self.room_power_ratings = {
+            "living_room": 4.8,
+            "kitchen": 3.2,
+            "bedroom_1": 2.4,
+            "bedroom_2": 2.0,
+            "bathroom": 1.5,
+            "office": 2.2,
+            "guest_room": 1.8,
+            "hallway": 0.8,
+            # Add all 16 rooms with their actual power ratings
+        }
+
+    def process_relay_data(self, relay_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+        """
+        Process raw relay data for analysis.
+
+        Args:
+            relay_data: Dictionary with room names as keys, DataFrames with relay states as values
+
+        Returns:
+            Dictionary with processed relay data and statistics
+        """
+        if not relay_data:
+            return {"error": "No relay data provided"}
+
+        processed_data = {}
+        total_power_series = None
+
+        for room_name, room_df in relay_data.items():
+            if room_df.empty:
+                continue
+
+            # Process individual room data
+            room_processed = self._process_single_room_relay(room_name, room_df)
+            processed_data[room_name] = room_processed
+
+            # Accumulate total power consumption
+            if "power_consumption" in room_processed:
+                if total_power_series is None:
+                    total_power_series = room_processed["power_consumption"].copy()
+                else:
+                    total_power_series = total_power_series.add(
+                        room_processed["power_consumption"], fill_value=0
+                    )
+
+        # Add system-wide statistics
+        if total_power_series is not None:
+            processed_data["system_totals"] = self._calculate_system_statistics(
+                total_power_series, relay_data
+            )
+
+        return processed_data
+
+    def _process_single_room_relay(
+        self, room_name: str, room_df: pd.DataFrame
+    ) -> Dict[str, Any]:
+        """Process relay data for a single room."""
+        # Find relay state column
+        relay_col = None
+        for col in room_df.columns:
+            if any(
+                keyword in col.lower()
+                for keyword in ["relay", "state", "heating", "on"]
+            ):
+                relay_col = col
+                break
+
+        if relay_col is None:
+            return {"error": f"No relay state column found for {room_name}"}
+
+        # Clean relay data
+        relay_states = room_df[relay_col].copy()
+
+        # Binary state validation and smoothing
+        cleaned_states = self._validate_and_smooth_binary_states(relay_states)
+
+        # Calculate power consumption
+        power_rating = self.room_power_ratings.get(room_name, 2.0)  # Default 2kW
+        power_consumption = cleaned_states * power_rating * 1000  # Convert to watts
+
+        # Calculate switching statistics
+        switching_stats = self._calculate_switching_statistics(cleaned_states)
+
+        # Time-based features
+        time_features = self._create_relay_time_features(cleaned_states)
+
+        # Gap analysis
+        gap_analysis = self._analyze_relay_gaps(cleaned_states)
+
+        return {
+            "cleaned_relay_states": cleaned_states,
+            "power_consumption": power_consumption,
+            "power_rating_kw": power_rating,
+            "switching_statistics": switching_stats,
+            "time_features": time_features,
+            "gap_analysis": gap_analysis,
+        }
+
+    def _validate_and_smooth_binary_states(self, relay_states: pd.Series) -> pd.Series:
+        """Validate and smooth binary relay states to remove excessive switching."""
+        # Convert to binary (0/1)
+        binary_states = (relay_states > 0.5).astype(int)
+
+        # Remove rapid switching (less than 10 minutes between changes)
+        smoothed_states = binary_states.copy()
+
+        # Find state changes
+        state_changes = binary_states.diff().abs() > 0
+        change_times = state_changes[state_changes].index
+
+        # Group rapid switches and use majority vote
+        min_duration = pd.Timedelta(minutes=10)
+        i = 0
+        while i < len(change_times) - 1:
+            current_change = change_times[i]
+            next_change = change_times[i + 1]
+
+            if next_change - current_change < min_duration:
+                # Short duration - check if this is excessive switching
+                period_end = current_change + min_duration
+                period_mask = (binary_states.index >= current_change) & (
+                    binary_states.index <= period_end
+                )
+                period_data = binary_states[period_mask]
+
+                # Use majority vote for the period
+                majority_state = (
+                    period_data.mode().iloc[0]
+                    if not period_data.empty
+                    else binary_states.iloc[i]
+                )
+                smoothed_states.loc[period_mask] = majority_state
+
+                # Skip processed changes
+                while i < len(change_times) - 1 and change_times[i + 1] <= period_end:
+                    i += 1
+
+            i += 1
+
+        return smoothed_states
+
+    def _calculate_switching_statistics(
+        self, relay_states: pd.Series
+    ) -> Dict[str, Any]:
+        """Calculate relay switching statistics."""
+        # Count state changes
+        state_changes = relay_states.diff().abs() > 0
+        total_switches = state_changes.sum()
+
+        # Calculate ON and OFF periods
+        state_changes_idx = state_changes[state_changes].index.tolist()
+
+        on_periods = []
+        off_periods = []
+
+        current_state = relay_states.iloc[0] if len(relay_states) > 0 else 0
+        last_change = relay_states.index[0] if len(relay_states) > 0 else None
+
+        for change_time in state_changes_idx + [relay_states.index[-1]]:
+            if last_change is not None:
+                duration = change_time - last_change
+                duration_minutes = duration.total_seconds() / 60
+
+                if current_state == 1:
+                    on_periods.append(duration_minutes)
+                else:
+                    off_periods.append(duration_minutes)
+
+            if change_time in state_changes_idx:
+                current_state = 1 - current_state  # Switch state
+            last_change = change_time
+
+        # Calculate statistics
+        stats = {
+            "total_switches": total_switches,
+            "switches_per_day": total_switches / (len(relay_states) / (24 * 4))
+            if len(relay_states) > 0
+            else 0,
+            "on_time_percentage": relay_states.mean() * 100,
+            "avg_on_duration_minutes": np.mean(on_periods) if on_periods else 0,
+            "avg_off_duration_minutes": np.mean(off_periods) if off_periods else 0,
+            "max_on_duration_minutes": max(on_periods) if on_periods else 0,
+            "max_off_duration_minutes": max(off_periods) if off_periods else 0,
+            "on_periods_count": len(on_periods),
+            "off_periods_count": len(off_periods),
+        }
+
+        return stats
+
+    def _create_relay_time_features(self, relay_states: pd.Series) -> pd.DataFrame:
+        """Create time-based features for relay analysis."""
+        features_df = pd.DataFrame(index=relay_states.index)
+
+        # Basic time features
+        features_df["hour"] = relay_states.index.hour
+        features_df["weekday"] = relay_states.index.weekday
+        features_df["is_weekend"] = features_df["weekday"].isin([5, 6])
+        features_df["is_night"] = features_df["hour"].isin(range(22, 24)) | features_df[
+            "hour"
+        ].isin(range(0, 6))
+        features_df["is_peak_hours"] = features_df["hour"].isin(
+            range(17, 21)
+        )  # Evening peak
+
+        # Relay-specific features
+        features_df["relay_state"] = relay_states
+        features_df["state_duration"] = self._calculate_state_durations(relay_states)
+        features_df["time_since_last_change"] = self._calculate_time_since_change(
+            relay_states
+        )
+
+        return features_df
+
+    def _calculate_state_durations(self, relay_states: pd.Series) -> pd.Series:
+        """Calculate how long the relay has been in current state."""
+        durations = pd.Series(index=relay_states.index, dtype=float)
+
+        current_state = None
+        state_start = None
+
+        for timestamp, state in relay_states.items():
+            if state != current_state:
+                current_state = state
+                state_start = timestamp
+                durations.loc[timestamp] = 0
+            else:
+                if state_start is not None:
+                    duration = timestamp - state_start
+                    durations.loc[timestamp] = duration.total_seconds() / 60  # Minutes
+
+        return durations.fillna(0)
+
+    def _calculate_time_since_change(self, relay_states: pd.Series) -> pd.Series:
+        """Calculate time since last state change."""
+        state_changes = relay_states.diff().abs() > 0
+        change_times = state_changes[state_changes].index
+
+        time_since_change = pd.Series(index=relay_states.index, dtype=float)
+
+        for timestamp in relay_states.index:
+            # Find most recent change before this timestamp
+            recent_changes = change_times[change_times <= timestamp]
+            if len(recent_changes) > 0:
+                last_change = recent_changes[-1]
+                time_since = timestamp - last_change
+                time_since_change.loc[timestamp] = (
+                    time_since.total_seconds() / 60
+                )  # Minutes
+            else:
+                time_since_change.loc[timestamp] = 0
+
+        return time_since_change.fillna(0)
+
+    def _analyze_relay_gaps(self, relay_states: pd.Series) -> Dict[str, Any]:
+        """Analyze gaps in relay data."""
+        if len(relay_states) < 2:
+            return {"warning": "Insufficient data for gap analysis"}
+
+        # Calculate time intervals
+        time_diffs = relay_states.index.to_series().diff()
+
+        # Expected interval (mode of differences)
+        expected_interval = (
+            time_diffs.mode().iloc[0]
+            if not time_diffs.empty
+            else pd.Timedelta(minutes=15)
+        )
+
+        # Find gaps (intervals significantly larger than expected)
+        gap_threshold = expected_interval * 3
+        gaps = time_diffs[time_diffs > gap_threshold]
+
+        gap_analysis = {
+            "total_gaps": len(gaps),
+            "total_gap_duration_hours": gaps.sum().total_seconds() / 3600
+            if len(gaps) > 0
+            else 0,
+            "largest_gap_hours": gaps.max().total_seconds() / 3600
+            if len(gaps) > 0
+            else 0,
+            "expected_interval_minutes": expected_interval.total_seconds() / 60,
+            "data_completeness_percentage": (
+                1 - gaps.sum() / (relay_states.index[-1] - relay_states.index[0])
+            )
+            * 100,
+        }
+
+        return gap_analysis
+
+    def _calculate_system_statistics(
+        self, total_power: pd.Series, relay_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Any]:
+        """Calculate system-wide relay statistics."""
+        # Peak demand analysis
+        daily_peak = total_power.resample("D").max()
+        monthly_peak = total_power.resample("M").max()
+
+        # Simultaneous operation analysis
+        simultaneous_rooms = 0
+        total_rooms = len(relay_data)
+
+        # Count rooms operating simultaneously at peak times
+        peak_times = total_power.nlargest(100).index  # Top 100 power consumption times
+
+        if len(peak_times) > 0:
+            # For simplification, estimate from total power and average room power
+            avg_room_power = (
+                np.mean(list(self.room_power_ratings.values())) * 1000
+            )  # Watts
+            simultaneous_rooms = total_power.loc[peak_times].mean() / avg_room_power
+
+        # Load distribution analysis
+        hourly_avg = total_power.groupby(total_power.index.hour).mean()
+        peak_hour = hourly_avg.idxmax()
+        off_peak_hour = hourly_avg.idxmin()
+
+        system_stats = {
+            "total_rooms": total_rooms,
+            "total_installed_capacity_kw": sum(self.room_power_ratings.values()),
+            "peak_demand_kw": total_power.max() / 1000,
+            "average_demand_kw": total_power.mean() / 1000,
+            "daily_peak_avg_kw": daily_peak.mean() / 1000,
+            "monthly_peak_max_kw": monthly_peak.max() / 1000,
+            "peak_hour": peak_hour,
+            "off_peak_hour": off_peak_hour,
+            "load_factor": total_power.mean() / total_power.max()
+            if total_power.max() > 0
+            else 0,
+            "estimated_simultaneous_rooms_at_peak": min(
+                simultaneous_rooms, total_rooms
+            ),
+            "diversity_factor": total_power.max()
+            / (sum(self.room_power_ratings.values()) * 1000),
+        }
+
+        return system_stats
+
+
+class PVDataProcessor:
+    """Enhanced data preprocessing specifically for PV systems with export constraints."""
+
+    def __init__(self):
+        """Initialize the PV data processor."""
+        self.logger = logging.getLogger(f"{__name__}.PVDataProcessor")
+
+    def process_pv_data(
+        self, pv_data: pd.DataFrame, price_data: pd.DataFrame = None
+    ) -> Dict[str, Any]:
+        """
+        Process PV data considering export constraints and policy changes.
+
+        Args:
+            pv_data: PV production and consumption data
+            price_data: Electricity price data for export analysis
+
+        Returns:
+            Dictionary with processed PV data and analysis
+        """
+        if pv_data.empty:
+            return {"error": "No PV data provided"}
+
+        processed_data = {}
+
+        # Detect export policy periods
+        export_analysis = self._detect_export_periods(pv_data)
+        processed_data["export_periods"] = export_analysis
+
+        # Process production data
+        production_analysis = self._process_production_data(pv_data)
+        processed_data["production_analysis"] = production_analysis
+
+        # Self-consumption analysis
+        self_consumption_analysis = self._analyze_self_consumption(pv_data)
+        processed_data["self_consumption"] = self_consumption_analysis
+
+        # Export behavior analysis (if export data available)
+        if "ExportPower" in pv_data.columns:
+            export_behavior = self._analyze_export_behavior(pv_data, price_data)
+            processed_data["export_behavior"] = export_behavior
+
+        # Curtailment estimation
+        curtailment_analysis = self._estimate_curtailment(pv_data)
+        processed_data["curtailment"] = curtailment_analysis
+
+        return processed_data
+
+    def _detect_export_periods(self, pv_data: pd.DataFrame) -> Dict[str, Any]:
+        """Detect periods with different export policies."""
+        if "ExportPower" not in pv_data.columns:
+            return {"warning": "No export power data available for period detection"}
+
+        # Calculate daily export amounts
+        daily_export = pv_data.resample("D")["ExportPower"].sum()
+
+        # Find first significant export day
+        export_threshold = daily_export.quantile(0.05)  # 5th percentile as minimum
+        first_export_day = daily_export[daily_export > export_threshold].index.min()
+
+        if pd.isna(first_export_day):
+            return {"warning": "No significant export periods found"}
+
+        periods = {
+            "pre_export_period": {
+                "start": pv_data.index.min(),
+                "end": first_export_day,
+                "description": "Export disabled period",
+            },
+            "post_export_period": {
+                "start": first_export_day,
+                "end": pv_data.index.max(),
+                "description": "Conditional export period",
+            },
+            "policy_change_date": first_export_day,
+        }
+
+        return periods
+
+    def _process_production_data(self, pv_data: pd.DataFrame) -> Dict[str, Any]:
+        """Process PV production data with quality checks."""
+        # Find production column
+        prod_col = None
+        for col in pv_data.columns:
+            if any(
+                keyword in col.lower() for keyword in ["input", "production", "power"]
+            ):
+                if "export" not in col.lower():  # Exclude export power
+                    prod_col = col
+                    break
+
+        if prod_col is None:
+            return {"error": "No production power column found"}
+
+        production = pv_data[prod_col].copy()
+
+        # Clean negative values (nighttime/errors)
+        production_clean = production.clip(lower=0)
+
+        # Calculate production statistics
+        daily_production = (
+            production_clean.resample("D").sum() * 0.25 / 1000
+        )  # Convert to kWh
+        monthly_production = daily_production.resample("M").sum()
+
+        # Identify peak production periods
+        peak_days = daily_production.nlargest(30)  # Top 30 production days
+        low_days = daily_production[daily_production > 0].nsmallest(
+            30
+        )  # Bottom 30 non-zero days
+
+        # Weather-adjusted production analysis
+        production_by_hour = production_clean.groupby(
+            production_clean.index.hour
+        ).mean()
+        peak_production_hour = production_by_hour.idxmax()
+
+        analysis = {
+            "total_production_kwh": daily_production.sum(),
+            "daily_avg_kwh": daily_production.mean(),
+            "peak_power_kw": production_clean.max() / 1000,
+            "peak_production_hour": peak_production_hour,
+            "peak_production_days": peak_days.index.tolist()[:10],  # Top 10 dates
+            "low_production_days": low_days.index.tolist()[:10],  # Bottom 10 dates
+            "monthly_production_kwh": monthly_production.to_dict(),
+            "capacity_factor": production_clean.mean() / production_clean.max()
+            if production_clean.max() > 0
+            else 0,
+            "production_variance": daily_production.std(),
+            "zero_production_days": (daily_production == 0).sum(),
+        }
+
+        return analysis
+
+    def _analyze_self_consumption(self, pv_data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze self-consumption patterns."""
+        if "SelfConsumption" in pv_data.columns and "InputPower" in pv_data.columns:
+            production = pv_data["InputPower"]
+            self_consumption = pv_data["SelfConsumption"]
+
+            # Calculate self-consumption ratio
+            daily_production = production.resample("D").sum()
+            daily_self_consumption = self_consumption.resample("D").sum()
+
+            self_consumption_ratio = daily_self_consumption / daily_production
+            self_consumption_ratio = self_consumption_ratio.fillna(0).clip(0, 1)
+
+            # Analyze patterns
+            hourly_ratio = (
+                self_consumption.groupby(production.index.hour).sum()
+                / production.groupby(production.index.hour).sum()
+            ).fillna(0)
+
+            analysis = {
+                "overall_self_consumption_ratio": self_consumption_ratio.mean(),
+                "daily_self_consumption_ratio": self_consumption_ratio.to_dict(),
+                "hourly_self_consumption_ratio": hourly_ratio.to_dict(),
+                "peak_self_consumption_hour": hourly_ratio.idxmax(),
+                "min_self_consumption_hour": hourly_ratio.idxmin(),
+                "self_consumption_variability": self_consumption_ratio.std(),
+                "high_self_consumption_days": self_consumption_ratio.nlargest(
+                    10
+                ).index.tolist(),
+                "low_self_consumption_days": self_consumption_ratio.nsmallest(
+                    10
+                ).index.tolist(),
+            }
+
+            return analysis
+        else:
+            return {"warning": "Insufficient data for self-consumption analysis"}
+
+    def _analyze_export_behavior(
+        self, pv_data: pd.DataFrame, price_data: pd.DataFrame = None
+    ) -> Dict[str, Any]:
+        """Analyze export behavior patterns."""
+        export_power = pv_data["ExportPower"]
+
+        # Basic export statistics
+        daily_export = export_power.resample("D").sum() * 0.25 / 1000  # Convert to kWh
+        export_days = (daily_export > 0).sum()
+        total_export_kwh = daily_export.sum()
+
+        # Export timing analysis
+        hourly_export = export_power.groupby(export_power.index.hour).mean()
+        peak_export_hour = hourly_export.idxmax()
+
+        analysis = {
+            "total_export_kwh": total_export_kwh,
+            "export_days": export_days,
+            "avg_daily_export_kwh": daily_export[daily_export > 0].mean()
+            if export_days > 0
+            else 0,
+            "peak_export_hour": peak_export_hour,
+            "export_frequency": export_days / len(daily_export)
+            if len(daily_export) > 0
+            else 0,
+            "hourly_export_pattern": hourly_export.to_dict(),
+        }
+
+        # Price correlation analysis (if price data available)
+        if price_data is not None and not price_data.empty:
+            # Align export and price data
+            aligned_data = pv_data[["ExportPower"]].merge(
+                price_data, left_index=True, right_index=True, how="inner"
+            )
+
+            if not aligned_data.empty:
+                price_correlation = aligned_data["ExportPower"].corr(
+                    aligned_data["price"]
+                )
+
+                # Export behavior by price quartiles
+                price_quartiles = aligned_data["price"].quantile([0.25, 0.5, 0.75])
+
+                q1_export = aligned_data[
+                    aligned_data["price"] <= price_quartiles[0.25]
+                ]["ExportPower"].mean()
+                q2_export = aligned_data[
+                    (aligned_data["price"] > price_quartiles[0.25])
+                    & (aligned_data["price"] <= price_quartiles[0.5])
+                ]["ExportPower"].mean()
+                q3_export = aligned_data[
+                    (aligned_data["price"] > price_quartiles[0.5])
+                    & (aligned_data["price"] <= price_quartiles[0.75])
+                ]["ExportPower"].mean()
+                q4_export = aligned_data[aligned_data["price"] > price_quartiles[0.75]][
+                    "ExportPower"
+                ].mean()
+
+                analysis.update(
+                    {
+                        "price_correlation": price_correlation,
+                        "export_by_price_quartile": {
+                            "q1_low_price": q1_export,
+                            "q2_med_low_price": q2_export,
+                            "q3_med_high_price": q3_export,
+                            "q4_high_price": q4_export,
+                        },
+                    }
+                )
+
+        return analysis
+
+    def _estimate_curtailment(self, pv_data: pd.DataFrame) -> Dict[str, Any]:
+        """Estimate energy curtailment during no-export periods."""
+        if "InputPower" not in pv_data.columns:
+            return {
+                "warning": "No production data available for curtailment estimation"
+            }
+
+        production = pv_data["InputPower"]
+
+        # If we have both self-consumption and export data
+        if "SelfConsumption" in pv_data.columns and "ExportPower" in pv_data.columns:
+            self_consumption = pv_data["SelfConsumption"]
+            export_power = pv_data["ExportPower"]
+
+            # Curtailment = Production - Self-consumption - Export
+            curtailment = production - self_consumption - export_power
+            curtailment = curtailment.clip(lower=0)  # Can't be negative
+
+        elif "SelfConsumption" in pv_data.columns:
+            # No export data - assume all excess production was curtailed
+            self_consumption = pv_data["SelfConsumption"]
+            curtailment = (production - self_consumption).clip(lower=0)
+
+        else:
+            # No consumption data - estimate based on typical patterns
+            # This is a rough estimation and should be improved with actual data
+            return {"warning": "Insufficient data for accurate curtailment estimation"}
+
+        # Calculate curtailment statistics
+        daily_curtailment = (
+            curtailment.resample("D").sum() * 0.25 / 1000
+        )  # Convert to kWh
+        total_curtailment = daily_curtailment.sum()
+
+        # Curtailment as percentage of production
+        daily_production = production.resample("D").sum() * 0.25 / 1000
+        curtailment_ratio = daily_curtailment / daily_production
+        curtailment_ratio = curtailment_ratio.fillna(0)
+
+        analysis = {
+            "total_curtailment_kwh": total_curtailment,
+            "avg_daily_curtailment_kwh": daily_curtailment.mean(),
+            "max_daily_curtailment_kwh": daily_curtailment.max(),
+            "curtailment_ratio": curtailment_ratio.mean(),
+            "high_curtailment_days": daily_curtailment.nlargest(10).index.tolist(),
+            "curtailment_by_month": daily_curtailment.resample("M").sum().to_dict(),
+        }
+
+        return analysis

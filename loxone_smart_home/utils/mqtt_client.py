@@ -5,7 +5,6 @@ import logging
 from typing import Any, Callable, Dict, Optional, Union
 
 from asyncio_mqtt import Client, MqttError
-
 from config.settings import Settings
 
 
@@ -71,7 +70,9 @@ class SharedMQTTClient:
             raise
 
     async def subscribe(
-        self, topic: str, callback: Union[Callable[[str, Any], None], Callable[[str, Any], Any]]
+        self,
+        topic: str,
+        callback: Union[Callable[[str, Any], None], Callable[[str, Any], Any]],
     ) -> None:
         """Subscribe to a topic with a callback."""
         if not self.client:
@@ -105,7 +106,9 @@ class SharedMQTTClient:
                                 self._handle_callback(callback, topic, payload)
                             )
                         except Exception as e:
-                            self.logger.error(f"Error in callback for {topic}: {e}", exc_info=True)
+                            self.logger.error(
+                                f"Error in callback for {topic}: {e}", exc_info=True
+                            )
 
     async def _handle_callback(
         self,

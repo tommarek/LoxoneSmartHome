@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from config.settings import GrowattConfig, Settings
 from modules.growatt_controller import GrowattController
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -67,7 +66,9 @@ async def test_controller_initialization(growatt_controller: GrowattController) 
 
 
 @pytest.mark.asyncio
-async def test_fetch_dam_energy_prices_success(growatt_controller: GrowattController) -> None:
+async def test_fetch_dam_energy_prices_success(
+    growatt_controller: GrowattController,
+) -> None:
     """Test successful energy price fetching."""
     mock_response = {
         "data": {
@@ -88,7 +89,9 @@ async def test_fetch_dam_energy_prices_success(growatt_controller: GrowattContro
         mock_get = AsyncMock()
         mock_get.__aenter__.return_value.status = 200
         mock_get.__aenter__.return_value.json = AsyncMock(return_value=mock_response)
-        mock_session.return_value.__aenter__.return_value.get = MagicMock(return_value=mock_get)
+        mock_session.return_value.__aenter__.return_value.get = MagicMock(
+            return_value=mock_get
+        )
 
         prices = await growatt_controller._fetch_dam_energy_prices("2024-01-01")
 
@@ -99,19 +102,25 @@ async def test_fetch_dam_energy_prices_success(growatt_controller: GrowattContro
 
 
 @pytest.mark.asyncio
-async def test_fetch_dam_energy_prices_failure(growatt_controller: GrowattController) -> None:
+async def test_fetch_dam_energy_prices_failure(
+    growatt_controller: GrowattController,
+) -> None:
     """Test energy price fetching with API failure."""
     with patch("aiohttp.ClientSession") as mock_session:
         mock_get = AsyncMock()
         mock_get.__aenter__.return_value.status = 500
-        mock_session.return_value.__aenter__.return_value.get = MagicMock(return_value=mock_get)
+        mock_session.return_value.__aenter__.return_value.get = MagicMock(
+            return_value=mock_get
+        )
 
         prices = await growatt_controller._fetch_dam_energy_prices()
         assert prices == {}
 
 
 @pytest.mark.asyncio
-async def test_find_cheapest_consecutive_hours(growatt_controller: GrowattController) -> None:
+async def test_find_cheapest_consecutive_hours(
+    growatt_controller: GrowattController,
+) -> None:
     """Test finding cheapest consecutive hours."""
     prices = {
         ("00:00", "01:00"): 1500.0,
@@ -146,7 +155,9 @@ async def test_find_n_cheapest_hours(growatt_controller: GrowattController) -> N
 
 
 @pytest.mark.asyncio
-async def test_categorize_prices_into_quadrants(growatt_controller: GrowattController) -> None:
+async def test_categorize_prices_into_quadrants(
+    growatt_controller: GrowattController,
+) -> None:
     """Test price categorization into quadrants."""
     prices = {
         ("00:00", "01:00"): 1000.0,  # Cheapest
@@ -202,13 +213,15 @@ async def test_battery_control_commands(
     # Test enable AC charge
     await growatt_controller._enable_ac_charge()
     mock_mqtt_client.publish.assert_called_with(
-        "energy/solar/command/batteryfirst/set/acchargeenabled", json.dumps({"value": True})
+        "energy/solar/command/batteryfirst/set/acchargeenabled",
+        json.dumps({"value": True}),
     )
 
     # Test disable AC charge
     await growatt_controller._disable_ac_charge()
     mock_mqtt_client.publish.assert_called_with(
-        "energy/solar/command/batteryfirst/set/acchargeenabled", json.dumps({"value": False})
+        "energy/solar/command/batteryfirst/set/acchargeenabled",
+        json.dumps({"value": False}),
     )
 
     # Test disable battery first
@@ -268,7 +281,9 @@ async def test_calculate_and_schedule_next_day_no_prices(
 ) -> None:
     """Test scheduling with no price data available."""
     with patch.object(growatt_controller, "_fetch_dam_energy_prices", return_value={}):
-        with patch.object(growatt_controller, "_schedule_fallback_mode") as mock_fallback:
+        with patch.object(
+            growatt_controller, "_schedule_fallback_mode"
+        ) as mock_fallback:
             await growatt_controller._calculate_and_schedule_next_day()
             mock_fallback.assert_called_once()
 
@@ -285,8 +300,12 @@ async def test_calculate_and_schedule_next_day_with_prices(
         ("03:00", "04:00"): 4.0,
     }
 
-    with patch.object(growatt_controller, "_fetch_dam_energy_prices", return_value=mock_prices):
-        with patch.object(growatt_controller, "_schedule_battery_control") as mock_battery:
+    with patch.object(
+        growatt_controller, "_fetch_dam_energy_prices", return_value=mock_prices
+    ):
+        with patch.object(
+            growatt_controller, "_schedule_battery_control"
+        ) as mock_battery:
             with patch.object(growatt_controller, "_schedule_export_control"):
                 await growatt_controller._calculate_and_schedule_next_day()
 
@@ -324,7 +343,9 @@ async def test_schedule_export_control(
 @pytest.mark.asyncio
 async def test_start_stop(growatt_controller: GrowattController) -> None:
     """Test controller start and stop."""
-    with patch.object(growatt_controller, "_schedule_daily_calculation") as mock_schedule:
+    with patch.object(
+        growatt_controller, "_schedule_daily_calculation"
+    ) as mock_schedule:
         await growatt_controller.start()
         mock_schedule.assert_called_once()
 
@@ -369,7 +390,9 @@ async def test_daily_calculation_loop(growatt_controller: GrowattController) -> 
         else:
             raise asyncio.CancelledError()  # Second sleep (after calculation) cancels
 
-    with patch.object(growatt_controller, "_calculate_and_schedule_next_day") as mock_calc:
+    with patch.object(
+        growatt_controller, "_calculate_and_schedule_next_day"
+    ) as mock_calc:
         with patch("asyncio.sleep", side_effect=mock_sleep):
             try:
                 await growatt_controller._daily_calculation_loop()

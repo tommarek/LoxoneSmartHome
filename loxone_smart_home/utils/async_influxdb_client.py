@@ -6,10 +6,9 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Deque, Dict, List, Optional
 
+from config.settings import Settings
 from influxdb_client import Point, WritePrecision
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
-
-from config.settings import Settings
 
 
 class AsyncInfluxDBClient:
@@ -50,7 +49,9 @@ class AsyncInfluxDBClient:
         # Start background flush task
         self._flush_task = asyncio.create_task(self._flush_loop())
 
-        self.logger.info(f"Async InfluxDB client started with pool size {self.pool_size}")
+        self.logger.info(
+            f"Async InfluxDB client started with pool size {self.pool_size}"
+        )
 
     async def stop(self) -> None:
         """Stop the client and flush remaining data."""
@@ -196,12 +197,14 @@ class AsyncInfluxDBClient:
                 if attempt < max_retries - 1:
                     wait_time = 2**attempt  # Exponential backoff
                     self.logger.warning(
-                        f"Failed to write batch to {bucket}, " f"retrying in {wait_time}s: {e}"
+                        f"Failed to write batch to {bucket}, "
+                        f"retrying in {wait_time}s: {e}"
                     )
                     await asyncio.sleep(wait_time)
                 else:
                     self.logger.error(
-                        f"Failed to write batch to {bucket} after " f"{max_retries} attempts: {e}"
+                        f"Failed to write batch to {bucket} after "
+                        f"{max_retries} attempts: {e}"
                     )
                     # Could implement dead letter queue here
 
@@ -209,7 +212,9 @@ class AsyncInfluxDBClient:
         """Execute a query against InfluxDB."""
         client = await self._get_client()
         try:
-            return await client.query_api().query(query=query, org=self.settings.influxdb.org)
+            return await client.query_api().query(
+                query=query, org=self.settings.influxdb.org
+            )
         except Exception as e:
             self.logger.error(f"Failed to query InfluxDB: {e}")
             raise

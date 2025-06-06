@@ -40,7 +40,9 @@ class TimezoneAwareFormatter(colorlog.ColoredFormatter):
         super().__init__(fmt, datefmt, **kwargs)
         self.timezone = zoneinfo.ZoneInfo(timezone)
 
-    def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
+    def formatTime(
+        self, record: logging.LogRecord, datefmt: Optional[str] = None
+    ) -> str:
         """Format time in the specified timezone."""
         # Convert the record timestamp to local timezone
         dt = time.localtime(record.created)
@@ -49,7 +51,9 @@ class TimezoneAwareFormatter(colorlog.ColoredFormatter):
         # Create a datetime object and convert to our timezone
         import datetime
 
-        utc_time = datetime.datetime.fromtimestamp(record.created, tz=datetime.timezone.utc)
+        utc_time = datetime.datetime.fromtimestamp(
+            record.created, tz=datetime.timezone.utc
+        )
         local_time = utc_time.astimezone(self.timezone)
 
         if datefmt:
@@ -99,7 +103,10 @@ def setup_service_logger(
 
 
 def configure_module_logger(
-    module_name: str, service_name: str, timezone: str = "Europe/Prague", log_level: str = "INFO"
+    module_name: str,
+    service_name: str,
+    timezone: str = "Europe/Prague",
+    log_level: str = "INFO",
 ) -> logging.Logger:
     """Configure a logger for a module with service prefix.
 

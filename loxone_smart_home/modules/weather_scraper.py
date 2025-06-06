@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import aiohttp
-
 from config.settings import Settings
 from modules.base import BaseModule
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -170,7 +169,9 @@ class WeatherScraper(BaseModule):
 
         # Process data
         hour_now = int(
-            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+            datetime.now(timezone.utc)
+            .replace(minute=0, second=0, microsecond=0)
+            .timestamp()
         )
 
         # Build hourly data

@@ -1,1 +1,24 @@
 .sublime-project
+.log
+
+.venv/
+venv/
+__pycache__/
+# Local environment files
+.env
+# Local configuration files
+*.local
+# Python bytecode files
+*.py[cod]
+# Distribution / packaging
+.Python
+build/
+dist/
+# PyInstaller
+#  PyInstaller creates a build/ directory with a lot of files.
+#  See https://pyinstaller.readthedocs.io/en/stable/usage.html#cleaning-up
+#  for more information.
+*.spec
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt           

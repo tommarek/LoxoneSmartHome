@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytz
-
 from config.settings import Settings
 from modules.udp_listener import UDPListener, UDPProtocol
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -72,8 +71,12 @@ class TestUDPListener:
         call_args = mock_influxdb.write_point.call_args  # type: ignore[attr-defined]
 
         assert call_args.kwargs["bucket"] == "loxone"
-        assert call_args.kwargs["measurement"] == "sensor"  # measurement_type is the measurement
-        assert call_args.kwargs["fields"] == {"temperature": 21.5}  # measurement_name is the field
+        assert (
+            call_args.kwargs["measurement"] == "sensor"
+        )  # measurement_type is the measurement
+        assert call_args.kwargs["fields"] == {
+            "temperature": 21.5
+        }  # measurement_name is the field
         assert call_args.kwargs["tags"]["room"] == "living_room"
         assert call_args.kwargs["tags"]["tag1"] == "tag1_value"
         assert call_args.kwargs["tags"]["tag2"] == "tag2_value"
