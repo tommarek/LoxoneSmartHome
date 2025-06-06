@@ -17,10 +17,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 import pandas as pd
-
 from analysis.base_load_analysis import BaseLoadAnalyzer
 from analysis.data_extraction import DataExtractor
-from analysis.pattern_analysis import PVAnalyzer
+from analysis.pattern_analysis import PVAnalyzer, RelayPatternAnalyzer
 from analysis.thermal_analysis import ThermalAnalyzer
 from config.settings import PEMSSettings as Settings
 
@@ -62,7 +61,9 @@ class DataPreprocessor:
             df_clean = self._general_cleaning(df_clean)
 
         # Generate quality report
-        self.quality_report[data_type] = self._generate_quality_report(df, df_clean, data_type)
+        self.quality_report[data_type] = self._generate_quality_report(
+            df, df_clean, data_type
+        )
 
         self.logger.info(
             f"Processed {data_type}: {len(df_clean)} clean records from {len(df)} original"
@@ -85,7 +86,9 @@ class DataPreprocessor:
         for col in numeric_cols:
             df_clean.loc[night_mask, col] = df_clean.loc[night_mask, col].fillna(0)
             # Interpolate remaining missing values during daylight
-            df_clean[col] = df_clean[col].interpolate(method="linear", limit=6)  # Max 1.5 hours gap
+            df_clean[col] = df_clean[col].interpolate(
+                method="linear", limit=6
+            )  # Max 1.5 hours gap
 
         return df_clean
 
@@ -98,7 +101,9 @@ class DataPreprocessor:
         for col in temp_cols:
             if col in df_clean.columns:
                 # Remove temperatures outside reasonable range (-10 to 50°C)
-                df_clean[col] = df_clean[col].mask((df_clean[col] < -10) | (df_clean[col] > 50))
+                df_clean[col] = df_clean[col].mask(
+                    (df_clean[col] < -10) | (df_clean[col] > 50)
+                )
                 # Interpolate missing values (max 30 minutes gap)
                 df_clean[col] = df_clean[col].interpolate(method="linear", limit=6)
 
@@ -109,8 +114,12 @@ class DataPreprocessor:
         df_clean = df.copy()
 
         # Forward fill then interpolate
-        df_clean = df_clean.fillna(method="ffill", limit=12)  # Forward fill up to 3 hours
-        df_clean = df_clean.interpolate(method="linear", limit=24)  # Interpolate up to 6 hours
+        df_clean = df_clean.fillna(
+            method="ffill", limit=12
+        )  # Forward fill up to 3 hours
+        df_clean = df_clean.interpolate(
+            method="linear", limit=24
+        )  # Interpolate up to 6 hours
 
         return df_clean
 
@@ -158,13 +167,18 @@ class DataPreprocessor:
 
         clean_missing = clean_df.isnull().sum().sum()
         clean_total = clean_df.size
-        clean_missing_pct = (clean_missing / clean_total * 100) if clean_total > 0 else 100
+        clean_missing_pct = (
+            (clean_missing / clean_total * 100) if clean_total > 0 else 100
+        )
 
         # Find significant time gaps (>2 hours)
         if not clean_df.index.empty:
             time_diffs = clean_df.index.to_series().diff()
             large_gaps = time_diffs[time_diffs > pd.Timedelta(hours=2)]
-            time_gaps = [(gap_time, gap_duration) for gap_time, gap_duration in large_gaps.items()]
+            time_gaps = [
+                (gap_time, gap_duration)
+                for gap_time, gap_duration in large_gaps.items()
+            ]
         else:
             time_gaps = []
 
@@ -307,7 +321,9 @@ class AnalysisVisualizer:
             ):
                 pattern = base_load_results["time_patterns"]["weekday_vs_weekend"]
                 weekend_inc = pattern.get("weekend_increase", 0)
-                report_lines.append(f"• Weekend vs Weekday: {weekend_inc:.1f}% higher on weekends")
+                report_lines.append(
+                    f"• Weekend vs Weekday: {weekend_inc:.1f}% higher on weekends"
+                )
 
             report_lines.append("")
 
@@ -384,7 +400,9 @@ class AnalysisPipeline:
         for directory in directories:
             Path(directory).mkdir(parents=True, exist_ok=True)
 
-    async def run_full_analysis(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+    async def run_full_analysis(
+        self, start_date: datetime, end_date: datetime
+    ) -> Dict[str, Any]:
         """Run the complete analysis pipeline."""
         self.logger.info("Starting PEMS v2 Data Analysis Pipeline")
         self.logger.info(
@@ -432,7 +450,9 @@ class AnalysisPipeline:
             self.logger.error(f"Analysis pipeline failed: {e}", exc_info=True)
             raise
 
-    async def _extract_all_data(self, start_date: datetime, end_date: datetime) -> Dict[str, Any]:
+    async def _extract_all_data(
+        self, start_date: datetime, end_date: datetime
+    ) -> Dict[str, Any]:
         """Extract all required data from InfluxDB."""
         data = {}
 
@@ -445,14 +465,18 @@ class AnalysisPipeline:
 
             # Extract room temperature data
             self.logger.info("Extracting room temperature data...")
-            data["rooms"] = await self.extractor.extract_room_temperatures(start_date, end_date)
+            data["rooms"] = await self.extractor.extract_room_temperatures(
+                start_date, end_date
+            )
             for room_name, room_df in data["rooms"].items():
                 if not room_df.empty:
                     self.extractor.save_to_parquet(room_df, f"room_{room_name}")
 
             # Extract weather data
             self.logger.info("Extracting weather data...")
-            data["weather"] = await self.extractor.extract_weather_data(start_date, end_date)
+            data["weather"] = await self.extractor.extract_weather_data(
+                start_date, end_date
+            )
             if not data["weather"].empty:
                 self.extractor.save_to_parquet(data["weather"], "weather_data")
 
@@ -467,12 +491,94 @@ class AnalysisPipeline:
             # Extract energy prices (optional)
             self.logger.info("Extracting energy price data...")
             try:
-                data["prices"] = await self.extractor.extract_energy_prices(start_date, end_date)
+                data["prices"] = await self.extractor.extract_energy_prices(
+                    start_date, end_date
+                )
                 if data["prices"] is not None and not data["prices"].empty:
                     self.extractor.save_to_parquet(data["prices"], "energy_prices")
             except Exception as e:
                 self.logger.warning(f"Could not extract energy prices: {e}")
                 data["prices"] = None
+
+            # Extract relay states (for PEMS analysis)
+            self.logger.info("Extracting relay state data...")
+            try:
+                data["relay_states"] = await self.extractor.extract_relay_states(
+                    start_date, end_date
+                )
+                for room_name, room_df in data["relay_states"].items():
+                    if not room_df.empty:
+                        self.extractor.save_to_parquet(room_df, f"relay_{room_name}")
+            except Exception as e:
+                self.logger.warning(f"Could not extract relay states: {e}")
+                data["relay_states"] = {}
+
+            # Extract battery data
+            self.logger.info("Extracting battery data...")
+            try:
+                data["battery"] = await self.extractor.extract_battery_data(
+                    start_date, end_date
+                )
+                if not data["battery"].empty:
+                    self.extractor.save_to_parquet(data["battery"], "battery_data")
+            except Exception as e:
+                self.logger.warning(f"Could not extract battery data: {e}")
+                data["battery"] = pd.DataFrame()
+
+            # Extract EV data (if available)
+            self.logger.info("Extracting EV charging data...")
+            try:
+                data["ev"] = await self.extractor.extract_ev_data(start_date, end_date)
+                if not data["ev"].empty:
+                    self.extractor.save_to_parquet(data["ev"], "ev_data")
+            except Exception as e:
+                self.logger.warning(f"Could not extract EV data: {e}")
+                data["ev"] = pd.DataFrame()
+
+            # Extract current weather data from Loxone
+            self.logger.info("Extracting current weather data from Loxone...")
+            try:
+                data["current_weather"] = await self.extractor.extract_current_weather(
+                    start_date, end_date
+                )
+                if not data["current_weather"].empty:
+                    self.extractor.save_to_parquet(
+                        data["current_weather"], "current_weather_data"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Could not extract current weather data: {e}")
+                data["current_weather"] = pd.DataFrame()
+
+            # Extract shading relay states
+            self.logger.info("Extracting shading relay states...")
+            try:
+                data["shading_relays"] = await self.extractor.extract_shading_relays(
+                    start_date, end_date
+                )
+                if not data["shading_relays"].empty:
+                    self.extractor.save_to_parquet(
+                        data["shading_relays"], "shading_relays"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Could not extract shading relay data: {e}")
+                data["shading_relays"] = pd.DataFrame()
+
+            # Validate data completeness
+            self.logger.info("Validating data completeness...")
+            validation_results = self.extractor.validate_data_completeness(data)
+            data["validation"] = validation_results
+
+            if not validation_results["is_complete"]:
+                self.logger.warning(
+                    f"Missing required data: {validation_results['missing_required']}"
+                )
+            if validation_results["missing_optional"]:
+                self.logger.info(
+                    f"Missing optional data: {validation_results['missing_optional']}"
+                )
+
+            for recommendation in validation_results["recommendations"]:
+                self.logger.info(f"Data recommendation: {recommendation}")
 
         except Exception as e:
             self.logger.error(f"Data extraction failed: {e}")
@@ -506,7 +612,9 @@ class AnalysisPipeline:
             # Process weather data
             if not data["weather"].empty:
                 self.logger.info("Processing weather data...")
-                processed["weather"] = self.preprocessor.process_dataset(data["weather"], "weather")
+                processed["weather"] = self.preprocessor.process_dataset(
+                    data["weather"], "weather"
+                )
             else:
                 processed["weather"] = pd.DataFrame()
 
@@ -519,10 +627,46 @@ class AnalysisPipeline:
             else:
                 processed["consumption"] = pd.DataFrame()
 
+            # Process battery data
+            if "battery" in data and not data["battery"].empty:
+                self.logger.info("Processing battery data...")
+                processed["battery"] = self.preprocessor.process_dataset(
+                    data["battery"], "battery"
+                )
+            else:
+                processed["battery"] = pd.DataFrame()
+
+            # Process EV data
+            if "ev" in data and not data["ev"].empty:
+                self.logger.info("Processing EV data...")
+                processed["ev"] = self.preprocessor.process_dataset(data["ev"], "ev")
+            else:
+                processed["ev"] = pd.DataFrame()
+
+            # Process current weather data
+            if "current_weather" in data and not data["current_weather"].empty:
+                self.logger.info("Processing current weather data...")
+                processed["current_weather"] = self.preprocessor.process_dataset(
+                    data["current_weather"], "current_weather"
+                )
+            else:
+                processed["current_weather"] = pd.DataFrame()
+
+            # Process shading relay data
+            if "shading_relays" in data and not data["shading_relays"].empty:
+                self.logger.info("Processing shading relay data...")
+                processed["shading_relays"] = self.preprocessor.process_dataset(
+                    data["shading_relays"], "shading"
+                )
+            else:
+                processed["shading_relays"] = pd.DataFrame()
+
             # Process price data if available
             if data["prices"] is not None and not data["prices"].empty:
                 self.logger.info("Processing energy price data...")
-                processed["prices"] = self.preprocessor.process_dataset(data["prices"], "prices")
+                processed["prices"] = self.preprocessor.process_dataset(
+                    data["prices"], "prices"
+                )
             else:
                 processed["prices"] = pd.DataFrame()
 
@@ -568,22 +712,43 @@ class AnalysisPipeline:
             # Thermal analysis
             if data["rooms"]:
                 self.logger.info("Running thermal dynamics analysis...")
-                results["thermal_analysis"] = self.thermal_analyzer.analyze_room_dynamics(
+                results[
+                    "thermal_analysis"
+                ] = self.thermal_analyzer.analyze_room_dynamics(
                     data["rooms"], data["weather"]
                 )
             else:
-                self.logger.warning("Skipping thermal analysis - no room data available")
+                self.logger.warning(
+                    "Skipping thermal analysis - no room data available"
+                )
                 results["thermal_analysis"] = {}
 
             # Base load analysis
             if not data["consumption"].empty:
                 self.logger.info("Running base load analysis...")
-                results["base_load_analysis"] = self.base_load_analyzer.analyze_base_load(
+                results[
+                    "base_load_analysis"
+                ] = self.base_load_analyzer.analyze_base_load(
                     data["consumption"], data["pv"], data["rooms"]
                 )
             else:
-                self.logger.warning("Skipping base load analysis - no consumption data available")
+                self.logger.warning(
+                    "Skipping base load analysis - no consumption data available"
+                )
                 results["base_load_analysis"] = {}
+
+            # Relay pattern analysis (for PEMS optimization)
+            if data.get("relay_states") and len(data["relay_states"]) > 0:
+                self.logger.info("Running relay pattern analysis...")
+                relay_analyzer = RelayPatternAnalyzer()
+                results["relay_analysis"] = relay_analyzer.analyze_relay_patterns(
+                    data["relay_states"], data.get("weather"), data.get("prices")
+                )
+            else:
+                self.logger.warning(
+                    "Skipping relay analysis - no relay state data available"
+                )
+                results["relay_analysis"] = {}
 
         except Exception as e:
             self.logger.error(f"Analysis execution failed: {e}")
@@ -666,7 +831,10 @@ async def main():
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[logging.StreamHandler(), logging.FileHandler("analysis/analysis.log")],
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler("analysis/analysis.log"),
+        ],
     )
 
     logger = logging.getLogger(__name__)

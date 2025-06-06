@@ -8,6 +8,7 @@ help:
 	@echo "  make test-basic   - Test basic structure and imports"
 	@echo "  make test-extraction - Test data extraction from InfluxDB"
 	@echo "  make test-relay   - Test relay analysis functionality"
+	@echo "  make test-new-extractors - Test new extraction methods (offline)"
 	@echo "  make test         - Run all tests with coverage"
 	@echo "  make lint         - Format code and run all linting (black, isort, flake8)"
 	@echo "  make lint-check   - Check code quality without making changes"
@@ -42,6 +43,9 @@ test-extraction:
 
 test-relay:
 	. venv/bin/activate && python3 pems_v2/tests/test_relay_analysis.py
+
+test-new-extractors:
+	. venv/bin/activate && python3 pems_v2/tests/test_new_extractors.py
 
 test:
 	. venv/bin/activate && pytest -v --cov=pems_v2 --cov-report=term-missing pems_v2/tests/

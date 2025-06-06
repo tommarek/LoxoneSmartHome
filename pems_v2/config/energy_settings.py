@@ -5,18 +5,24 @@ from typing import Any, Dict
 # Room power ratings in kW (from your heating patterns notebook)
 ROOM_CONFIG = {
     "rooms": {
-        "hosti": {"power_kw": 2.02, "area_m2": 20, "zone": "living"},
-        "chodba_dole": {"power_kw": 1.8, "area_m2": 15, "zone": "circulation"},
-        "chodba_nahore": {"power_kw": 1.2, "area_m2": 10, "zone": "circulation"},
-        "koupelna_dole": {"power_kw": 1.5, "area_m2": 8, "zone": "wet"},
-        "koupelna_nahore": {"power_kw": 1.2, "area_m2": 6, "zone": "wet"},
-        "kuchyn": {"power_kw": 2.5, "area_m2": 25, "zone": "living"},
-        "loznice": {"power_kw": 1.8, "area_m2": 18, "zone": "sleeping"},
-        "obyvak": {"power_kw": 3.0, "area_m2": 35, "zone": "living"},
-        "pracovna": {"power_kw": 1.5, "area_m2": 12, "zone": "working"},
-        "wc_dole": {"power_kw": 0.8, "area_m2": 4, "zone": "wet"},
-        "wc_nahore": {"power_kw": 0.8, "area_m2": 4, "zone": "wet"},
-        # Add more rooms as needed
+        "hosti": {"power_kw": 2.02, "volume_m3": 75.67852925, "zone": "living"},
+        "chodba_dole": {"power_kw": 1.8, "volume_m3": 50.055, "zone": "circulation"},
+        "chodba_nahore": {"power_kw": 1.2, "volume_m3": 53.55708977, "zone": "circulation"},
+        "koupelna_dole": {"power_kw": 0.47, "volume_m3": 15.87374, "zone": "wet"},
+        "koupelna_nahore": {"power_kw": 0.62, "volume_m3": 21.86725157, "zone": "wet"},
+        "loznice": {"power_kw": 1.2, "volume_m3": 34.84, "zone": "sleeping"},
+        "obyvak": {"power_kw": 3.0, "volume_m3": 102.6375, "zone": "living"},
+        "kuchyne": {"power_kw": 1.8, "volume_m3": 62.0066, "zone": "living"},
+        "pokoj_1": {"power_kw": 1.2, "volume_m3": 36.5769, "zone": "sleeping"},
+        "pokoj_2": {"power_kw": 1.2, "volume_m3": 36.5769, "zone": "sleeping"},
+        "pracovna": {"power_kw": 0.82, "volume_m3": 29.10398, "zone": "working"},
+        "satna_dole": {"power_kw": 0.82, "volume_m3": 23.79915, "zone": "storage"},
+        "satna_nahore": {"power_kw": 0.56, "volume_m3": 31.5675, "zone": "storage"},
+        "spajz": {"power_kw": 0.46, "volume_m3": 15.2337, "zone": "storage"},
+        "technicka_mistnost": {"power_kw": 0.82, "volume_m3": 27.34875, "zone": "utility"},
+        "zadveri": {"power_kw": 0.82, "volume_m3": 23.3325, "zone": "circulation"},
+        "zachod": {"power_kw": 0.22, "volume_m3": 7.630824, "zone": "wet"},
+        # Note: kuchyne excluded from heating relay data as per Flux query filter
     },
     "system": {
         "battery_capacity_kwh": 10.0,  # Your actual battery capacity
@@ -88,5 +94,7 @@ def get_total_heating_power() -> float:
 def get_rooms_by_zone(zone: str) -> Dict[str, Dict[str, Any]]:
     """Get all rooms in a specific zone."""
     return {
-        name: config for name, config in ROOM_CONFIG["rooms"].items() if config.get("zone") == zone
+        name: config
+        for name, config in ROOM_CONFIG["rooms"].items()
+        if config.get("zone") == zone
     }

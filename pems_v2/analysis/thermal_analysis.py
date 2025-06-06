@@ -17,6 +17,8 @@ from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
+from config.energy_settings import get_room_power
+
 
 class ThermalAnalyzer:
     """Analyze thermal dynamics for each room."""
@@ -51,7 +53,11 @@ class ThermalAnalyzer:
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
 
             try:
-                room_results = self._analyze_single_room(room_df, weather_data, room_name)
+                # Store room name for power calculations
+                self._current_room_name = room_name
+                room_results = self._analyze_single_room(
+                    room_df, weather_data, room_name
+                )
                 results[room_name] = room_results
             except Exception as e:
                 self.logger.error(f"Failed to analyze room {room_name}: {e}")
@@ -80,7 +86,9 @@ class ThermalAnalyzer:
         results = {}
 
         # Basic thermal statistics
-        results["basic_stats"] = self._calculate_basic_thermal_stats(merged_data, room_name)
+        results["basic_stats"] = self._calculate_basic_thermal_stats(
+            merged_data, room_name
+        )
 
         # Heat-up and cool-down analysis
         results["heatup_cooldown"] = self._analyze_heatup_cooldown(merged_data)
@@ -94,8 +102,8 @@ class ThermalAnalyzer:
         # Solar gain analysis
         results["solar_gains"] = self._analyze_solar_gains(merged_data)
 
-        # RC model parameters
-        results["rc_model"] = self._fit_rc_model(merged_data)
+        # RC model parameters (enhanced for relay systems)
+        results["rc_parameters"] = self.estimate_rc_parameters(merged_data)
 
         # ARX model identification
         results["arx_model"] = self._fit_arx_model(merged_data)
@@ -129,13 +137,17 @@ class ThermalAnalyzer:
 
         # Add heating status if available
         heating_cols = [
-            col for col in room_df.columns if "heating" in col.lower() or "heat" in col.lower()
+            col
+            for col in room_df.columns
+            if "heating" in col.lower() or "heat" in col.lower()
         ]
         if heating_cols:
             room_clean["heating_on"] = room_df[heating_cols[0]]
         else:
             # Infer heating from temperature changes
-            room_clean["heating_on"] = self._infer_heating_status(room_clean["room_temp"])
+            room_clean["heating_on"] = self._infer_heating_status(
+                room_clean["room_temp"]
+            )
 
         # Add setpoint if available
         if "setpoint" in room_df.columns:
@@ -144,7 +156,9 @@ class ThermalAnalyzer:
         # Merge with weather data
         if not weather_data.empty and "temperature" in weather_data.columns:
             weather_resampled = (
-                weather_data[["temperature"]].resample("5T").interpolate(method="linear")
+                weather_data[["temperature"]]
+                .resample("5T")
+                .interpolate(method="linear")
             )
             weather_resampled.columns = ["outdoor_temp"]
             merged = room_clean.join(weather_resampled, how="inner")
@@ -165,12 +179,16 @@ class ThermalAnalyzer:
     def _infer_heating_status(self, temperature: pd.Series) -> pd.Series:
         """Infer heating status from temperature changes."""
         # Simple heuristic: heating is on when temperature is rising significantly
-        temp_change = temperature.diff().rolling(window=3).mean()  # 15-minute moving average
+        temp_change = (
+            temperature.diff().rolling(window=3).mean()
+        )  # 15-minute moving average
         heating_threshold = 0.1  # 0.1°C increase per 5 minutes indicates heating
 
         return (temp_change > heating_threshold).astype(int)
 
-    def _calculate_basic_thermal_stats(self, data: pd.DataFrame, room_name: str) -> Dict[str, Any]:
+    def _calculate_basic_thermal_stats(
+        self, data: pd.DataFrame, room_name: str
+    ) -> Dict[str, Any]:
         """Calculate basic thermal statistics."""
         room_temp = data["room_temp"]
 
@@ -191,7 +209,9 @@ class ThermalAnalyzer:
                 {
                     "heating_percentage": len(heating_data) / len(data) * 100,
                     "mean_temp_heating_on": (
-                        heating_data["room_temp"].mean() if not heating_data.empty else None
+                        heating_data["room_temp"].mean()
+                        if not heating_data.empty
+                        else None
                     ),
                     "mean_temp_heating_off": (
                         data[data["heating_on"] == 0]["room_temp"].mean()
@@ -227,23 +247,33 @@ class ThermalAnalyzer:
         )  # Per hour (5-min intervals)
 
         # Heat-up analysis (heating on, temperature rising)
-        heatup_mask = (data_copy["heating_on"] == 1) & (data_copy["temp_change_rate"] > 0)
+        heatup_mask = (data_copy["heating_on"] == 1) & (
+            data_copy["temp_change_rate"] > 0
+        )
         heatup_data = data_copy[heatup_mask]
 
         # Cool-down analysis (heating off, temperature falling)
-        cooldown_mask = (data_copy["heating_on"] == 0) & (data_copy["temp_change_rate"] < 0)
+        cooldown_mask = (data_copy["heating_on"] == 0) & (
+            data_copy["temp_change_rate"] < 0
+        )
         cooldown_data = data_copy[cooldown_mask]
 
         results = {
             "heatup_rate": {
                 "mean_rate": (
-                    heatup_data["temp_change_rate"].mean() if not heatup_data.empty else None
+                    heatup_data["temp_change_rate"].mean()
+                    if not heatup_data.empty
+                    else None
                 ),
                 "max_rate": (
-                    heatup_data["temp_change_rate"].max() if not heatup_data.empty else None
+                    heatup_data["temp_change_rate"].max()
+                    if not heatup_data.empty
+                    else None
                 ),
                 "std_rate": (
-                    heatup_data["temp_change_rate"].std() if not heatup_data.empty else None
+                    heatup_data["temp_change_rate"].std()
+                    if not heatup_data.empty
+                    else None
                 ),
                 "samples": len(heatup_data),
             },
@@ -259,7 +289,9 @@ class ThermalAnalyzer:
                     else None
                 ),
                 "std_rate": (
-                    cooldown_data["temp_change_rate"].std() if not cooldown_data.empty else None
+                    cooldown_data["temp_change_rate"].std()
+                    if not cooldown_data.empty
+                    else None
                 ),
                 "samples": len(cooldown_data),
             },
@@ -326,7 +358,9 @@ class ThermalAnalyzer:
         else:
             return {"warning": "Could not identify time constant from available data"}
 
-    def _fit_exponential_response(self, time: np.ndarray, temperature: np.ndarray) -> float:
+    def _fit_exponential_response(
+        self, time: np.ndarray, temperature: np.ndarray
+    ) -> float:
         """Fit exponential response to temperature data."""
         if len(time) < 10:
             raise ValueError("Insufficient data points")
@@ -347,7 +381,10 @@ class ThermalAnalyzer:
                 time,
                 temperature,
                 p0=[T_final, T_initial, tau_guess],
-                bounds=([T_initial - 5, T_initial - 5, 10], [T_initial + 5, T_initial + 5, 600]),
+                bounds=(
+                    [T_initial - 5, T_initial - 5, 10],
+                    [T_initial + 5, T_initial + 5, 600],
+                ),
             )
             return popt[2]  # Return tau
         except Exception:
@@ -367,7 +404,9 @@ class ThermalAnalyzer:
 
         # Calculate heat loss rate during stable periods
         stable_data = stable_data.copy()
-        stable_data["temp_change_rate"] = stable_data["room_temp"].diff() * 12  # Per hour
+        stable_data["temp_change_rate"] = (
+            stable_data["room_temp"].diff() * 12
+        )  # Per hour
 
         # Filter for actual cooling periods
         cooling_data = stable_data[
@@ -386,7 +425,9 @@ class ThermalAnalyzer:
 
         # Linear regression to find relationship
         if len(temp_diff) > 10:
-            slope, intercept, r_value, p_value, std_err = linregress(temp_diff, cooling_rate)
+            slope, intercept, r_value, p_value, std_err = linregress(
+                temp_diff, cooling_rate
+            )
 
             # UA / thermal_mass = slope
             # Assume typical thermal mass for room estimation
@@ -395,7 +436,8 @@ class ThermalAnalyzer:
 
             return {
                 "ua_coefficient": ua_estimate,  # W/°C
-                "base_heat_loss": intercept * estimated_thermal_mass,  # Base heat loss in W
+                "base_heat_loss": intercept
+                * estimated_thermal_mass,  # Base heat loss in W
                 "r_squared": r_value**2,
                 "p_value": p_value,
                 "cooling_samples": len(cooling_data),
@@ -432,7 +474,9 @@ class ThermalAnalyzer:
             return {"warning": "Insufficient solar warming periods found"}
 
         # Correlation analysis
-        solar_correlation = solar_warming["solar_proxy"].corr(solar_warming["temp_change"])
+        solar_correlation = solar_warming["solar_proxy"].corr(
+            solar_warming["temp_change"]
+        )
 
         # Peak solar gain estimation
         peak_solar_hours = no_heating_data[
@@ -464,7 +508,9 @@ class ThermalAnalyzer:
         data_copy["dT_dt"] = data_copy["room_temp"].diff() / dt
 
         # Prepare features
-        temp_diff = data_copy["outdoor_temp"] - data_copy["room_temp"]  # Heat flow driving force
+        temp_diff = (
+            data_copy["outdoor_temp"] - data_copy["room_temp"]
+        )  # Heat flow driving force
 
         if "heating_on" in data_copy.columns:
             heating_power = data_copy["heating_on"] * 1000  # Assume 1kW heating when on
@@ -516,10 +562,330 @@ class ThermalAnalyzer:
         except Exception as e:
             return {"warning": f"RC model fitting failed: {str(e)}"}
 
+    def estimate_rc_parameters(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """
+        Enhanced RC parameter estimation specifically for relay-based heating systems.
+
+        This method implements multiple approaches to estimate thermal resistance (R) and
+        thermal capacitance (C) parameters for binary ON/OFF relay control systems typical
+        in residential heating applications.
+
+        Args:
+            data: DataFrame with room temperature, heating state, and optionally outdoor temperature
+
+        Returns:
+            Dict containing RC parameters estimated using different methods with confidence metrics
+        """
+        if "heating_on" not in data.columns or len(data) < 200:
+            return {
+                "warning": "Insufficient data for RC parameter estimation (need heating_on column and >200 points)"
+            }
+
+        self.logger.info("Starting enhanced RC parameter estimation for relay system")
+        results = {}
+
+        # Method 1: Cooldown Analysis (Relay OFF periods)
+        cooldown_results = self._analyze_cooldown_periods(data)
+        if "thermal_resistance" in cooldown_results:
+            results["cooldown_analysis"] = cooldown_results
+            self.logger.info(
+                f"Cooldown analysis complete: R = {cooldown_results['thermal_resistance']:.2f} °C/W"
+            )
+
+        # Method 2: Heatup Analysis (Relay ON periods)
+        heatup_results = self._analyze_heatup_periods(data)
+        if "thermal_capacitance" in heatup_results:
+            results["heatup_analysis"] = heatup_results
+            self.logger.info(
+                f"Heatup analysis complete: C = {heatup_results['thermal_capacitance']:.0f} Wh/°C"
+            )
+
+        # Method 3: Combined RC estimation using both periods
+        combined_results = self._combined_rc_estimation(data)
+        if "R" in combined_results and "C" in combined_results:
+            results["combined_estimation"] = combined_results
+            time_const = combined_results.get("time_constant", 0)
+            self.logger.info(
+                f"Combined analysis: R={combined_results['R']:.2f} °C/W, C={combined_results['C']:.0f} Wh/°C, τ={time_const:.1f}h"
+            )
+
+        # Method 4: State-space identification for relay systems
+        ss_results = self._relay_state_space_identification(data)
+        if "thermal_parameters" in ss_results:
+            results["state_space"] = ss_results
+            self.logger.info("State-space identification complete")
+
+        # Select best estimate based on confidence metrics
+        best_estimate = self._select_best_rc_estimate(results)
+        if best_estimate:
+            results["recommended_parameters"] = best_estimate
+            self.logger.info(f"Recommended parameters: {best_estimate}")
+
+        self.logger.info("RC parameter estimation completed")
+        return results
+
+    def _select_best_rc_estimate(self, results: Dict[str, Any]) -> Dict[str, Any]:
+        """Select the best RC parameter estimate based on confidence metrics."""
+        candidates = []
+
+        # Evaluate each method
+        if "combined_estimation" in results:
+            combined = results["combined_estimation"]
+            confidence = combined.get("confidence_score", 0)
+            candidates.append(("combined", confidence, combined))
+
+        if "state_space" in results and "model_quality" in results["state_space"]:
+            ss = results["state_space"]
+            r2 = ss["model_quality"].get("r_squared", 0)
+            candidates.append(("state_space", r2, ss.get("thermal_parameters", {})))
+
+        if "cooldown_analysis" in results and "heatup_analysis" in results:
+            # Create manual combination
+            cooldown = results["cooldown_analysis"]
+            heatup = results["heatup_analysis"]
+
+            if "thermal_resistance" in cooldown and "thermal_capacitance" in heatup:
+                R = cooldown["thermal_resistance"]
+                C = heatup["thermal_capacitance"]
+                confidence = (
+                    cooldown.get("r_squared", 0) + 0.5
+                ) / 2  # Lower confidence for manual
+
+                manual = {
+                    "R": R,
+                    "C": C,
+                    "time_constant": R * C / 3600,
+                    "method": "manual_combination",
+                }
+                candidates.append(("manual", confidence, manual))
+
+        # Select best candidate
+        if candidates:
+            best = max(candidates, key=lambda x: x[1])
+            return {"method": best[0], "confidence": best[1], **best[2]}
+
+        return {}
+
+    def _analyze_cooldown_periods(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze cooldown periods when relay is OFF to estimate thermal resistance."""
+        # Find relay OFF periods longer than 1 hour
+        relay_off = data[data["heating_on"] == 0].copy()
+
+        if len(relay_off) < 50:
+            return {"warning": "Insufficient relay OFF periods"}
+
+        # Calculate temperature decay during OFF periods
+        relay_off["temp_change_rate"] = relay_off["room_temp"].diff() * 12  # Per hour
+
+        # Only consider periods with actual cooling (negative rate)
+        cooling_periods = relay_off[relay_off["temp_change_rate"] < -0.01]
+
+        if len(cooling_periods) < 20:
+            return {"warning": "Insufficient cooling periods found"}
+
+        # For exponential decay: dT/dt = -(T_room - T_outdoor) / (R*C)
+        # So: thermal_resistance R can be estimated from decay rate vs temp difference
+        if "outdoor_temp" in data.columns:
+            cooling_periods = cooling_periods.merge(
+                data[["outdoor_temp"]], left_index=True, right_index=True, how="inner"
+            )
+
+            temp_diff = cooling_periods["room_temp"] - cooling_periods["outdoor_temp"]
+            decay_rate = -cooling_periods["temp_change_rate"]  # Make positive
+
+            # Linear regression: decay_rate = temp_diff / (R*C)
+            # Assuming typical C for room, estimate R
+            if len(temp_diff) > 10:
+                slope, intercept, r_value, p_value, _ = linregress(
+                    temp_diff, decay_rate
+                )
+
+                # Estimate thermal capacitance (typical room values)
+                estimated_C = 15000  # Wh/°C (conservative estimate for room)
+                thermal_resistance = 1 / (slope * estimated_C) if slope > 0 else None
+
+                return {
+                    "thermal_resistance": thermal_resistance,  # °C/W
+                    "assumed_capacitance": estimated_C,
+                    "r_squared": r_value**2,
+                    "p_value": p_value,
+                    "cooling_samples": len(cooling_periods),
+                    "method": "cooldown_exponential_decay",
+                }
+
+        return {"warning": "Could not estimate thermal resistance from cooldown"}
+
+    def _analyze_heatup_periods(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Analyze heatup periods when relay is ON to estimate thermal capacitance."""
+        # Find relay ON periods
+        relay_on = data[data["heating_on"] == 1].copy()
+
+        if len(relay_on) < 50:
+            return {"warning": "Insufficient relay ON periods"}
+
+        # Calculate temperature rise rate during ON periods
+        relay_on["temp_change_rate"] = relay_on["room_temp"].diff() * 12  # Per hour
+
+        # Only consider periods with actual heating (positive rate)
+        heating_periods = relay_on[relay_on["temp_change_rate"] > 0.01]
+
+        if len(heating_periods) < 20:
+            return {"warning": "Insufficient heating periods found"}
+
+        # For heating: C * dT/dt = P_heating - (T_room - T_outdoor)/R
+        # Initial heating rate when temp difference is small gives: C * dT/dt ≈ P_heating
+
+        # Find periods right after relay turns ON (first 30 minutes)
+        relay_changes = data["heating_on"].diff()
+        heating_starts = data[relay_changes == 1].index
+
+        initial_heating_rates = []
+
+        for start_time in heating_starts[:20]:  # Analyze first 20 events
+            # Look at first 30 minutes after heating starts
+            end_time = start_time + pd.Timedelta(minutes=30)
+            initial_period = data.loc[start_time:end_time]
+
+            if len(initial_period) >= 6:  # At least 30 minutes of data
+                initial_rate = (
+                    initial_period["room_temp"].diff().mean() * 12
+                )  # Per hour
+                if initial_rate > 0:
+                    initial_heating_rates.append(initial_rate)
+
+        if initial_heating_rates:
+            mean_initial_rate = np.mean(initial_heating_rates)
+
+            # Estimate heating power and thermal capacitance
+            # Use actual room power rating from configuration
+            room_name = getattr(self, "_current_room_name", "unknown")
+            estimated_power = get_room_power(room_name) * 1000  # Convert kW to W
+            thermal_capacitance = (
+                estimated_power / mean_initial_rate if mean_initial_rate > 0 else None
+            )
+
+            return {
+                "thermal_capacitance": thermal_capacitance,  # Wh/°C
+                "assumed_power": estimated_power,
+                "mean_initial_heating_rate": mean_initial_rate,
+                "heating_events_analyzed": len(initial_heating_rates),
+                "method": "initial_heating_response",
+            }
+
+        return {"warning": "Could not estimate thermal capacitance from heatup"}
+
+    def _combined_rc_estimation(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """Combined RC estimation using both heating and cooling periods."""
+        # Get separate estimates
+        cooldown_results = self._analyze_cooldown_periods(data)
+        heatup_results = self._analyze_heatup_periods(data)
+
+        R = cooldown_results.get("thermal_resistance")
+        C = heatup_results.get("thermal_capacitance")
+
+        if R is not None and C is not None:
+            time_constant = R * C / 3600  # Convert to hours
+
+            # Confidence metrics
+            cooldown_r2 = cooldown_results.get("r_squared", 0)
+            heating_events = heatup_results.get("heating_events_analyzed", 0)
+
+            confidence_score = (cooldown_r2 + min(heating_events / 10, 1)) / 2
+
+            return {
+                "R": R,  # °C/W
+                "C": C,  # Wh/°C
+                "time_constant": time_constant,  # hours
+                "confidence_score": confidence_score,
+                "method": "combined_relay_analysis",
+            }
+
+        return {"warning": "Could not combine RC estimates"}
+
+    def _relay_state_space_identification(self, data: pd.DataFrame) -> Dict[str, Any]:
+        """State-space identification specifically for relay-controlled systems."""
+        if len(data) < 300:
+            return {"warning": "Insufficient data for state-space identification"}
+
+        # Discrete-time state-space model for relay control:
+        # T[k+1] = a*T[k] + b*T_outdoor[k] + c*relay[k] + d
+        # Where: a = exp(-dt/(R*C)), b = (1-a), c = P*R*(1-a), d = noise
+
+        # Prepare data
+        T_room = data["room_temp"].values[1:]  # T[k+1]
+        T_room_prev = data["room_temp"].values[:-1]  # T[k]
+        relay_state = data["heating_on"].values[:-1]  # relay[k]
+
+        if "outdoor_temp" in data.columns:
+            T_outdoor = data["outdoor_temp"].values[:-1]  # T_outdoor[k]
+        else:
+            T_outdoor = np.zeros_like(T_room_prev)
+
+        # Create feature matrix
+        X = np.column_stack(
+            [T_room_prev, T_outdoor, relay_state, np.ones(len(T_room_prev))]
+        )
+        y = T_room
+
+        try:
+            # Fit linear model
+            reg = LinearRegression().fit(X, y)
+            a, b, c, d = reg.coef_
+
+            # Extract physical parameters
+            dt = 5 / 60  # 5 minutes in hours
+
+            if 0 < a < 1:  # Stability check
+                RC = -dt / np.log(a)  # Time constant in hours
+
+                # Estimate individual R and C using additional constraints
+                # Use heating power estimation from coefficient c
+                if abs(b) > 1e-6:  # Have outdoor temperature influence
+                    R_estimate = c / ((1 - a) * 2000)  # Assume 2kW heating power
+                    C_estimate = RC / R_estimate
+                else:
+                    # Fall back to combined estimate
+                    R_estimate = None
+                    C_estimate = None
+
+                # Model quality
+                y_pred = reg.predict(X)
+                r2 = r2_score(y, y_pred)
+                rmse = np.sqrt(mean_squared_error(y, y_pred))
+
+                results = {
+                    "thermal_parameters": {
+                        "time_constant": RC,  # hours
+                        "thermal_resistance": R_estimate,  # °C/W
+                        "thermal_capacitance": C_estimate,  # Wh/°C
+                    },
+                    "state_space_coefficients": {
+                        "a": a,  # Temperature persistence
+                        "b": b,  # Outdoor influence
+                        "c": c,  # Heating effect
+                        "d": d,  # Bias term
+                    },
+                    "model_quality": {
+                        "r_squared": r2,
+                        "rmse": rmse,
+                        "stable": 0 < a < 1,
+                    },
+                    "method": "discrete_state_space",
+                }
+
+                return results
+            else:
+                return {"warning": "Unstable state-space model identified"}
+
+        except Exception as e:
+            return {"warning": f"State-space identification failed: {str(e)}"}
+
     def _fit_arx_model(self, data: pd.DataFrame) -> Dict[str, Any]:
         """Fit ARX (AutoRegressive with eXogenous inputs) model."""
         if len(data) < 200:
-            return {"warning": "Insufficient data for ARX model (need at least 200 points)"}
+            return {
+                "warning": "Insufficient data for ARX model (need at least 200 points)"
+            }
 
         # Prepare data for ARX model
         # T[k] = a1*T[k-1] + a2*T[k-2] + b1*T_out[k-1] + b2*P_heat[k-1]
@@ -611,7 +977,9 @@ class ThermalAnalyzer:
         }
 
         # Overshoot and undershoot analysis
-        setpoint_changes = data["setpoint"].diff().abs() > 0.5  # Significant setpoint changes
+        setpoint_changes = (
+            data["setpoint"].diff().abs() > 0.5
+        )  # Significant setpoint changes
         if setpoint_changes.any():
             change_periods = data[setpoint_changes]
 
@@ -685,7 +1053,9 @@ class ThermalAnalyzer:
             "overall_comfort_score": comfort_stats["comfortable"]["percentage"],
         }
 
-    def _analyze_room_coupling(self, room_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    def _analyze_room_coupling(
+        self, room_data: Dict[str, pd.DataFrame]
+    ) -> Dict[str, Any]:
         """Analyze thermal coupling between rooms."""
         if len(room_data) < 2:
             return {"warning": "Need at least 2 rooms for coupling analysis"}
@@ -714,14 +1084,21 @@ class ThermalAnalyzer:
                     common_index = common_index.intersection(room_df.index)
 
         if len(room_temps) < 2 or common_index.empty:
-            return {"warning": "Insufficient room temperature data for coupling analysis"}
+            return {
+                "warning": "Insufficient room temperature data for coupling analysis"
+            }
 
         # Create correlation matrix
-        temp_df = pd.DataFrame({name: temp[common_index] for name, temp in room_temps.items()})
+        temp_df = pd.DataFrame(
+            {name: temp[common_index] for name, temp in room_temps.items()}
+        )
         correlation_matrix = temp_df.corr()
 
         # Heat transfer analysis
-        coupling_results = {"correlation_matrix": correlation_matrix.to_dict(), "room_pairs": {}}
+        coupling_results = {
+            "correlation_matrix": correlation_matrix.to_dict(),
+            "room_pairs": {},
+        }
 
         # Analyze each room pair
         for i, room1 in enumerate(temp_df.columns):
@@ -742,7 +1119,8 @@ class ThermalAnalyzer:
 
         # Identify most and least coupled room pairs
         correlations = [
-            (pair, data["correlation"]) for pair, data in coupling_results["room_pairs"].items()
+            (pair, data["correlation"])
+            for pair, data in coupling_results["room_pairs"].items()
         ]
         if correlations:
             most_coupled = max(correlations, key=lambda x: x[1])

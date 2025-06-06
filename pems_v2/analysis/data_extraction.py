@@ -1,30 +1,30 @@
 """
 Data extraction module for PEMS v2.
 
-Extracts historical data from InfluxDB for analysis:
-- Query 2 years of data for PV production, room temperatures, weather, etc.
+Extracts comprehensive historical data from InfluxDB for analysis:
+- PV production data with string-level monitoring and battery status
+- Room temperature, humidity, and target temperature data
+- Weather forecast data with solar radiation parameters
+- Current weather data with real-time solar position from Loxone
+- Heating and shading relay states
+- Energy prices from OTE market
+- EV charging data (if available)
 - Save as parquet files for fast analysis
 - Implement data quality checks
 - Handle missing data interpolation
 """
 
 import logging
-import math
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-import numpy as np
 import pandas as pd
 import pytz
-from influxdb_client import InfluxDBClient
-
-from config.energy_settings import (
-    CONSUMPTION_CATEGORIES,
-    DATA_QUALITY_THRESHOLDS,
-    get_room_power,
-)
+from config.energy_settings import (CONSUMPTION_CATEGORIES,
+                                    DATA_QUALITY_THRESHOLDS, get_room_power)
 from config.settings import PEMSSettings as Settings
+from influxdb_client import InfluxDBClient
 
 
 class DataExtractor:
@@ -61,30 +61,51 @@ class DataExtractor:
         self, start_date: datetime, end_date: datetime
     ) -> pd.DataFrame:
         """
-        Extract PV production data from InfluxDB.
+        Extract comprehensive PV production data from InfluxDB.
 
         Returns DataFrame with columns:
         - timestamp: datetime index
-        - InputPower: solar panel input power (W)
+        - InputPower: total solar panel input power (W)
+        - PV1InputPower: PV string 1 power (W)
+        - PV2InputPower: PV string 2 power (W)
+        - PV1Voltage: PV string 1 voltage (V)
+        - PV2Voltage: PV string 2 voltage (V)
         - INVPowerToLocalLoad: inverter power to local load (W)
         - ACPowerToUser: AC power to user consumption (W)
         - ACPowerToGrid: AC power exported to grid (W)
         - ChargePower: battery charging power (W)
+        - DischargePower: battery discharging power (W)
         - SOC: battery state of charge (%)
+        - BatteryTemperature: battery temperature (°C)
+        - InverterTemperature: inverter temperature (°C)
+        - InverterStatus: inverter operational status
+        - TodayGenerateEnergy: energy generated today (kWh)
         """
         self.logger.info(f"Extracting PV data from {start_date} to {end_date}")
 
-        # Query for actual solar fields from your system
+        # Query for comprehensive solar fields from your system
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "solar")
           |> filter(fn: (r) => r["_field"] == "InputPower" or
+                              r["_field"] == "PV1InputPower" or
+                              r["_field"] == "PV2InputPower" or
+                              r["_field"] == "PV1Voltage" or
+                              r["_field"] == "PV2Voltage" or
                               r["_field"] == "INVPowerToLocalLoad" or
                               r["_field"] == "ACPowerToUser" or
                               r["_field"] == "ACPowerToGrid" or
                               r["_field"] == "ChargePower" or
-                              r["_field"] == "SOC")
+                              r["_field"] == "DischargePower" or
+                              r["_field"] == "SOC" or
+                              r["_field"] == "BatteryTemperature" or
+                              r["_field"] == "InverterTemperature" or
+                              r["_field"] == "InverterStatus" or
+                              r["_field"] == "TodayGenerateEnergy" or
+                              r["_field"] == "LocalLoadEnergyToday" or
+                              r["_field"] == "EnergyToGridToday" or
+                              r["_field"] == "EnergyToUserToday")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
           |> keep(columns: ["_time", "_value", "_field"])
         """
@@ -135,11 +156,25 @@ class DataExtractor:
                 0
             ) + df_pivot["ACPowerToUser"].fillna(0)
 
-        if "ChargePower" in df_pivot.columns:
+        if "ChargePower" in df_pivot.columns and "DischargePower" in df_pivot.columns:
+            # Calculate net battery power
+            df_pivot["net_battery_power"] = df_pivot["ChargePower"].fillna(
+                0
+            ) - df_pivot["DischargePower"].fillna(0)
             # Calculate battery energy change (15-minute intervals)
             df_pivot["battery_energy_kwh"] = (
-                df_pivot["ChargePower"] * 0.25 / 1000
+                df_pivot["net_battery_power"] * 0.25 / 1000
             )  # Convert W*0.25h to kWh
+
+        if "PV1InputPower" in df_pivot.columns and "PV2InputPower" in df_pivot.columns:
+            # Calculate total PV power if individual strings available
+            df_pivot["total_pv_power"] = df_pivot["PV1InputPower"].fillna(0) + df_pivot[
+                "PV2InputPower"
+            ].fillna(0)
+            # Calculate string balance factor
+            df_pivot["pv_string_balance"] = df_pivot["PV1InputPower"] / (
+                df_pivot["total_pv_power"] + 1e-6
+            )
 
         self.logger.info(
             f"Extracted {len(df_pivot)} PV data points with fields: {list(df_pivot.columns)}"
@@ -150,26 +185,26 @@ class DataExtractor:
         self, start_date: datetime, end_date: datetime
     ) -> Dict[str, pd.DataFrame]:
         """
-        Extract room temperature data from InfluxDB.
+        Extract room temperature and humidity data from InfluxDB.
 
         Returns dict of DataFrames by room name with columns:
         - timestamp: datetime index
         - temperature: current temperature
-        - setpoint: target temperature (if available)
+        - humidity: current humidity (%)
+        - target_temp: target temperature (if available)
         - heating_on: boolean heating status
         """
         self.logger.info(
-            f"Extracting room temperature data from {start_date} to {end_date}"
+            f"Extracting room temperature and humidity data from {start_date} to {end_date}"
         )
 
-        # Query for temperature data
+        # Query for temperature and humidity data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_loxone}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "temperature" or
-                      r["_measurement"] == "heating")
-          |> filter(fn: (r) => r["_field"] == "value" or r["_field"] == "temperature" or
-                      r["_field"] == "setpoint" or r["_field"] == "state")
+                      r["_measurement"] == "humidity" or
+                      r["_measurement"] == "target_temp")
           |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
         """
 
@@ -194,13 +229,25 @@ class DataExtractor:
                         # Skip if no room identified
                         continue
 
+                # Extract room from field name if present
+                field_name = record.get_field()
+                measurement = record.get_measurement()
+
+                # For temperature and humidity, extract room from field name
+                if measurement in ["temperature", "humidity"] and "_" in field_name:
+                    parts = field_name.split("_")
+                    if len(parts) >= 2:
+                        room_name = "_".join(
+                            parts[1:]
+                        )  # Everything after measurement type
+
                 records.append(
                     {
                         "timestamp": record.get_time(),
                         "room": room_name,
-                        "field": record.get_field(),
+                        "field": field_name,
                         "value": record.get_value(),
-                        "measurement": record.get_measurement(),
+                        "measurement": measurement,
                     }
                 )
 
@@ -213,21 +260,36 @@ class DataExtractor:
         # Group by room
         room_data = {}
         for room_name, room_df in df.groupby("room"):
-            # Pivot to get fields as columns
-            room_pivot = room_df.pivot_table(
-                index="timestamp", columns="field", values="value", aggfunc="mean"
-            ).reset_index()
+            # Process temperature, humidity, and target temp fields
+            # Create separate dataframes for each measurement type
+            temp_data = room_df[room_df["measurement"] == "temperature"]
+            humidity_data = room_df[room_df["measurement"] == "humidity"]
+            target_data = room_df[room_df["measurement"] == "target_temp"]
 
-            # Set timestamp as index
-            room_pivot["timestamp"] = pd.to_datetime(room_pivot["timestamp"])
-            room_pivot.set_index("timestamp", inplace=True)
+            # Start with temperature data
+            if not temp_data.empty:
+                room_pivot = temp_data.set_index("timestamp")[["value"]].rename(
+                    columns={"value": "temperature"}
+                )
+            else:
+                continue  # Skip rooms without temperature data
 
-            # Ensure required columns exist
-            if (
-                "temperature" not in room_pivot.columns
-                and "value" in room_pivot.columns
-            ):
-                room_pivot["temperature"] = room_pivot["value"]
+            # Add humidity if available
+            if not humidity_data.empty:
+                humidity_pivot = humidity_data.set_index("timestamp")[["value"]].rename(
+                    columns={"value": "humidity"}
+                )
+                room_pivot = room_pivot.join(humidity_pivot, how="outer")
+
+            # Add target temperature if available
+            if not target_data.empty:
+                target_pivot = target_data.set_index("timestamp")[["value"]].rename(
+                    columns={"value": "target_temp"}
+                )
+                room_pivot = room_pivot.join(target_pivot, how="outer")
+
+            # Ensure timestamp index is datetime
+            room_pivot.index = pd.to_datetime(room_pivot.index)
 
             room_data[room_name] = room_pivot
             self.logger.info(
@@ -240,19 +302,28 @@ class DataExtractor:
         self, start_date: datetime, end_date: datetime
     ) -> pd.DataFrame:
         """
-        Extract weather data including sun elevation.
+        Extract weather forecast data from weather_forecast bucket.
 
         Returns DataFrame with columns:
         - timestamp: datetime index
-        - sun_elevation: sun elevation angle (degrees)
-        - temperature: outdoor temperature
-        - humidity: relative humidity
-        - wind_speed: wind speed (if available)
-        - cloud_cover: cloud coverage (if available)
+        - temperature_2m: air temperature at 2m height (°C)
+        - relativehumidity_2m: relative humidity at 2m (%)
+        - windspeed_10m: wind speed at 10m (km/h)
+        - cloudcover: total cloud coverage (%)
+        - precipitation: precipitation amount (mm)
+        - shortwave_radiation: solar radiation (W/m²)
+        - direct_radiation: direct solar radiation (W/m²)
+        - diffuse_radiation: diffuse solar radiation (W/m²)
+        - uv_index: UV radiation index
+        - apparent_temperature: "feels like" temperature (°C)
+        - surface_pressure: atmospheric pressure (hPa)
+
+        Note: For actual solar position (sun_elevation, sun_direction),
+        use extract_current_weather() which gets real-time data from Loxone.
         """
         self.logger.info(f"Extracting weather data from {start_date} to {end_date}")
 
-        # Query for weather data (excluding sun elevation - we'll calculate that)
+        # Query for comprehensive weather forecast data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_weather}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
@@ -261,7 +332,19 @@ class DataExtractor:
                               r["_field"] == "relativehumidity_2m" or
                               r["_field"] == "windspeed_10m" or
                               r["_field"] == "cloudcover" or
-                              r["_field"] == "precipitation")
+                              r["_field"] == "cloudcover_low" or
+                              r["_field"] == "cloudcover_mid" or
+                              r["_field"] == "cloudcover_high" or
+                              r["_field"] == "precipitation" or
+                              r["_field"] == "shortwave_radiation" or
+                              r["_field"] == "direct_radiation" or
+                              r["_field"] == "diffuse_radiation" or
+                              r["_field"] == "direct_normal_irradiance" or
+                              r["_field"] == "terrestrial_radiation" or
+                              r["_field"] == "uv_index" or
+                              r["_field"] == "apparent_temperature" or
+                              r["_field"] == "dewpoint_2m" or
+                              r["_field"] == "surface_pressure")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
           |> keep(columns: ["_time", "_value", "_field"])
         """
@@ -295,17 +378,14 @@ class DataExtractor:
             df_pivot.set_index("timestamp", inplace=True)
         else:
             # If no weather data available, create time range for solar calculations
-            self.logger.info("No weather data found in database, creating time range for solar calculations")
-            time_range = pd.date_range(start=start_date, end=end_date, freq='15min')
+            self.logger.info(
+                "No weather data found in database, creating time range for solar calculations"
+            )
+            time_range = pd.date_range(start=start_date, end=end_date, freq="15min")
             df_pivot = pd.DataFrame(index=time_range)
 
-        # Always calculate solar position data regardless of whether we have weather data
-        self.logger.info("Calculating solar position data...")
-        solar_data = self.calculate_solar_position(df_pivot.index)
-        
-        # Merge solar data with weather data
-        for col in solar_data.columns:
-            df_pivot[col] = solar_data[col]
+        # Solar position data should come from current_weather in loxone bucket
+        # No need to calculate it separately
 
         self.logger.info(
             f"Extracted {len(df_pivot)} weather data points with fields: {list(df_pivot.columns)}"
@@ -320,19 +400,18 @@ class DataExtractor:
 
         Returns DataFrame with columns:
         - timestamp: datetime index
-        - price_eur_mwh: electricity price in EUR/MWh
         - price_czk_kwh: electricity price in CZK/kWh
         """
         self.logger.info(
             f"Extracting energy price data from {start_date} to {end_date}"
         )
 
-        # Query for energy price data
+        # Query for energy price data from the correct bucket
         query = f"""
-        from(bucket: "{self.settings.influxdb.bucket_solar}")
+        from(bucket: "ote_prices")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "energy_prices" or
-                      r["_measurement"] == "electricity_prices")
+          |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
+          |> filter(fn: (r) => r["_field"] == "price_czk_kwh")
           |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
         """
 
@@ -415,7 +494,7 @@ class DataExtractor:
                     measurement = record.get_measurement()
                 except (KeyError, AttributeError):
                     continue
-                    
+
                 room_name = record.values.get("room", "unknown")
                 tag1 = record.values.get("tag1", "")
                 tag2 = record.values.get("tag2", "")
@@ -893,133 +972,146 @@ class DataExtractor:
 
         return room_relay_data
 
-    def calculate_solar_position(self, timestamps: pd.DatetimeIndex, 
-                               latitude: float = 49.4949522, 
-                               longitude: float = 15.7763924) -> pd.DataFrame:
+    async def extract_current_weather(
+        self, start_date: datetime, end_date: datetime
+    ) -> pd.DataFrame:
         """
-        Calculate solar position (elevation and azimuth) for given timestamps.
-        
-        Args:
-            timestamps: DatetimeIndex with timestamps
-            latitude: Latitude in decimal degrees (default: Prague, Czech Republic)
-            longitude: Longitude in decimal degrees (default: Prague, Czech Republic)
-            
-        Returns:
-            DataFrame with columns: sun_elevation, sun_azimuth, is_daytime, theoretical_solar_radiation
+        Extract current weather data from Loxone system including solar position.
+
+        Returns DataFrame with columns:
+        - timestamp: datetime index
+        - absolute_solar_irradiance: solar irradiance (W/m²)
+        - current_temperature: outdoor temperature (°C)
+        - pressure: atmospheric pressure (hPa)
+        - relative_humidity: humidity (%)
+        - wind_direction: wind direction (degrees)
+        - sun_direction: sun azimuth (degrees)
+        - sun_elevation: sun elevation (degrees)
+        - minutes_past_midnight: time of day
+        - precipitation: current precipitation
+        - brightness: ambient brightness
+        - rain: rain measurement
+        - wind_speed: wind speed
+        - sunshine: sunshine measurement
         """
-        self.logger.info(f"Calculating solar positions for {len(timestamps)} timestamps")
-        
-        results = []
-        
-        for timestamp in timestamps:
-            # Convert to UTC if not already
-            if timestamp.tz is None:
-                timestamp = timestamp.tz_localize('UTC')
-            elif timestamp.tz != pytz.UTC:
-                timestamp = timestamp.astimezone(pytz.UTC)
-            
-            # Calculate solar position using simplified algorithm
-            elevation, azimuth = self._calculate_sun_position(
-                timestamp, latitude, longitude
-            )
-            
-            # Determine if it's daytime (sun above horizon)
-            is_daytime = elevation > 0
-            
-            # Calculate theoretical clear-sky solar radiation
-            if is_daytime:
-                # Simple clear-sky model: I = I0 * sin(elevation) * atmospheric_transmission
-                solar_constant = 1361  # W/m² (solar constant)
-                atmospheric_transmission = 0.7  # Simplified atmospheric factor
-                theoretical_radiation = (
-                    solar_constant * math.sin(math.radians(elevation)) * atmospheric_transmission
+        self.logger.info(
+            f"Extracting current weather data from {start_date} to {end_date}"
+        )
+
+        # Query for current weather data from Loxone
+        query = f"""
+        from(bucket: "{self.settings.influxdb.bucket_loxone}")
+          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          |> filter(fn: (r) => r["_measurement"] == "current_weather" or
+                              r["_measurement"] == "brightness" or
+                              r["_measurement"] == "rain" or
+                              r["_measurement"] == "wind_speed" or
+                              r["_measurement"] == "sunshine")
+          |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
+          |> keep(columns: ["_time", "_value", "_field", "_measurement"])
+        """
+
+        tables = self.query_api.query(query)
+
+        if not tables:
+            self.logger.warning("No current weather data found")
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        records = []
+        for table in tables:
+            for record in table.records:
+                measurement = record.get_measurement()
+                field = record.get_field()
+
+                # Map measurement to field name
+                if measurement == "current_weather":
+                    field_name = field
+                else:
+                    field_name = measurement
+
+                records.append(
+                    {
+                        "timestamp": record.get_time(),
+                        "field": field_name,
+                        "value": record.get_value(),
+                    }
                 )
-                theoretical_radiation = max(0, theoretical_radiation)
-            else:
-                theoretical_radiation = 0
-            
-            results.append({
-                'timestamp': timestamp,
-                'sun_elevation': elevation,
-                'sun_azimuth': azimuth,
-                'is_daytime': is_daytime,
-                'theoretical_solar_radiation': theoretical_radiation
-            })
-        
-        df = pd.DataFrame(results)
-        df = df.set_index('timestamp')
-        
-        self.logger.info(f"Calculated solar positions: elevation range {df['sun_elevation'].min():.1f}° to {df['sun_elevation'].max():.1f}°")
-        
-        return df
-    
-    def _calculate_sun_position(self, timestamp: datetime, latitude: float, longitude: float) -> tuple:
-        """
-        Calculate sun elevation and azimuth using simplified solar position algorithm.
-        
-        Args:
-            timestamp: UTC datetime
-            latitude: Latitude in decimal degrees
-            longitude: Longitude in decimal degrees
-            
-        Returns:
-            Tuple of (elevation, azimuth) in degrees
-        """
-        # Julian day calculation
-        jd = self._julian_day(timestamp)
-        
-        # Number of days since J2000.0
-        n = jd - 2451545.0
-        
-        # Mean longitude of the sun
-        L = (280.460 + 0.9856474 * n) % 360
-        
-        # Mean anomaly
-        g = math.radians((357.528 + 0.9856003 * n) % 360)
-        
-        # Ecliptic longitude
-        lambda_sun = math.radians(L + 1.915 * math.sin(g) + 0.020 * math.sin(2 * g))
-        
-        # Obliquity of the ecliptic
-        epsilon = math.radians(23.439 - 0.0000004 * n)
-        
-        # Right ascension and declination
-        alpha = math.atan2(math.cos(epsilon) * math.sin(lambda_sun), math.cos(lambda_sun))
-        delta = math.asin(math.sin(epsilon) * math.sin(lambda_sun))
-        
-        # Hour angle
-        theta0 = (280.147 + 360.9856235 * n) % 360  # Greenwich sidereal time
-        theta = math.radians((theta0 + longitude - math.degrees(alpha)) % 360)
-        
-        # Convert to radians
-        lat_rad = math.radians(latitude)
-        
-        # Calculate elevation and azimuth
-        elevation = math.asin(
-            math.sin(lat_rad) * math.sin(delta) +
-            math.cos(lat_rad) * math.cos(delta) * math.cos(theta)
+
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+
+        # Pivot to get weather parameters as columns
+        df_pivot = df.pivot_table(
+            index="timestamp", columns="field", values="value", aggfunc="mean"
+        ).reset_index()
+
+        df_pivot["timestamp"] = pd.to_datetime(df_pivot["timestamp"])
+        df_pivot.set_index("timestamp", inplace=True)
+
+        self.logger.info(
+            f"Extracted {len(df_pivot)} current weather points with fields: {list(df_pivot.columns)}"
         )
-        
-        azimuth = math.atan2(
-            -math.sin(theta),
-            math.tan(delta) * math.cos(lat_rad) - math.sin(lat_rad) * math.cos(theta)
+        return df_pivot
+
+    async def extract_shading_relays(
+        self, start_date: datetime, end_date: datetime
+    ) -> pd.DataFrame:
+        """
+        Extract shading/blinds relay states from InfluxDB.
+
+        Returns DataFrame with columns:
+        - timestamp: datetime index
+        - {room}_{position}: relay state for each blind (0/1)
+        """
+        self.logger.info(
+            f"Extracting shading relay states from {start_date} to {end_date}"
         )
-        
-        # Convert to degrees
-        elevation_deg = math.degrees(elevation)
-        azimuth_deg = (math.degrees(azimuth) + 180) % 360  # Convert to 0-360°
-        
-        return elevation_deg, azimuth_deg
-    
-    def _julian_day(self, dt: datetime) -> float:
-        """Calculate Julian day number for given datetime."""
-        a = (14 - dt.month) // 12
-        y = dt.year + 4800 - a
-        m = dt.month + 12 * a - 3
-        
-        jd = dt.day + (153 * m + 2) // 5 + 365 * y + y // 4 - y // 100 + y // 400 - 32045
-        
-        # Add time fraction
-        time_fraction = (dt.hour + dt.minute / 60.0 + dt.second / 3600.0) / 24.0
-        
-        return jd + time_fraction
+
+        # Query for shading relay data
+        query = f"""
+        from(bucket: "{self.settings.influxdb.bucket_loxone}")
+          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "shading")
+          |> aggregateWindow(every: 15m, fn: last, createEmpty: false)
+          |> keep(columns: ["_time", "_value", "_field"])
+        """
+
+        tables = self.query_api.query(query)
+
+        if not tables:
+            self.logger.warning("No shading relay data found")
+            return pd.DataFrame()
+
+        # Convert to DataFrame
+        records = []
+        for table in tables:
+            for record in table.records:
+                field_name = record.get_field()
+                records.append(
+                    {
+                        "timestamp": record.get_time(),
+                        "field": f"shading_{field_name}",
+                        "value": record.get_value(),
+                    }
+                )
+
+        if not records:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(records)
+
+        # Pivot to get shading relays as columns
+        df_pivot = df.pivot_table(
+            index="timestamp", columns="field", values="value", aggfunc="last"
+        ).reset_index()
+
+        df_pivot["timestamp"] = pd.to_datetime(df_pivot["timestamp"])
+        df_pivot.set_index("timestamp", inplace=True)
+
+        self.logger.info(
+            f"Extracted {len(df_pivot)} shading relay points with {len(df_pivot.columns)} blinds"
+        )
+        return df_pivot

@@ -9,11 +9,11 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from analysis.data_extraction import DataExtractor
-from config.settings import PEMSSettings
-
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
+
+from analysis.data_extraction import DataExtractor
+from config.settings import PEMSSettings
 
 
 async def test_data_extraction():
@@ -21,7 +21,8 @@ async def test_data_extraction():
 
     # Set up logging
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
     logger = logging.getLogger(__name__)
@@ -37,7 +38,9 @@ async def test_data_extraction():
                     "QezDh132utLbXi-IL8h9A=="
                 ),
                 "org": "loxone",
-                "bucket_historical": "loxone",
+                "bucket_solar": "solar",
+                "bucket_loxone": "loxone",
+                "bucket_weather": "weather_forecast",
             }
         )
         logger.info(f"InfluxDB URL: {settings.influxdb.url}")
@@ -62,7 +65,8 @@ async def test_data_extraction():
             import importlib.util
 
             spec = importlib.util.spec_from_file_location(
-                "relay_analyzer", Path(__file__).parent.parent / "test_relay_analysis.py"
+                "relay_analyzer",
+                Path(__file__).parent.parent / "test_relay_analysis.py",
             )
             relay_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(relay_module)
@@ -70,11 +74,15 @@ async def test_data_extraction():
             analyzer = relay_module.RelayAnalyzer()
             relay_data = await analyzer.extract_relay_data(start_date, end_date)
 
-            logger.info(f"✓ Relay data extraction successful: {len(relay_data)} records")
+            logger.info(
+                f"✓ Relay data extraction successful: {len(relay_data)} records"
+            )
             if not relay_data.empty:
                 logger.info(f"  Columns: {list(relay_data.columns)}")
                 logger.info(f"  Rooms found: {relay_data['room'].unique().tolist()}")
-                logger.info(f"  Date range: {relay_data.index.min()} to {relay_data.index.max()}")
+                logger.info(
+                    f"  Date range: {relay_data.index.min()} to {relay_data.index.max()}"
+                )
         except Exception as e:
             logger.error(f"✗ Relay data extraction failed: {e}")
 
@@ -85,7 +93,9 @@ async def test_data_extraction():
 
         try:
             room_data = await extractor.extract_room_temperatures(start_date, end_date)
-            logger.info(f"✓ Temperature data extraction successful: {len(room_data)} rooms")
+            logger.info(
+                f"✓ Temperature data extraction successful: {len(room_data)} rooms"
+            )
             for room_name, room_df in room_data.items():
                 logger.info(f"  Room '{room_name}': {len(room_df)} records")
         except Exception as e:
@@ -98,7 +108,9 @@ async def test_data_extraction():
 
         try:
             weather_data = await extractor.extract_weather_data(start_date, end_date)
-            logger.info(f"✓ Weather data extraction successful: {len(weather_data)} records")
+            logger.info(
+                f"✓ Weather data extraction successful: {len(weather_data)} records"
+            )
             if not weather_data.empty:
                 logger.info(f"  Columns: {list(weather_data.columns)}")
         except Exception as e:
