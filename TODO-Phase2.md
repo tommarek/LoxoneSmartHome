@@ -1,596 +1,63 @@
-Based on the completed Phase 1 analysis framework, I'll create a comprehensive Phase 2 TODO that builds upon the existing infrastructure to implement ML models, optimization, and control systems.
+# PEMS v2 Phase 2: Advanced ML-Based Energy Management System
 
-# Phase 2 TODO: ML Model Development & Optimization Implementation
+## Executive Summary
 
-## Overview
-Phase 2 focuses on building predictive ML models using the features engineered in Phase 1, implementing optimization algorithms, and creating the control system that will replace the basic Growatt controller.
+Phase 2 transforms the analysis framework from Phase 1 into a production-ready, intelligent energy management system. This phase implements **predictive ML models**, **multi-objective optimization**, and **model predictive control (MPC)** to replace the basic rule-based Growatt controller with an advanced system capable of:
 
-## Folder Structure & Implementation Plan
+- **20%+ cost reduction** through optimal energy scheduling
+- **70%+ self-consumption** via predictive battery management
+- **Sub-0.5°C temperature control** using thermal modeling
+- **Automatic adaptation** through online learning
+- **Fault-tolerant operation** with graceful degradation
 
-```
-pems_v2/
-├── models/                      # 🤖 ML Model Components
-│   ├── __init__.py
-│   ├── base.py                 # Abstract base classes for all predictors
-│   ├── model_registry.py       # Model versioning and management
-│   ├── predictors/             # Individual prediction models
-│   │   ├── __init__.py
-│   │   ├── pv_predictor.py
-│   │   ├── thermal_predictor.py
-│   │   ├── load_predictor.py
-│   │   └── price_predictor.py
-│   ├── ensemble/               # Ensemble methods
-│   │   ├── __init__.py
-│   │   └── weighted_ensemble.py
-│   └── training/               # Training pipelines
-│       ├── __init__.py
-│       ├── trainer.py
-│       └── hyperparameter_tuning.py
-│
-├── optimization/               # 🎯 Optimization Engine
-│   ├── __init__.py
-│   ├── problem_formulation.py
-│   ├── constraints.py
-│   ├── objectives.py
-│   ├── solvers/
-│   │   ├── __init__.py
-│   │   ├── milp_solver.py
-│   │   └── stochastic_solver.py
-│   └── mpc/
-│       ├── __init__.py
-│       └── mpc_controller.py
-│
-├── control/                    # 🎮 Control System
-│   ├── __init__.py
-│   ├── energy_controller.py
-│   ├── interfaces/
-│   │   ├── __init__.py
-│   │   ├── loxone_interface.py
-│   │   ├── battery_interface.py
-│   │   └── ev_interface.py
-│   └── safety/
-│       ├── __init__.py
-│       └── safety_checks.py
-│
-├── monitoring/                 # 📊 Performance Monitoring
-│   ├── __init__.py
-│   ├── metrics_collector.py
-│   ├── model_monitor.py
-│   └── dashboards/
-│       ├── __init__.py
-│       └── grafana_config.py
-│
-└── deployment/                 # 🚀 Deployment & Integration
-    ├── __init__.py
-    ├── service_manager.py
-    ├── config_validator.py
-    └── backup_controller.py
-```
+### Key Innovations
+1. **Hybrid ML/Physics Models**: Combines XGBoost ML with physical PVLib and RC thermal models
+2. **Uncertainty Quantification**: P10/P50/P90 predictions for robust optimization
+3. **Multi-Objective MILP**: Simultaneous cost, comfort, and self-consumption optimization
+4. **Receding Horizon MPC**: 48-hour prediction, 24-hour control, 1-hour re-optimization
+5. **Online Learning**: Continuous model adaptation based on prediction errors
 
-## Detailed Implementation Tasks
+## Strategic Implementation Approach
 
-### 1. Models Module (`models/`)
+### Development Philosophy
+- **Incremental Development**: Each component builds on proven Phase 1 foundations
+- **Shadow Mode Deployment**: Run parallel to existing system for validation
+- **Graceful Degradation**: Always maintain fallback to rule-based control
+- **Comprehensive Testing**: 95%+ test coverage with real-world scenarios
+- **Performance Monitoring**: Continuous validation of model accuracy and system performance
 
-#### 1.1 `models/base.py`
-```python
-"""
-Abstract base classes for all predictors.
+### Architecture Principles
+- **Modular Design**: Independent, swappable components
+- **Async-First**: All I/O operations use async/await patterns
+- **Type Safety**: Full mypy compliance with strict checking
+- **Resource Management**: Proper cleanup and connection pooling
+- **Error Resilience**: Comprehensive exception handling and recovery
 
-PURPOSE:
-- Define common interface for all prediction models
-- Implement model persistence (save/load)
-- Provide performance tracking methods
-- Handle feature preprocessing pipeline
+---
 
-DATA USED:
-- Feature sets from analysis/analyzers/feature_engineering.py
-- Historical predictions for performance tracking
+# DETAILED PHASE 2 IMPLEMENTATION PLAN
 
-INTEGRATION:
-- All predictors inherit from BasePredictor
-- Uses analysis results for feature definitions
-- Integrates with model_registry for versioning
-"""
-```
+## 🔧 1. Data Infrastructure Overhaul
 
-**TODO:**
-- [ ] Implement `BasePredictor` abstract class with methods:
-  - `train(X, y)` - Train model on historical data
-  - `predict(X)` - Make predictions
-  - `predict_proba(X)` - Prediction with uncertainty
-  - `save_model(path)` - Persist trained model
-  - `load_model(path)` - Load trained model
-  - `get_feature_importance()` - Feature importance scores
-  - `evaluate(X, y)` - Model evaluation metrics
-- [ ] Implement `ModelMetadata` class for tracking:
-  - Model version
-  - Training date
-  - Feature list
-  - Performance metrics
-  - Training parameters
+### Problem Statement
+Current Phase 1 data extraction has redundancy and inefficiency:
+- Multiple methods extract overlapping data
+- No unified data validation
+- Inconsistent error handling
+- Missing data quality metrics
 
-#### 1.2 `models/predictors/pv_predictor.py`
-```python
-"""
-PV production prediction model.
+### Solution: Unified Data Pipeline
 
-PURPOSE:
-- Predict PV power output for next 48 hours
-- Provide uncertainty quantification (P10, P50, P90)
-- Handle weather forecast integration
-- Account for seasonal variations
+#### 1.1 Enhanced Data Extraction (`analysis/core/unified_data_extractor.py`)
 
-DATA USED:
-- Historical PV data from analysis results
-- Weather forecast data (cloud cover, temperature, radiation)
-- Seasonal patterns from pattern_analysis.py
-- Feature set from feature_engineering.create_pv_features()
+**PURPOSE**: Single source of truth for all energy data with built-in validation, gap detection, and quality metrics.
 
-INTEGRATION:
-- Uses weather API for real-time forecasts
-- Integrates with optimization for production planning
-- Updates predictions based on actual vs predicted analysis
-"""
-```
-
-**TODO:**
-- [ ] Implement `PVPredictor` class:
-  - XGBoost as primary model
-  - Physical model (PVLib) as baseline
-  - Ensemble approach for robustness
-- [ ] Weather feature extraction:
-  - DNI, DHI, GHI calculation
-  - Cloud cover impact modeling
-  - Temperature derating effects
-- [ ] Uncertainty quantification:
-  - Quantile regression for P10, P50, P90
-  - Prediction intervals based on weather uncertainty
-- [ ] Real-time adaptation:
-  - Online learning with recent errors
-  - Bias correction based on last 7 days
-  - Seasonal adjustment factors
-
-#### 1.3 `models/predictors/thermal_predictor.py`
-```python
-"""
-Room temperature prediction using RC models.
-
-PURPOSE:
-- Predict room temperatures for 48-hour horizon
-- Model heating system response (binary relay control)
-- Account for thermal inertia and weather effects
-- Enable optimal heating scheduling
-
-DATA USED:
-- RC parameters from thermal_analysis.py
-- Historical room temperature data
-- Weather forecast (outdoor temperature, solar gains)
-- Relay state history
-
-INTEGRATION:
-- Provides temperature constraints for optimization
-- Uses relay control decisions from optimizer
-- Updates RC parameters based on prediction errors
-"""
-```
-
-**TODO:**
-- [ ] Implement state-space thermal model:
-  - Discrete-time formulation for 5-min steps
-  - Room coupling effects
-  - Solar gain estimation
-- [ ] Kalman filter for state estimation:
-  - Temperature state tracking
-  - Parameter adaptation
-  - Uncertainty propagation
-- [ ] Multi-zone coordination:
-  - Heat transfer between rooms
-  - Shared heating capacity constraints
-- [ ] Comfort prediction:
-  - Occupancy-based setpoints
-  - Comfort zone violations
-
-#### 1.4 `models/predictors/load_predictor.py`
-```python
-"""
-Base load prediction model.
-
-PURPOSE:
-- Predict non-controllable electricity consumption
-- Capture daily, weekly, and seasonal patterns
-- Provide hourly forecasts for optimization
-
-DATA USED:
-- Historical base load from base_load_analysis.py
-- Calendar features (holidays, weekends)
-- Weather data for weather-sensitive loads
-- Anomaly detection results
-
-INTEGRATION:
-- Feeds into optimization as fixed load
-- Updates based on recent consumption patterns
-- Handles special events/anomalies
-"""
-```
-
-**TODO:**
-- [ ] Implement time series models:
-  - LightGBM for pattern recognition
-  - Separate models for weekday/weekend/holiday
-  - Hourly predictions with confidence intervals
-- [ ] Feature engineering:
-  - Lag features (24h, 168h)
-  - Rolling statistics
-  - Holiday encoding
-- [ ] Anomaly handling:
-  - Detect and exclude outliers in training
-  - Special event detection
-  - Adaptive model updates
-
-### 2. Optimization Module (`optimization/`)
-
-#### 2.1 `optimization/problem_formulation.py`
-```python
-"""
-Energy optimization problem formulation.
-
-PURPOSE:
-- Define MILP/MINLP optimization problem
-- Set up decision variables and constraints
-- Implement multi-objective optimization
-- Handle 48-hour rolling horizon
-
-DATA USED:
-- Predictions from all ML models
-- Current system state (battery SOC, temperatures)
-- Electricity prices and export policies
-- System constraints from config
-
-INTEGRATION:
-- Uses predictions from models module
-- Feeds decisions to control module
-- Re-optimizes based on MPC feedback
-"""
-```
-
-**TODO:**
-- [ ] Decision variables:
-  - Binary heating decisions for 16 rooms × 48 hours
-  - Continuous battery charge/discharge power
-  - EV charging power profile
-  - Grid import/export
-- [ ] Objectives:
-  - Minimize total electricity cost
-  - Maximize self-consumption
-  - Minimize peak demand (optional)
-- [ ] Time discretization:
-  - 1-hour steps for optimization
-  - Aggregation from 5-min control intervals
-- [ ] Warm start strategies:
-  - Use previous solution
-  - Heuristic initialization
-
-#### 2.2 `optimization/constraints.py`
-```python
-"""
-Optimization constraint builders.
-
-PURPOSE:
-- Build all system constraints for optimization
-- Handle physical limitations and comfort requirements
-- Implement safety constraints
-- Manage grid interaction limits
-
-DATA USED:
-- System specifications (battery limits, room power)
-- Comfort boundaries from config
-- Grid connection limits
-- Physical models from predictors
-
-INTEGRATION:
-- Called by problem_formulation
-- Uses thermal models for temperature constraints
-- Validates against safety checks
-"""
-```
-
-**TODO:**
-- [ ] Power balance constraints:
-  - PV + grid = load + battery + export
-  - Account for conversion losses
-- [ ] Battery constraints:
-  - SOC limits [10%, 90%]
-  - Charge/discharge power limits
-  - Prevent simultaneous charge/discharge
-  - Degradation-aware cycling limits
-- [ ] Thermal comfort constraints:
-  - Room temperature bounds
-  - Heating power limits (binary × rated power)
-  - Minimum off-time between cycles
-- [ ] Grid constraints:
-  - Maximum import/export limits
-  - Export only when price > threshold
-  - Power factor requirements
-
-#### 2.3 `optimization/mpc/mpc_controller.py`
-```python
-"""
-Model Predictive Control implementation.
-
-PURPOSE:
-- Implement receding horizon control
-- Handle disturbances and model updates
-- Coordinate re-optimization triggers
-- Manage computational resources
-
-DATA USED:
-- Current system state from monitoring
-- Updated predictions from models
-- Optimization results from solver
-- Actual vs planned deviations
-
-INTEGRATION:
-- Main loop in energy_controller
-- Triggers re-optimization
-- Updates model predictions
-- Feeds back to ML models
-"""
-```
-
-**TODO:**
-- [ ] MPC configuration:
-  - 48-hour prediction horizon
-  - 24-hour control horizon
-  - 1-hour re-optimization frequency
-- [ ] Disturbance handling:
-  - Measure prediction errors
-  - Update state estimates
-  - Trigger immediate re-optimization if needed
-- [ ] Move blocking:
-  - Detailed control for next 6 hours
-  - Aggregated decisions for 6-24 hours
-  - Rough plan for 24-48 hours
-- [ ] Computational management:
-  - Time limits for optimization
-  - Fallback to simpler models if needed
-
-### 3. Control Module (`control/`)
-
-#### 3.1 `control/energy_controller.py`
-```python
-"""
-Main energy management controller.
-
-PURPOSE:
-- Replace growatt_controller.py with advanced control
-- Coordinate all subsystems (heating, battery, EV)
-- Implement MPC main loop
-- Handle fault conditions and fallbacks
-
-DATA USED:
-- Current state from InfluxDB
-- Optimization results from MPC
-- System status from interfaces
-- Safety limits from config
-
-INTEGRATION:
-- Main entry point for control system
-- Replaces existing main.py controller
-- Interfaces with all hardware systems
-- Logs all decisions to InfluxDB
-"""
-```
-
-**TODO:**
-- [ ] Initialization:
-  - Load all ML models
-  - Initialize optimization engine
-  - Set up interface connections
-  - Configure logging
-- [ ] Main control loop (5-minute):
-  - Read current state
-  - Check for re-optimization triggers
-  - Apply control decisions
-  - Log metrics
-- [ ] State management:
-  - Track execution vs plan
-  - Detect deviations
-  - Handle manual overrides
-- [ ] Fault handling:
-  - Fallback to rule-based control
-  - Safe mode operation
-  - Alert generation
-
-#### 3.2 `control/interfaces/loxone_interface.py`
-```python
-"""
-Loxone system control interface.
-
-PURPOSE:
-- Send relay control commands via MQTT
-- Read current relay states
-- Handle Loxone-specific protocols
-- Implement command queuing
-
-DATA USED:
-- Relay decisions from optimizer
-- Current states from Loxone
-- Room mapping from config
-- Command acknowledgments
-
-INTEGRATION:
-- Called by energy_controller
-- Uses existing MQTT infrastructure
-- Maps to Loxone field names via adapter
-- Handles async communication
-"""
-```
-
-**TODO:**
-- [ ] MQTT command structure:
-  - Topic: `loxone/relay/{room}/set`
-  - Payload: `{"state": 0/1, "until": timestamp}`
-  - QoS level 2 for reliability
-- [ ] State verification:
-  - Read back commanded state
-  - Retry on failure
-  - Alert on persistent errors
-- [ ] Batch commands:
-  - Queue multiple relay changes
-  - Coordinate switching order
-  - Respect minimum switching intervals
-
-### 4. Monitoring Module (`monitoring/`)
-
-#### 4.1 `monitoring/metrics_collector.py`
-```python
-"""
-System performance metrics collection.
-
-PURPOSE:
-- Track prediction accuracy
-- Monitor optimization performance
-- Calculate cost savings
-- Generate performance reports
-
-DATA USED:
-- Predictions vs actuals from all models
-- Optimization decisions and costs
-- System state history
-- Baseline comparisons
-
-INTEGRATION:
-- Stores metrics in InfluxDB
-- Feeds Grafana dashboards
-- Triggers model retraining
-- Generates daily reports
-"""
-```
-
-**TODO:**
-- [ ] Prediction metrics:
-  - RMSE for each predictor
-  - Bias detection
-  - Uncertainty calibration
-- [ ] Optimization metrics:
-  - Cost savings vs baseline
-  - Self-consumption rate
-  - Computation time
-  - Constraint violations
-- [ ] System metrics:
-  - Uptime and reliability
-  - Response times
-  - Error rates
-- [ ] Automated reporting:
-  - Daily performance summary
-  - Weekly trends
-  - Monthly cost analysis
-
-### 5. Training Pipeline Tasks
-
-#### 5.1 Initial Model Training
-**TODO:**
-- [ ] Load Phase 1 analysis results
-- [ ] Split data into train/validation/test sets
-- [ ] Train PV predictor on 2 years of data
-- [ ] Train thermal models for each room
-- [ ] Train base load predictor
-- [ ] Evaluate ensemble performance
-- [ ] Save trained models with versioning
-
-#### 5.2 Feature Pipeline
-**TODO:**
-- [ ] Implement real-time feature calculation
-- [ ] Create feature store for online predictions
-- [ ] Implement feature monitoring
-- [ ] Handle missing data in production
-
-## Implementation Timeline
-
-### Week 1-2: Core ML Models
-- [ ] Implement base model classes
-- [ ] Develop PV predictor with weather integration
-- [ ] Create thermal state-space models
-- [ ] Build base load predictor
-
-### Week 3: Optimization Engine
-- [ ] Formulate MILP problem
-- [ ] Implement constraint builders
-- [ ] Integrate GEKKO/PuLP solver
-- [ ] Test optimization convergence
-
-### Week 4: Control System
-- [ ] Develop main controller
-- [ ] Implement Loxone interface
-- [ ] Create battery/EV interfaces
-- [ ] Add safety checks
-
-### Week 5: Integration & Testing
-- [ ] End-to-end testing
-- [ ] Performance optimization
-- [ ] Fault scenario testing
-- [ ] Documentation
-
-### Week 6: Monitoring & Deployment
-- [ ] Set up metrics collection
-- [ ] Create Grafana dashboards
-- [ ] Implement model monitoring
-- [ ] Deploy in shadow mode
-
-## Key Integration Points
-
-1. **Feature Usage**: All ML models use features from `analysis/analyzers/feature_engineering.py`
-2. **Data Flow**: InfluxDB → Feature Engineering → ML Models → Optimization → Control → InfluxDB
-3. **State Feedback**: Control results feed back to improve predictions
-4. **Configuration**: All parameters from `config/settings.py` and `config/energy_settings.py`
-5. **Logging**: Unified logging through `utils/logging.py`
-
-## Success Metrics
-
-- PV prediction RMSE < 10% of capacity
-- Temperature prediction MAE < 0.5°C
-- Cost reduction > 20% vs baseline
-- Self-consumption > 70%
-- System uptime > 99.5%
-
-## Risk Mitigation
-
-1. **Fallback Control**: Keep rule-based controller as backup
-2. **Shadow Mode**: Run parallel to existing system initially
-3. **Gradual Rollout**: Start with one room, expand gradually
-4. **Safety Limits**: Hard-coded limits in safety module
-5. **Manual Override**: Always allow user intervention
-
-This Phase 2 implementation builds directly on the Phase 1 analysis, using all the extracted features, patterns, and parameters to create a production-ready predictive energy management system.
-
-
-this might help as well although not complete
-I'll provide a comprehensive code review with detailed implementations and recommendations for the PEMS v2 project.
-
-# PEMS v2 Comprehensive Code Review and Implementation Guide
-
-## 1. Data Architecture Issues and Solutions
-
-### Current Problem: Redundant Data Extraction
-
-The current implementation has multiple methods extracting similar data:
-
-```python
-# CURRENT PROBLEMATIC CODE in data_extraction.py
-async def extract_pv_data(self, start_date, end_date):
-    # Extracts: ChargePower, DischargePower, SOC, BatteryTemperature
-    ...
-
-async def extract_battery_data(self, start_date, end_date):
-    # ALSO extracts: ChargePower, DischargePower, SOC, BatteryVoltage
-    ...
-
-async def extract_energy_consumption(self, start_date, end_date):
-    # Complex relay state calculations mixed with consumption
-    ...
-```
-
-### Solution: Unified Data Extraction Architecture
+**KEY FEATURES**:
+- Parallel extraction of all data streams
+- Automatic data validation and gap detection
+- Quality scoring for ML model input
+- Efficient InfluxDB query optimization
+- Structured data containers with type safety
 
 ```python
 # analysis/core/unified_data_extractor.py
@@ -600,6 +67,8 @@ from datetime import datetime
 import asyncio
 from dataclasses import dataclass
 from influxdb_client import InfluxDBClient
+import numpy as np
+from scipy import stats
 
 @dataclass
 class EnergyDataset:
@@ -691,119 +160,234 @@ class UnifiedDataExtractor:
                 self.logger.error(f"Extraction task {i} failed: {result}")
         
         return dataset
-    
-    async def _extract_production_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-        """Extract all production-related data (PV + Battery production side)."""
-        query = f"""
-        from(bucket: "{self.settings['bucket_solar']}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "solar")
-          |> filter(fn: (r) => 
-              r["_field"] == "InputPower" or
-              r["_field"] == "PV1InputPower" or
-              r["_field"] == "PV2InputPower" or
-              r["_field"] == "PV1Voltage" or
-              r["_field"] == "PV2Voltage" or
-              r["_field"] == "DischargePower" or
-              r["_field"] == "TodayGenerateEnergy" or
-              r["_field"] == "TotalGenerateEnergy"
-          )
-          |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
-          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-        """
+
+    def calculate_data_quality_score(self, dataset: EnergyDataset) -> Dict[str, float]:
+        """Calculate comprehensive data quality metrics for ML readiness."""
+        quality_scores = {}
         
-        result = await self._execute_query(query)
-        df = self._process_query_result(result)
+        for component_name, df in dataset.__dict__.items():
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                # Completeness score
+                completeness = 1 - df.isnull().sum().sum() / (len(df) * len(df.columns))
+                
+                # Consistency score (check for outliers)
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                consistency = 1.0
+                if len(numeric_cols) > 0:
+                    z_scores = np.abs(stats.zscore(df[numeric_cols].fillna(0)))
+                    outlier_rate = (z_scores > 3).sum().sum() / (len(df) * len(numeric_cols))
+                    consistency = 1 - min(outlier_rate, 0.1) / 0.1
+                
+                # Temporal consistency
+                if hasattr(df.index, 'freq') or len(df) > 1:
+                    expected_freq = pd.infer_freq(df.index[:100]) or '5min'
+                    resampled = df.resample(expected_freq).count().iloc[:, 0]
+                    temporal_consistency = (resampled > 0).mean()
+                else:
+                    temporal_consistency = 1.0
+                
+                # Combined score
+                quality_scores[component_name] = {
+                    'overall': (completeness * 0.4 + consistency * 0.3 + temporal_consistency * 0.3),
+                    'completeness': completeness,
+                    'consistency': consistency, 
+                    'temporal_consistency': temporal_consistency
+                }
         
-        # Add calculated fields
-        if not df.empty:
-            df['total_pv_power'] = df.get('PV1InputPower', 0) + df.get('PV2InputPower', 0)
-            df['pv_efficiency'] = self._calculate_pv_efficiency(df)
-        
-        return df
-    
-    async def _extract_consumption_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-        """Extract all consumption data including calculated relay consumption."""
-        # First get relay states
-        relay_query = f"""
-        from(bucket: "{self.settings['bucket_solar']}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "heating")
-          |> aggregateWindow(every: 5m, fn: last, createEmpty: false)
-          |> pivot(rowKey:["_time"], columnKey: ["room"], valueColumn: "_value")
-        """
-        
-        relay_result = await self._execute_query(relay_query)
-        relay_df = self._process_query_result(relay_result)
-        
-        # Calculate consumption from relay states
-        consumption_df = pd.DataFrame(index=relay_df.index)
-        
-        from config.energy_settings import ROOM_CONFIG
-        
-        for room_name in relay_df.columns:
-            if room_name in ROOM_CONFIG['rooms']:
-                power_kw = ROOM_CONFIG['rooms'][room_name]['power_kw']
-                consumption_df[f'{room_name}_consumption'] = relay_df[room_name] * power_kw * 1000  # W
-        
-        # Add total consumption
-        consumption_df['heating_total'] = consumption_df.sum(axis=1)
-        
-        # Get other consumption data (base load, etc.)
-        other_query = f"""
-        from(bucket: "{self.settings['bucket_solar']}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "solar")
-          |> filter(fn: (r) => r["_field"] == "ACPowerToUser" or r["_field"] == "LocalLoadEnergyToday")
-          |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
-          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-        """
-        
-        other_result = await self._execute_query(other_query)
-        other_df = self._process_query_result(other_result)
-        
-        # Merge all consumption data
-        if not other_df.empty:
-            consumption_df = consumption_df.join(other_df, how='outer')
-        
-        return consumption_df
-    
-    async def _extract_storage_data(self, start_date: datetime, end_date: datetime) -> pd.DataFrame:
-        """Extract battery storage data."""
-        query = f"""
-        from(bucket: "{self.settings['bucket_solar']}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "solar")
-          |> filter(fn: (r) => 
-              r["_field"] == "SOC" or
-              r["_field"] == "BatteryVoltage" or
-              r["_field"] == "BatteryTemperature" or
-              r["_field"] == "ChargePower" or
-              r["_field"] == "DischargePower" or
-              r["_field"] == "ChargeEnergyToday" or
-              r["_field"] == "DischargeEnergyToday"
-          )
-          |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
-          |> pivot(rowKey:["_time"], columnKey: ["_field"], valueColumn: "_value")
-        """
-        
-        result = await self._execute_query(query)
-        df = self._process_query_result(result)
-        
-        # Add calculated fields
-        if not df.empty:
-            df['net_battery_power'] = df.get('ChargePower', 0) - df.get('DischargePower', 0)
-            df['battery_energy_change'] = df['net_battery_power'] * (5/60) / 1000  # kWh
-        
-        return df
+        return quality_scores
 ```
 
-## 2. Missing Core Predictor Implementations
+---
 
-### PV Production Predictor
+## 🤖 2. Advanced ML Model Implementation
+
+### 2.1 Base Model Infrastructure (`models/base.py`)
+
+**PURPOSE**: Unified interface for all predictive models with automatic versioning, performance tracking, and deployment management.
 
 ```python
-# modules/predictors/pv_predictor.py
+# models/base.py
+from abc import ABC, abstractmethod
+from typing import Dict, Any, Optional, Tuple, Union
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import joblib
+import json
+from pathlib import Path
+import hashlib
+from dataclasses import dataclass, asdict
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+@dataclass
+class ModelMetadata:
+    """Comprehensive model metadata for versioning and tracking."""
+    model_name: str
+    version: str
+    training_date: datetime
+    features: List[str]
+    target_variable: str
+    performance_metrics: Dict[str, float]
+    training_params: Dict[str, Any]
+    data_hash: str
+    model_type: str
+    deployment_status: str = "development"
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization."""
+        result = asdict(self)
+        result['training_date'] = self.training_date.isoformat()
+        return result
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'ModelMetadata':
+        """Create from dictionary."""
+        data['training_date'] = datetime.fromisoformat(data['training_date'])
+        return cls(**data)
+
+class BasePredictor(ABC):
+    """Abstract base class for all PEMS predictive models."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.model = None
+        self.scaler = None
+        self.feature_columns = None
+        self.metadata: Optional[ModelMetadata] = None
+        self.performance_history = []
+        
+    @abstractmethod
+    def train(self, X: pd.DataFrame, y: pd.Series, **kwargs) -> Dict[str, float]:
+        """Train the model on historical data."""
+        pass
+    
+    @abstractmethod
+    def predict(self, X: pd.DataFrame, **kwargs) -> Union[pd.Series, pd.DataFrame]:
+        """Make predictions on new data."""
+        pass
+    
+    def predict_with_uncertainty(self, X: pd.DataFrame) -> pd.DataFrame:
+        """Make predictions with uncertainty quantification."""
+        # Default implementation - override in specific models
+        predictions = self.predict(X)
+        if isinstance(predictions, pd.Series):
+            return pd.DataFrame({
+                'prediction': predictions,
+                'uncertainty': predictions * 0.1  # 10% default uncertainty
+            })
+        return predictions
+    
+    def evaluate(self, X: pd.DataFrame, y: pd.Series) -> Dict[str, float]:
+        """Evaluate model performance."""
+        predictions = self.predict(X)
+        
+        if isinstance(predictions, pd.DataFrame):
+            predictions = predictions['prediction']
+        
+        metrics = {
+            'mae': mean_absolute_error(y, predictions),
+            'rmse': np.sqrt(mean_squared_error(y, predictions)),
+            'r2': r2_score(y, predictions),
+            'mape': np.mean(np.abs((y - predictions) / (y + 1e-8))) * 100
+        }
+        
+        # Add to performance history
+        self.performance_history.append({
+            'timestamp': datetime.now(),
+            'metrics': metrics,
+            'sample_size': len(y)
+        })
+        
+        return metrics
+    
+    def get_feature_importance(self) -> Optional[Dict[str, float]]:
+        """Get feature importance if model supports it."""
+        if hasattr(self.model, 'feature_importances_') and self.feature_columns is not None:
+            return dict(zip(self.feature_columns, self.model.feature_importances_))
+        return None
+    
+    def save_model(self, path: Union[str, Path]) -> None:
+        """Save complete model state with metadata."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+        
+        # Save model artifacts
+        model_data = {
+            'model': self.model,
+            'scaler': self.scaler,
+            'feature_columns': self.feature_columns,
+            'config': self.config,
+            'performance_history': self.performance_history
+        }
+        
+        joblib.dump(model_data, path / 'model.pkl')
+        
+        # Save metadata
+        if self.metadata:
+            with open(path / 'metadata.json', 'w') as f:
+                json.dump(self.metadata.to_dict(), f, indent=2)
+    
+    def load_model(self, path: Union[str, Path]) -> None:
+        """Load complete model state."""
+        path = Path(path)
+        
+        # Load model artifacts
+        model_data = joblib.load(path / 'model.pkl')
+        self.model = model_data['model']
+        self.scaler = model_data['scaler']
+        self.feature_columns = model_data['feature_columns']
+        self.performance_history = model_data.get('performance_history', [])
+        
+        # Load metadata
+        metadata_path = path / 'metadata.json'
+        if metadata_path.exists():
+            with open(metadata_path, 'r') as f:
+                metadata_dict = json.load(f)
+                self.metadata = ModelMetadata.from_dict(metadata_dict)
+    
+    def update_online(self, X: pd.DataFrame, y: pd.Series) -> None:
+        """Update model with new data (online learning)."""
+        # Default: retrain periodically
+        # Override in specific models for true online learning
+        recent_performance = self.evaluate(X, y)
+        
+        # Trigger retraining if performance degrades
+        if len(self.performance_history) > 1:
+            previous_mae = self.performance_history[-2]['metrics']['mae']
+            current_mae = recent_performance['mae']
+            
+            if current_mae > previous_mae * 1.2:  # 20% degradation
+                self._trigger_retraining_alert()
+    
+    def _trigger_retraining_alert(self) -> None:
+        """Alert system that model needs retraining."""
+        # Implementation would send alert via logging/monitoring system
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.warning(f"Model {self.__class__.__name__} requires retraining due to performance degradation")
+    
+    def _calculate_data_hash(self, X: pd.DataFrame, y: pd.Series) -> str:
+        """Calculate hash of training data for versioning."""
+        combined_data = pd.concat([X, y], axis=1)
+        data_string = combined_data.to_string()
+        return hashlib.md5(data_string.encode()).hexdigest()
+```
+
+### 2.2 PV Production Predictor (`models/predictors/pv_predictor.py`)
+
+**PURPOSE**: Hybrid physical-ML model for accurate PV production forecasting with uncertainty quantification.
+
+**TECHNICAL APPROACH**:
+- **Base Model**: PVLib physical model for clear-sky baseline
+- **ML Enhancement**: XGBoost for cloud/weather pattern learning
+- **Ensemble**: Weighted combination based on weather conditions
+- **Uncertainty**: Quantile regression + temporal uncertainty propagation
+- **Features**: 50+ engineered features including solar geometry, weather, lags
+
+**EXPECTED PERFORMANCE**: RMSE < 10% of system capacity, R² > 0.85
+
+```python
+# models/predictors/pv_predictor.py
 import numpy as np
 import pandas as pd
 from typing import Dict, Tuple, Optional
@@ -812,21 +396,20 @@ import xgboost as xgb
 from datetime import datetime, timedelta
 import pvlib
 import joblib
+from .base import BasePredictor
 
-class PVPredictor:
+class PVPredictor(BasePredictor):
     """Advanced PV production predictor with uncertainty quantification."""
     
     def __init__(self, system_config: Dict[str, Any]):
-        self.config = system_config
+        super().__init__(system_config)
         self.models = {
             'clear_sky': self._init_clearsky_model(),
             'ml_model': None,
             'ensemble_weights': {'clear_sky': 0.3, 'ml': 0.7}
         }
-        self.feature_columns = None
-        self.scaler = None
         
-    def _init_clearsky_model(self) -> pvlib.pvsystem.PVSystem:
+    def _init_clearsky_model(self) -> Dict[str, Any]:
         """Initialize physical clear-sky model using pvlib."""
         location = pvlib.location.Location(
             latitude=self.config['latitude'],
@@ -835,7 +418,6 @@ class PVPredictor:
             altitude=self.config.get('altitude', 300)
         )
         
-        # Define PV system based on configuration
         system = pvlib.pvsystem.PVSystem(
             surface_tilt=self.config.get('tilt', 35),
             surface_azimuth=self.config.get('azimuth', 180),
@@ -899,9 +481,10 @@ class PVPredictor:
             verbose=False
         )
         
-        # Calculate validation metrics
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        # Train quantile models for uncertainty
+        self.train_quantile_models(features_df[feature_cols], y)
         
+        # Calculate validation metrics
         predictions = self.models['ml_model'].predict(X_val)
         
         metrics = {
@@ -911,24 +494,17 @@ class PVPredictor:
             'mape': np.mean(np.abs((y_val - predictions) / (y_val + 1))) * 100
         }
         
-        # Feature importance
-        if hasattr(self.models['ml_model'], 'feature_importances_'):
-            feature_importance = dict(zip(
-                feature_cols,
-                self.models['ml_model'].feature_importances_
-            ))
-            metrics['feature_importance'] = sorted(
-                feature_importance.items(),
-                key=lambda x: x[1],
-                reverse=True
-            )[:10]
-        
         return metrics
     
     def predict(self, 
                 weather_forecast: pd.DataFrame,
                 include_uncertainty: bool = True) -> pd.DataFrame:
         """Generate PV production forecast with uncertainty bands."""
+        
+        # Validate weather forecast
+        validation_result = self.validate_weather_forecast(weather_forecast)
+        if validation_result['status'] == 'invalid':
+            raise ValueError(f"Invalid weather forecast: {validation_result['errors']}")
         
         # Generate clear-sky baseline
         clearsky_pred = self._predict_clearsky(weather_forecast)
@@ -975,688 +551,87 @@ class PVPredictor:
         
         return predictions_df
     
-    def _engineer_features(self, 
-                          pv_data: pd.DataFrame, 
-                          weather_data: pd.DataFrame) -> pd.DataFrame:
-        """Engineer features for ML model training."""
+    def train_quantile_models(self, X: pd.DataFrame, y: pd.Series) -> None:
+        """Train separate quantile regression models for uncertainty."""
+        from sklearn.ensemble import GradientBoostingRegressor
         
-        # Merge PV and weather data
-        df = pv_data.join(weather_data, how='inner')
+        self.quantile_models = {}
         
-        # Time-based features
-        df['hour'] = df.index.hour
-        df['day_of_year'] = df.index.dayofyear
-        df['month'] = df.index.month
-        
-        # Cyclical encoding
-        df['hour_sin'] = np.sin(2 * np.pi * df['hour'] / 24)
-        df['hour_cos'] = np.cos(2 * np.pi * df['hour'] / 24)
-        df['day_sin'] = np.sin(2 * np.pi * df['day_of_year'] / 365)
-        df['day_cos'] = np.cos(2 * np.pi * df['day_of_year'] / 365)
-        
-        # Solar position features
-        solar_position = pvlib.solarposition.get_solarposition(
-            df.index,
-            self.config['latitude'],
-            self.config['longitude']
-        )
-        
-        df['solar_elevation'] = solar_position['elevation']
-        df['solar_azimuth'] = solar_position['azimuth']
-        df['air_mass'] = pvlib.atmosphere.get_relative_airmass(
-            solar_position['apparent_zenith']
-        )
-        
-        # Weather features
-        if 'temperature' in df.columns:
-            df['temp_squared'] = df['temperature'] ** 2
-            df['temp_effect'] = 1 - 0.004 * (df['temperature'] - 25)
-        
-        if 'wind_speed' in df.columns:
-            df['wind_cooling'] = np.sqrt(df['wind_speed'])
-        
-        # Clear-sky radiation
-        clearsky = self._calculate_clearsky_radiation(df.index)
-        df['clearsky_ghi'] = clearsky['ghi']
-        df['clearsky_dni'] = clearsky['dni']
-        df['clearsky_dhi'] = clearsky['dhi']
-        
-        # Radiation ratios
-        if 'ghi' in df.columns:
-            df['clearness_index'] = df['ghi'] / (df['clearsky_ghi'] + 1)
-        
-        # Lag features
-        df['pv_power_lag_1h'] = df['pv_power'].shift(4)  # 1 hour ago
-        df['pv_power_lag_24h'] = df['pv_power'].shift(96)  # 24 hours ago
-        
-        # Rolling statistics
-        df['pv_power_rolling_mean_1h'] = df['pv_power'].rolling(4).mean()
-        df['pv_power_rolling_std_1h'] = df['pv_power'].rolling(4).std()
-        
-        return df
-    
-    def _predict_clearsky(self, weather_df: pd.DataFrame) -> np.ndarray:
-        """Generate clear-sky PV production estimate."""
-        
-        location = self.models['clear_sky']['location']
-        system = self.models['clear_sky']['system']
-        
-        # Calculate solar position
-        solar_position = location.get_solarposition(weather_df.index)
-        
-        # Get clear-sky radiation
-        clearsky = location.get_clearsky(weather_df.index)
-        
-        # Calculate POA irradiance
-        poa_sky_diffuse = pvlib.irradiance.get_sky_diffuse(
-            system.surface_tilt,
-            system.surface_azimuth,
-            solar_position['apparent_zenith'],
-            solar_position['azimuth'],
-            clearsky['dni'],
-            clearsky['ghi'],
-            clearsky['dhi']
-        )
-        
-        poa_global = pvlib.irradiance.get_total_irradiance(
-            system.surface_tilt,
-            system.surface_azimuth,
-            solar_position['apparent_zenith'],
-            solar_position['azimuth'],
-            clearsky['dni'],
-            clearsky['ghi'],
-            clearsky['dhi']
-        )
-        
-        # Temperature model (if available)
-        if 'temperature' in weather_df.columns:
-            cell_temp = pvlib.temperature.pvsyst_cell(
-                poa_global['poa_global'],
-                weather_df['temperature'],
-                weather_df.get('wind_speed', 1)
+        for quantile in [0.1, 0.9]:
+            model = GradientBoostingRegressor(
+                loss='quantile',
+                alpha=quantile,
+                n_estimators=100,
+                max_depth=4,
+                random_state=42
             )
-        else:
-            cell_temp = 25  # Default
-        
-        # DC power
-        dc_power = pvlib.pvsystem.pvwatts_dc(
-            poa_global['poa_global'],
-            cell_temp,
-            self.config.get('pdc0', 10000),
-            self.config.get('gamma_pdc', -0.004)
-        )
-        
-        # AC power (including inverter efficiency)
-        ac_power = pvlib.inverter.pvwatts(
-            dc_power,
-            self.config.get('pdc0', 10000),
-            self.config.get('eta_inv_nom', 0.96)
-        )
-        
-        # Apply cloud cover if available
-        if 'cloud_cover' in weather_df.columns:
-            cloud_factor = 1 - weather_df['cloud_cover'] / 100 * 0.8
-            ac_power *= cloud_factor
-        
-        return np.maximum(ac_power, 0)
+            
+            X_scaled = self.scaler.transform(X[self.feature_columns])
+            model.fit(X_scaled, y)
+            self.quantile_models[quantile] = model
     
     def _predict_quantile(self, X: np.ndarray, quantile: float) -> np.ndarray:
         """Predict specific quantile using quantile regression."""
-        # For now, use simple uncertainty estimation
-        # In production, train separate quantile regression models
-        base_pred = self.models['ml_model'].predict(X)
-        
-        if quantile < 0.5:
-            return base_pred * (0.5 + quantile)
+        if hasattr(self, 'quantile_models') and quantile in self.quantile_models:
+            return self.quantile_models[quantile].predict(X)
         else:
-            return base_pred * (0.5 + quantile)
+            # Fallback to simple uncertainty estimation
+            base_pred = self.models['ml_model'].predict(X)
+            if quantile < 0.5:
+                return base_pred * (0.5 + quantile)
+            else:
+                return base_pred * (0.5 + quantile)
     
-    def _postprocess_predictions(self, predictions: pd.DataFrame) -> pd.DataFrame:
-        """Post-process predictions for physical constraints."""
-        
-        # Ensure non-negative
-        for col in predictions.columns:
-            predictions[col] = np.maximum(predictions[col], 0)
-        
-        # Cap at system maximum
-        max_power = self.config.get('pdc0', 10000) * self.config.get('eta_inv_nom', 0.96)
-        for col in predictions.columns:
-            predictions[col] = np.minimum(predictions[col], max_power)
-        
-        # Set to zero during night (no sun elevation data)
-        night_mask = predictions.index.hour.isin([22, 23, 0, 1, 2, 3, 4, 5])
-        predictions.loc[night_mask] = 0
-        
-        # Smooth predictions to avoid unrealistic jumps
-        for col in predictions.columns:
-            predictions[col] = predictions[col].rolling(3, center=True, min_periods=1).mean()
-        
-        return predictions
-    
-    def update_online(self, 
-                     recent_data: pd.DataFrame,
-                     weather_data: pd.DataFrame) -> None:
-        """Update model with recent prediction errors."""
-        
-        # Calculate recent errors
-        features = self._engineer_features(recent_data, weather_data)
-        X = features[self.feature_columns]
-        y_true = recent_data['pv_power']
-        
-        X_scaled = self.scaler.transform(X)
-        y_pred = self.models['ml_model'].predict(X_scaled)
-        
-        errors = y_true - y_pred
-        
-        # Update ensemble weights based on recent performance
-        clearsky_pred = self._predict_clearsky(weather_data)
-        clearsky_errors = y_true - clearsky_pred
-        
-        ml_mae = np.mean(np.abs(errors))
-        clearsky_mae = np.mean(np.abs(clearsky_errors))
-        
-        # Adjust weights inversely proportional to error
-        total_error = ml_mae + clearsky_mae
-        if total_error > 0:
-            self.models['ensemble_weights']['ml'] = 1 - ml_mae / total_error
-            self.models['ensemble_weights']['clear_sky'] = 1 - clearsky_mae / total_error
-        
-        # Bias correction
-        bias = np.mean(errors)
-        if abs(bias) > 50:  # Significant bias
-            # Apply exponential smoothing to bias correction
-            self._bias_correction = getattr(self, '_bias_correction', 0) * 0.9 + bias * 0.1
-    
-    def save_model(self, path: str):
-        """Save trained model to disk."""
-        model_data = {
-            'ml_model': self.models['ml_model'],
-            'feature_columns': self.feature_columns,
-            'scaler': self.scaler,
-            'config': self.config,
-            'ensemble_weights': self.models['ensemble_weights']
+    def validate_weather_forecast(self, weather_df: pd.DataFrame) -> Dict[str, Any]:
+        """Validate weather forecast data quality."""
+        validation_results = {
+            'status': 'valid',
+            'warnings': [],
+            'errors': []
         }
-        joblib.dump(model_data, path)
-    
-    def load_model(self, path: str):
-        """Load model from disk."""
-        model_data = joblib.load(path)
-        self.models['ml_model'] = model_data['ml_model']
-        self.feature_columns = model_data['feature_columns']
-        self.scaler = model_data['scaler']
-        self.models['ensemble_weights'] = model_data['ensemble_weights']
+        
+        required_columns = ['temperature', 'cloud_cover']
+        missing_cols = [col for col in required_columns if col not in weather_df.columns]
+        
+        if missing_cols:
+            validation_results['errors'].append(f"Missing required columns: {missing_cols}")
+            validation_results['status'] = 'invalid'
+        
+        # Check for reasonable value ranges
+        if 'temperature' in weather_df.columns:
+            temp_range = weather_df['temperature'].quantile([0.01, 0.99])
+            if temp_range[0.01] < -20 or temp_range[0.99] > 50:
+                validation_results['warnings'].append("Temperature values outside expected range (-20°C to 50°C)")
+        
+        if 'cloud_cover' in weather_df.columns:
+            if weather_df['cloud_cover'].min() < 0 or weather_df['cloud_cover'].max() > 100:
+                validation_results['errors'].append("Cloud cover must be between 0 and 100")
+                validation_results['status'] = 'invalid'
+        
+        return validation_results
 ```
 
-## 3. Thermal Model Implementation
+---
+
+## ⚡ 3. Advanced Optimization Engine
+
+### 3.1 Multi-Objective MILP Formulation (`optimization/optimizer.py`)
+
+**PURPOSE**: Sophisticated energy optimization balancing cost, comfort, and self-consumption with real-world constraints.
+
+**TECHNICAL APPROACH**:
+- **Mixed-Integer Linear Programming**: Binary heating decisions + continuous power flows
+- **Multi-Objective**: Weighted combination of cost, self-consumption, peak demand
+- **Receding Horizon**: 48h prediction, 24h control, 1h re-optimization
+- **Robust Optimization**: Uncertainty-aware decisions using prediction intervals
+- **Constraint Handling**: Physical limits, comfort zones, grid limits, cycling restrictions
+
+**SOLVER**: Gurobi (commercial) with PuLP fallback (open-source)
+
+**EXPECTED PERFORMANCE**: Solutions within 30 seconds, <1% optimality gap
 
 ```python
-# modules/predictors/thermal_model.py
-import numpy as np
-import pandas as pd
-from typing import Dict, List, Tuple, Optional
-from scipy.optimize import minimize
-from filterpy.kalman import KalmanFilter
-import json
-
-class ThermalModel:
-    """Multi-zone thermal model with inter-room heat transfer."""
-    
-    def __init__(self, building_config: Dict[str, Any]):
-        self.config = building_config
-        self.rooms = list(building_config['rooms'].keys())
-        self.n_rooms = len(self.rooms)
-        
-        # Model parameters (to be identified)
-        self.params = {
-            'R': {},  # Thermal resistance [K/W]
-            'C': {},  # Thermal capacitance [J/K]
-            'R_coupling': {},  # Inter-room resistance [K/W]
-            'solar_aperture': {},  # Solar gain coefficient
-            'internal_gains': {}  # Base internal heat gains [W]
-        }
-        
-        # Kalman filter for state estimation
-        self.kf = self._init_kalman_filter()
-        
-        # Model state
-        self.current_state = None
-        
-    def _init_kalman_filter(self) -> KalmanFilter:
-        """Initialize Kalman filter for temperature estimation."""
-        kf = KalmanFilter(dim_x=self.n_rooms, dim_z=self.n_rooms)
-        
-        # State transition matrix (discrete time dynamics)
-        # Will be updated based on identified parameters
-        kf.F = np.eye(self.n_rooms)
-        
-        # Measurement matrix (direct temperature measurements)
-        kf.H = np.eye(self.n_rooms)
-        
-        # Process noise
-        kf.Q = np.eye(self.n_rooms) * 0.01  # Temperature variance
-        
-        # Measurement noise
-        kf.R = np.eye(self.n_rooms) * 0.1  # Sensor variance
-        
-        # Initial state
-        kf.x = np.ones(self.n_rooms) * 20  # 20°C initial guess
-        
-        # Initial covariance
-        kf.P = np.eye(self.n_rooms) * 1.0
-        
-        return kf
-    
-    def identify_parameters(self,
-                          historical_data: Dict[str, pd.DataFrame],
-                          weather_data: pd.DataFrame) -> Dict[str, Any]:
-        """Identify thermal parameters from historical data."""
-        
-        # Prepare training data
-        X, y = self._prepare_training_data(historical_data, weather_data)
-        
-        # Initial parameter guess
-        x0 = self._get_initial_params()
-        
-        # Bounds for parameters
-        bounds = self._get_param_bounds()
-        
-        # Optimize parameters
-        result = minimize(
-            fun=lambda x: self._objective_function(x, X, y),
-            x0=x0,
-            bounds=bounds,
-            method='L-BFGS-B',
-            options={'maxiter': 1000}
-        )
-        
-        # Extract optimized parameters
-        self._set_params_from_vector(result.x)
-        
-        # Validate model
-        validation_metrics = self._validate_model(X, y)
-        
-        return {
-            'parameters': self.params,
-            'optimization_result': {
-                'success': result.success,
-                'final_cost': result.fun,
-                'iterations': result.nit
-            },
-            'validation_metrics': validation_metrics
-        }
-    
-    def _prepare_training_data(self,
-                              historical_data: Dict[str, pd.DataFrame],
-                              weather_data: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Prepare data for parameter identification."""
-        
-        # Align all room data
-        aligned_data = {}
-        common_index = None
-        
-        for room, df in historical_data.items():
-            if 'temperature' in df.columns and 'heating_on' in df.columns:
-                room_data = df[['temperature', 'heating_on']].copy()
-                
-                if common_index is None:
-                    common_index = room_data.index
-                else:
-                    common_index = common_index.intersection(room_data.index)
-                
-                aligned_data[room] = room_data
-        
-        # Create feature matrix
-        features = pd.DataFrame(index=common_index)
-        targets = pd.DataFrame(index=common_index)
-        
-        # Room temperatures and heating states
-        for i, room in enumerate(self.rooms):
-            if room in aligned_data:
-                features[f'T_{room}'] = aligned_data[room]['temperature']
-                features[f'P_{room}'] = aligned_data[room]['heating_on'] * \
-                                       self.config['rooms'][room]['power_kw'] * 1000
-                targets[f'T_next_{room}'] = aligned_data[room]['temperature'].shift(-1)
-        
-        # Weather features
-        if 'temperature' in weather_data.columns:
-            features['T_out'] = weather_data['temperature'].reindex(common_index)
-        
-        if 'solar_irradiance' in weather_data.columns:
-            features['solar'] = weather_data['solar_irradiance'].reindex(common_index)
-        
-        # Remove NaN values
-        valid_mask = features.notna().all(axis=1) & targets.notna().all(axis=1)
-        
-        return features[valid_mask], targets[valid_mask]
-    
-    def _objective_function(self, params: np.ndarray, X: pd.DataFrame, y: pd.DataFrame) -> float:
-        """Objective function for parameter optimization."""
-        
-        # Set parameters
-        self._set_params_from_vector(params)
-        
-        # Predict temperatures
-        predictions = self._predict_batch(X)
-        
-        # Calculate MSE
-        mse = 0
-        for room in self.rooms:
-            if f'T_next_{room}' in y.columns and room in predictions:
-                error = y[f'T_next_{room}'] - predictions[room]
-                mse += np.mean(error ** 2)
-        
-        return mse / len(self.rooms)
-    
-    def _predict_batch(self, X: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """Predict temperature evolution for batch of data."""
-        
-        predictions = {room: [] for room in self.rooms}
-        dt = 5 * 60  # 5 minutes in seconds
-        
-        for idx in X.index:
-            # Current state
-            T_current = {room: X.loc[idx, f'T_{room}'] for room in self.rooms 
-                        if f'T_{room}' in X.columns}
-            
-            # Inputs
-            P_heating = {room: X.loc[idx, f'P_{room}'] for room in self.rooms 
-                        if f'P_{room}' in X.columns}
-            T_out = X.loc[idx, 'T_out'] if 'T_out' in X.columns else 20
-            solar = X.loc[idx, 'solar'] if 'solar' in X.columns else 0
-            
-            # Predict next state
-            T_next = self._state_transition(T_current, P_heating, T_out, solar, dt)
-            
-            for room in self.rooms:
-                if room in T_next:
-                    predictions[room].append(T_next[room])
-        
-        return {room: np.array(pred) for room, pred in predictions.items()}
-    
-    def _state_transition(self,
-                         T_current: Dict[str, float],
-                         P_heating: Dict[str, float],
-                         T_out: float,
-                         solar: float,
-                         dt: float) -> Dict[str, float]:
-        """Calculate next state using thermal dynamics."""
-        
-        T_next = {}
-        
-        for room in self.rooms:
-            if room not in T_current:
-                continue
-            
-            # Current temperature
-            T = T_current[room]
-            
-            # Heat flows
-            Q_heating = P_heating.get(room, 0)
-            Q_outdoor = (T_out - T) / self.params['R'].get(room, 0.005)
-            Q_solar = solar * self.params['solar_aperture'].get(room, 0.001)
-            Q_internal = self.params['internal_gains'].get(room, 100)
-            
-            # Inter-room heat transfer
-            Q_coupling = 0
-            for other_room in self.rooms:
-                if other_room != room and other_room in T_current:
-                    coupling_key = f'{room}_{other_room}'
-                    if coupling_key in self.params['R_coupling']:
-                        R_coup = self.params['R_coupling'][coupling_key]
-                        Q_coupling += (T_current[other_room] - T) / R_coup
-            
-            # Total heat flow
-            Q_total = Q_heating + Q_outdoor + Q_solar + Q_internal + Q_coupling
-            
-            # Temperature change
-            C = self.params['C'].get(room, 1e7)  # J/K
-            dT = Q_total * dt / C
-            
-            T_next[room] = T + dT
-        
-        return T_next
-    
-    def predict(self,
-                initial_state: Dict[str, float],
-                control_sequence: pd.DataFrame,
-                weather_forecast: pd.DataFrame,
-                horizon_hours: int = 48) -> pd.DataFrame:
-        """Predict temperature evolution given control sequence."""
-        
-        # Time steps
-        dt = 5 * 60  # 5 minutes
-        n_steps = horizon_hours * 12  # 5-minute intervals
-        
-        # Initialize predictions
-        predictions = pd.DataFrame(
-            index=pd.date_range(
-                start=control_sequence.index[0],
-                periods=n_steps,
-                freq='5min'
-            ),
-            columns=[f'T_{room}' for room in self.rooms]
-        )
-        
-        # Initial state
-        current_state = initial_state.copy()
-        self.kf.x = np.array([initial_state.get(room, 20) for room in self.rooms])
-        
-        # Simulate
-        for i in range(n_steps):
-            time_idx = predictions.index[i]
-            
-            # Get inputs
-            P_heating = {}
-            for room in self.rooms:
-                if f'heating_{room}' in control_sequence.columns:
-                    # Find nearest control time
-                    control_idx = control_sequence.index.get_indexer([time_idx], method='nearest')[0]
-                    heating_on = control_sequence.iloc[control_idx][f'heating_{room}']
-                    P_heating[room] = heating_on * self.config['rooms'][room]['power_kw'] * 1000
-                else:
-                    P_heating[room] = 0
-            
-            # Weather inputs
-            weather_idx = weather_forecast.index.get_indexer([time_idx], method='nearest')[0]
-            T_out = weather_forecast.iloc[weather_idx].get('temperature', 10)
-            solar = weather_forecast.iloc[weather_idx].get('solar_irradiance', 0)
-            
-            # State transition
-            current_state = self._state_transition(
-                current_state, P_heating, T_out, solar, dt
-            )
-            
-            # Kalman filter update (if measurements available)
-            self.kf.predict()
-            
-            # Store predictions
-            for j, room in enumerate(self.rooms):
-                predictions.loc[time_idx, f'T_{room}'] = current_state.get(room, 20)
-                self.kf.x[j] = current_state.get(room, 20)
-        
-        return predictions
-    
-    def get_comfort_constraints(self, 
-                               time_range: pd.DatetimeIndex) -> Dict[str, pd.DataFrame]:
-        """Get temperature comfort constraints for optimization."""
-        
-        constraints = {}
-        
-        for room in self.rooms:
-            room_config = self.config['rooms'][room]
-            
-            # Create constraint DataFrame
-            df = pd.DataFrame(index=time_range)
-            
-            # Default comfort range
-            default_min = room_config.get('temp_min', 19)
-            default_max = room_config.get('temp_max', 23)
-            
-            # Time-based constraints
-            df['T_min'] = default_min
-            df['T_max'] = default_max
-            
-            # Night setback
-            night_hours = (time_range.hour >= 22) | (time_range.hour < 6)
-            df.loc[night_hours, 'T_min'] = room_config.get('temp_min_night', 17)
-            df.loc[night_hours, 'T_max'] = room_config.get('temp_max_night', 21)
-            
-            # Away mode
-            weekday_away = (time_range.weekday < 5) & \
-                          (time_range.hour >= 9) & \
-                          (time_range.hour < 17)
-            df.loc[weekday_away, 'T_min'] = room_config.get('temp_min_away', 16)
-            df.loc[weekday_away, 'T_max'] = room_config.get('temp_max_away', 20)
-            
-            constraints[room] = df
-        
-        return constraints
-    
-    def _get_initial_params(self) -> np.ndarray:
-        """Get initial parameter vector for optimization."""
-        params = []
-        
-        # R values (thermal resistance)
-        for room in self.rooms:
-            params.append(0.005)  # K/W
-        
-        # C values (thermal capacitance)  
-        for room in self.rooms:
-            room_volume = self.config['rooms'][room].get('volume', 50)  # m³
-            params.append(room_volume * 1.2 * 1005 * 3)  # J/K
-        
-        # R_coupling values (simplified: adjacent rooms only)
-        n_couplings = self.n_rooms * (self.n_rooms - 1) // 2
-        params.extend([0.01] * n_couplings)  # K/W
-        
-        # Solar aperture
-        for room in self.rooms:
-            params.append(0.001)  # m²
-        
-        # Internal gains
-        for room in self.rooms:
-            params.append(100)  # W
-        
-        return np.array(params)
-    
-    def _get_param_bounds(self) -> List[Tuple[float, float]]:
-        """Get parameter bounds for optimization."""
-        bounds = []
-        
-        # R values: 0.001 to 0.05 K/W
-        bounds.extend([(0.001, 0.05)] * self.n_rooms)
-        
-        # C values: 1e6 to 1e8 J/K
-        bounds.extend([(1e6, 1e8)] * self.n_rooms)
-        
-        # R_coupling: 0.005 to 0.1 K/W
-        n_couplings = self.n_rooms * (self.n_rooms - 1) // 2
-        bounds.extend([(0.005, 0.1)] * n_couplings)
-        
-        # Solar aperture: 0 to 0.01
-        bounds.extend([(0, 0.01)] * self.n_rooms)
-        
-        # Internal gains: 0 to 500 W
-        bounds.extend([(0, 500)] * self.n_rooms)
-        
-        return bounds
-    
-    def _set_params_from_vector(self, params: np.ndarray):
-        """Set model parameters from optimization vector."""
-        idx = 0
-        
-        # R values
-        for room in self.rooms:
-            self.params['R'][room] = params[idx]
-            idx += 1
-        
-        # C values
-        for room in self.rooms:
-            self.params['C'][room] = params[idx]
-            idx += 1
-        
-        # R_coupling values
-        for i, room1 in enumerate(self.rooms):
-            for room2 in self.rooms[i+1:]:
-                coupling_key = f'{room1}_{room2}'
-                self.params['R_coupling'][coupling_key] = params[idx]
-                self.params['R_coupling'][f'{room2}_{room1}'] = params[idx]  # Symmetric
-                idx += 1
-        
-        # Solar aperture
-        for room in self.rooms:
-            self.params['solar_aperture'][room] = params[idx]
-            idx += 1
-        
-        # Internal gains
-        for room in self.rooms:
-            self.params['internal_gains'][room] = params[idx]
-            idx += 1
-    
-    def _validate_model(self, X: pd.DataFrame, y: pd.DataFrame) -> Dict[str, float]:
-        """Validate model performance."""
-        predictions = self._predict_batch(X)
-        
-        metrics = {}
-        
-        for room in self.rooms:
-            if f'T_next_{room}' in y.columns and room in predictions:
-                y_true = y[f'T_next_{room}']
-                y_pred = predictions[room]
-                
-                # Calculate metrics
-                mae = np.mean(np.abs(y_true - y_pred))
-                rmse = np.sqrt(np.mean((y_true - y_pred) ** 2))
-                
-                # R² score
-                ss_res = np.sum((y_true - y_pred) ** 2)
-                ss_tot = np.sum((y_true - y_true.mean()) ** 2)
-                r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
-                
-                metrics[room] = {
-                    'mae': mae,
-                    'rmse': rmse,
-                    'r2': r2
-                }
-        
-        # Average metrics
-        avg_metrics = {
-            'avg_mae': np.mean([m['mae'] for m in metrics.values()]),
-            'avg_rmse': np.mean([m['rmse'] for m in metrics.values()]),
-            'avg_r2': np.mean([m['r2'] for m in metrics.values()])
-        }
-        
-        return {'room_metrics': metrics, 'average_metrics': avg_metrics}
-    
-    def save_model(self, path: str):
-        """Save model parameters to file."""
-        model_data = {
-            'config': self.config,
-            'params': self.params,
-            'rooms': self.rooms
-        }
-        
-        with open(path, 'w') as f:
-            json.dump(model_data, f, indent=2)
-    
-    def load_model(self, path: str):
-        """Load model parameters from file."""
-        with open(path, 'r') as f:
-            model_data = json.load(f)
-        
-        self.config = model_data['config']
-        self.params = model_data['params']
-        self.rooms = model_data['rooms']
-        self.n_rooms = len(self.rooms)
-        
-        # Reinitialize Kalman filter
-        self.kf = self._init_kalman_filter()
-```
-
-## 4. Optimization Engine Implementation
-
-```python
-# modules/optimization/optimizer.py
+# optimization/optimizer.py
 import numpy as np
 import pandas as pd
 from typing import Dict, List, Tuple, Optional, Any
@@ -1664,6 +639,7 @@ from dataclasses import dataclass
 import gurobipy as gp
 from gurobipy import GRB
 import logging
+import copy
 
 @dataclass
 class OptimizationProblem:
@@ -1713,11 +689,6 @@ class EnergyOptimizer:
             }
         }
         
-    def set_models(self, thermal_model, battery_model=None):
-        """Set component models for optimization."""
-        self.thermal_model = thermal_model
-        self.battery_model = battery_model
-    
     def optimize(self, problem: OptimizationProblem) -> Dict[str, Any]:
         """Solve the energy optimization problem."""
         
@@ -1758,317 +729,604 @@ class EnergyOptimizer:
             self.logger.error(f"Optimization error: {e}")
             return self._get_fallback_solution(problem)
     
-    def _create_variables(self, model: gp.Model, problem: OptimizationProblem) -> Dict[str, Any]:
-        """Create optimization variables."""
+    def optimize_with_uncertainty(self, 
+                                 problem: OptimizationProblem,
+                                 uncertainty_factor: float = 0.1) -> Dict[str, Any]:
+        """Robust optimization considering forecast uncertainty."""
+        # Create pessimistic scenarios
+        scenarios = self._create_uncertainty_scenarios(problem, uncertainty_factor)
         
-        n_steps = problem.n_steps
-        vars_dict = {}
+        # Solve for multiple scenarios and find robust solution
+        solutions = []
+        for scenario in scenarios:
+            try:
+                solution = self.optimize(scenario)
+                if not solution.get('fallback_mode', False):
+                    solutions.append(solution)
+            except Exception as e:
+                self.logger.warning(f"Scenario optimization failed: {e}")
         
-        # Heating decisions (binary)
-        vars_dict['heating'] = {}
-        for room in problem.rooms:
-            vars_dict['heating'][room] = model.addVars(
-                n_steps, vtype=GRB.BINARY, name=f'heating_{room}'
-            )
+        if not solutions:
+            return self._get_fallback_solution(problem)
         
-        # Battery variables
-        if self.config.get('battery'):
-            battery_config = self.config['battery']
-            
-            # Battery power (continuous, can be negative for discharge)
-            vars_dict['battery_power'] = model.addVars(
-                n_steps, 
-                lb=-battery_config['max_discharge_power'],
-                ub=battery_config['max_charge_power'],
-                name='battery_power'
-            )
-            
-            # Battery SOC
-            vars_dict['battery_soc'] = model.addVars(
-                n_steps + 1,
-                lb=battery_config['min_soc'],
-                ub=battery_config['max_soc'],
-                name='battery_soc'
-            )
-            
-            # Separate charge/discharge for efficiency
-            vars_dict['battery_charge'] = model.addVars(
-                n_steps, lb=0, name='battery_charge'
-            )
-            vars_dict['battery_discharge'] = model.addVars(
-                n_steps, lb=0, name='battery_discharge'
-            )
-        
-        # Grid variables
-        vars_dict['grid_import'] = model.addVars(
-            n_steps, lb=0, ub=self.config['grid']['max_import'], name='grid_import'
-        )
-        vars_dict['grid_export'] = model.addVars(
-            n_steps, lb=0, ub=self.config['grid']['max_export'], name='grid_export'
-        )
-        
-        # Peak demand variable
-        vars_dict['peak_demand'] = model.addVar(lb=0, name='peak_demand')
-        
-        # Temperature variables (if using linear thermal model)
-        vars_dict['temperature'] = {}
-        for room in problem.rooms:
-            vars_dict['temperature'][room] = model.addVars(
-                n_steps + 1, lb=10, ub=30, name=f'temperature_{room}'
-            )
-        
-        return vars_dict
+        # Select most robust solution (best worst-case performance)
+        return self._select_robust_solution(solutions, problem)
     
-    def _add_constraints(self, model: gp.Model, vars_dict: Dict, problem: OptimizationProblem):
-        """Add optimization constraints."""
+    def _create_uncertainty_scenarios(self, 
+                                    problem: OptimizationProblem, 
+                                    uncertainty_factor: float) -> List[OptimizationProblem]:
+        """Create multiple scenarios with perturbed forecasts."""
+        scenarios = []
         
-        n_steps = problem.n_steps
-        dt_hours = problem.time_step_minutes / 60
+        # Base scenario (original)
+        scenarios.append(problem)
         
-        # Power balance constraint
-        for t in range(n_steps):
-            # Calculate total heating load
-            heating_load = gp.quicksum(
-                vars_dict['heating'][room][t] * 
-                self.config['rooms'][room]['power_kw'] * 1000
-                for room in problem.rooms
-            )
-            
-            # Base load
-            base_load = problem.load_forecast.iloc[t]
-            
-            # PV production
-            pv_power = problem.pv_forecast.iloc[t]['prediction']
-            
-            # Power balance: PV + grid_import + battery_discharge = load + grid_export + battery_charge
-            if self.config.get('battery'):
-                model.addConstr(
-                    pv_power + vars_dict['grid_import'][t] + vars_dict['battery_discharge'][t] ==
-                    base_load + heating_load + vars_dict['grid_export'][t] + vars_dict['battery_charge'][t],
-                    name=f'power_balance_{t}'
-                )
-            else:
-                model.addConstr(
-                    pv_power + vars_dict['grid_import'][t] ==
-                    base_load + heating_load + vars_dict['grid_export'][t],
-                    name=f'power_balance_{t}'
-                )
+        # Pessimistic PV scenario
+        pessimistic_problem = copy.deepcopy(problem)
+        pessimistic_problem.pv_forecast['prediction'] *= (1 - uncertainty_factor)
+        scenarios.append(pessimistic_problem)
         
-        # Battery constraints
-        if self.config.get('battery'):
-            battery_config = self.config['battery']
-            capacity_kwh = battery_config['capacity_kwh']
-            
-            # Initial SOC
-            model.addConstr(
-                vars_dict['battery_soc'][0] == problem.initial_battery_soc,
-                name='initial_soc'
-            )
-            
-            # SOC dynamics
-            for t in range(n_steps):
-                # Link charge/discharge to battery power
-                model.addConstr(
-                    vars_dict['battery_power'][t] == 
-                    vars_dict['battery_charge'][t] - vars_dict['battery_discharge'][t],
-                    name=f'battery_power_link_{t}'
-                )
-                
-                # SOC update with efficiency
-                charge_eff = battery_config['charge_efficiency']
-                discharge_eff = battery_config['discharge_efficiency']
-                
-                model.addConstr(
-                    vars_dict['battery_soc'][t + 1] == vars_dict['battery_soc'][t] +
-                    (vars_dict['battery_charge'][t] * charge_eff * dt_hours / (capacity_kwh * 1000)) -
-                    (vars_dict['battery_discharge'][t] * dt_hours / (discharge_eff * capacity_kwh * 1000)),
-                    name=f'soc_dynamics_{t}'
-                )
-                
-                # Power limits based on SOC
-                # Reduce power limits near SOC boundaries
-                # This requires piecewise linear approximation in Gurobi
+        # High load scenario
+        high_load_problem = copy.deepcopy(problem)
+        high_load_problem.load_forecast *= (1 + uncertainty_factor)
+        scenarios.append(high_load_problem)
         
-        # Temperature constraints
-        for room in problem.rooms:
-            # Initial temperature
-            model.addConstr(
-                vars_dict['temperature'][room][0] == problem.initial_temperatures[room],
-                name=f'initial_temp_{room}'
-            )
-            
-            # Temperature dynamics (simplified linear model)
-            R = self.thermal_model.params['R'][room]
-            C = self.thermal_model.params['C'][room]
-            tau = R * C / 3600  # Time constant in hours
-            
-            for t in range(n_steps):
-                # Discrete time dynamics
-                T_out = problem.temperature_forecast.iloc[t]
-                P_heat = vars_dict['heating'][room][t] * \
-                        self.config['rooms'][room]['power_kw'] * 1000
-                
-                # Linear approximation of exponential dynamics
-                alpha = np.exp(-dt_hours / tau)
-                
-                model.addConstr(
-                    vars_dict['temperature'][room][t + 1] == 
-                    alpha * vars_dict['temperature'][room][t] +
-                    (1 - alpha) * (T_out + R * P_heat),
-                    name=f'temp_dynamics_{room}_{t}'
-                )
-                
-                # Comfort constraints
-                T_min = problem.comfort_constraints[room].iloc[t]['T_min']
-                T_max = problem.comfort_constraints[room].iloc[t]['T_max']
-                
-                model.addConstr(
-                    vars_dict['temperature'][room][t] >= T_min,
-                    name=f'temp_min_{room}_{t}'
-                )
-                model.addConstr(
-                    vars_dict['temperature'][room][t] <= T_max,
-                    name=f'temp_max_{room}_{t}'
-                )
+        # High price scenario
+        high_price_problem = copy.deepcopy(problem)
+        high_price_problem.prices *= (1 + uncertainty_factor)
+        scenarios.append(high_price_problem)
         
-        # Peak demand constraint
-        for t in range(n_steps):
-            model.addConstr(
-                vars_dict['grid_import'][t] <= vars_dict['peak_demand'],
-                name=f'peak_demand_{t}'
-            )
-        
-        # Minimum switching time for heating (avoid rapid cycling)
-        min_on_time = 3  # 15-minute periods
-        min_off_time = 2
-        
-        for room in problem.rooms:
-            heating_var = vars_dict['heating'][room]
-            
-            # Minimum on time
-            for t in range(n_steps - min_on_time + 1):
-                # If heating turns on at time t, it must stay on for min_on_time
-                model.addConstr(
-                    heating_var[t + 1] - heating_var[t] <=
-                    gp.quicksum(heating_var[t + k] for k in range(1, min_on_time + 1)) / min_on_time,
-                    name=f'min_on_time_{room}_{t}'
-                )
-            
-            # Minimum off time (similar logic)
-        
-        # Grid export constraints (price-based)
-        if self.config.get('export_policy'):
-            threshold = self.config['export_policy']['price_threshold']
-            
-            for t in range(n_steps):
-                price = problem.prices.iloc[t]
-                
-                if price < threshold:
-                    # No export when price is below threshold
-                    model.addConstr(
-                        vars_dict['grid_export'][t] == 0,
-                        name=f'no_export_{t}'
-                    )
+        return scenarios
     
-    def _set_objective(self, model: gp.Model, vars_dict: Dict, problem: OptimizationProblem):
-        """Set multi-objective function."""
-        
-        n_steps = problem.n_steps
-        dt_hours = problem.time_step_minutes / 60
-        weights = self.settings['weights']
-        
-        # Objective 1: Minimize energy cost
-        energy_cost = gp.quicksum(
-            (vars_dict['grid_import'][t] * problem.prices.iloc[t] -
-             vars_dict['grid_export'][t] * problem.prices.iloc[t] * 0.9) *  # 90% of import price
-            dt_hours / 1000  # Convert to kWh
-            for t in range(n_steps)
-        )
-        
-        # Objective 2: Maximize self-consumption
-        self_consumption = gp.quicksum(
-            problem.pv_forecast.iloc[t]['prediction'] - vars_dict['grid_export'][t]
-            for t in range(n_steps)
-        )
-        
-        # Objective 3: Minimize peak demand
-        peak_cost = vars_dict['peak_demand'] * self.config['grid'].get('peak_charge', 100)
-        
-        # Combined objective (minimization)
-        model.setObjective(
-            weights['cost'] * energy_cost -
-            weights['self_consumption'] * self_consumption / 1000 +  # Scale to similar magnitude
-            weights['peak_shaving'] * peak_cost,
-            GRB.MINIMIZE
-        )
-    
-    def _extract_solution(self, vars_dict: Dict, problem: OptimizationProblem) -> Dict[str, Any]:
-        """Extract solution from solved model."""
-        
-        solution = {
-            'heating_schedule': {},
-            'battery_schedule': None,
-            'grid_schedule': None,
-            'temperature_forecast': {},
-            'costs': {},
-            'metrics': {}
-        }
-        
-        # Extract heating schedules
+    def _get_fallback_solution(self, problem: OptimizationProblem) -> Dict[str, Any]:
+        """Generate simple rule-based fallback solution."""
+        # Simple heating schedule based on time-of-use
+        heating_schedule = {}
         for room in problem.rooms:
+            # Heat during cheap hours (typically night)
+            cheap_hours = problem.prices < problem.prices.quantile(0.3)
             schedule = pd.Series(
-                [vars_dict['heating'][room][t].X for t in range(problem.n_steps)],
-                index=problem.time_index
+                cheap_hours.astype(int),
+                index=problem.time_index[:len(cheap_hours)]
             )
-            solution['heating_schedule'][room] = schedule.astype(int)
+            heating_schedule[room] = schedule
         
-        # Extract battery schedule
-        if self.config.get('battery'):
-            solution['battery_schedule'] = pd.DataFrame({
-                'power': [vars_dict['battery_power'][t].X for t in range(problem.n_steps)],
-                'soc': [vars_dict['battery_soc'][t].X for t in range(problem.n_steps + 1)][:-1],
-                'charge': [vars_dict['battery_charge'][t].X for t in range(problem.n_steps)],
-                'discharge': [vars_dict['battery_discharge'][t].X for t in range(problem.n_steps)]
-            }, index=problem.time_index)
+        # Simple battery schedule - charge when PV > load
+        grid_schedule = pd.DataFrame(index=problem.time_index)
+        pv_power = problem.pv_forecast['prediction']
+        base_load = problem.load_forecast
         
-        # Extract grid schedule
-        solution['grid_schedule'] = pd.DataFrame({
-            'import': [vars_dict['grid_import'][t].X for t in range(problem.n_steps)],
-            'export': [vars_dict['grid_export'][t].X for t in range(problem.n_steps)]
-        }, index=problem.time_index)
+        net_power = pv_power - base_load
+        grid_schedule['export'] = np.maximum(net_power, 0)
+        grid_schedule['import'] = np.maximum(-net_power, 0)
         
-        # Extract temperature forecasts
-        for room in problem.rooms:
-            temps = pd.Series(
-                [vars_dict['temperature'][room][t].X for t in range(problem.n_steps + 1)][:-1],
-                index=problem.time_index
-            )
-            solution['temperature_forecast'][room] = temps
+        return {
+            'heating_schedule': heating_schedule,
+            'battery_schedule': None,
+            'grid_schedule': grid_schedule,
+            'temperature_forecast': {},
+            'costs': {'net_cost': 0, 'peak_demand': 0},
+            'metrics': {'self_consumption_rate': 0.5},
+            'fallback_mode': True
+        }
+```
+
+---
+
+## 🎮 4. Control System Implementation
+
+### 4.1 Main Energy Controller (`control/energy_controller.py`)
+
+**PURPOSE**: Central orchestrator replacing the basic Growatt controller with advanced MPC-based energy management.
+
+**KEY FEATURES**:
+- Async operation with proper resource management
+- Fallback to rule-based control on ML/optimization failures
+- Comprehensive state tracking and logging
+- Manual override capabilities
+- Safety limit enforcement
+
+```python
+# control/energy_controller.py
+import asyncio
+from typing import Dict, Any, Optional
+import logging
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+import pandas as pd
+
+@dataclass
+class SystemState:
+    """Current system state snapshot."""
+    timestamp: datetime
+    battery_soc: float
+    room_temperatures: Dict[str, float]
+    pv_power: float
+    grid_power: float
+    heating_states: Dict[str, bool]
+    
+class EnergyController:
+    """Advanced energy management controller replacing basic Growatt controller."""
+    
+    def __init__(self, 
+                 config: Dict[str, Any],
+                 models: Dict[str, Any],
+                 optimizer,
+                 interfaces: Dict[str, Any]):
+        self.config = config
+        self.models = models
+        self.optimizer = optimizer
+        self.interfaces = interfaces
+        self.logger = logging.getLogger(__name__)
         
-        # Calculate costs and metrics
-        dt_hours = problem.time_step_minutes / 60
+        # State management
+        self.current_state: Optional[SystemState] = None
+        self.control_mode = "mpc"  # mpc, rule_based, manual, safety
+        self.manual_overrides = {}
         
-        # Energy costs
-        import_cost = sum(
-            solution['grid_schedule']['import'].iloc[t] * problem.prices.iloc[t] * dt_hours / 1000
-            for t in range(problem.n_steps)
-        )
-        export_revenue = sum(
-            solution['grid_schedule']['export'].iloc[t] * problem.prices.iloc[t] * 0.9 * dt_hours / 1000
-            for t in range(problem.n_steps)
-        )
+        # Performance tracking
+        self.control_history = []
+        self.mode_switches = []
         
-        solution['costs'] = {
-            'import_cost': import_cost,
-            'export_revenue': export_revenue,
-            'net_cost': import_cost - export_revenue,
-            'peak_demand': vars_dict['peak_demand'].X
+        # Safety limits
+        self.safety_limits = {
+            'max_temperature': 25.0,
+            'min_temperature': 16.0,
+            'max_battery_power': 5000,  # W
+            'max_heating_power': 20000  # W total
+        }
+    
+    async def start(self) -> None:
+        """Start the energy controller."""
+        self.logger.info("Starting Advanced Energy Controller")
+        
+        # Initialize all components
+        await self._initialize_interfaces()
+        await self._load_models()
+        
+        # Start main control loop
+        self.control_task = asyncio.create_task(self._main_control_loop())
+        
+        self.logger.info("Energy controller started successfully")
+    
+    async def _main_control_loop(self) -> None:
+        """Main control loop - runs every 5 minutes."""
+        while True:
+            try:
+                # Update system state
+                await self._update_system_state()
+                
+                # Check safety conditions
+                safety_status = self._check_safety_conditions()
+                
+                if not safety_status['safe']:
+                    await self._enter_safety_mode(safety_status['violations'])
+                    continue
+                
+                # Execute control logic based on current mode
+                if self.control_mode == "mpc":
+                    await self._execute_mpc_control()
+                elif self.control_mode == "rule_based":
+                    await self._execute_rule_based_control()
+                elif self.control_mode == "manual":
+                    await self._execute_manual_control()
+                elif self.control_mode == "safety":
+                    await self._execute_safety_control()
+                
+                # Log control actions
+                await self._log_control_cycle()
+                
+                # Wait for next cycle
+                await asyncio.sleep(300)  # 5 minutes
+                
+            except Exception as e:
+                self.logger.error(f"Control loop error: {e}")
+                await self._enter_fallback_mode()
+                await asyncio.sleep(60)  # Wait longer on error
+    
+    def get_system_status(self) -> Dict[str, Any]:
+        """Get comprehensive system status."""
+        return {
+            'current_state': self.current_state,
+            'control_mode': self.control_mode,
+            'manual_overrides': self.manual_overrides,
+            'recent_actions': self.control_history[-5:],
+            'mode_switches': self.mode_switches[-10:],
+            'safety_status': self._check_safety_conditions()
+        }
+```
+
+---
+
+## 📊 5. Performance Monitoring & Validation
+
+### 5.1 Comprehensive Metrics Collection (`monitoring/metrics_collector.py`)
+
+**PURPOSE**: Track all aspects of system performance for continuous improvement and validation.
+
+```python
+# monitoring/metrics_collector.py
+import asyncio
+from typing import Dict, Any, List
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+import logging
+from dataclasses import dataclass, asdict
+
+@dataclass
+class PerformanceMetrics:
+    """Container for system performance metrics."""
+    timestamp: datetime
+    
+    # Prediction accuracy metrics
+    pv_prediction_mae: float
+    pv_prediction_rmse: float
+    thermal_prediction_mae: float
+    load_prediction_mae: float
+    
+    # Optimization metrics
+    optimization_solve_time: float
+    cost_savings_vs_baseline: float
+    self_consumption_rate: float
+    peak_reduction: float
+    
+    # Control system metrics
+    control_loop_uptime: float
+    mode_switch_frequency: float
+    safety_violations: int
+    
+    # Energy metrics
+    total_energy_cost: float
+    pv_generation: float
+    battery_cycles: float
+    heating_efficiency: float
+    
+class MetricsCollector:
+    """Comprehensive system performance monitoring."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+        
+        # Metrics storage
+        self.daily_metrics: List[PerformanceMetrics] = []
+        self.hourly_predictions_vs_actuals = []
+        self.cost_tracking = []
+        
+        # Baseline performance for comparison
+        self.baseline_metrics = {
+            'daily_cost': 150,  # CZK
+            'self_consumption': 0.45,
+            'peak_demand': 8000  # W
+        }
+    
+    def calculate_cost_savings(self, 
+                             actual_costs: pd.DataFrame,
+                             baseline_period: Tuple[datetime, datetime]) -> Dict[str, float]:
+        """Calculate cost savings vs baseline period."""
+        # Get baseline costs
+        baseline_start, baseline_end = baseline_period
+        baseline_data = actual_costs[
+            (actual_costs.index >= baseline_start) & 
+            (actual_costs.index <= baseline_end)
+        ]
+        
+        if len(baseline_data) == 0:
+            return {'error': 'No baseline data available'}
+        
+        baseline_daily_avg = baseline_data['total_cost'].resample('D').sum().mean()
+        
+        # Get recent costs (last 30 days)
+        recent_data = actual_costs[actual_costs.index >= datetime.now() - timedelta(days=30)]
+        
+        if len(recent_data) == 0:
+            return {'error': 'No recent data available'}
+        
+        recent_daily_avg = recent_data['total_cost'].resample('D').sum().mean()
+        
+        # Calculate savings
+        absolute_savings = baseline_daily_avg - recent_daily_avg
+        percentage_savings = (absolute_savings / baseline_daily_avg) * 100 if baseline_daily_avg > 0 else 0
+        
+        return {
+            'baseline_daily_cost': baseline_daily_avg,
+            'recent_daily_cost': recent_daily_avg,
+            'daily_savings_czk': absolute_savings,
+            'percentage_savings': percentage_savings,
+            'monthly_savings_czk': absolute_savings * 30,
+            'annual_savings_czk': absolute_savings * 365
+        }
+    
+    def generate_performance_report(self, 
+                                  start_date: datetime,
+                                  end_date: datetime) -> Dict[str, Any]:
+        """Generate comprehensive performance report."""
+        report = {
+            'report_period': {'start': start_date, 'end': end_date},
+            'summary': {},
+            'detailed_metrics': {},
+            'recommendations': []
         }
         
-        # Calculate metrics
-        total_pv = problem.pv_forecast['prediction'].sum() * dt_hours / 1000
-        total_export = solution['grid_schedule']['export'].sum() * dt_hours / 1000
+        # Filter metrics for report period
+        period_metrics = [
+            m for m in self.daily_metrics 
+            if start_date <= m.timestamp <= end_date
+        ]
         
-        solution['metrics'] = {
-            'self_consumption_rate': (total_pv - total_export) / total_pv if total_pv > 0 else 0,
-            'peak_reduction':
+        if not period_metrics:
+            report['summary'] = {'error': 'No data available for specified period'}
+            return report
+        
+        # Calculate summary statistics
+        report['summary'] = {
+            'average_pv_prediction_mae': np.mean([m.pv_prediction_mae for m in period_metrics]),
+            'average_thermal_prediction_mae': np.mean([m.thermal_prediction_mae for m in period_metrics]),
+            'average_optimization_time': np.mean([m.optimization_solve_time for m in period_metrics]),
+            'total_cost_savings': sum(m.cost_savings_vs_baseline for m in period_metrics),
+            'average_self_consumption': np.mean([m.self_consumption_rate for m in period_metrics]),
+            'system_uptime': np.mean([m.control_loop_uptime for m in period_metrics]),
+            'total_safety_violations': sum(m.safety_violations for m in period_metrics)
+        }
+        
+        # Generate recommendations
+        avg_pv_mae = report['summary']['average_pv_prediction_mae']
+        if avg_pv_mae > 500:  # 500W threshold
+            report['recommendations'].append(
+                f"PV prediction accuracy needs improvement (MAE: {avg_pv_mae:.0f}W). Consider retraining model."
+            )
+        
+        avg_thermal_mae = report['summary']['average_thermal_prediction_mae']
+        if avg_thermal_mae > 0.5:  # 0.5°C threshold
+            report['recommendations'].append(
+                f"Thermal model accuracy below target (MAE: {avg_thermal_mae:.2f}°C). Check RC parameters."
+            )
+        
+        return report
+```
+
+---
+
+## 🚀 6. Implementation Timeline & Phases
+
+### Phase 2A: Foundation (Weeks 1-2)
+**Target**: Establish robust ML infrastructure
+
+#### Week 1: Core Infrastructure
+- ✅ **Day 1-2**: Implement `models/base.py` with full metadata and versioning
+- ✅ **Day 3-4**: Enhanced data extraction with quality scoring
+- ✅ **Day 5**: Initial PV predictor with basic XGBoost
+
+#### Week 2: Advanced Predictors  
+- ✅ **Day 1-2**: Complete PV predictor with PVLib integration
+- ✅ **Day 3-4**: Thermal model with RC parameter identification
+- ✅ **Day 5**: Load predictor with time series features
+
+**Success Criteria**:
+- PV predictor RMSE < 15% (target: 10%)
+- Thermal model MAE < 1.0°C (target: 0.5°C)
+- All models deployable with versioning
+
+### Phase 2B: Optimization Engine (Week 3)
+**Target**: Production-ready optimization with MPC
+
+#### Detailed Tasks:
+- ✅ **Day 1-2**: MILP problem formulation with Gurobi
+- ✅ **Day 3**: Constraint builders and safety limits
+- ✅ **Day 4**: Multi-objective optimization with uncertainty
+- ✅ **Day 5**: MPC controller with receding horizon
+
+**Success Criteria**:
+- Optimization solves within 30 seconds
+- Handles 16 rooms × 48 hours problem size
+- Robust to forecast uncertainty
+
+### Phase 2C: Control Integration (Week 4)
+**Target**: Replace Growatt controller with advanced system
+
+#### Detailed Tasks:
+- ✅ **Day 1-2**: Energy controller with mode switching
+- ✅ **Day 3**: Loxone interface with MQTT commands
+- ✅ **Day 4**: Safety systems and manual overrides
+- ✅ **Day 5**: Integration testing with shadow mode
+
+**Success Criteria**:
+- Controller runs continuously without crashes
+- Smooth fallback to rule-based control
+- All safety systems functional
+
+### Phase 2D: Validation & Deployment (Weeks 5-6)
+**Target**: Proven system ready for production
+
+#### Week 5: Testing & Validation
+- ✅ **Day 1-2**: End-to-end system testing
+- ✅ **Day 3**: Performance benchmarking vs Phase 1
+- ✅ **Day 4**: Load testing and fault scenarios
+- ✅ **Day 5**: Documentation and monitoring setup
+
+#### Week 6: Production Deployment
+- ✅ **Day 1-2**: Shadow mode deployment (parallel operation)
+- ✅ **Day 3**: Gradual rollout (1 room, then 5, then all)
+- ✅ **Day 4**: Performance monitoring and tuning
+- ✅ **Day 5**: Final validation and handover
+
+**Success Criteria**:
+- Cost reduction > 15% (target: 20%)
+- Self-consumption > 65% (target: 70%)
+- System uptime > 99%
+- All Phase 2 success metrics achieved
+
+---
+
+## 📈 Success Metrics & Validation
+
+### Technical Performance Targets
+
+| Metric | Phase 1 Baseline | Phase 2 Target | Measurement Method |
+|--------|------------------|----------------|---------------------|
+| PV Prediction RMSE | N/A | < 10% of capacity | Daily MAE vs actual production |
+| Thermal Prediction MAE | N/A | < 0.5°C | Hourly temperature comparison |
+| Load Prediction RMSE | N/A | < 15% | Daily consumption comparison |
+| Optimization Solve Time | N/A | < 30 seconds | Average across all optimizations |
+| System Uptime | 95% | > 99.5% | Controller availability monitoring |
+| Cost Reduction | 0% (baseline) | > 20% | Monthly cost comparison |
+| Self-Consumption Rate | 45% | > 70% | PV generation vs grid export |
+| Peak Demand Reduction | 0% | > 15% | Monthly peak comparison |
+
+### Economic Impact Targets
+
+- **Daily Savings**: 30+ CZK/day (900+ CZK/month)
+- **Annual Savings**: 10,000+ CZK/year
+- **ROI Period**: < 2 years for development investment
+- **Peak Demand Savings**: 1,500+ CZK/month during winter
+
+### Validation Methodology
+
+1. **A/B Testing**: Run new system in shadow mode parallel to existing controller
+2. **Historical Backtesting**: Validate predictions against 2+ years of historical data
+3. **Monte Carlo Analysis**: Test robustness across 1000+ scenario simulations
+4. **Gradual Rollout**: Start with 1 room, expand to 5, then full system
+5. **Continuous Monitoring**: Real-time performance tracking with automated alerts
+
+---
+
+## 🛡️ Risk Mitigation & Contingency Plans
+
+### Technical Risks
+
+| Risk | Probability | Impact | Mitigation Strategy |
+|------|-------------|--------|---------------------|
+| ML models fail to achieve accuracy targets | Medium | High | Hybrid approach with physics models, ensemble methods |
+| Optimization solver licensing/performance issues | Low | Medium | PuLP open-source fallback, problem size reduction |
+| Integration issues with existing Loxone system | Medium | High | Comprehensive testing, gradual rollout, manual override |
+| Weather forecast API failures | Medium | Medium | Multiple forecast sources, persistence forecasting |
+| InfluxDB data quality issues | High | Medium | Data validation, gap filling, quality scoring |
+
+### Fallback Strategies
+
+1. **Rule-Based Controller**: Always maintain working rule-based system as backup
+2. **Manual Override**: Web interface for immediate human intervention
+3. **Safety Mode**: Minimal heating operation if all automated systems fail
+4. **Gradual Rollback**: Ability to quickly revert to previous system version
+5. **Expert Support**: Escalation procedures for complex issues
+
+---
+
+## 🔧 Development Infrastructure
+
+### Required Tools & Libraries
+
+```python
+# Core ML/Optimization
+xgboost>=1.7.0
+lightgbm>=3.3.0
+scikit-learn>=1.2.0
+pvlib>=0.9.0
+gurobipy>=10.0.0  # Commercial license required
+pulp>=2.7.0      # Open source fallback
+scipy>=1.9.0
+filterpy>=1.4.5
+
+# Data Processing
+pandas>=1.5.0
+numpy>=1.23.0
+aiohttp>=3.8.0
+aiofiles>=22.1.0
+
+# Infrastructure  
+aioredis>=2.0.1
+aiomqtt>=1.1.0
+asyncpg>=0.27.0
+celery>=5.2.0
+
+# Monitoring
+prometheus-client>=0.15.0
+grafana-api>=1.0.3
+structlog>=22.2.0
+
+# Testing
+pytest>=7.2.0
+pytest-asyncio>=0.20.0
+pytest-cov>=4.0.0
+hypothesis>=6.65.0
+```
+
+### Development Environment Setup
+
+```bash
+# Set up Phase 2 development environment
+cd pems_v2
+python -m venv venv_phase2
+source venv_phase2/bin/activate
+
+# Install dependencies
+pip install -r requirements-phase2.txt
+
+# Development tools
+pip install -r requirements-dev.txt
+
+# Set up pre-commit hooks
+pre-commit install
+
+# Initialize testing database
+pytest tests/ --setup-only
+
+# Run full test suite
+make test-phase2
+```
+
+### Code Quality Standards
+
+- **Type Safety**: 100% mypy compliance with strict mode
+- **Test Coverage**: Minimum 90% code coverage
+- **Documentation**: Comprehensive docstrings for all public APIs
+- **Linting**: Black, isort, flake8 with 100-character line length
+- **Security**: Bandit security scanning
+- **Performance**: Memory usage < 500MB, startup time < 30 seconds
+
+---
+
+## 📚 Integration with Phase 1
+
+### Data Flow Integration
+
+```
+Phase 1 Analysis Results
+    ↓
+Phase 2 Feature Engineering
+    ↓
+ML Model Training
+    ↓
+Real-time Prediction
+    ↓
+Optimization Engine
+    ↓
+Control Execution
+    ↓
+Performance Monitoring
+    ↓
+Model Retraining (back to Phase 1)
+```
+
+### Reused Components
+
+- **Data Extraction**: Enhanced version of Phase 1 extractors
+- **InfluxDB Interface**: Extended with real-time capabilities
+- **Configuration Management**: Unified config system
+- **Logging Infrastructure**: Extended with structured logging
+- **Testing Framework**: Built upon Phase 1 test patterns
+
+### New Dependencies
+
+- **Gurobi Optimizer**: Commercial MILP solver (requires license)
+- **PVLib**: Solar physics calculations
+- **FilterPy**: Kalman filtering implementation  
+- **Celery**: Distributed task processing
+- **Redis**: Caching and message broker
+- **Prometheus**: Metrics collection
+- **Grafana**: Performance dashboards
+
+---
+
+This comprehensive Phase 2 plan transforms the PEMS v2 system from analysis tool to production-ready intelligent energy management system. The implementation follows proven software engineering practices with robust testing, monitoring, and fallback mechanisms to ensure reliable operation in a critical home automation environment.
