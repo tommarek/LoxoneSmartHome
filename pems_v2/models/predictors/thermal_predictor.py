@@ -138,6 +138,10 @@ class ThermalPredictor(BasePredictor):
         # Model configuration
         self.zones: Dict[str, ThermalZone] = {}
         self.ml_model: Optional[RandomForestRegressor] = None
+        self.physics_model = None
+        self.thermal_parameters = None
+        self.zone_capacitance = None
+        self.zone_resistance = None
         self.physics_model_weight = config.get("physics_weight", 0.6)
         self.ml_model_weight = config.get("ml_weight", 0.4)
         self.prediction_horizon = config.get("prediction_horizon", 24)  # hours
@@ -585,6 +589,16 @@ class ThermalPredictor(BasePredictor):
             f"RMSE={rmse:.3f}°C, MAE={mae:.3f}°C, R²={r2:.3f}, "
             f"Training time={training_time:.1f}s"
         )
+
+        # Set the trained model for persistence
+        self.model = {
+            'physics_model': getattr(self, 'physics_model', None),
+            'ml_model': self.ml_model,
+            'feature_scaler': self.feature_scaler,
+            'thermal_parameters': getattr(self, 'thermal_parameters', None),
+            'zone_capacitance': getattr(self, 'zone_capacitance', None),
+            'zone_resistance': getattr(self, 'zone_resistance', None)
+        }
 
         return performance
 

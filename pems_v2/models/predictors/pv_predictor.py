@@ -96,6 +96,13 @@ class PVPredictor(BasePredictor):
             latitude=self.location_lat, longitude=self.location_lon, tz="Europe/Prague"
         )
 
+        # Initialize models
+        self.ml_model = None
+        self.physics_model = None
+        self.q10_model = None
+        self.q90_model = None
+        self.feature_scaler = None
+
         self.logger.info(f"Initialized PV predictor for {self.capacity_kw}kW system")
 
     def create_weather_features(self, weather_df: pd.DataFrame) -> pd.DataFrame:
@@ -462,13 +469,17 @@ class PVPredictor(BasePredictor):
         }
 
         self.ml_model = xgb.XGBRegressor(**xgb_params)
-        self.ml_model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_val, y_val)],
-            early_stopping_rounds=50,
-            verbose=False,
-        )
+        # Check if validation data is provided for early stopping
+        if validation_data is not None:
+            X_val_fit, y_val_fit = validation_data
+            self.ml_model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_val_fit, y_val_fit)],
+                verbose=False,
+            )
+        else:
+            self.ml_model.fit(X_train, y_train, verbose=False)
 
         # Train quantile models for uncertainty
         self.logger.info("Training quantile models...")
@@ -521,6 +532,16 @@ class PVPredictor(BasePredictor):
         self.logger.info(
             f"Validation RMSE: {performance.rmse:.3f} kW, R²: {performance.r2:.3f}"
         )
+
+        # Set the trained model for persistence
+        self.model = {
+            'ml_model': self.ml_model,
+            'physics_model': getattr(self, 'physics_model', None),
+            'q10_model': getattr(self, 'q10_model', None),
+            'q90_model': getattr(self, 'q90_model', None),
+            'feature_scaler': self.feature_scaler,
+            'system_config': self.system_config
+        }
 
         return performance
 

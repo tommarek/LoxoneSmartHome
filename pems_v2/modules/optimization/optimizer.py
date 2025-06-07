@@ -31,6 +31,11 @@ class OptimizationResult:
     cost_breakdown: Dict[str, float]
     solve_time_seconds: float
     message: str = ""
+    
+    @property
+    def solve_time(self) -> float:
+        """Alias for solve_time_seconds for compatibility."""
+        return self.solve_time_seconds
 
 
 @dataclass
@@ -160,13 +165,30 @@ class EnergyOptimizer:
             # Solve the optimization problem
             prob = cp.Problem(cp.Minimize(objective), constraints)
             
-            # Use appropriate solver
-            solver_options = {
-                'verbose': False,
-                'max_iters': 1000
-            }
+            # Use appropriate solver based on problem type
+            has_binary_vars = any(getattr(var, 'attributes', {}).get('boolean', False) 
+                                for var in heating_vars.values())
             
-            prob.solve(solver=cp.ECOS, **solver_options)
+            self.logger.debug(f"Binary variables detected: {has_binary_vars}")
+            
+            if has_binary_vars:
+                # Use ECOS_BB for mixed-integer problems
+                solver_options = {
+                    'verbose': False,
+                    'mi_max_iters': 1000,
+                    'feastol': 1e-8,
+                    'abstol': 1e-8
+                }
+                prob.solve(solver=cp.ECOS_BB, **solver_options)
+            else:
+                # Use ECOS for continuous problems
+                solver_options = {
+                    'verbose': False,
+                    'max_iters': 1000,
+                    'feastol': 1e-8,
+                    'abstol': 1e-8
+                }
+                prob.solve(solver=cp.ECOS, **solver_options)
             
             solve_time = (datetime.now() - start_time).total_seconds()
             
@@ -188,6 +210,8 @@ class EnergyOptimizer:
             
         except Exception as e:
             self.logger.error(f"Optimization error: {e}")
+            import traceback
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
             solve_time = (datetime.now() - start_time).total_seconds()
             result = self._get_fallback_solution(problem, solve_time)
             result.success = False
