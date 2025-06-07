@@ -392,6 +392,55 @@ class DataExtractor:
         )
         return df_pivot
 
+    async def extract_outdoor_temperature_data(
+        self, start_date: datetime, end_date: datetime
+    ) -> pd.DataFrame:
+        """
+        Extract outdoor temperature data from solar bucket (teplomer sensor).
+        
+        Returns DataFrame with columns:
+        - timestamp: datetime index
+        - outdoor_temp: outdoor temperature (°C)
+        """
+        self.logger.info("Extracting outdoor temperature data from teplomer sensor...")
+        
+        query = f"""
+        from(bucket: "{self.settings.influxdb.bucket_solar}")
+          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          |> filter(fn: (r) => r["_measurement"] == "teplomer")
+          |> filter(fn: (r) => r["topic"] == "teplomer/TC")
+          |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
+          |> keep(columns: ["topic", "_time", "_value"])
+        """
+        
+        tables = self.query_api.query(query)
+        
+        if not tables:
+            self.logger.warning("No outdoor temperature data found")
+            return pd.DataFrame()
+        
+        # Convert to DataFrame
+        records = []
+        for table in tables:
+            for record in table.records:
+                records.append(
+                    {
+                        "timestamp": record.get_time(),
+                        "outdoor_temp": record.get_value(),
+                    }
+                )
+        
+        if not records:
+            self.logger.warning("No outdoor temperature records found")
+            return pd.DataFrame()
+        
+        df = pd.DataFrame(records)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df.set_index("timestamp", inplace=True)
+        
+        self.logger.info(f"Extracted {len(df)} outdoor temperature records")
+        return df
+
     async def extract_energy_prices(
         self, start_date: datetime, end_date: datetime
     ) -> Optional[pd.DataFrame]:
@@ -455,28 +504,35 @@ class DataExtractor:
         self, start_date: datetime, end_date: datetime
     ) -> pd.DataFrame:
         """
-        Extract total energy consumption data.
+        Extract energy consumption data categorized by usage type.
+        
+        NOTE: This method serves a different purpose than extract_pv_data():
+        - extract_pv_data(): Focuses on energy GENERATION (solar, battery storage)
+        - extract_energy_consumption(): Focuses on energy CONSUMPTION by category
+        
+        This method extracts relay states and power measurements to calculate
+        consumption for different categories (heating, lighting, etc.) as defined
+        in CONSUMPTION_CATEGORIES. For heating, it multiplies relay states by
+        room power ratings to get actual power consumption.
 
         Returns DataFrame with columns:
         - timestamp: datetime index
-        - grid_import: power imported from grid
-        - grid_export: power exported to grid
-        - battery_power: battery charge/discharge power
-        - total_consumption: total house consumption
+        - {category}_power: power consumption for each category (W)
+        - {category}_energy_kwh: energy consumption for each category
+        - total_consumption: sum of all category powers (W)
+        - total_consumption_energy_kwh: total energy consumption
         """
         self.logger.info(
             f"Extracting energy consumption data from {start_date} to {end_date}"
         )
 
-        # Query for ALL energy consumption data - not just heating
+        # Query specifically for heating relay data (only category we track)
         query = f"""
-        from(bucket: "{self.settings.influxdb.bucket_solar}")
+        from(bucket: "{self.settings.influxdb.bucket_loxone}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "relay" or
-                              r["_measurement"] == "power" or
-                              r["_measurement"] == "energy")
+          |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "heating")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
-          |> keep(columns: ["_time", "_value", "_field", "room", "tag1", "tag2"])
+          |> keep(columns: ["_time", "_value", "_field", "room"])
         """
 
         tables = self.query_api.query(query)
@@ -485,68 +541,43 @@ class DataExtractor:
             self.logger.warning("No energy consumption data found")
             return pd.DataFrame()
 
-        # Convert to DataFrame with more metadata
+        # Convert to DataFrame - simpler structure for heating only
         records = []
         for table in tables:
             for record in table.records:
-                # Skip records that don't have measurement data
-                try:
-                    measurement = record.get_measurement()
-                except (KeyError, AttributeError):
-                    continue
-
                 room_name = record.values.get("room", "unknown")
-                tag1 = record.values.get("tag1", "")
-                tag2 = record.values.get("tag2", "")
 
                 records.append(
                     {
                         "timestamp": record.get_time(),
-                        "field": record.get_field(),
                         "value": record.get_value(),
                         "room": room_name,
-                        "tag1": tag1,
-                        "tag2": tag2,
-                        "measurement": measurement,
                     }
                 )
 
         if not records:
+            self.logger.warning("No relay/power/energy records found in database")
             return pd.DataFrame()
 
         df = pd.DataFrame(records)
+        self.logger.info(f"Found {len(df)} heating relay records")
 
-        # Calculate total consumption by category
+        # Calculate heating consumption
         consumption_data = {}
 
-        # Group by consumption category
-        for category, config in CONSUMPTION_CATEGORIES.items():
-            category_df = df[
-                (df["measurement"] == config["measurement"])
-                & (df["tag1"].str.contains(category, na=False))
-            ]
+        if not df.empty:
+            # Add room power ratings
+            df = df.copy()
+            df["power_kw"] = df["room"].apply(get_room_power)
+            # Convert relay state (0/1) to actual power consumption
+            df["actual_power"] = (
+                df["value"] * df["power_kw"] * 1000
+            )  # Convert to W
 
-            if not category_df.empty:
-                # For heating, multiply relay state by room power
-                if category == "heating" and "room" in category_df.columns:
-                    category_df = category_df.copy()
-                    category_df["power_kw"] = category_df["room"].apply(get_room_power)
-                    # Convert relay state (0/1) to actual power consumption
-                    category_df["actual_power"] = (
-                        category_df["value"] * category_df["power_kw"] * 1000
-                    )  # Convert to W
-
-                    # Group by timestamp and sum all rooms
-                    category_consumption = category_df.groupby("timestamp")[
-                        "actual_power"
-                    ].sum()
-                else:
-                    # For other categories, use direct power values
-                    category_consumption = category_df.groupby("timestamp")[
-                        "value"
-                    ].sum()
-
-                consumption_data[f"{category}_power"] = category_consumption
+            # Group by timestamp and sum all rooms
+            heating_consumption = df.groupby("timestamp")["actual_power"].sum()
+            consumption_data["heating_power"] = heating_consumption
+            self.logger.info(f"Calculated heating consumption for {len(heating_consumption)} time points")
 
         # Combine all consumption categories
         if consumption_data:
@@ -581,6 +612,16 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract battery charge/discharge data from InfluxDB.
+        
+        NOTE: This method has some overlap with extract_pv_data() as both query
+        battery fields (ChargePower, DischargePower, SOC) from the same bucket.
+        However, this method:
+        1. Focuses solely on battery data (no PV/inverter fields)
+        2. Includes additional battery fields: BatteryVoltage, BatteryCurrent
+        3. Calculates battery power from V*I for validation
+        
+        Consider using extract_pv_data() if you need comprehensive energy data.
+        Use this method if you only need battery-specific analysis.
 
         Returns DataFrame with columns:
         - timestamp: datetime index
@@ -589,6 +630,9 @@ class DataExtractor:
         - SOC: battery state of charge (%)
         - BatteryVoltage: battery voltage (V)
         - BatteryCurrent: battery current (A)
+        - net_battery_power: calculated net power (positive = charging)
+        - battery_energy_change_kwh: energy change per interval
+        - calculated_battery_power: V*I validation
         """
         self.logger.info(f"Extracting battery data from {start_date} to {end_date}")
 
@@ -670,82 +714,29 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract EV charging data from InfluxDB.
+        
+        NOTE: EV charging in this system is just a load without specific charging 
+        timestamps or dedicated measurements. This method returns an empty DataFrame
+        as a placeholder. To identify EV charging patterns:
+        
+        1. Look for characteristic load patterns in total consumption data:
+           - Sudden increase of 3.7kW (single phase) or 11kW (three phase)
+           - Sustained load for 2-8 hours typically during night
+           - Regular daily/weekly patterns
+           
+        2. Use load disaggregation techniques in feature engineering phase
+        3. Consider adding dedicated EV charger monitoring in the future
 
-        Returns DataFrame with columns:
-        - timestamp: datetime index
-        - ev_power: EV charging power (W)
-        - ev_energy: EV charging energy (kWh)
-        - ev_connected: EV connection status
+        Returns:
+            Empty DataFrame as EV data is not separately tracked
         """
-        self.logger.info(f"Extracting EV data from {start_date} to {end_date}")
-
-        # Query for EV data - adjust measurement/field names based on your system
-        query = f"""
-        from(bucket: "{self.settings.influxdb.bucket_solar}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "ev_charger" or
-                              r["_measurement"] == "wallbox" or
-                              r["_measurement"] == "car_charging")
-          |> filter(fn: (r) => r["_field"] == "power" or
-                              r["_field"] == "energy" or
-                              r["_field"] == "connected" or
-                              r["_field"] == "charging_state")
-          |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
-          |> keep(columns: ["_time", "_value", "_field"])
-        """
-
-        tables = self.query_api.query(query)
-
-        if not tables:
-            self.logger.warning("No EV data found - EV charging may not be available")
-            return pd.DataFrame()
-
-        # Convert to DataFrame
-        records = []
-        for table in tables:
-            for record in table.records:
-                records.append(
-                    {
-                        "timestamp": record.get_time(),
-                        "field": record.get_field(),
-                        "value": record.get_value(),
-                    }
-                )
-
-        if not records:
-            self.logger.warning("No EV records found")
-            return pd.DataFrame()
-
-        df = pd.DataFrame(records)
-
-        # Pivot to get EV fields as columns
-        df_pivot = df.pivot_table(
-            index="timestamp", columns="field", values="value", aggfunc="mean"
-        ).reset_index()
-
-        # Set timestamp as index
-        df_pivot["timestamp"] = pd.to_datetime(df_pivot["timestamp"])
-        df_pivot.set_index("timestamp", inplace=True)
-
-        # Rename columns for consistency
-        column_mapping = {
-            "power": "ev_power",
-            "energy": "ev_energy",
-            "connected": "ev_connected",
-            "charging_state": "ev_charging_state",
-        }
-        df_pivot.rename(columns=column_mapping, inplace=True)
-
-        # Calculate EV energy consumption if power is available
-        if "ev_power" in df_pivot.columns:
-            df_pivot["ev_energy_kwh"] = (
-                df_pivot["ev_power"] * 0.25 / 1000
-            )  # 15min intervals
-
         self.logger.info(
-            f"Extracted {len(df_pivot)} EV data points with fields: {list(df_pivot.columns)}"
+            f"EV data extraction called for {start_date} to {end_date}, "
+            "but EV charging is not separately tracked in the database"
         )
-        return df_pivot
+        
+        # Return empty DataFrame with expected columns for compatibility
+        return pd.DataFrame(columns=['ev_power', 'ev_energy_kwh', 'ev_connected'])
 
     def save_to_parquet(self, df: pd.DataFrame, filename: str) -> None:
         """Save DataFrame to parquet file for fast loading."""
@@ -920,7 +911,7 @@ class DataExtractor:
 
         # Query for relay data
         query = f"""
-        from(bucket: "{self.settings.influxdb.bucket_solar}")
+        from(bucket: "{self.settings.influxdb.bucket_loxone}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "heating")
           |> aggregateWindow(every: 5m, fn: last, createEmpty: false)

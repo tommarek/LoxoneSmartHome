@@ -50,31 +50,12 @@ ROOM_CONFIG = {
 }
 
 # Energy consumption categories for analysis
+# Note: Only heating is tracked via relay states, other categories don't exist in database
 CONSUMPTION_CATEGORIES = {
     "heating": {
         "measurement": "relay",
         "tag_filter": "tag1 == 'heating'",
         "description": "Space heating consumption",
-    },
-    "hot_water": {
-        "measurement": "relay",
-        "tag_filter": "tag1 == 'hot_water'",
-        "description": "Hot water heating consumption",
-    },
-    "ventilation": {
-        "measurement": "relay",
-        "tag_filter": "tag1 == 'ventilation'",
-        "description": "Ventilation system consumption",
-    },
-    "appliances": {
-        "measurement": "power",
-        "tag_filter": "tag1 == 'appliances'",
-        "description": "General appliance consumption",
-    },
-    "lighting": {
-        "measurement": "power",
-        "tag_filter": "tag1 == 'lighting'",
-        "description": "Lighting consumption",
     },
 }
 
