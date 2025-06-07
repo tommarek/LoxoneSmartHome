@@ -1,3 +1,570 @@
+Based on the completed Phase 1 analysis framework, I'll create a comprehensive Phase 2 TODO that builds upon the existing infrastructure to implement ML models, optimization, and control systems.
+
+# Phase 2 TODO: ML Model Development & Optimization Implementation
+
+## Overview
+Phase 2 focuses on building predictive ML models using the features engineered in Phase 1, implementing optimization algorithms, and creating the control system that will replace the basic Growatt controller.
+
+## Folder Structure & Implementation Plan
+
+```
+pems_v2/
+├── models/                      # 🤖 ML Model Components
+│   ├── __init__.py
+│   ├── base.py                 # Abstract base classes for all predictors
+│   ├── model_registry.py       # Model versioning and management
+│   ├── predictors/             # Individual prediction models
+│   │   ├── __init__.py
+│   │   ├── pv_predictor.py
+│   │   ├── thermal_predictor.py
+│   │   ├── load_predictor.py
+│   │   └── price_predictor.py
+│   ├── ensemble/               # Ensemble methods
+│   │   ├── __init__.py
+│   │   └── weighted_ensemble.py
+│   └── training/               # Training pipelines
+│       ├── __init__.py
+│       ├── trainer.py
+│       └── hyperparameter_tuning.py
+│
+├── optimization/               # 🎯 Optimization Engine
+│   ├── __init__.py
+│   ├── problem_formulation.py
+│   ├── constraints.py
+│   ├── objectives.py
+│   ├── solvers/
+│   │   ├── __init__.py
+│   │   ├── milp_solver.py
+│   │   └── stochastic_solver.py
+│   └── mpc/
+│       ├── __init__.py
+│       └── mpc_controller.py
+│
+├── control/                    # 🎮 Control System
+│   ├── __init__.py
+│   ├── energy_controller.py
+│   ├── interfaces/
+│   │   ├── __init__.py
+│   │   ├── loxone_interface.py
+│   │   ├── battery_interface.py
+│   │   └── ev_interface.py
+│   └── safety/
+│       ├── __init__.py
+│       └── safety_checks.py
+│
+├── monitoring/                 # 📊 Performance Monitoring
+│   ├── __init__.py
+│   ├── metrics_collector.py
+│   ├── model_monitor.py
+│   └── dashboards/
+│       ├── __init__.py
+│       └── grafana_config.py
+│
+└── deployment/                 # 🚀 Deployment & Integration
+    ├── __init__.py
+    ├── service_manager.py
+    ├── config_validator.py
+    └── backup_controller.py
+```
+
+## Detailed Implementation Tasks
+
+### 1. Models Module (`models/`)
+
+#### 1.1 `models/base.py`
+```python
+"""
+Abstract base classes for all predictors.
+
+PURPOSE:
+- Define common interface for all prediction models
+- Implement model persistence (save/load)
+- Provide performance tracking methods
+- Handle feature preprocessing pipeline
+
+DATA USED:
+- Feature sets from analysis/analyzers/feature_engineering.py
+- Historical predictions for performance tracking
+
+INTEGRATION:
+- All predictors inherit from BasePredictor
+- Uses analysis results for feature definitions
+- Integrates with model_registry for versioning
+"""
+```
+
+**TODO:**
+- [ ] Implement `BasePredictor` abstract class with methods:
+  - `train(X, y)` - Train model on historical data
+  - `predict(X)` - Make predictions
+  - `predict_proba(X)` - Prediction with uncertainty
+  - `save_model(path)` - Persist trained model
+  - `load_model(path)` - Load trained model
+  - `get_feature_importance()` - Feature importance scores
+  - `evaluate(X, y)` - Model evaluation metrics
+- [ ] Implement `ModelMetadata` class for tracking:
+  - Model version
+  - Training date
+  - Feature list
+  - Performance metrics
+  - Training parameters
+
+#### 1.2 `models/predictors/pv_predictor.py`
+```python
+"""
+PV production prediction model.
+
+PURPOSE:
+- Predict PV power output for next 48 hours
+- Provide uncertainty quantification (P10, P50, P90)
+- Handle weather forecast integration
+- Account for seasonal variations
+
+DATA USED:
+- Historical PV data from analysis results
+- Weather forecast data (cloud cover, temperature, radiation)
+- Seasonal patterns from pattern_analysis.py
+- Feature set from feature_engineering.create_pv_features()
+
+INTEGRATION:
+- Uses weather API for real-time forecasts
+- Integrates with optimization for production planning
+- Updates predictions based on actual vs predicted analysis
+"""
+```
+
+**TODO:**
+- [ ] Implement `PVPredictor` class:
+  - XGBoost as primary model
+  - Physical model (PVLib) as baseline
+  - Ensemble approach for robustness
+- [ ] Weather feature extraction:
+  - DNI, DHI, GHI calculation
+  - Cloud cover impact modeling
+  - Temperature derating effects
+- [ ] Uncertainty quantification:
+  - Quantile regression for P10, P50, P90
+  - Prediction intervals based on weather uncertainty
+- [ ] Real-time adaptation:
+  - Online learning with recent errors
+  - Bias correction based on last 7 days
+  - Seasonal adjustment factors
+
+#### 1.3 `models/predictors/thermal_predictor.py`
+```python
+"""
+Room temperature prediction using RC models.
+
+PURPOSE:
+- Predict room temperatures for 48-hour horizon
+- Model heating system response (binary relay control)
+- Account for thermal inertia and weather effects
+- Enable optimal heating scheduling
+
+DATA USED:
+- RC parameters from thermal_analysis.py
+- Historical room temperature data
+- Weather forecast (outdoor temperature, solar gains)
+- Relay state history
+
+INTEGRATION:
+- Provides temperature constraints for optimization
+- Uses relay control decisions from optimizer
+- Updates RC parameters based on prediction errors
+"""
+```
+
+**TODO:**
+- [ ] Implement state-space thermal model:
+  - Discrete-time formulation for 5-min steps
+  - Room coupling effects
+  - Solar gain estimation
+- [ ] Kalman filter for state estimation:
+  - Temperature state tracking
+  - Parameter adaptation
+  - Uncertainty propagation
+- [ ] Multi-zone coordination:
+  - Heat transfer between rooms
+  - Shared heating capacity constraints
+- [ ] Comfort prediction:
+  - Occupancy-based setpoints
+  - Comfort zone violations
+
+#### 1.4 `models/predictors/load_predictor.py`
+```python
+"""
+Base load prediction model.
+
+PURPOSE:
+- Predict non-controllable electricity consumption
+- Capture daily, weekly, and seasonal patterns
+- Provide hourly forecasts for optimization
+
+DATA USED:
+- Historical base load from base_load_analysis.py
+- Calendar features (holidays, weekends)
+- Weather data for weather-sensitive loads
+- Anomaly detection results
+
+INTEGRATION:
+- Feeds into optimization as fixed load
+- Updates based on recent consumption patterns
+- Handles special events/anomalies
+"""
+```
+
+**TODO:**
+- [ ] Implement time series models:
+  - LightGBM for pattern recognition
+  - Separate models for weekday/weekend/holiday
+  - Hourly predictions with confidence intervals
+- [ ] Feature engineering:
+  - Lag features (24h, 168h)
+  - Rolling statistics
+  - Holiday encoding
+- [ ] Anomaly handling:
+  - Detect and exclude outliers in training
+  - Special event detection
+  - Adaptive model updates
+
+### 2. Optimization Module (`optimization/`)
+
+#### 2.1 `optimization/problem_formulation.py`
+```python
+"""
+Energy optimization problem formulation.
+
+PURPOSE:
+- Define MILP/MINLP optimization problem
+- Set up decision variables and constraints
+- Implement multi-objective optimization
+- Handle 48-hour rolling horizon
+
+DATA USED:
+- Predictions from all ML models
+- Current system state (battery SOC, temperatures)
+- Electricity prices and export policies
+- System constraints from config
+
+INTEGRATION:
+- Uses predictions from models module
+- Feeds decisions to control module
+- Re-optimizes based on MPC feedback
+"""
+```
+
+**TODO:**
+- [ ] Decision variables:
+  - Binary heating decisions for 16 rooms × 48 hours
+  - Continuous battery charge/discharge power
+  - EV charging power profile
+  - Grid import/export
+- [ ] Objectives:
+  - Minimize total electricity cost
+  - Maximize self-consumption
+  - Minimize peak demand (optional)
+- [ ] Time discretization:
+  - 1-hour steps for optimization
+  - Aggregation from 5-min control intervals
+- [ ] Warm start strategies:
+  - Use previous solution
+  - Heuristic initialization
+
+#### 2.2 `optimization/constraints.py`
+```python
+"""
+Optimization constraint builders.
+
+PURPOSE:
+- Build all system constraints for optimization
+- Handle physical limitations and comfort requirements
+- Implement safety constraints
+- Manage grid interaction limits
+
+DATA USED:
+- System specifications (battery limits, room power)
+- Comfort boundaries from config
+- Grid connection limits
+- Physical models from predictors
+
+INTEGRATION:
+- Called by problem_formulation
+- Uses thermal models for temperature constraints
+- Validates against safety checks
+"""
+```
+
+**TODO:**
+- [ ] Power balance constraints:
+  - PV + grid = load + battery + export
+  - Account for conversion losses
+- [ ] Battery constraints:
+  - SOC limits [10%, 90%]
+  - Charge/discharge power limits
+  - Prevent simultaneous charge/discharge
+  - Degradation-aware cycling limits
+- [ ] Thermal comfort constraints:
+  - Room temperature bounds
+  - Heating power limits (binary × rated power)
+  - Minimum off-time between cycles
+- [ ] Grid constraints:
+  - Maximum import/export limits
+  - Export only when price > threshold
+  - Power factor requirements
+
+#### 2.3 `optimization/mpc/mpc_controller.py`
+```python
+"""
+Model Predictive Control implementation.
+
+PURPOSE:
+- Implement receding horizon control
+- Handle disturbances and model updates
+- Coordinate re-optimization triggers
+- Manage computational resources
+
+DATA USED:
+- Current system state from monitoring
+- Updated predictions from models
+- Optimization results from solver
+- Actual vs planned deviations
+
+INTEGRATION:
+- Main loop in energy_controller
+- Triggers re-optimization
+- Updates model predictions
+- Feeds back to ML models
+"""
+```
+
+**TODO:**
+- [ ] MPC configuration:
+  - 48-hour prediction horizon
+  - 24-hour control horizon
+  - 1-hour re-optimization frequency
+- [ ] Disturbance handling:
+  - Measure prediction errors
+  - Update state estimates
+  - Trigger immediate re-optimization if needed
+- [ ] Move blocking:
+  - Detailed control for next 6 hours
+  - Aggregated decisions for 6-24 hours
+  - Rough plan for 24-48 hours
+- [ ] Computational management:
+  - Time limits for optimization
+  - Fallback to simpler models if needed
+
+### 3. Control Module (`control/`)
+
+#### 3.1 `control/energy_controller.py`
+```python
+"""
+Main energy management controller.
+
+PURPOSE:
+- Replace growatt_controller.py with advanced control
+- Coordinate all subsystems (heating, battery, EV)
+- Implement MPC main loop
+- Handle fault conditions and fallbacks
+
+DATA USED:
+- Current state from InfluxDB
+- Optimization results from MPC
+- System status from interfaces
+- Safety limits from config
+
+INTEGRATION:
+- Main entry point for control system
+- Replaces existing main.py controller
+- Interfaces with all hardware systems
+- Logs all decisions to InfluxDB
+"""
+```
+
+**TODO:**
+- [ ] Initialization:
+  - Load all ML models
+  - Initialize optimization engine
+  - Set up interface connections
+  - Configure logging
+- [ ] Main control loop (5-minute):
+  - Read current state
+  - Check for re-optimization triggers
+  - Apply control decisions
+  - Log metrics
+- [ ] State management:
+  - Track execution vs plan
+  - Detect deviations
+  - Handle manual overrides
+- [ ] Fault handling:
+  - Fallback to rule-based control
+  - Safe mode operation
+  - Alert generation
+
+#### 3.2 `control/interfaces/loxone_interface.py`
+```python
+"""
+Loxone system control interface.
+
+PURPOSE:
+- Send relay control commands via MQTT
+- Read current relay states
+- Handle Loxone-specific protocols
+- Implement command queuing
+
+DATA USED:
+- Relay decisions from optimizer
+- Current states from Loxone
+- Room mapping from config
+- Command acknowledgments
+
+INTEGRATION:
+- Called by energy_controller
+- Uses existing MQTT infrastructure
+- Maps to Loxone field names via adapter
+- Handles async communication
+"""
+```
+
+**TODO:**
+- [ ] MQTT command structure:
+  - Topic: `loxone/relay/{room}/set`
+  - Payload: `{"state": 0/1, "until": timestamp}`
+  - QoS level 2 for reliability
+- [ ] State verification:
+  - Read back commanded state
+  - Retry on failure
+  - Alert on persistent errors
+- [ ] Batch commands:
+  - Queue multiple relay changes
+  - Coordinate switching order
+  - Respect minimum switching intervals
+
+### 4. Monitoring Module (`monitoring/`)
+
+#### 4.1 `monitoring/metrics_collector.py`
+```python
+"""
+System performance metrics collection.
+
+PURPOSE:
+- Track prediction accuracy
+- Monitor optimization performance
+- Calculate cost savings
+- Generate performance reports
+
+DATA USED:
+- Predictions vs actuals from all models
+- Optimization decisions and costs
+- System state history
+- Baseline comparisons
+
+INTEGRATION:
+- Stores metrics in InfluxDB
+- Feeds Grafana dashboards
+- Triggers model retraining
+- Generates daily reports
+"""
+```
+
+**TODO:**
+- [ ] Prediction metrics:
+  - RMSE for each predictor
+  - Bias detection
+  - Uncertainty calibration
+- [ ] Optimization metrics:
+  - Cost savings vs baseline
+  - Self-consumption rate
+  - Computation time
+  - Constraint violations
+- [ ] System metrics:
+  - Uptime and reliability
+  - Response times
+  - Error rates
+- [ ] Automated reporting:
+  - Daily performance summary
+  - Weekly trends
+  - Monthly cost analysis
+
+### 5. Training Pipeline Tasks
+
+#### 5.1 Initial Model Training
+**TODO:**
+- [ ] Load Phase 1 analysis results
+- [ ] Split data into train/validation/test sets
+- [ ] Train PV predictor on 2 years of data
+- [ ] Train thermal models for each room
+- [ ] Train base load predictor
+- [ ] Evaluate ensemble performance
+- [ ] Save trained models with versioning
+
+#### 5.2 Feature Pipeline
+**TODO:**
+- [ ] Implement real-time feature calculation
+- [ ] Create feature store for online predictions
+- [ ] Implement feature monitoring
+- [ ] Handle missing data in production
+
+## Implementation Timeline
+
+### Week 1-2: Core ML Models
+- [ ] Implement base model classes
+- [ ] Develop PV predictor with weather integration
+- [ ] Create thermal state-space models
+- [ ] Build base load predictor
+
+### Week 3: Optimization Engine
+- [ ] Formulate MILP problem
+- [ ] Implement constraint builders
+- [ ] Integrate GEKKO/PuLP solver
+- [ ] Test optimization convergence
+
+### Week 4: Control System
+- [ ] Develop main controller
+- [ ] Implement Loxone interface
+- [ ] Create battery/EV interfaces
+- [ ] Add safety checks
+
+### Week 5: Integration & Testing
+- [ ] End-to-end testing
+- [ ] Performance optimization
+- [ ] Fault scenario testing
+- [ ] Documentation
+
+### Week 6: Monitoring & Deployment
+- [ ] Set up metrics collection
+- [ ] Create Grafana dashboards
+- [ ] Implement model monitoring
+- [ ] Deploy in shadow mode
+
+## Key Integration Points
+
+1. **Feature Usage**: All ML models use features from `analysis/analyzers/feature_engineering.py`
+2. **Data Flow**: InfluxDB → Feature Engineering → ML Models → Optimization → Control → InfluxDB
+3. **State Feedback**: Control results feed back to improve predictions
+4. **Configuration**: All parameters from `config/settings.py` and `config/energy_settings.py`
+5. **Logging**: Unified logging through `utils/logging.py`
+
+## Success Metrics
+
+- PV prediction RMSE < 10% of capacity
+- Temperature prediction MAE < 0.5°C
+- Cost reduction > 20% vs baseline
+- Self-consumption > 70%
+- System uptime > 99.5%
+
+## Risk Mitigation
+
+1. **Fallback Control**: Keep rule-based controller as backup
+2. **Shadow Mode**: Run parallel to existing system initially
+3. **Gradual Rollout**: Start with one room, expand gradually
+4. **Safety Limits**: Hard-coded limits in safety module
+5. **Manual Override**: Always allow user intervention
+
+This Phase 2 implementation builds directly on the Phase 1 analysis, using all the extracted features, patterns, and parameters to create a production-ready predictive energy management system.
+
+
+this might help as well although not complete
 I'll provide a comprehensive code review with detailed implementations and recommendations for the PEMS v2 project.
 
 # PEMS v2 Comprehensive Code Review and Implementation Guide

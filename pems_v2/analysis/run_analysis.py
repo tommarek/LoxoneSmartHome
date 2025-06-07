@@ -17,11 +17,11 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
-from analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
-from config.settings import PEMSSettings as Settings
-
 # Add the parent directory to the path so we can import from other modules
 sys.path.append(str(Path(__file__).parent.parent))
+
+from analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
+from config.settings import PEMSSettings as Settings
 
 
 async def run_analysis(

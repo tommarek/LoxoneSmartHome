@@ -1095,7 +1095,7 @@ class DataPreprocessor:
         df_clean = df.copy()
 
         # Forward fill then interpolate
-        df_clean = df_clean.fillna(method="ffill").fillna(method="bfill")
+        df_clean = df_clean.ffill().bfill()
         df_clean = df_clean.interpolate(method="linear", limit=6)
 
         return df_clean

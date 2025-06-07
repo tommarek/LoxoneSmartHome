@@ -1,4 +1,4 @@
-.PHONY: help setup install install-dev test lint lint-check type-check format clean run test-extraction clean-analysis run-analysis run-relay-analysis
+.PHONY: help setup install install-dev test lint lint-check type-check format clean run test-extraction clean-analysis clean-all run-analysis run-relay-analysis
 
 help:
 	@echo "Available commands:"
@@ -15,6 +15,7 @@ help:
 	@echo "  make format       - Format code with black and isort only"
 	@echo "  make clean        - Remove build artifacts"
 	@echo "  make clean-analysis - Remove analysis outputs and data files"
+	@echo "  make clean-all    - Remove all artifacts (build + analysis)"
 	@echo "  make run          - Run the PEMS application"
 	@echo "  make run-analysis - Run 2-year thermal analysis pipeline"
 	@echo "  make run-relay-analysis - Run corrected relay-based heating analysis"
@@ -87,10 +88,15 @@ clean-analysis:
 	rm -rf pems_v2/data/test_output/
 	rm -rf pems_v2/analysis/results/*.json
 	rm -rf pems_v2/analysis/reports/*.txt
+	rm -rf pems_v2/analysis/reports/*.html
 	rm -rf pems_v2/analysis/figures/*.png
+	rm -f pems_v2/analysis/*.log
 	rm -f pems_v2/analysis_*.log
 	rm -f pems_v2/test_*.log
 	@echo "Analysis outputs cleaned!"
+
+clean-all: clean clean-analysis
+	@echo "All artifacts cleaned!"
 
 run:
 	. venv/bin/activate && python loxone_smart_home/main.py

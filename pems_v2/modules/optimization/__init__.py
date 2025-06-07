@@ -1,1 +1,0 @@
-"""Optimization engine for energy management."""

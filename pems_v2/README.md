@@ -25,10 +25,11 @@ Phase 1 data analysis and feature engineering is now complete! All core function
 - ✅ **Visualization**: Interactive Plotly dashboards for all analysis types
 - ✅ **Data Quality**: Validation and completeness checking throughout pipeline
 
-### Analysis Notebooks:
-- `02_pv_production_analysis.ipynb`: PV system analysis with export policy impact
-- `06_weather_correlation.ipynb`: Weather-energy correlations and patterns
-- `07_feature_selection.ipynb`: Advanced feature engineering for ML models
+### Analysis Capabilities:
+- **Complete 2-year analysis** in 15-20 minutes with 10+ detailed reports
+- **Interactive Jupyter notebooks** for detailed exploration (moved to `../pems_v2_analysis/`)
+- **Energy optimization roadmap** with cost-benefit analysis and implementation phases
+- **Executive summaries** with ROI calculations and strategic recommendations
 
 ## Key Features
 
@@ -43,22 +44,33 @@ Phase 1 data analysis and feature engineering is now complete! All core function
 ## Architecture
 
 ```
-pems_v2/
-├── analysis/              # Data extraction and pattern analysis [PHASE 1 COMPLETE]
-│   ├── data_extraction.py # Async InfluxDB data extraction
-│   ├── pattern_analysis.py # PV export policy detection
-│   ├── thermal_analysis.py # RC parameter estimation (16 rooms)
-│   ├── feature_engineering.py # Relay & price feature generation
-│   ├── visualization.py   # Comprehensive plotting functions
-│   └── notebooks/         # Jupyter analysis notebooks
-├── models/               # ML model implementations [PHASE 2]
-├── modules/              # Core functionality
-│   ├── predictors/       # PV, load, and thermal predictors [PHASE 2]
-│   ├── optimization/     # Optimization engine and constraints [PHASE 2]
-│   └── control/          # Device control interfaces [PHASE 3]
-├── config/               # Configuration management
-├── utils/                # Shared utilities
-└── tests/                # Test suite
+pems_v2/                   # 📁 PEMS v2 Analysis Framework
+├── analysis/              # 📊 Complete analysis pipeline [PHASE 1 COMPLETE]
+│   ├── core/              # Core data processing
+│   │   ├── data_extraction.py     # Async InfluxDB extraction
+│   │   ├── data_preprocessing.py  # Data cleaning & standardization
+│   │   └── visualization.py       # Advanced visualizations
+│   ├── analyzers/         # Specialized analysis modules
+│   │   ├── pattern_analysis.py    # PV & relay patterns
+│   │   ├── thermal_analysis.py    # RC thermal modeling
+│   │   ├── base_load_analysis.py  # Load forecasting
+│   │   └── feature_engineering.py # ML feature generation
+│   ├── pipelines/         # End-to-end analysis pipelines
+│   │   └── comprehensive_analysis.py
+│   ├── reports/           # Report generation
+│   ├── utils/             # Analysis utilities
+│   │   └── loxone_adapter.py      # Loxone field mapping
+│   └── run_analysis.py    # 🚀 Main analysis entry point
+├── config/               # ⚙️ Configuration management
+│   ├── settings.py       # Main settings with Pydantic
+│   └── energy_settings.py # Room power configurations
+├── utils/                # 🔧 Shared utilities  
+│   └── logging.py        # Logging configuration
+└── tests/                # 🧪 Comprehensive test suite
+    ├── test_basic_structure.py
+    ├── test_data_extraction.py
+    ├── test_relay_analysis.py
+    └── test_new_extractors.py
 ```
 
 ## Quick Start
@@ -70,10 +82,20 @@ pems_v2/
 
 2. Configure the system by setting environment variables or creating a `.env` file
 
-3. Run the main controller:
+3. Run complete energy analysis:
    ```bash
-   python main.py
+   cd pems_v2
+   python analysis/run_analysis.py
    ```
+
+## 📊 Running Analysis
+
+For detailed instructions on running the complete 2-year analysis and getting all reports, see [README_ANALYSIS.md](README_ANALYSIS.md).
+
+**Quick commands:**
+- **Full 2-year analysis**: `python analysis/run_analysis.py` 
+- **Interactive notebooks**: Open `../pems_v2_analysis/` folder
+- **Test system**: `make test-basic && make test-extraction`
 
 ## Requirements
 

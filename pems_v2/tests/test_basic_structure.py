@@ -118,7 +118,7 @@ def test_directory_structure():
     """Test that required directories exist."""
     print("\n📁 Testing directory structure...")
 
-    required_dirs = ["analysis", "config", "modules", "utils", "tests"]
+    required_dirs = ["analysis", "config", "utils", "tests"]
 
     missing_dirs = []
     project_root = Path(__file__).parent.parent

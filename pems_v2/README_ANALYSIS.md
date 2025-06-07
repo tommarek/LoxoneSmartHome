@@ -12,36 +12,359 @@ Your Loxone heating system works with **binary relay control**:
 - **Energy**: `Energy = Relay_State × Power_Rating × Time_Duration`
 - **Duty Cycle**: Percentage of time relay is ON (indicates heating demand)
 
-## 🚀 Quick Start
+## 🚀 How to Run Complete Analysis
 
 ### Prerequisites
 ```bash
+# Navigate to project root
+cd /path/to/LoxoneSmartHome
+
 # Set up development environment (first time only)
 make setup
 
-# Activate virtual environment (required for all operations)
+# Activate virtual environment (ALWAYS required)
 source venv/bin/activate
 ```
 
-### Available Analysis Commands
+### 📊 Complete 2-Year Analysis (Recommended)
 
-| Command | Description | Use Case |
-|---------|-------------|----------|
-| `python analysis/run_analysis.py` | Full comprehensive analysis (2 years) | Complete system analysis |
-| `python -c "from analysis.run_analysis import run_quick_analysis; run_quick_analysis(30)"` | Quick analysis (30 days) | Recent performance check |
-| `python -c "from analysis.run_analysis import run_pv_only_analysis; run_pv_only_analysis()"` | PV production analysis only | Solar system performance |
-| `python -c "from analysis.run_analysis import run_thermal_only_analysis; run_thermal_only_analysis()"` | Thermal analysis only | Heating system analysis |
-| `python analysis/daily_analysis.py` | Daily analysis workflow | Automated daily reports |
+Run comprehensive analysis on 2 years of data to get all reports, charts, and insights:
+
+```bash
+# Method 1: Using the main analysis script (recommended)
+cd pems_v2
+python analysis/run_analysis.py
+
+# Method 2: Interactive Python
+python -c "
+import asyncio
+from datetime import datetime, timedelta
+from pems_v2.analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
+from pems_v2.config.settings import PEMSSettings
+
+async def run_full_analysis():
+    settings = PEMSSettings()
+    analyzer = ComprehensiveAnalyzer(settings)
+    
+    # 2-year analysis period
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=730)  # 2 years
+    
+    print(f'Running analysis from {start_date.date()} to {end_date.date()}')
+    
+    results = await analyzer.run_comprehensive_analysis(
+        start_date=start_date,
+        end_date=end_date,
+        analysis_types={
+            'pv': True,
+            'thermal': True, 
+            'base_load': True,
+            'relay_patterns': True,
+            'weather_correlation': True
+        }
+    )
+    
+    print('✅ Analysis completed! Check data/processed/ for results.')
+    return results
+
+asyncio.run(run_full_analysis())
+"
+```
+
+### 📈 Using Jupyter Notebooks (Interactive Analysis)
+
+For detailed interactive analysis with charts and visualizations:
+
+```bash
+# Navigate to repo root
+cd /path/to/LoxoneSmartHome
+
+# Start Jupyter (if installed)
+jupyter lab
+
+# Or use VS Code to open notebooks
+code pems_v2_analysis/
+```
+
+**Run notebooks in this order:**
+1. `01_data_exploration.ipynb` - Data loading and quality check
+2. `02_pv_production_analysis.ipynb` - Solar PV analysis
+3. `03_heating_patterns.ipynb` - Heating system analysis
+4. `04_thermal_analysis.ipynb` - Thermal dynamics modeling
+5. `05_base_load_analysis.ipynb` - Base load forecasting
+6. `06_weather_correlation.ipynb` - Weather impact analysis
+7. `07_energy_optimization.ipynb` - Comprehensive optimization
+
+### ⚡ Quick Analysis Options
+
+| Command | Duration | Use Case | Output |
+|---------|----------|----------|--------|
+| **Full 2-Year Analysis** | 10-15 min | Complete system analysis | All reports + charts |
+| **Recent 60 Days** | 2-3 min | Recent performance check | Key metrics only |
+| **Heating Season Only** | 5-8 min | Winter analysis (Oct-Mar) | Thermal focus |
+| **PV Season Only** | 3-5 min | Summer analysis (Apr-Sep) | Solar focus |
+
+```bash
+# Recent 60 days analysis
+python -c "
+import asyncio
+from datetime import datetime, timedelta
+from pems_v2.analysis.run_analysis import run_analysis
+
+async def quick_analysis():
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=60)
+    results = await run_analysis(start_date, end_date)
+    return results
+
+asyncio.run(quick_analysis())
+"
+
+# Heating season only (October to March)
+python -c "
+import asyncio
+from datetime import datetime
+from pems_v2.analysis.run_analysis import run_analysis
+
+async def heating_season_analysis():
+    # Current year heating season
+    year = datetime.now().year
+    start_date = datetime(year-1, 10, 1)  # Oct 1 previous year
+    end_date = datetime(year, 3, 31)      # Mar 31 current year
+    
+    results = await run_analysis(start_date, end_date, {
+        'pv': False,
+        'thermal': True,
+        'base_load': True,
+        'relay_patterns': True,
+        'weather_correlation': True
+    })
+    return results
+
+asyncio.run(heating_season_analysis())
+"
+```
+
+### 🎯 What You'll Get After Analysis
+
+#### Generated Files & Reports
+
+```
+📁 LoxoneSmartHome/
+├── 📁 data/
+│   ├── 📁 processed/                    # ⭐ MAIN RESULTS FOLDER
+│   │   ├── 📄 heating_pattern_analysis.pkl
+│   │   ├── 📄 heating_analysis_summary.txt
+│   │   ├── 📄 thermal_analysis_results.pkl
+│   │   ├── 📄 thermal_rc_parameters.csv
+│   │   ├── 📄 base_load_analysis_results.pkl
+│   │   ├── 📄 weather_correlation_results.pkl
+│   │   ├── 📄 weather_correlations.csv
+│   │   ├── 📄 energy_optimization_analysis.pkl
+│   │   ├── 📄 optimization_opportunities.csv
+│   │   ├── 📄 optimization_cost_benefit.csv
+│   │   ├── 📄 energy_optimization_executive_summary.txt
+│   │   └── 📄 implementation_roadmap.txt
+│   └── 📁 raw/                          # Raw data from InfluxDB
+├── 📁 pems_v2/analysis/
+│   ├── 📁 reports/                      # HTML & detailed reports
+│   ├── 📁 results/                      # JSON analysis results
+│   └── 📁 figures/                      # Generated charts & plots
+└── 📁 pems_v2_analysis/                 # Jupyter notebooks with outputs
+```
+
+#### 📊 Key Reports You'll Get
+
+**1. Executive Summary** (`energy_optimization_executive_summary.txt`)
+```text
+ENERGY OPTIMIZATION ANALYSIS - EXECUTIVE SUMMARY
+===============================================
+
+FINANCIAL SUMMARY:
+  Total Investment Required: 245,000 CZK
+  Expected Annual Savings: 28,500 CZK
+  Payback Period: 8.6 years
+  Five-Year ROI: +18.2%
+
+TOP STRATEGIC RECOMMENDATIONS:
+1. Implement Phase 1 quick wins immediately
+2. Deploy comprehensive monitoring system
+3. Focus on heating system optimization
+...
+```
+
+**2. Heating Analysis Summary** (`heating_analysis_summary.txt`)
+```text
+Heating Pattern Analysis Summary
+===============================
+
+Analysis Period: 2022-06-06 to 2024-06-06
+Rooms Analyzed: 16
+
+Key Insights:
+1. High utilization rooms: obyvak(52.1%), chodba_dole(48.3%)
+2. Low utilization rooms: zachod(8.2%), spajz(12.1%)
+3. Total heating energy: 3,339 kWh over 2 years
+...
+```
+
+**3. Optimization Opportunities** (`optimization_opportunities.csv`)
+- Detailed cost-benefit analysis for each improvement
+- Priority ranking and implementation timeline
+- Expected savings and payback periods
+
+**4. Implementation Roadmap** (`implementation_roadmap.txt`)
+- Phase 1: Quick wins (0-6 months)
+- Phase 2: Medium-term improvements (6-18 months)  
+- Phase 3: Long-term upgrades (18+ months)
+
+#### 📈 Charts & Visualizations
+
+When running Jupyter notebooks, you'll get interactive charts:
+
+- **Daily heating patterns by room**
+- **Temperature vs relay correlation plots**
+- **Energy consumption pie charts**
+- **Peak demand analysis**
+- **Weather correlation heatmaps**
+- **PV production vs weather patterns**
+- **Thermal time constants by room**
+- **Cost optimization matrices**
+
+### 🔧 Step-by-Step Analysis Guide
+
+#### Complete 2-Year Analysis Walkthrough
+
+```bash
+# 1. Navigate and setup (first time only)
+cd /Users/tommarek/git/LoxoneSmartHome
+make setup
+source venv/bin/activate
+
+# 2. Verify system is ready
+make test-basic                    # Should pass ✅
+make test-extraction              # Tests InfluxDB connection ✅
+
+# 3. Run complete analysis (15-20 minutes)
+cd pems_v2
+python analysis/run_analysis.py
+
+# 4. Check results
+ls -la ../data/processed/         # See generated reports
+cat ../data/processed/energy_optimization_executive_summary.txt
+
+# 5. Run interactive notebooks (optional)
+cd ..
+code pems_v2_analysis/           # Open in VS Code
+# OR
+jupyter lab pems_v2_analysis/    # Open in Jupyter
+```
+
+#### Expected Timeline & Progress
+
+```text
+⏱️  ANALYSIS PROGRESS TIMELINE
+
+[00:00] Starting data extraction from InfluxDB...
+[02:00] ✅ PV data extracted (50,000+ records)
+[04:00] ✅ Room temperature data extracted (16 rooms)
+[06:00] ✅ Relay state data extracted (heating patterns)
+[08:00] ✅ Weather data extracted (correlations)
+[10:00] ✅ Running thermal analysis (RC models)
+[12:00] ✅ Running base load analysis (forecasting)
+[14:00] ✅ Running energy optimization analysis
+[15:00] ✅ Generating reports and recommendations
+[16:00] 🎉 ANALYSIS COMPLETE! 
+
+📊 Generated: 10+ reports, 15+ charts, optimization roadmap
+💰 Identified: Potential savings opportunities
+📈 Created: 2-year performance baseline
+```
+
+#### What Each Report Contains
+
+| File | Contains | Best For |
+|------|----------|----------|
+| `energy_optimization_executive_summary.txt` | 📈 ROI, payback, top recommendations | **Management decisions** |
+| `heating_analysis_summary.txt` | 🏠 Room utilization, energy consumption | **System optimization** |
+| `optimization_opportunities.csv` | 💡 Specific improvements with costs | **Implementation planning** |
+| `implementation_roadmap.txt` | 📅 Phased approach, timeline | **Project management** |
+| `thermal_rc_parameters.csv` | 🌡️ Room thermal characteristics | **Technical analysis** |
+| `weather_correlations.csv` | 🌤️ Weather impact factors | **Predictive modeling** |
+| Jupyter notebooks | 📊 Interactive charts & visualizations | **Detailed exploration** |
 
 ### Test Commands
 
-| Command | Description |
-|---------|-------------|
-| `make test-basic` | Basic structure and import tests |
-| `make test-extraction` | Data extraction from InfluxDB |
-| `make test-relay` | Relay analysis functionality |
-| `make test` | Full test suite with coverage |
-| `make lint` | Code formatting and quality check |
+| Command | Description | Duration |
+|---------|-------------|----------|
+| `make test-basic` | Basic structure and import tests | 30s |
+| `make test-extraction` | Data extraction from InfluxDB | 2 min |
+| `make test-relay` | Relay analysis functionality | 1 min |
+| `make test` | Full test suite with coverage | 3 min |
+| `make lint` | Code formatting and quality check | 30s |
+
+### 🚨 Troubleshooting Common Issues
+
+#### ❌ "No module named 'analysis'"
+```bash
+# Solution: Ensure you're in the right directory and venv is active
+cd /Users/tommarek/git/LoxoneSmartHome
+source venv/bin/activate
+cd pems_v2
+python analysis/run_analysis.py
+```
+
+#### ❌ "InfluxDB connection failed"
+```bash
+# Solution: Check your .env file
+cd /Users/tommarek/git/LoxoneSmartHome
+cat .env  # Verify INFLUXDB_* settings
+make test-extraction  # Test connection
+```
+
+#### ❌ "No data found for analysis period"
+```bash
+# Solution: Check available data range
+python -c "
+from pems_v2.analysis.core.data_extraction import DataExtractor
+import asyncio
+
+async def check_data():
+    extractor = DataExtractor()
+    available_dates = await extractor.get_available_date_range()
+    print(f'Data available from: {available_dates}')
+
+asyncio.run(check_data())
+"
+```
+
+#### ❌ "Analysis taking too long"
+```bash
+# Solution: Try smaller date range first
+python -c "
+import asyncio
+from datetime import datetime, timedelta
+from pems_v2.analysis.run_analysis import run_analysis
+
+async def quick_test():
+    # Test with just 30 days
+    end_date = datetime.now()
+    start_date = end_date - timedelta(days=30)
+    results = await run_analysis(start_date, end_date)
+    print('Quick analysis completed!')
+
+asyncio.run(quick_test())
+"
+```
+
+#### ❌ Jupyter notebooks not working
+```bash
+# Solution: Install Jupyter and update import paths
+pip install jupyter matplotlib seaborn
+cd /Users/tommarek/git/LoxoneSmartHome
+jupyter lab pems_v2_analysis/
+# All import paths are already updated for new location ✅
+```
 
 ## 📊 Comprehensive Analysis Pipeline
 

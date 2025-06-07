@@ -165,6 +165,18 @@ class ComprehensiveAnalyzer:
             if not self.raw_data["weather"].empty:
                 self.extractor.save_to_parquet(self.raw_data["weather"], "weather_data")
 
+            # Extract outdoor temperature data from teplomer sensor
+            self.logger.info("Extracting outdoor temperature data...")
+            try:
+                self.raw_data["outdoor_temp"] = await self.extractor.extract_outdoor_temperature_data(
+                    start_date, end_date
+                )
+                if not self.raw_data["outdoor_temp"].empty:
+                    self.extractor.save_to_parquet(self.raw_data["outdoor_temp"], "outdoor_temperature")
+            except Exception as e:
+                self.logger.warning(f"Could not extract outdoor temperature data: {e}")
+                self.raw_data["outdoor_temp"] = pd.DataFrame()
+
             # Extract energy consumption data
             self.logger.info("Extracting energy consumption data...")
             self.raw_data[
@@ -306,7 +318,7 @@ class ComprehensiveAnalyzer:
                 weather_data = self.processed_data.get("weather")
                 self.analysis_results[
                     "pv_analysis"
-                ] = await self.pv_analyzer.analyze_pv_production(
+                ] = self.pv_analyzer.analyze_pv_production(
                     self.processed_data["pv"], weather_data
                 )
                 self.logger.info("PV analysis completed successfully")
@@ -318,22 +330,24 @@ class ComprehensiveAnalyzer:
         if analysis_types.get("thermal", True) and "rooms" in self.processed_data:
             self.logger.info("Running thermal analysis...")
             try:
-                weather_data = self.processed_data.get("weather")
+                # Use outdoor temperature data from teplomer sensor if available, otherwise fallback to weather data
+                weather_data = self.processed_data.get("outdoor_temp")
+                if weather_data is None or weather_data.empty:
+                    self.logger.info("Using weather forecast data for thermal analysis")
+                    weather_data = self.processed_data.get("weather")
+                else:
+                    self.logger.info("Using outdoor temperature data from teplomer sensor for thermal analysis")
+                    self.logger.info(f"Outdoor temperature data shape: {weather_data.shape}")
+                    self.logger.info(f"Outdoor temperature columns: {list(weather_data.columns)}")
+                    self.logger.info(f"Outdoor temperature data preview:\n{weather_data.head()}")
+                
                 relay_data = self.processed_data.get("relay_states", {})
 
-                thermal_results = {}
-                for room_name, room_data in self.processed_data["rooms"].items():
-                    if not room_data.empty:
-                        room_relay_data = relay_data.get(room_name)
-                        thermal_results[
-                            room_name
-                        ] = await self.thermal_analyzer.analyze_room_thermal_dynamics(
-                            room_data, weather_data, room_relay_data, room_name
-                        )
-
-                self.analysis_results["thermal_analysis"] = thermal_results
+                self.analysis_results["thermal_analysis"] = self.thermal_analyzer.analyze_room_dynamics(
+                    self.processed_data["rooms"], weather_data, relay_data
+                )
                 self.logger.info(
-                    f"Thermal analysis completed for {len(thermal_results)} rooms"
+                    f"Thermal analysis completed for {len(self.processed_data['rooms'])} rooms"
                 )
             except Exception as e:
                 self.logger.error(f"Thermal analysis failed: {e}", exc_info=True)

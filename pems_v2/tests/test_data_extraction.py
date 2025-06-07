@@ -66,7 +66,7 @@ async def test_data_extraction():
 
             spec = importlib.util.spec_from_file_location(
                 "relay_analyzer",
-                Path(__file__).parent.parent / "test_relay_analysis.py",
+                Path(__file__).parent / "test_relay_analysis.py",
             )
             relay_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(relay_module)
