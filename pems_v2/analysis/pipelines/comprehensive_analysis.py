@@ -168,11 +168,15 @@ class ComprehensiveAnalyzer:
             # Extract outdoor temperature data from teplomer sensor
             self.logger.info("Extracting outdoor temperature data...")
             try:
-                self.raw_data["outdoor_temp"] = await self.extractor.extract_outdoor_temperature_data(
+                self.raw_data[
+                    "outdoor_temp"
+                ] = await self.extractor.extract_outdoor_temperature_data(
                     start_date, end_date
                 )
                 if not self.raw_data["outdoor_temp"].empty:
-                    self.extractor.save_to_parquet(self.raw_data["outdoor_temp"], "outdoor_temperature")
+                    self.extractor.save_to_parquet(
+                        self.raw_data["outdoor_temp"], "outdoor_temperature"
+                    )
             except Exception as e:
                 self.logger.warning(f"Could not extract outdoor temperature data: {e}")
                 self.raw_data["outdoor_temp"] = pd.DataFrame()
@@ -336,14 +340,24 @@ class ComprehensiveAnalyzer:
                     self.logger.info("Using weather forecast data for thermal analysis")
                     weather_data = self.processed_data.get("weather")
                 else:
-                    self.logger.info("Using outdoor temperature data from teplomer sensor for thermal analysis")
-                    self.logger.info(f"Outdoor temperature data shape: {weather_data.shape}")
-                    self.logger.info(f"Outdoor temperature columns: {list(weather_data.columns)}")
-                    self.logger.info(f"Outdoor temperature data preview:\n{weather_data.head()}")
-                
+                    self.logger.info(
+                        "Using outdoor temperature data from teplomer sensor for thermal analysis"
+                    )
+                    self.logger.info(
+                        f"Outdoor temperature data shape: {weather_data.shape}"
+                    )
+                    self.logger.info(
+                        f"Outdoor temperature columns: {list(weather_data.columns)}"
+                    )
+                    self.logger.info(
+                        f"Outdoor temperature data preview:\n{weather_data.head()}"
+                    )
+
                 relay_data = self.processed_data.get("relay_states", {})
 
-                self.analysis_results["thermal_analysis"] = self.thermal_analyzer.analyze_room_dynamics(
+                self.analysis_results[
+                    "thermal_analysis"
+                ] = self.thermal_analyzer.analyze_room_dynamics(
                     self.processed_data["rooms"], weather_data, relay_data
                 )
                 self.logger.info(

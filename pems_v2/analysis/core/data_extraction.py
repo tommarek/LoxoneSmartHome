@@ -397,13 +397,13 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract outdoor temperature data from solar bucket (teplomer sensor).
-        
+
         Returns DataFrame with columns:
         - timestamp: datetime index
         - outdoor_temp: outdoor temperature (°C)
         """
         self.logger.info("Extracting outdoor temperature data from teplomer sensor...")
-        
+
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
@@ -412,13 +412,13 @@ class DataExtractor:
           |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
           |> keep(columns: ["topic", "_time", "_value"])
         """
-        
+
         tables = self.query_api.query(query)
-        
+
         if not tables:
             self.logger.warning("No outdoor temperature data found")
             return pd.DataFrame()
-        
+
         # Convert to DataFrame
         records = []
         for table in tables:
@@ -429,15 +429,15 @@ class DataExtractor:
                         "outdoor_temp": record.get_value(),
                     }
                 )
-        
+
         if not records:
             self.logger.warning("No outdoor temperature records found")
             return pd.DataFrame()
-        
+
         df = pd.DataFrame(records)
         df["timestamp"] = pd.to_datetime(df["timestamp"])
         df.set_index("timestamp", inplace=True)
-        
+
         self.logger.info(f"Extracted {len(df)} outdoor temperature records")
         return df
 
@@ -505,11 +505,11 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract energy consumption data categorized by usage type.
-        
+
         NOTE: This method serves a different purpose than extract_pv_data():
         - extract_pv_data(): Focuses on energy GENERATION (solar, battery storage)
         - extract_energy_consumption(): Focuses on energy CONSUMPTION by category
-        
+
         This method extracts relay states and power measurements to calculate
         consumption for different categories (heating, lighting, etc.) as defined
         in CONSUMPTION_CATEGORIES. For heating, it multiplies relay states by
@@ -570,14 +570,14 @@ class DataExtractor:
             df = df.copy()
             df["power_kw"] = df["room"].apply(get_room_power)
             # Convert relay state (0/1) to actual power consumption
-            df["actual_power"] = (
-                df["value"] * df["power_kw"] * 1000
-            )  # Convert to W
+            df["actual_power"] = df["value"] * df["power_kw"] * 1000  # Convert to W
 
             # Group by timestamp and sum all rooms
             heating_consumption = df.groupby("timestamp")["actual_power"].sum()
             consumption_data["heating_power"] = heating_consumption
-            self.logger.info(f"Calculated heating consumption for {len(heating_consumption)} time points")
+            self.logger.info(
+                f"Calculated heating consumption for {len(heating_consumption)} time points"
+            )
 
         # Combine all consumption categories
         if consumption_data:
@@ -612,14 +612,14 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract battery charge/discharge data from InfluxDB.
-        
+
         NOTE: This method has some overlap with extract_pv_data() as both query
         battery fields (ChargePower, DischargePower, SOC) from the same bucket.
         However, this method:
         1. Focuses solely on battery data (no PV/inverter fields)
         2. Includes additional battery fields: BatteryVoltage, BatteryCurrent
         3. Calculates battery power from V*I for validation
-        
+
         Consider using extract_pv_data() if you need comprehensive energy data.
         Use this method if you only need battery-specific analysis.
 
@@ -714,16 +714,16 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract EV charging data from InfluxDB.
-        
-        NOTE: EV charging in this system is just a load without specific charging 
+
+        NOTE: EV charging in this system is just a load without specific charging
         timestamps or dedicated measurements. This method returns an empty DataFrame
         as a placeholder. To identify EV charging patterns:
-        
+
         1. Look for characteristic load patterns in total consumption data:
            - Sudden increase of 3.7kW (single phase) or 11kW (three phase)
            - Sustained load for 2-8 hours typically during night
            - Regular daily/weekly patterns
-           
+
         2. Use load disaggregation techniques in feature engineering phase
         3. Consider adding dedicated EV charger monitoring in the future
 
@@ -734,9 +734,9 @@ class DataExtractor:
             f"EV data extraction called for {start_date} to {end_date}, "
             "but EV charging is not separately tracked in the database"
         )
-        
+
         # Return empty DataFrame with expected columns for compatibility
-        return pd.DataFrame(columns=['ev_power', 'ev_energy_kwh', 'ev_connected'])
+        return pd.DataFrame(columns=["ev_power", "ev_energy_kwh", "ev_connected"])
 
     def save_to_parquet(self, df: pd.DataFrame, filename: str) -> None:
         """Save DataFrame to parquet file for fast loading."""

@@ -20,7 +20,9 @@ class InfluxDBSettings(BaseSettings):
     bucket_predictions: str = Field(default="predictions")
     bucket_optimization: str = Field(default="optimization")
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="INFLUXDB_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="INFLUXDB_", extra="ignore"
+    )
 
 
 class MQTTSettings(BaseSettings):
@@ -32,7 +34,9 @@ class MQTTSettings(BaseSettings):
     password: Optional[SecretStr] = Field(default=None)
     client_id: str = Field(default="pems_v2")
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="MQTT_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="MQTT_", extra="ignore"
+    )
 
 
 class PVPredictionSettings(BaseSettings):
@@ -54,7 +58,9 @@ class ThermalSettings(BaseSettings):
     default_setpoint_night: float = Field(default=19.0)
     comfort_band: float = Field(default=0.5)  # ±°C
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="THERMAL_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="THERMAL_", extra="ignore"
+    )
 
 
 class OptimizationSettings(BaseSettings):
@@ -72,7 +78,9 @@ class OptimizationSettings(BaseSettings):
     peak_shaving_weight: float = Field(default=0.1)
     comfort_weight: float = Field(default=0.5)
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="OPT_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="OPT_", extra="ignore"
+    )
 
 
 class BatterySettings(BaseSettings):
@@ -84,7 +92,9 @@ class BatterySettings(BaseSettings):
     min_soc: float = Field(default=0.1)
     max_soc: float = Field(default=0.9)
 
-    model_config = SettingsConfigDict(env_file=".env", env_prefix="BATTERY_", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env", env_prefix="BATTERY_", extra="ignore"
+    )
 
 
 class EVSettings(BaseSettings):
@@ -119,8 +129,5 @@ class PEMSSettings(BaseSettings):
     ev: EVSettings = Field(default_factory=EVSettings)
 
     model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        env_prefix="PEMS_",
-        extra="ignore"
+        env_file=".env", env_file_encoding="utf-8", env_prefix="PEMS_", extra="ignore"
     )

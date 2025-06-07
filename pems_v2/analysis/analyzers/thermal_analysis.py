@@ -190,30 +190,36 @@ class ThermalAnalyzer:
 
         # Merge with weather/outdoor temperature data
         if not weather_data.empty:
-            self.logger.info(f"Weather data available with columns: {list(weather_data.columns)}")
+            self.logger.info(
+                f"Weather data available with columns: {list(weather_data.columns)}"
+            )
             self.logger.info(f"Weather data shape: {weather_data.shape}")
             self.logger.info(f"Weather data index type: {type(weather_data.index)}")
             self.logger.info(f"Room data index type: {type(room_clean.index)}")
-            
+
             # Check for possible temperature column names (outdoor_temp from teplomer or temperature_2m from forecast)
             temp_column = None
             for col in ["outdoor_temp", "temperature_2m", "temperature", "temp"]:
                 if col in weather_data.columns:
                     temp_column = col
                     break
-            
+
             if temp_column:
                 self.logger.info(f"Using temperature column: {temp_column}")
-                
+
                 # Ensure both dataframes have datetime index
                 if not isinstance(weather_data.index, pd.DatetimeIndex):
-                    self.logger.warning("Weather data index is not DatetimeIndex, attempting conversion")
+                    self.logger.warning(
+                        "Weather data index is not DatetimeIndex, attempting conversion"
+                    )
                     weather_data.index = pd.to_datetime(weather_data.index)
-                
+
                 if not isinstance(room_clean.index, pd.DatetimeIndex):
-                    self.logger.warning("Room data index is not DatetimeIndex, attempting conversion")
+                    self.logger.warning(
+                        "Room data index is not DatetimeIndex, attempting conversion"
+                    )
                     room_clean.index = pd.to_datetime(room_clean.index)
-                
+
                 # Resample weather data to match room data frequency (5 minutes)
                 try:
                     weather_resampled = (
@@ -222,26 +228,32 @@ class ThermalAnalyzer:
                         .interpolate(method="linear")
                     )
                     weather_resampled.columns = ["outdoor_temp"]
-                    
+
                     # Use outer join to see what data we have
                     merged = room_clean.join(weather_resampled, how="left")
-                    
+
                     # Check if we got any outdoor temperature data
                     outdoor_temp_count = merged["outdoor_temp"].notna().sum()
-                    self.logger.info(f"Merged data has {outdoor_temp_count} valid outdoor temperature records out of {len(merged)}")
-                    
+                    self.logger.info(
+                        f"Merged data has {outdoor_temp_count} valid outdoor temperature records out of {len(merged)}"
+                    )
+
                     if outdoor_temp_count > 0:
                         # Forward fill missing outdoor temperature values
                         merged["outdoor_temp"] = merged["outdoor_temp"].ffill().bfill()
                     else:
-                        self.logger.warning("No outdoor temperature data was merged successfully")
-                        
+                        self.logger.warning(
+                            "No outdoor temperature data was merged successfully"
+                        )
+
                 except Exception as e:
                     self.logger.error(f"Error resampling weather data: {e}")
                     merged = room_clean
             else:
                 merged = room_clean
-                self.logger.warning(f"No temperature column found in weather data. Available columns: {list(weather_data.columns)}")
+                self.logger.warning(
+                    f"No temperature column found in weather data. Available columns: {list(weather_data.columns)}"
+                )
         else:
             merged = room_clean
             self.logger.warning("Weather data is empty")
@@ -249,9 +261,13 @@ class ThermalAnalyzer:
         # Calculate temperature difference if outdoor temperature is available
         if "outdoor_temp" in merged.columns:
             merged["temp_diff"] = merged["room_temp"] - merged["outdoor_temp"]
-            self.logger.info(f"Successfully merged room and outdoor temperature data. Outdoor temp range: {merged['outdoor_temp'].min():.1f}°C to {merged['outdoor_temp'].max():.1f}°C")
+            self.logger.info(
+                f"Successfully merged room and outdoor temperature data. Outdoor temp range: {merged['outdoor_temp'].min():.1f}°C to {merged['outdoor_temp'].max():.1f}°C"
+            )
         else:
-            self.logger.warning("No outdoor temperature data available for thermal analysis")
+            self.logger.warning(
+                "No outdoor temperature data available for thermal analysis"
+            )
 
         # Add time features
         merged["hour"] = merged.index.hour
@@ -780,21 +796,36 @@ class ThermalAnalyzer:
         # So: thermal_resistance R can be estimated from decay rate vs temp difference
         if "outdoor_temp" in data.columns:
             try:
-                self.logger.info(f"Attempting to merge outdoor temp data. Available columns in data: {list(data.columns)}")
-                self.logger.info(f"Cooling periods shape before merge: {cooling_periods.shape}")
-                
-                cooling_periods = cooling_periods.merge(
-                    data[["outdoor_temp"]], left_index=True, right_index=True, how="inner"
+                self.logger.info(
+                    f"Attempting to merge outdoor temp data. Available columns in data: {list(data.columns)}"
                 )
-                
-                self.logger.info(f"Cooling periods shape after merge: {cooling_periods.shape}")
-                self.logger.info(f"Cooling periods columns: {list(cooling_periods.columns)}")
+                self.logger.info(
+                    f"Cooling periods shape before merge: {cooling_periods.shape}"
+                )
+
+                cooling_periods = cooling_periods.merge(
+                    data[["outdoor_temp"]],
+                    left_index=True,
+                    right_index=True,
+                    how="inner",
+                )
+
+                self.logger.info(
+                    f"Cooling periods shape after merge: {cooling_periods.shape}"
+                )
+                self.logger.info(
+                    f"Cooling periods columns: {list(cooling_periods.columns)}"
+                )
 
                 if "outdoor_temp" not in cooling_periods.columns:
-                    self.logger.error(f"outdoor_temp column missing after merge. Available columns: {list(cooling_periods.columns)}")
+                    self.logger.error(
+                        f"outdoor_temp column missing after merge. Available columns: {list(cooling_periods.columns)}"
+                    )
                     return {"warning": "outdoor_temp column missing after merge"}
-                
-                temp_diff = cooling_periods["room_temp"] - cooling_periods["outdoor_temp"]
+
+                temp_diff = (
+                    cooling_periods["room_temp"] - cooling_periods["outdoor_temp"]
+                )
                 decay_rate = -cooling_periods["temp_change_rate"]  # Make positive
             except Exception as e:
                 self.logger.error(f"Error in outdoor temp merge: {e}")

@@ -3,8 +3,8 @@
     "total_records": 65806,
     "clean_records": 65806,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 14:15:00+00:00"
+      "2023-06-08 20:45:00+00:00",
+      "2025-06-07 18:45:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,
@@ -33,11 +33,11 @@
     "cleaning_summary": "Cleaned 65806 -> 65806 records, missing data: 0.0% -> 0.0%"
   },
   "room_chodba_dole": {
-    "total_records": 46481,
-    "clean_records": 46481,
+    "total_records": 46482,
+    "clean_records": 46482,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 13:45:00+00:00"
+      "2023-06-08 21:35:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 57.65,
     "clean_missing_percentage": 12.43,
@@ -83,14 +83,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 46481 -> 46481 records, missing data: 57.7% -> 12.4%"
+    "cleaning_summary": "Cleaned 46482 -> 46482 records, missing data: 57.7% -> 12.4%"
   },
   "room_chodba_nahore": {
-    "total_records": 196738,
-    "clean_records": 196738,
+    "total_records": 196735,
+    "clean_records": 196735,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:15:00+00:00"
+      "2023-06-08 20:40:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 49.44,
     "clean_missing_percentage": 43.37,
@@ -112,16 +112,16 @@
         "0 days 05:45:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 196738 -> 196738 records, missing data: 49.4% -> 43.4%"
+    "cleaning_summary": "Cleaned 196735 -> 196735 records, missing data: 49.4% -> 43.4%"
   },
   "room_hosti": {
-    "total_records": 39663,
-    "clean_records": 39663,
+    "total_records": 39680,
+    "clean_records": 39680,
     "date_range": [
-      "2023-06-08 16:55:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 20:45:00+00:00",
+      "2025-06-07 18:25:00+00:00"
     ],
-    "original_missing_percentage": 59.75,
+    "original_missing_percentage": 59.74,
     "clean_missing_percentage": 26.61,
     "time_gaps": [
       [
@@ -165,14 +165,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 39663 -> 39663 records, missing data: 59.7% -> 26.6%"
+    "cleaning_summary": "Cleaned 39680 -> 39680 records, missing data: 59.7% -> 26.6%"
   },
   "room_koupelna_dole": {
-    "total_records": 47842,
-    "clean_records": 47842,
+    "total_records": 47835,
+    "clean_records": 47835,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 20:55:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 56.58,
     "clean_missing_percentage": 19.19,
@@ -218,16 +218,16 @@
         "0 days 02:45:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 47842 -> 47842 records, missing data: 56.6% -> 19.2%"
+    "cleaning_summary": "Cleaned 47835 -> 47835 records, missing data: 56.6% -> 19.2%"
   },
   "room_koupelna_nahore": {
-    "total_records": 48518,
-    "clean_records": 48518,
+    "total_records": 48526,
+    "clean_records": 48526,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 21:05:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
-    "original_missing_percentage": 60.38,
+    "original_missing_percentage": 60.37,
     "clean_missing_percentage": 20.83,
     "time_gaps": [
       [
@@ -271,14 +271,14 @@
         "0 days 02:35:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 48518 -> 48518 records, missing data: 60.4% -> 20.8%"
+    "cleaning_summary": "Cleaned 48526 -> 48526 records, missing data: 60.4% -> 20.8%"
   },
   "room_kuchyne": {
-    "total_records": 45453,
-    "clean_records": 45453,
+    "total_records": 45452,
+    "clean_records": 45452,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 13:55:00+00:00"
+      "2023-06-08 20:50:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 31.09,
     "clean_missing_percentage": 0.02,
@@ -324,14 +324,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 45453 -> 45453 records, missing data: 31.1% -> 0.0%"
+    "cleaning_summary": "Cleaned 45452 -> 45452 records, missing data: 31.1% -> 0.0%"
   },
   "room_loznice": {
-    "total_records": 49408,
-    "clean_records": 49408,
+    "total_records": 49420,
+    "clean_records": 49420,
     "date_range": [
-      "2023-06-08 16:45:00+00:00",
-      "2025-06-07 14:05:00+00:00"
+      "2023-06-08 21:00:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 58.33,
     "clean_missing_percentage": 18.61,
@@ -377,14 +377,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 49408 -> 49408 records, missing data: 58.3% -> 18.6%"
+    "cleaning_summary": "Cleaned 49420 -> 49420 records, missing data: 58.3% -> 18.6%"
   },
   "room_obyvak": {
     "total_records": 59947,
-    "clean_records": 57631,
+    "clean_records": 57630,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 21:05:00+00:00",
+      "2025-06-07 18:30:00+00:00"
     ],
     "original_missing_percentage": 54.3,
     "clean_missing_percentage": 16.33,
@@ -430,14 +430,14 @@
         "0 days 02:30:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 59947 -> 57631 records, missing data: 54.3% -> 16.3%"
+    "cleaning_summary": "Cleaned 59947 -> 57630 records, missing data: 54.3% -> 16.3%"
   },
   "room_outside": {
-    "total_records": 135787,
-    "clean_records": 135787,
+    "total_records": 135793,
+    "clean_records": 135793,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 20:45:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.1,
@@ -459,14 +459,14 @@
         "0 days 06:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 135787 -> 135787 records, missing data: 0.0% -> 0.1%"
+    "cleaning_summary": "Cleaned 135793 -> 135793 records, missing data: 0.0% -> 0.1%"
   },
   "room_pokoj_1": {
-    "total_records": 45757,
-    "clean_records": 45757,
+    "total_records": 45764,
+    "clean_records": 45764,
     "date_range": [
-      "2023-06-08 17:15:00+00:00",
-      "2025-06-07 14:05:00+00:00"
+      "2023-06-08 20:55:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 59.2,
     "clean_missing_percentage": 17.86,
@@ -512,17 +512,17 @@
         "0 days 05:20:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 45757 -> 45757 records, missing data: 59.2% -> 17.9%"
+    "cleaning_summary": "Cleaned 45764 -> 45764 records, missing data: 59.2% -> 17.9%"
   },
   "room_pokoj_2": {
-    "total_records": 35281,
-    "clean_records": 35281,
+    "total_records": 35292,
+    "clean_records": 35292,
     "date_range": [
-      "2023-06-08 16:30:00+00:00",
-      "2025-06-07 14:05:00+00:00"
+      "2023-06-08 21:00:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 61.9,
-    "clean_missing_percentage": 28.11,
+    "clean_missing_percentage": 28.1,
     "time_gaps": [
       [
         "2023-06-09 01:30:00+00:00",
@@ -565,17 +565,17 @@
         "0 days 02:20:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 35281 -> 35281 records, missing data: 61.9% -> 28.1%"
+    "cleaning_summary": "Cleaned 35292 -> 35292 records, missing data: 61.9% -> 28.1%"
   },
   "room_pracovna": {
-    "total_records": 42082,
-    "clean_records": 42082,
+    "total_records": 42086,
+    "clean_records": 42086,
     "date_range": [
-      "2023-06-08 16:25:00+00:00",
-      "2025-06-07 14:05:00+00:00"
+      "2023-06-08 21:15:00+00:00",
+      "2025-06-07 18:30:00+00:00"
     ],
     "original_missing_percentage": 56.47,
-    "clean_missing_percentage": 14.34,
+    "clean_missing_percentage": 14.35,
     "time_gaps": [
       [
         "2023-06-10 01:35:00+00:00",
@@ -618,14 +618,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 42082 -> 42082 records, missing data: 56.5% -> 14.3%"
+    "cleaning_summary": "Cleaned 42086 -> 42086 records, missing data: 56.5% -> 14.3%"
   },
   "room_satna_dole": {
-    "total_records": 64648,
-    "clean_records": 64648,
+    "total_records": 64647,
+    "clean_records": 64647,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 14:00:00+00:00"
+      "2023-06-08 20:40:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 49.49,
     "clean_missing_percentage": 31.97,
@@ -671,14 +671,14 @@
         "0 days 02:15:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 64648 -> 64648 records, missing data: 49.5% -> 32.0%"
+    "cleaning_summary": "Cleaned 64647 -> 64647 records, missing data: 49.5% -> 32.0%"
   },
   "room_satna_nahore": {
-    "total_records": 78289,
-    "clean_records": 78289,
+    "total_records": 78293,
+    "clean_records": 78293,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 21:10:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 49.65,
     "clean_missing_percentage": 42.02,
@@ -724,14 +724,14 @@
         "0 days 02:30:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 78289 -> 78289 records, missing data: 49.6% -> 42.0%"
+    "cleaning_summary": "Cleaned 78293 -> 78293 records, missing data: 49.6% -> 42.0%"
   },
   "room_spajz": {
     "total_records": 53371,
     "clean_records": 53371,
     "date_range": [
-      "2023-06-08 16:30:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 21:05:00+00:00",
+      "2025-06-07 18:25:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,
@@ -780,14 +780,14 @@
     "cleaning_summary": "Cleaned 53371 -> 53371 records, missing data: 0.0% -> 0.0%"
   },
   "room_technicka_mistnost": {
-    "total_records": 66661,
-    "clean_records": 66661,
+    "total_records": 66660,
+    "clean_records": 66660,
     "date_range": [
-      "2023-06-08 16:35:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 21:30:00+00:00",
+      "2025-06-07 18:40:00+00:00"
     ],
     "original_missing_percentage": 49.23,
-    "clean_missing_percentage": 29.8,
+    "clean_missing_percentage": 29.81,
     "time_gaps": [
       [
         "2023-06-09 02:10:00+00:00",
@@ -830,14 +830,14 @@
         "0 days 07:05:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 66661 -> 66661 records, missing data: 49.2% -> 29.8%"
+    "cleaning_summary": "Cleaned 66660 -> 66660 records, missing data: 49.2% -> 29.8%"
   },
   "room_zachod": {
     "total_records": 195195,
     "clean_records": 195195,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 20:40:00+00:00",
+      "2025-06-07 18:40:00+00:00"
     ],
     "original_missing_percentage": 49.58,
     "clean_missing_percentage": 44.06,
@@ -862,11 +862,11 @@
     "cleaning_summary": "Cleaned 195195 -> 195195 records, missing data: 49.6% -> 44.1%"
   },
   "room_zadveri": {
-    "total_records": 186406,
-    "clean_records": 186406,
+    "total_records": 186405,
+    "clean_records": 186405,
     "date_range": [
-      "2023-06-08 16:20:00+00:00",
-      "2025-06-07 14:10:00+00:00"
+      "2023-06-08 20:40:00+00:00",
+      "2025-06-07 18:35:00+00:00"
     ],
     "original_missing_percentage": 49.53,
     "clean_missing_percentage": 43.62,
@@ -888,14 +888,14 @@
         "0 days 05:45:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 186406 -> 186406 records, missing data: 49.5% -> 43.6%"
+    "cleaning_summary": "Cleaned 186405 -> 186405 records, missing data: 49.5% -> 43.6%"
   },
   "weather": {
-    "total_records": 32846,
-    "clean_records": 32846,
+    "total_records": 32845,
+    "clean_records": 32845,
     "date_range": [
-      "2023-06-08 16:45:00+00:00",
-      "2025-06-07 14:15:00+00:00"
+      "2023-06-08 21:15:00+00:00",
+      "2025-06-07 18:15:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,
@@ -933,14 +933,14 @@
         "42 days 21:00:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 32846 -> 32846 records, missing data: 0.0% -> 0.0%"
+    "cleaning_summary": "Cleaned 32845 -> 32845 records, missing data: 0.0% -> 0.0%"
   },
   "outdoor_temp": {
-    "total_records": 199800,
-    "clean_records": 199800,
+    "total_records": 199853,
+    "clean_records": 199853,
     "date_range": [
       "2023-06-21 19:50:00+00:00",
-      "2025-06-07 14:15:00+00:00"
+      "2025-06-07 18:40:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,
@@ -982,7 +982,7 @@
         "0 days 12:30:00"
       ]
     ],
-    "cleaning_summary": "Cleaned 199800 -> 199800 records, missing data: 0.0% -> 0.0%"
+    "cleaning_summary": "Cleaned 199853 -> 199853 records, missing data: 0.0% -> 0.0%"
   },
   "consumption": {
     "total_records": 11149,
@@ -1041,8 +1041,8 @@
     "total_records": 17518,
     "clean_records": 17518,
     "date_range": [
-      "2023-06-08 18:00:00+00:00",
-      "2025-06-07 16:12:34.382157+00:00"
+      "2023-06-08 22:00:00+00:00",
+      "2025-06-07 20:36:16.650830+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,
@@ -1954,8 +1954,8 @@
     "total_records": 65806,
     "clean_records": 65806,
     "date_range": [
-      "2023-06-08 16:15:00+00:00",
-      "2025-06-07 14:15:00+00:00"
+      "2023-06-08 20:45:00+00:00",
+      "2025-06-07 18:45:00+00:00"
     ],
     "original_missing_percentage": 0.0,
     "clean_missing_percentage": 0.0,

@@ -946,10 +946,10 @@ class RelayPatternAnalyzer:
         # Handle different types of relay_data input
         if relay_data is None:
             return {"error": "No relay data provided"}
-        
+
         if isinstance(relay_data, pd.DataFrame) and relay_data.empty:
             return {"error": "No relay data provided"}
-        
+
         if isinstance(relay_data, dict) and not relay_data:
             return {"error": "No relay data provided"}
 
