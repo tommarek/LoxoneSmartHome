@@ -7,7 +7,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import ClientSession
-
 from config.settings import Settings
 from modules.weather_scraper import HourlyData, WeatherScraper
 
@@ -21,7 +20,9 @@ def mock_settings() -> Settings:
     settings.weather.longitude = 14.51994
     settings.weather.openmeteo_url = "https://api.open-meteo.com/v1/forecast"
     settings.weather.aladin_url_base = "http://www.nts2.cz:443/meteo/aladin/"
-    settings.weather.openweathermap_url = "https://api.openweathermap.org/data/2.5/onecall"
+    settings.weather.openweathermap_url = (
+        "https://api.openweathermap.org/data/2.5/onecall"
+    )
     settings.weather.openweathermap_api_key = "test-api-key"
     settings.weather.update_interval = 1800
     settings.weather.retry_delay = 60
@@ -67,7 +68,9 @@ def weather_scraper(
 def mock_openmeteo_response() -> Dict[str, Any]:
     """Mock OpenMeteo API response."""
     current_time = int(
-        datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+        datetime.now(timezone.utc)
+        .replace(minute=0, second=0, microsecond=0)
+        .timestamp()
     )
     return {
         "hourly": {
@@ -219,7 +222,10 @@ class TestWeatherScraper:
         # Mock the HTTP session
         mock_response = AsyncMock()
         mock_response.json = AsyncMock()
-        mock_response.json.side_effect = [mock_openmeteo_response, mock_air_quality_response]
+        mock_response.json.side_effect = [
+            mock_openmeteo_response,
+            mock_air_quality_response,
+        ]
 
         weather_scraper._session = create_mock_session(mock_response)
 
@@ -318,7 +324,13 @@ class TestWeatherScraper:
     async def test_hourly_data_format(self) -> None:
         """Test HourlyData named tuple format."""
         data = HourlyData(
-            temp=20.5, precip=0.0, wind=5.2, wind_direction=180, clouds=25, rh=65, pressure=1013.25
+            temp=20.5,
+            precip=0.0,
+            wind=5.2,
+            wind_direction=180,
+            clouds=25,
+            rh=65,
+            pressure=1013.25,
         )
 
         data_dict = data._asdict()

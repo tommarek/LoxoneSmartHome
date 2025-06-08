@@ -1,0 +1,11 @@
+# Minimal requirements for testing Phase 1
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+influxdb-client>=1.40.0
+pandas>=2.2.0
+numpy>=1.26.0
+pytz>=2023.3
+scipy>=1.11.0
+statsmodels>=0.14.0
+scikit-learn>=1.4.0

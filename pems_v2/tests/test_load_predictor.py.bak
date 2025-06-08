@@ -1,0 +1,612 @@
+"""
+Test suite for LoadPredictor.
+
+Tests ensemble load forecasting, pattern decomposition, and feature engineering
+with comprehensive scenarios for base electrical consumption prediction.
+"""
+
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from pems_v2.models.predictors.load_predictor import LoadComponent, LoadPredictor
+
+
+@pytest.fixture
+def load_config():
+    """Sample load model configuration."""
+    return {
+        "decomposition_method": "nmf",
+        "n_components": 3,
+        "prediction_horizon": 24,
+        "include_weather": True,
+        "include_occupancy": True,
+    }
+
+
+@pytest.fixture
+def sample_load_data():
+    """Generate realistic load consumption training data."""
+    # 7 days of 15-minute data
+    timestamps = pd.date_range("2024-01-01 00:00:00", periods=672, freq="15min")
+
+    # Base load pattern with daily cycle
+    base_load = 2.0  # 2 kW constant base load
+
+    # Daily consumption pattern (higher in evening, lower at night)
+    hour_of_day = (np.arange(672) % 96) / 4  # 0-24 hour cycle (96 intervals per day)
+    daily_pattern = (
+        1.0
+        + 0.5 * np.sin(2 * np.pi * (hour_of_day - 6) / 24)  # Base multiplier
+        + 0.3 * np.sin(2 * np.pi * hour_of_day / 12)  # Peak in evening  # Lunch peak
+    )
+
+    # Weekend effect (higher consumption)
+    day_of_week = timestamps.dayofweek
+    weekend_effect = np.where(day_of_week >= 5, 1.2, 1.0)
+
+    # Weather-dependent load (simplified)
+    outdoor_temp = 10 + 8 * np.sin(2 * np.pi * np.arange(672) / 96) + np.random.normal(0, 2, 672)
+    weather_load = np.where(outdoor_temp > 25, 0.5, 0) + np.where(
+        outdoor_temp < 5, 0.3, 0
+    )  # AC and heating
+
+    # Random appliance usage
+    appliance_load = np.random.exponential(0.5, 672) * (
+        np.random.random(672) < 0.3
+    )  # 30% chance of appliance use
+
+    # Total load
+    total_load = base_load * daily_pattern * weekend_effect + weather_load + appliance_load
+    total_load = np.maximum(total_load, 0.5)  # Minimum load
+
+    # Add some noise
+    total_load += np.random.normal(0, 0.1, 672)
+
+    # Create DataFrame
+    data = pd.DataFrame(
+        {
+            "load": total_load,
+            "consumption": total_load,  # Alias
+            "outdoor_temp": outdoor_temp,
+            "relativehumidity_2m": 60 + np.random.normal(0, 10, 672),
+            "windspeed_10m": 5 + np.random.normal(0, 2, 672),
+            "solar_radiation": np.maximum(
+                0, 600 * np.sin(np.pi * hour_of_day / 24) + np.random.normal(0, 50, 672)
+            ),
+        },
+        index=timestamps,
+    )
+
+    return data
+
+
+class TestLoadComponent:
+    """Test suite for LoadComponent class."""
+
+    def test_load_component_initialization(self):
+        """Test load component initialization."""
+        component = LoadComponent("appliances", "periodic")
+
+        assert component.name == "appliances"
+        assert component.pattern_type == "periodic"
+        assert component.contribution == 0.0
+        assert component.model is None
+
+    def test_extract_pattern(self, sample_load_data):
+        """Test pattern extraction from load data."""
+        component = LoadComponent("test_component")
+
+        load_series = sample_load_data["load"]
+        patterns = component.extract_pattern(load_series, sample_load_data.index)
+
+        # Check pattern structure
+        assert "daily_pattern" in patterns
+        assert "weekly_pattern" in patterns
+        assert "seasonal_pattern" in patterns
+        assert "statistics" in patterns
+
+        # Check daily pattern (24 hours)
+        assert len(patterns["daily_pattern"]) == 24
+
+        # Check weekly pattern (7 days)
+        assert len(patterns["weekly_pattern"]) == 7
+
+        # Check statistics
+        stats = patterns["statistics"]
+        assert "mean" in stats
+        assert "std" in stats
+        assert "variability" in stats
+        assert stats["mean"] > 0
+        assert stats["std"] > 0
+
+
+class TestLoadPredictor:
+    """Test suite for LoadPredictor class."""
+
+    def test_initialization(self, load_config):
+        """Test load predictor initialization."""
+        predictor = LoadPredictor(load_config)
+
+        assert predictor.decomposition_method == "nmf"
+        assert predictor.n_components == 3
+        assert predictor.prediction_horizon == 24
+        assert predictor.include_weather is True
+        assert predictor.include_occupancy is True
+        assert predictor.base_model is not None
+        assert predictor.pattern_model is not None
+        assert predictor.trend_model is not None
+
+    def test_feature_extraction(self, load_config, sample_load_data):
+        """Test load feature engineering."""
+        predictor = LoadPredictor(load_config)
+
+        features = predictor._extract_load_features(sample_load_data)
+
+        # Check essential temporal features
+        assert "hour" in features.columns
+        assert "day_of_week" in features.columns
+        assert "month" in features.columns
+        assert "hour_sin" in features.columns
+        assert "hour_cos" in features.columns
+        assert "is_weekend" in features.columns
+        assert "is_holiday" in features.columns
+
+        # Check time-based patterns
+        assert "is_business_hours" in features.columns
+        assert "is_evening" in features.columns
+        assert "is_night" in features.columns
+
+        # Check weather features (when enabled)
+        assert "outdoor_temp" in features.columns
+        assert "humidity" in features.columns
+        assert "solar_radiation" in features.columns
+
+        # Check occupancy features (when enabled)
+        assert "occupancy_prob" in features.columns
+        assert "wfh_indicator" in features.columns
+
+        # Check lag features
+        assert "load_lag_1h" in features.columns
+        assert "load_lag_24h" in features.columns
+        assert "load_rolling_mean_24h" in features.columns
+
+        # Check feature engineering
+        assert len(features) == len(sample_load_data)
+        assert features["hour_sin"].min() >= -1
+        assert features["hour_sin"].max() <= 1
+        assert features["is_weekend"].dtype == "int64"
+
+    def test_holiday_detection(self, load_config):
+        """Test holiday detection functionality."""
+        predictor = LoadPredictor(load_config)
+
+        # Test with specific dates
+        timestamps = pd.date_range("2024-01-01", "2024-12-31", freq="D")
+        holidays = predictor._detect_holidays(timestamps)
+
+        # Check that New Year's Day is detected
+        assert holidays.loc["2024-01-01"] == True
+        # Check that Christmas is detected
+        assert holidays.loc["2024-12-25"] == True
+        # Check that a regular day is not a holiday
+        assert holidays.loc["2024-03-15"] == False
+
+    def test_weather_feature_extraction(self, load_config, sample_load_data):
+        """Test weather feature extraction."""
+        predictor = LoadPredictor(load_config)
+
+        weather_features = predictor._extract_weather_features(sample_load_data)
+
+        # Check weather features
+        assert "outdoor_temp" in weather_features.columns
+        assert "temp_deviation" in weather_features.columns
+        assert "cooling_degree_hours" in weather_features.columns
+        assert "heating_degree_hours" in weather_features.columns
+        assert "humidity" in weather_features.columns
+        assert "solar_radiation" in weather_features.columns
+
+        # Check calculations
+        assert (weather_features["cooling_degree_hours"] >= 0).all()
+        assert (weather_features["heating_degree_hours"] >= 0).all()
+
+    def test_occupancy_feature_extraction(self, load_config, sample_load_data):
+        """Test occupancy feature extraction."""
+        predictor = LoadPredictor(load_config)
+
+        # Extract temporal features first
+        features = predictor._extract_load_features(sample_load_data)
+        time_features = features[
+            [
+                "hour",
+                "day_of_week",
+                "is_weekend",
+                "is_business_hours",
+                "is_evening",
+                "is_night",
+            ]
+        ]
+
+        occupancy_features = predictor._extract_occupancy_features(sample_load_data, time_features)
+
+        # Check occupancy features
+        assert "occupancy_prob" in occupancy_features.columns
+        assert "wfh_indicator" in occupancy_features.columns
+        assert "sleep_hours" in occupancy_features.columns
+
+        # Check value ranges
+        assert (occupancy_features["occupancy_prob"] >= 0).all()
+        assert (occupancy_features["occupancy_prob"] <= 1).all()
+
+    def test_load_decomposition(self, load_config, sample_load_data):
+        """Test load decomposition functionality."""
+        predictor = LoadPredictor(load_config)
+
+        # Extract features for decomposition
+        features = predictor._extract_load_features(sample_load_data)
+        load_data = sample_load_data["load"]
+
+        # Test NMF decomposition
+        decomposed = predictor._decompose_load(load_data, features)
+
+        # Check decomposition results
+        assert isinstance(decomposed, dict)
+        assert len(decomposed) >= predictor.n_components + 2  # Components + baseline + variable
+        assert "baseline" in decomposed
+        assert "variable" in decomposed
+
+        # Check baseline load calculation
+        assert predictor.baseline_load is not None
+        assert predictor.baseline_load > 0
+        assert predictor.baseline_load < load_data.mean()  # Should be less than average
+
+    def test_pattern_analysis(self, load_config, sample_load_data):
+        """Test load pattern analysis."""
+        predictor = LoadPredictor(load_config)
+
+        # Extract features
+        features = predictor._extract_load_features(sample_load_data)
+        load_data = sample_load_data["load"]
+
+        analysis = predictor._analyze_load_patterns(load_data, features)
+
+        # Check analysis structure
+        assert "statistics" in analysis
+        assert "daily_pattern" in analysis
+        assert "weekly_pattern" in analysis
+
+        # Check statistics
+        stats = analysis["statistics"]
+        assert "mean_load" in stats
+        assert "std_load" in stats
+        assert "load_factor" in stats
+        assert stats["mean_load"] > 0
+        assert 0 <= stats["load_factor"] <= 1
+
+        # Check daily pattern
+        daily = analysis["daily_pattern"]
+        assert "peak_hour" in daily
+        assert "min_hour" in daily
+        assert 0 <= daily["peak_hour"] <= 23
+        assert 0 <= daily["min_hour"] <= 23
+
+        # Check weekly pattern
+        weekly = analysis["weekly_pattern"]
+        assert "weekday_avg" in weekly
+        assert "weekend_avg" in weekly
+        assert weekly["weekday_avg"] > 0
+        assert weekly["weekend_avg"] > 0
+
+    def test_training(self, load_config, sample_load_data):
+        """Test load model training."""
+        predictor = LoadPredictor(load_config)
+
+        # Prepare training data
+        features = sample_load_data.drop(columns=["load"])
+        target = sample_load_data["load"]
+
+        # Mock decomposition to speed up test
+        with patch.object(predictor, "_decompose_load") as mock_decompose:
+
+            def mock_decompose_side_effect(load_data, features):
+                predictor.baseline_load = 2.0  # Set baseline load
+                return {
+                    "baseline": pd.Series(2.0, index=target.index),
+                    "variable": target - 2.0,
+                    "nmf_component_0": target * 0.3,
+                    "nmf_component_1": target * 0.4,
+                    "nmf_component_2": target * 0.3,
+                }
+
+            mock_decompose.side_effect = mock_decompose_side_effect
+
+            # Mock pattern analysis
+            with patch.object(predictor, "_analyze_load_patterns") as mock_analyze:
+                mock_analyze.return_value = {
+                    "statistics": {"mean_load": target.mean()},
+                    "daily_pattern": {"peak_hour": 20},
+                }
+
+                performance = predictor.train(features, target)
+
+        # Check training results
+        assert isinstance(performance.rmse, float)
+        assert isinstance(performance.mae, float)
+        assert isinstance(performance.r2, float)
+        assert performance.rmse > 0
+        assert performance.mae > 0
+
+        # Check that models are trained
+        assert predictor.base_model is not None
+        assert predictor.ensemble_weights is not None
+        assert len(predictor.ensemble_weights) == 3  # base, pattern, trend
+
+        # Check that weights sum to approximately 1
+        total_weight = sum(predictor.ensemble_weights.values())
+        assert abs(total_weight - 1.0) < 0.01
+
+    def test_prediction(self, load_config, sample_load_data):
+        """Test load prediction."""
+        predictor = LoadPredictor(load_config)
+
+        # Setup trained model (mock training state)
+        predictor.feature_scaler = MagicMock()
+        predictor.feature_scaler.transform.return_value = np.random.random((100, 20))
+        predictor.target_scaler = MagicMock()
+        predictor.target_scaler.inverse_transform.return_value = np.random.random((100, 1))
+        predictor.pattern_scaler = MagicMock()
+        predictor.pattern_scaler.transform.return_value = np.random.random((100, 8))
+        predictor.trend_scaler = MagicMock()
+        predictor.trend_scaler.transform.return_value = np.random.random((100, 4))
+
+        # Mock models
+        predictor.base_model = MagicMock()
+        predictor.base_model.predict.return_value = np.random.random(100)
+        predictor.pattern_model = MagicMock()
+        predictor.pattern_model.predict.return_value = np.random.random(100)
+        predictor.trend_model = MagicMock()
+        predictor.trend_model.predict.return_value = np.random.random(100)
+
+        # Set ensemble weights
+        predictor.ensemble_weights = {"base": 0.5, "pattern": 0.3, "trend": 0.2}
+
+        # Test prediction
+        test_data = sample_load_data.iloc[:100]
+
+        result = predictor.predict(test_data, return_uncertainty=True)
+
+        # Check prediction results
+        assert len(result.predictions) == 100
+        assert result.uncertainty is not None
+        assert len(result.uncertainty) == 100
+        assert result.confidence_intervals is not None
+        assert "lower_95" in result.confidence_intervals
+        assert "upper_95" in result.confidence_intervals
+
+        # Check prediction values are reasonable
+        assert (result.predictions > 0).all()
+
+    def test_prediction_without_training(self, load_config, sample_load_data):
+        """Test that prediction fails without training."""
+        predictor = LoadPredictor(load_config)
+
+        test_data = sample_load_data.iloc[:10]
+
+        with pytest.raises(ValueError, match="Model must be trained before making predictions"):
+            predictor.predict(test_data)
+
+    def test_online_update(self, load_config, sample_load_data):
+        """Test online model adaptation."""
+        predictor = LoadPredictor(load_config)
+
+        # Setup minimal trained state
+        predictor.base_model = MagicMock()
+        predictor.feature_scaler.scale_ = np.array([1.0])  # Mark as fitted
+        predictor.baseline_load = 2.0
+        predictor.ensemble_weights = {"base": 0.5, "pattern": 0.3, "trend": 0.2}
+        predictor.prediction_accuracy = {"last_mae": 0.5}
+
+        # Mock prediction method
+        with patch.object(predictor, "predict") as mock_predict:
+            mock_result = MagicMock()
+            mock_result.predictions = pd.Series([3.0] * 20)  # Mock predictions
+            mock_predict.return_value = mock_result
+
+            # Test online update
+            new_data = sample_load_data.iloc[:20]
+            new_load = pd.Series([2.5] * 20)  # Different from predictions
+
+            predictor.update_online(new_data, new_load)
+
+        # Check that baseline was updated
+        assert predictor.baseline_load is not None
+        # Baseline should be updated with exponential moving average
+        assert predictor.baseline_load != 2.0  # Should change
+
+    def test_load_insights(self, load_config):
+        """Test load insights generation."""
+        predictor = LoadPredictor(load_config)
+
+        # Setup trained model state
+        predictor.base_model = MagicMock()
+        predictor.base_model.n_estimators = 100
+        predictor.feature_scaler.scale_ = np.array([1.0])  # Mark as fitted
+        predictor.pattern_model = MagicMock()
+        predictor.pattern_model.n_estimators = 50
+        predictor.baseline_load = 2.0
+        predictor.ensemble_weights = {"base": 0.5, "pattern": 0.3, "trend": 0.2}
+        predictor.component_contributions = {"baseline_load": 0.6, "variable_load": 0.4}
+        predictor.prediction_accuracy = {"last_mae": 0.3}
+
+        insights = predictor.get_load_insights()
+
+        # Check insights structure
+        assert "model_configuration" in insights
+        assert "load_characteristics" in insights
+        assert "ensemble_performance" in insights
+        assert "feature_importance" in insights
+        assert "model_complexity" in insights
+
+        # Check configuration
+        config = insights["model_configuration"]
+        assert config["decomposition_method"] == "nmf"
+        assert config["n_components"] == 3
+        assert config["include_weather"] is True
+
+        # Check load characteristics
+        load_chars = insights["load_characteristics"]
+        assert load_chars["baseline_load_kw"] == 2.0
+        assert load_chars["baseline_contribution"] == 0.6
+
+        # Check ensemble performance
+        ensemble = insights["ensemble_performance"]
+        assert ensemble["base_model_weight"] == 0.5
+        assert ensemble["pattern_model_weight"] == 0.3
+        assert ensemble["last_mae"] == 0.3
+
+    def test_insights_without_training(self, load_config):
+        """Test insights with untrained model."""
+        predictor = LoadPredictor(load_config)
+
+        insights = predictor.get_load_insights()
+        assert "error" in insights
+        assert insights["error"] == "Model not trained"
+
+    def test_decomposition_methods(self, load_config, sample_load_data):
+        """Test different decomposition methods."""
+        # Test NMF
+        config_nmf = load_config.copy()
+        config_nmf["decomposition_method"] = "nmf"
+        predictor_nmf = LoadPredictor(config_nmf)
+
+        features = predictor_nmf._extract_load_features(sample_load_data)
+        decomposed_nmf = predictor_nmf._decompose_load(sample_load_data["load"], features)
+        assert "nmf_component_0" in decomposed_nmf
+
+        # Test PCA
+        config_pca = load_config.copy()
+        config_pca["decomposition_method"] = "pca"
+        predictor_pca = LoadPredictor(config_pca)
+
+        decomposed_pca = predictor_pca._decompose_load(sample_load_data["load"], features)
+        assert "pca_component_0" in decomposed_pca
+
+        # Test Clustering
+        config_cluster = load_config.copy()
+        config_cluster["decomposition_method"] = "clustering"
+        predictor_cluster = LoadPredictor(config_cluster)
+
+        decomposed_cluster = predictor_cluster._decompose_load(sample_load_data["load"], features)
+        assert "cluster_component_0" in decomposed_cluster
+
+    def test_feature_engineering_edge_cases(self, load_config):
+        """Test feature engineering with edge cases."""
+        predictor = LoadPredictor(load_config)
+
+        # Test with minimal data (no weather columns)
+        minimal_data = pd.DataFrame(
+            {
+                "load": [1.0, 1.1, 1.2],
+            },
+            index=pd.date_range("2024-01-01", periods=3, freq="15min"),
+        )
+
+        features = predictor._extract_load_features(minimal_data)
+
+        # Should still have temporal features
+        assert "hour" in features.columns
+        assert "day_of_week" in features.columns
+        assert "is_weekend" in features.columns
+
+        # Should have lag features
+        assert "load_lag_1h" in features.columns
+
+        # Should handle NaN values
+        assert not features.isnull().all().any()  # No column should be all NaN
+
+    def test_uncertainty_quantification(self, load_config, sample_load_data):
+        """Test prediction uncertainty estimation."""
+        predictor = LoadPredictor(load_config)
+
+        # Setup trained model
+        predictor.feature_scaler = MagicMock()
+        predictor.feature_scaler.transform.return_value = np.random.random((50, 20))
+        predictor.target_scaler = MagicMock()
+        predictor.target_scaler.inverse_transform.return_value = np.random.random((50, 1))
+        predictor.pattern_scaler = MagicMock()
+        predictor.pattern_scaler.transform.return_value = np.random.random((50, 8))
+        predictor.trend_scaler = MagicMock()
+        predictor.trend_scaler.transform.return_value = np.random.random((50, 4))
+
+        # Mock models with varied predictions for uncertainty
+        predictor.base_model = MagicMock()
+        predictor.base_model.predict.return_value = np.random.normal(3.0, 0.2, 50)
+        predictor.pattern_model = MagicMock()
+        predictor.pattern_model.predict.return_value = np.random.normal(2.8, 0.1, 50)
+        predictor.trend_model = MagicMock()
+        predictor.trend_model.predict.return_value = np.random.normal(3.1, 0.15, 50)
+
+        predictor.ensemble_weights = {"base": 0.5, "pattern": 0.3, "trend": 0.2}
+
+        test_data = sample_load_data.iloc[:50]
+
+        result = predictor.predict(test_data, return_uncertainty=True)
+
+        # Check uncertainty results
+        assert result.uncertainty is not None
+        assert len(result.uncertainty) == 50
+        assert (result.uncertainty >= 0).all()  # Uncertainty should be non-negative
+
+        # Check confidence intervals
+        assert result.confidence_intervals is not None
+        if result.uncertainty.sum() > 0:  # Only check if there's actual uncertainty
+            assert all(
+                result.confidence_intervals["upper_95"].iloc[i]
+                >= result.confidence_intervals["lower_95"].iloc[i]
+                for i in range(50)
+            )
+
+        # 80% intervals should be narrower than 95% intervals (if uncertainty > 0)
+        if result.uncertainty.sum() > 0:
+            assert all(
+                result.confidence_intervals["upper_80"].iloc[i]
+                <= result.confidence_intervals["upper_95"].iloc[i]
+                for i in range(50)
+            )
+
+    def test_feature_configuration_options(self, sample_load_data):
+        """Test different feature configuration options."""
+        # Test without weather features
+        config_no_weather = {
+            "decomposition_method": "nmf",
+            "n_components": 3,
+            "include_weather": False,
+            "include_occupancy": True,
+        }
+        predictor_no_weather = LoadPredictor(config_no_weather)
+        features_no_weather = predictor_no_weather._extract_load_features(sample_load_data)
+
+        # Should not have weather features but should have occupancy
+        assert "outdoor_temp" not in features_no_weather.columns
+        assert "occupancy_prob" in features_no_weather.columns
+
+        # Test without occupancy features
+        config_no_occupancy = {
+            "decomposition_method": "nmf",
+            "n_components": 3,
+            "include_weather": True,
+            "include_occupancy": False,
+        }
+        predictor_no_occupancy = LoadPredictor(config_no_occupancy)
+        features_no_occupancy = predictor_no_occupancy._extract_load_features(sample_load_data)
+
+        # Should have weather features but not occupancy
+        assert "outdoor_temp" in features_no_occupancy.columns
+        assert "occupancy_prob" not in features_no_occupancy.columns
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

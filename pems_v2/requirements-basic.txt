@@ -1,0 +1,7 @@
+# Minimal dependencies for testing data extraction
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+python-dotenv>=1.0.0
+influxdb-client>=1.40.0
+pandas>=2.2.0
+pytz>=2023.3

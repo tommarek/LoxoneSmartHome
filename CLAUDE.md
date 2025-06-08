@@ -8,21 +8,35 @@ This is a consolidated Python service that combines multiple smart home automati
 
 ## Development Commands
 
-Before making any commits, run these commands to ensure code quality:
+**ALWAYS use the virtual environment and Makefile for all development tasks:**
 
 ```bash
-# Run all tests
-make test
+# Set up development environment (first time only)
+make setup
 
-# Run linting (flake8 with 100 char line limit)
-make lint
+# Activate virtual environment (required for all development)
+source venv/bin/activate
 
-# Run type checking (mypy in strict mode)
-make type-check
+# Run all tests (use Makefile targets)
+make test-basic      # Basic structure and import tests
+make test-extraction # Data extraction tests  
+make test-relay      # Relay analysis tests
+make test            # Full test suite with coverage
 
-# Format code automatically
-make format
+# Code quality (ALWAYS run before commits)
+make lint           # Format code and run all linting (black, isort, flake8)
+make lint-check     # Check code quality without making changes (for CI)
+
+# Clean up
+make clean          # Remove build artifacts
+make clean-analysis # Remove analysis outputs
 ```
+
+**Development Rules:**
+- **NEVER** install packages globally - always use the virtual environment
+- **ALWAYS** use Makefile targets instead of direct tool calls
+- **ALWAYS** run `make lint` before commits to maintain code quality
+- **ALWAYS** ensure all tests pass before committing changes
 
 ## Architecture
 
@@ -113,6 +127,21 @@ The application uses:
 - **Code Quality**: 100% linting compliance (flake8 with 100-char limit)
 - **Test Coverage**: 76 tests covering all implemented modules with clean async execution
 
+### PEMS v2 Status 🎯
+- **Phase 1 Complete ✅**: Data Analysis & Feature Engineering
+  - Data extraction for all energy sources (PV, rooms, weather, battery, EV, prices)
+  - Room power configuration with actual measurements (18.12 kW total)
+  - Complete feature engineering pipeline for ML models
+  - Data validation and quality assessment
+  - Professional development setup (venv, Makefile, linting)
+- **Phase 2 Complete ✅**: ML Model Development & Production System
+  - Advanced ML predictors (PV, thermal, load) with physics+AI hybrid models
+  - Real-time optimization engine (<1 second for 6-hour horizons)
+  - Control interfaces for heating, battery, and inverter management
+  - Enterprise-grade testing (76+ tests, 96% file coverage)
+  - Production validation and comprehensive documentation
+- **PRESENTATION.md Status**: Complete technical documentation (96% coverage, 52/54 files analyzed)
+
 ### Next Phase 🎯
 - **Logging Improvements**: Local timezone timestamps and service-specific prefixes
 - **Loxone Control Integration**: MQTT command structure for manual override controls
@@ -134,3 +163,15 @@ The application uses:
 - **Concurrent Operations**: Thread-safe access to shared resources across modules
 - **Resource Optimization**: Automatic reconnection and health monitoring
 - **Memory Management**: Proper cleanup of async tasks and connections
+
+## PEMS v2 Documentation Maintenance 📚
+
+**IMPORTANT**: When making changes to any files in the `pems_v2/` directory:
+
+1. **Always update PRESENTATION.md** to reflect changes in the comprehensive technical documentation
+2. **Update file analysis** if new files are added or existing files are significantly modified
+3. **Maintain coverage tracking** - currently at 96% (52/54 files analyzed)
+4. **Keep both technical and simple explanations** for each component
+5. **Update system status and capabilities** if new features are implemented
+
+**PRESENTATION.md serves as the master technical documentation** for the PEMS v2 system and should always reflect the current state of the codebase.

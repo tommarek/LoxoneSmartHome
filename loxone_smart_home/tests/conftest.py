@@ -6,7 +6,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import pytest_asyncio
-
 from config.settings import Settings
 
 
@@ -64,7 +63,9 @@ def mock_influxdb_client(mock_settings: Settings) -> MagicMock:
 @pytest.fixture
 def sample_udp_data() -> bytes:
     """Sample UDP data for testing."""
-    return b"2024-01-15 10:30:00;temperature;21.5;living_room;sensor;tag1_value;tag2_value"
+    return (
+        b"2024-01-15 10:30:00;temperature;21.5;living_room;sensor;tag1_value;tag2_value"
+    )
 
 
 @pytest.fixture

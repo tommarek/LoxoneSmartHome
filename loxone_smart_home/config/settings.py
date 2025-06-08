@@ -92,7 +92,9 @@ class WeatherConfig(BaseModel):
     """Weather scraper configuration."""
 
     # Service selection
-    weather_service: str = Field(default="openmeteo", pattern="^(openmeteo|aladin|openweathermap)$")
+    weather_service: str = Field(
+        default="openmeteo", pattern="^(openmeteo|aladin|openweathermap)$"
+    )
 
     # API endpoints
     openmeteo_url: str = "https://api.open-meteo.com/v1/forecast"
@@ -142,9 +144,7 @@ class GrowattConfig(BaseModel):
     """Growatt controller configuration."""
 
     # API endpoints
-    ote_dam_url: str = (
-        "https://www.ote-cr.cz/en/short-term-markets/electricity/day-ahead-market/@@chart-data"
-    )
+    ote_dam_url: str = "https://www.ote-cr.cz/en/short-term-markets/electricity/day-ahead-market/@@chart-data"
 
     # Control parameters
     battery_capacity: float = Field(default=10.0, gt=0)  # kWh
@@ -154,8 +154,12 @@ class GrowattConfig(BaseModel):
 
     # Price thresholds and control parameters
     export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
-    battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
-    individual_cheapest_hours: int = Field(default=6, ge=1, le=24)  # Individual cheap hours
+    battery_charge_hours: int = Field(
+        default=2, ge=1, le=12
+    )  # Consecutive hours for AC charging
+    individual_cheapest_hours: int = Field(
+        default=6, ge=1, le=24
+    )  # Individual cheap hours
 
     # MQTT topics for Growatt control
     battery_first_topic: str = "energy/solar/command/batteryfirst/set/timeslot"
@@ -197,8 +201,12 @@ class Settings(BaseSettings):
     )
 
     # General settings
-    log_level: str = Field(default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$")
-    log_timezone: str = Field(default="Europe/Prague", description="Timezone for log timestamps")
+    log_level: str = Field(
+        default="INFO", pattern="^(DEBUG|INFO|WARNING|ERROR|CRITICAL)$"
+    )
+    log_timezone: str = Field(
+        default="Europe/Prague", description="Timezone for log timestamps"
+    )
 
     # Module configuration
     udp_listener_enabled: bool = True

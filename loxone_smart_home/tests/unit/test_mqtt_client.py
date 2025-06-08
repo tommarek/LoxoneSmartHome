@@ -5,7 +5,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from asyncio_mqtt import MqttError
-
 from config.settings import Settings
 from utils.async_mqtt_client import AsyncMQTTClient
 
@@ -92,7 +91,9 @@ class TestAsyncMQTTClient:
         assert queued_item == ("test/topic", "test message", True)
 
     @pytest.mark.asyncio
-    async def test_publish_without_connection(self, mqtt_client: AsyncMQTTClient) -> None:
+    async def test_publish_without_connection(
+        self, mqtt_client: AsyncMQTTClient
+    ) -> None:
         """Test publishing without active connection (still queues)."""
         # AsyncMQTTClient allows queuing even without connection
         mqtt_client.client = None

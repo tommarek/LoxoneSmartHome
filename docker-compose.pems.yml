@@ -1,0 +1,62 @@
+version: '3'
+services:
+  # PEMS v2 - Predictive Energy Management System
+  pems_v2:
+    build: ./pems_v2
+    container_name: pems_v2
+    restart: unless-stopped
+    user: '1026:65537'
+    environment:
+      # General settings
+      - LOG_LEVEL=INFO
+      - PEMS_MODE=development  # development, advisory, control
+      
+      # MQTT settings (reuse existing broker)
+      - MQTT_BROKER=localhost
+      - MQTT_PORT=1883
+      
+      # InfluxDB settings (reuse existing instance)
+      - INFLUXDB_HOST=http://localhost:8086
+      - INFLUXDB_ORG=loxone
+      - INFLUXDB_BUCKET=loxone
+      - INFLUXDB_TOKEN=${INFLUXDB_TOKEN}
+      
+      # Analysis settings
+      - ANALYSIS_ENABLED=true
+      - HISTORICAL_DATA_YEARS=2
+      
+      # Prediction settings
+      - PV_PREDICTOR_ENABLED=true
+      - THERMAL_MODEL_ENABLED=true
+      - LOAD_PREDICTOR_ENABLED=true
+      
+      # Optimization settings
+      - OPTIMIZATION_ENABLED=false  # Start in analysis mode
+      - OPTIMIZATION_HORIZON_HOURS=48
+      - OPTIMIZATION_INTERVAL_MINUTES=60
+      
+      # Control settings (disabled initially)
+      - CONTROL_ENABLED=false
+      - LOXONE_CONTROL_ENABLED=false
+      - BATTERY_CONTROL_ENABLED=false
+      - EV_CONTROL_ENABLED=false
+      
+      # Weather settings (reuse from existing)
+      - USE_SERVICE=openmeteo
+      - LATITUDE=${LATITUDE:-49.4949522}
+      - LONGITUDE=${LONGITUDE:-17.4302361}
+      - OPENWEATHERMAP_API_KEY=${OPENWEATHERMAP_API_KEY:-}
+      
+      # Growatt settings (for battery control)
+      - GROWATT_SIMULATION_MODE=true  # Start in simulation
+      
+    env_file:
+      - ./conf/common.env
+      - ./conf/influxdb.env
+      - ./pems_v2/.env  # PEMS-specific settings
+    network_mode: host  # Use host network to access existing services
+    volumes:
+      - ./pems_v2:/app:ro
+      - ./pems_v2/.env:/app/.env:ro
+      - ./pems_v2/models:/app/models:rw  # For saving trained models
+      - ./pems_v2/data:/app/data:rw      # For data analysis cache

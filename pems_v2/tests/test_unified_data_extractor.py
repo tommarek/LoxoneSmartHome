@@ -1,0 +1,649 @@
+"""
+Test suite for UnifiedDataExtractor.
+
+Tests parallel data extraction, quality assessment, and validation reporting
+with comprehensive mock data scenarios.
+"""
+
+import asyncio
+from dataclasses import asdict
+from datetime import datetime, timedelta
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from pems_v2.analysis.core.unified_data_extractor import (EnergyDataset,
+                                                          QueryDefinition,
+                                                          UnifiedDataExtractor)
+
+
+@pytest.fixture
+def mock_settings():
+    """Mock PEMS settings."""
+    settings = MagicMock()
+    settings.influxdb.url = "http://localhost:8086"
+    settings.influxdb.token.get_secret_value.return_value = "test-token"
+    settings.influxdb.org = "test-org"
+    settings.influxdb.bucket_solar = "solar"
+    settings.influxdb.bucket_loxone = "loxone"
+    settings.influxdb.bucket_weather = "weather_forecast"
+    return settings
+
+
+@pytest.fixture
+def mock_influxdb_client():
+    """Mock InfluxDB client."""
+    with patch(
+        "pems_v2.analysis.core.unified_data_extractor.InfluxDBClient"
+    ) as mock_client_class:
+        mock_client = MagicMock()
+        mock_query_api = MagicMock()
+        mock_client.query_api.return_value = mock_query_api
+        mock_client_class.return_value = mock_client
+        yield mock_client, mock_query_api
+
+
+@pytest.fixture
+def sample_date_range():
+    """Sample date range for testing."""
+    start_date = datetime(2024, 1, 1, 0, 0, 0)
+    end_date = datetime(2024, 1, 2, 0, 0, 0)
+    return start_date, end_date
+
+
+@pytest.fixture
+def mock_query_results():
+    """Mock InfluxDB query results."""
+
+    def create_mock_record(timestamp, field, value, **tags):
+        record = MagicMock()
+        record.get_time.return_value = timestamp
+        record.get_field.return_value = field
+        record.get_value.return_value = value
+        record.values = tags
+        return record
+
+    def create_mock_table(records):
+        table = MagicMock()
+        table.records = records
+        return table
+
+    # Create sample data for different query types
+    base_time = datetime(2024, 1, 1, 12, 0, 0)
+    time_points = [
+        base_time + timedelta(minutes=5 * i) for i in range(12)
+    ]  # 1 hour of 5-min data
+
+    results = {
+        "pv_production": [
+            create_mock_table(
+                [
+                    create_mock_record(t, "InputPower", 2000 + i * 100)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "PV1InputPower", 1000 + i * 50)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "PV2InputPower", 1000 + i * 50)
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "battery_storage": [
+            create_mock_table(
+                [
+                    create_mock_record(t, "SOC", 50 + i * 2)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "ChargePower", 500 if i < 6 else 0)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "DischargePower", 0 if i < 6 else 300)
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "heating_relays": [
+            create_mock_table(
+                [
+                    create_mock_record(
+                        t, "relay_state", 1 if i % 3 == 0 else 0, room="obyvak"
+                    )
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(
+                        t, "relay_state", 1 if i % 4 == 0 else 0, room="loznice"
+                    )
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "room_temperatures": [
+            create_mock_table(
+                [
+                    create_mock_record(t, "temperature", 22.0 + i * 0.1, room="obyvak")
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "temperature", 20.0 + i * 0.1, room="loznice")
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "weather_forecast": [
+            create_mock_table(
+                [
+                    create_mock_record(t, "temperature_2m", 5.0 + i * 0.5)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "cloudcover", 30 + i * 2)
+                    for i, t in enumerate(time_points)
+                ]
+                + [
+                    create_mock_record(t, "shortwave_radiation", 200 + i * 10)
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "energy_prices": [
+            create_mock_table(
+                [
+                    create_mock_record(t, "price_czk_kwh", 3.5 + i * 0.1)
+                    for i, t in enumerate(time_points)
+                ]
+            )
+        ],
+        "empty_result": [],  # For testing empty results
+    }
+
+    return results
+
+
+class TestUnifiedDataExtractor:
+    """Test suite for UnifiedDataExtractor."""
+
+    def test_initialization(self, mock_settings, mock_influxdb_client):
+        """Test proper initialization of extractor."""
+        mock_client, mock_query_api = mock_influxdb_client
+
+        extractor = UnifiedDataExtractor(mock_settings)
+
+        assert extractor.settings == mock_settings
+        assert hasattr(extractor, "query_configs")
+        assert len(extractor.query_configs) > 0
+        assert "pv_production" in extractor.query_configs
+        assert "battery_storage" in extractor.query_configs
+        assert "heating_relays" in extractor.query_configs
+
+    def test_query_configuration_structure(self, mock_settings, mock_influxdb_client):
+        """Test that query configurations are properly structured."""
+        extractor = UnifiedDataExtractor(mock_settings)
+
+        for config_name, config in extractor.query_configs.items():
+            assert isinstance(config, QueryDefinition)
+            assert config.name == config_name
+            assert config.bucket is not None
+            assert config.measurement is not None
+            assert isinstance(config.fields, list)
+            assert len(config.fields) > 0
+
+    @pytest.mark.asyncio
+    async def test_build_flux_query(
+        self, mock_settings, mock_influxdb_client, sample_date_range
+    ):
+        """Test Flux query building."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        start_date, end_date = sample_date_range
+
+        # Test basic query
+        config = QueryDefinition(
+            name="test",
+            bucket="test_bucket",
+            measurement="test_measurement",
+            fields=["field1", "field2"],
+            aggregation_window="5m",
+            aggregation_function="mean",
+        )
+
+        query = extractor._build_flux_query(config, start_date, end_date)
+
+        assert 'from(bucket: "test_bucket")' in query
+        assert f"range(start: {start_date.isoformat()}Z" in query
+        assert f"stop: {end_date.isoformat()}Z)" in query
+        assert 'filter(fn: (r) => r["_measurement"] == "test_measurement")' in query
+        assert 'r["_field"] == "field1"' in query
+        assert 'r["_field"] == "field2"' in query
+        assert "aggregateWindow(every: 5m, fn: mean" in query
+
+    @pytest.mark.asyncio
+    async def test_build_flux_query_with_tags(
+        self, mock_settings, mock_influxdb_client, sample_date_range
+    ):
+        """Test Flux query building with tag filters."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        start_date, end_date = sample_date_range
+
+        config = QueryDefinition(
+            name="test",
+            bucket="test_bucket",
+            measurement="test_measurement",
+            fields=["field1"],
+            tags={"tag1": "heating", "room": "obyvak"},
+        )
+
+        query = extractor._build_flux_query(config, start_date, end_date)
+
+        assert 'r["tag1"] == "heating"' in query
+        assert 'r["room"] == "obyvak"' in query
+
+    @pytest.mark.asyncio
+    async def test_execute_single_extraction_success(
+        self, mock_settings, mock_influxdb_client, mock_query_results, sample_date_range
+    ):
+        """Test successful single extraction."""
+        mock_client, mock_query_api = mock_influxdb_client
+        start_date, end_date = sample_date_range
+
+        # Setup mock to return PV production data
+        mock_query_api.query.return_value = mock_query_results["pv_production"]
+
+        extractor = UnifiedDataExtractor(mock_settings)
+        config = extractor.query_configs["pv_production"]
+
+        result = await extractor._execute_single_extraction(
+            config, start_date, end_date
+        )
+
+        assert isinstance(result, pd.DataFrame)
+        assert not result.empty
+        assert "InputPower" in result.columns
+        assert "PV1InputPower" in result.columns
+        assert "PV2InputPower" in result.columns
+        assert len(result) == 12  # 12 time points
+
+    @pytest.mark.asyncio
+    async def test_execute_single_extraction_empty(
+        self, mock_settings, mock_influxdb_client, mock_query_results, sample_date_range
+    ):
+        """Test extraction with empty results."""
+        mock_client, mock_query_api = mock_influxdb_client
+        start_date, end_date = sample_date_range
+
+        # Setup mock to return empty results
+        mock_query_api.query.return_value = mock_query_results["empty_result"]
+
+        extractor = UnifiedDataExtractor(mock_settings)
+        config = extractor.query_configs["pv_production"]
+
+        result = await extractor._execute_single_extraction(
+            config, start_date, end_date
+        )
+
+        assert isinstance(result, pd.DataFrame)
+        assert result.empty
+
+    @pytest.mark.asyncio
+    async def test_execute_single_extraction_room_data(
+        self, mock_settings, mock_influxdb_client, mock_query_results, sample_date_range
+    ):
+        """Test extraction of room-based data."""
+        mock_client, mock_query_api = mock_influxdb_client
+        start_date, end_date = sample_date_range
+
+        # Setup mock to return room temperature data
+        mock_query_api.query.return_value = mock_query_results["room_temperatures"]
+
+        extractor = UnifiedDataExtractor(mock_settings)
+        config = extractor.query_configs["room_temperatures"]
+
+        result = await extractor._execute_single_extraction(
+            config, start_date, end_date
+        )
+
+        assert isinstance(result, dict)
+        assert "obyvak" in result
+        assert "loznice" in result
+        assert isinstance(result["obyvak"], pd.DataFrame)
+        assert not result["obyvak"].empty
+
+    def test_process_room_data(self, mock_settings, mock_influxdb_client):
+        """Test processing of room-based data."""
+        extractor = UnifiedDataExtractor(mock_settings)
+
+        # Create sample room data
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=5, freq="5min")
+        df = pd.DataFrame(
+            {
+                "timestamp": time_points.tolist() * 2,
+                "field": ["temperature"] * 5 + ["temperature"] * 5,
+                "value": [22.0, 22.1, 22.2, 22.3, 22.4, 20.0, 20.1, 20.2, 20.3, 20.4],
+                "room": ["obyvak"] * 5 + ["loznice"] * 5,
+            }
+        )
+
+        config = QueryDefinition(
+            name="room_temperatures",
+            bucket="test",
+            measurement="temperature",
+            fields=["temperature"],
+        )
+
+        result = extractor._process_room_data(df, config)
+
+        assert isinstance(result, dict)
+        assert "obyvak" in result
+        assert "loznice" in result
+        assert len(result["obyvak"]) == 5
+        assert len(result["loznice"]) == 5
+
+    def test_populate_dataset_field(self, mock_settings, mock_influxdb_client):
+        """Test populating dataset fields with different data types."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        dataset = EnergyDataset()
+
+        # Test DataFrame population
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=5, freq="5min")
+        df = pd.DataFrame(
+            {"InputPower": [1000, 1100, 1200, 1300, 1400]}, index=time_points
+        )
+
+        extractor._populate_dataset_field(dataset, "pv_production", df)
+        assert not dataset.pv_production.empty
+        assert len(dataset.pv_production) == 5
+
+        # Test room data population
+        room_data = {
+            "obyvak": pd.DataFrame(
+                {"temperature": [22.0, 22.1]}, index=time_points[:2]
+            ),
+            "loznice": pd.DataFrame(
+                {"temperature": [20.0, 20.1]}, index=time_points[:2]
+            ),
+        }
+
+        extractor._populate_dataset_field(dataset, "heating_relays", room_data)
+        assert len(dataset.heating_relay_states) == 2
+        assert "obyvak" in dataset.heating_relay_states
+        assert "loznice" in dataset.heating_relay_states
+
+    def test_post_process_dataset(self, mock_settings, mock_influxdb_client):
+        """Test dataset post-processing calculations."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        dataset = EnergyDataset()
+
+        # Setup PV production data
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=5, freq="5min")
+        dataset.pv_production = pd.DataFrame(
+            {
+                "InputPower": [1000, 1100, 1200, 1300, 1400],
+                "PV1InputPower": [500, 550, 600, 650, 700],
+                "PV2InputPower": [500, 550, 600, 650, 700],
+            },
+            index=time_points,
+        )
+
+        # Setup battery data
+        dataset.battery_storage = pd.DataFrame(
+            {
+                "ChargePower": [200, 300, 400, 0, 0],
+                "DischargePower": [0, 0, 0, 100, 200],
+                "SOC": [50, 55, 60, 58, 55],
+            },
+            index=time_points,
+        )
+
+        extractor._post_process_dataset(dataset)
+
+        # Check PV calculations
+        assert "total_pv_power" in dataset.pv_production.columns
+        assert "pv_string_balance" in dataset.pv_production.columns
+        assert "solar_energy_kwh" in dataset.pv_production.columns
+
+        # Check battery calculations
+        assert "net_battery_power" in dataset.battery_storage.columns
+        assert "battery_energy_change_kwh" in dataset.battery_storage.columns
+
+        # Verify calculation correctness
+        assert dataset.pv_production["total_pv_power"].iloc[0] == 1000
+        assert dataset.battery_storage["net_battery_power"].iloc[0] == 200  # 200 - 0
+        assert dataset.battery_storage["net_battery_power"].iloc[-1] == -200  # 0 - 200
+
+    def test_calculate_df_quality(self, mock_settings, mock_influxdb_client):
+        """Test data quality calculation for DataFrame."""
+        extractor = UnifiedDataExtractor(mock_settings)
+
+        # Create test data with known quality characteristics
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=10, freq="5min")
+
+        # High quality data
+        good_df = pd.DataFrame(
+            {
+                "temperature": [
+                    22.0,
+                    22.1,
+                    22.2,
+                    22.3,
+                    22.4,
+                    22.5,
+                    22.6,
+                    22.7,
+                    22.8,
+                    22.9,
+                ],
+                "power": [1000, 1100, 1200, 1300, 1400, 1500, 1600, 1700, 1800, 1900],
+            },
+            index=time_points,
+        )
+
+        quality = extractor._calculate_df_quality(good_df, "test_good")
+
+        assert quality["completeness"] == 1.0  # No missing data
+        assert quality["temporal_consistency"] == 1.0  # Perfect 5-min intervals
+        assert quality["reasonableness"] > 0.9  # Reasonable values
+        assert quality["overall"] > 0.8  # High overall quality
+
+        # Poor quality data with missing values and outliers
+        bad_df = good_df.copy()
+        bad_df.loc[time_points[2:4], "temperature"] = np.nan  # Missing data
+        bad_df.loc[time_points[5], "power"] = -5000  # Unreasonable negative power
+        bad_df.loc[time_points[7], "temperature"] = 150  # Unreasonable temperature
+
+        quality_bad = extractor._calculate_df_quality(bad_df, "test_bad")
+
+        assert quality_bad["completeness"] < 1.0  # Missing data present
+        assert (
+            quality_bad["reasonableness"] < quality["reasonableness"]
+        )  # Outliers detected
+        assert quality_bad["overall"] < quality["overall"]  # Lower overall quality
+
+    def test_calculate_data_quality_score(self, mock_settings, mock_influxdb_client):
+        """Test comprehensive data quality scoring."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        dataset = EnergyDataset()
+
+        # Add sample data
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=10, freq="5min")
+
+        dataset.pv_production = pd.DataFrame(
+            {"InputPower": range(1000, 2000, 100)}, index=time_points
+        )
+
+        dataset.room_temperatures = {
+            "obyvak": pd.DataFrame(
+                {"temperature": [22.0 + i * 0.1 for i in range(10)]}, index=time_points
+            ),
+            "loznice": pd.DataFrame(
+                {"temperature": [20.0 + i * 0.1 for i in range(10)]}, index=time_points
+            ),
+        }
+
+        quality_scores = extractor.calculate_data_quality_score(dataset)
+
+        assert "pv_production" in quality_scores
+        assert "room_temperatures_obyvak" in quality_scores
+        assert "room_temperatures_loznice" in quality_scores
+
+        for component, scores in quality_scores.items():
+            assert "overall" in scores
+            assert "completeness" in scores
+            assert "consistency" in scores
+            assert "temporal_consistency" in scores
+            assert "reasonableness" in scores
+            assert 0 <= scores["overall"] <= 1
+
+    def test_get_validation_report(self, mock_settings, mock_influxdb_client):
+        """Test validation report generation."""
+        extractor = UnifiedDataExtractor(mock_settings)
+        dataset = EnergyDataset()
+
+        # Add required data
+        time_points = pd.date_range("2024-01-01 12:00:00", periods=10, freq="5min")
+
+        dataset.pv_production = pd.DataFrame(
+            {"InputPower": range(1000, 2000, 100)}, index=time_points
+        )
+
+        dataset.room_temperatures = {
+            "obyvak": pd.DataFrame(
+                {"temperature": [22.0 + i * 0.1 for i in range(10)]}, index=time_points
+            )
+        }
+
+        dataset.heating_relay_states = {
+            "obyvak": pd.DataFrame(
+                {"relay_state": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0]}, index=time_points
+            )
+        }
+
+        # Calculate quality scores
+        dataset.quality_scores = extractor.calculate_data_quality_score(dataset)
+
+        report = extractor.get_validation_report(dataset)
+
+        assert "is_ml_ready" in report
+        assert "missing_required" in report
+        assert "missing_recommended" in report
+        assert "quality_issues" in report
+        assert "recommendations" in report
+        assert "ml_readiness_score" in report
+
+        # Should have minimal missing required since we added the basics
+        assert len(report["missing_required"]) == 0
+        assert 0 <= report["ml_readiness_score"] <= 1
+
+    @pytest.mark.asyncio
+    async def test_extract_complete_dataset_integration(
+        self, mock_settings, mock_influxdb_client, mock_query_results, sample_date_range
+    ):
+        """Test complete dataset extraction integration."""
+        mock_client, mock_query_api = mock_influxdb_client
+        start_date, end_date = sample_date_range
+
+        # Setup mock to return different results based on query content
+        def mock_query_side_effect(query_str):
+            if "InputPower" in query_str:
+                return mock_query_results["pv_production"]
+            elif "ChargePower" in query_str:
+                return mock_query_results["battery_storage"]
+            elif "relay" in query_str and "heating" in query_str:
+                return mock_query_results["heating_relays"]
+            elif "temperature_2m" in query_str:
+                return mock_query_results["weather_forecast"]
+            elif "price_czk_kwh" in query_str:
+                return mock_query_results["energy_prices"]
+            else:
+                return mock_query_results["empty_result"]
+
+        mock_query_api.query.side_effect = mock_query_side_effect
+
+        extractor = UnifiedDataExtractor(mock_settings)
+
+        # Mock get_room_power function
+        with patch(
+            "pems_v2.analysis.core.unified_data_extractor.get_room_power",
+            return_value=1.5,
+        ):
+            dataset = await extractor.extract_complete_dataset(start_date, end_date)
+
+        # Verify dataset structure
+        assert isinstance(dataset, EnergyDataset)
+        assert dataset.extraction_timestamp is not None
+        assert dataset.date_range == (start_date, end_date)
+
+        # Verify data was extracted
+        assert not dataset.pv_production.empty
+        assert not dataset.battery_storage.empty
+        assert len(dataset.heating_relay_states) > 0
+        assert not dataset.weather_forecast.empty
+        assert not dataset.energy_prices.empty
+
+        # Verify quality scores were calculated
+        assert len(dataset.quality_scores) > 0
+
+        # Verify derived calculations were performed
+        if "total_pv_power" in dataset.pv_production.columns:
+            assert "pv_string_balance" in dataset.pv_production.columns
+        if "net_battery_power" in dataset.battery_storage.columns:
+            assert "battery_energy_change_kwh" in dataset.battery_storage.columns
+
+
+@pytest.mark.asyncio
+async def test_error_handling_in_parallel_extraction(
+    mock_settings, mock_influxdb_client, sample_date_range
+):
+    """Test error handling during parallel extraction."""
+    mock_client, mock_query_api = mock_influxdb_client
+    start_date, end_date = sample_date_range
+
+    # Setup mock to raise exception for some queries
+    def mock_query_side_effect(query_str):
+        if "InputPower" in query_str:
+            raise Exception("Database connection error")
+        else:
+            return []
+
+    mock_query_api.query.side_effect = mock_query_side_effect
+
+    extractor = UnifiedDataExtractor(mock_settings)
+
+    # Should handle errors gracefully and continue with other extractions
+    dataset = await extractor.extract_complete_dataset(start_date, end_date)
+
+    assert isinstance(dataset, EnergyDataset)
+    # PV production should be empty due to error, but other fields may have data
+    assert dataset.pv_production.empty
+
+
+def test_energy_dataset_serialization():
+    """Test EnergyDataset serialization capabilities."""
+    dataset = EnergyDataset()
+
+    # Add sample data
+    time_points = pd.date_range("2024-01-01 12:00:00", periods=5, freq="5min")
+    dataset.pv_production = pd.DataFrame(
+        {"InputPower": range(1000, 1500, 100)}, index=time_points
+    )
+
+    dataset.room_temperatures = {
+        "obyvak": pd.DataFrame(
+            {"temperature": [22.0, 22.1, 22.2, 22.3, 22.4]}, index=time_points
+        )
+    }
+
+    # Test that dataset can be converted to dict for serialization
+    dataset_dict = asdict(dataset)
+    assert "pv_production" in dataset_dict
+    assert "room_temperatures" in dataset_dict
+    assert "extraction_timestamp" in dataset_dict
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

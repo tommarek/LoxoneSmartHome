@@ -9,7 +9,6 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
-
 from config.settings import Settings
 from modules.base import BaseModule
 from utils.async_influxdb_client import AsyncInfluxDBClient
@@ -64,7 +63,9 @@ class GrowattController(BaseModule):
         local_date = self._get_local_now() + timedelta(days=days_ahead)
         return local_date.strftime("%Y-%m-%d")
 
-    def _log_price_table(self, hourly_prices: Dict[Tuple[str, str], float], date: str) -> None:
+    def _log_price_table(
+        self, hourly_prices: Dict[Tuple[str, str], float], date: str
+    ) -> None:
         """Log hourly prices in a nice table format."""
         eur_czk_rate = 25.0
 
@@ -116,12 +117,16 @@ class GrowattController(BaseModule):
         current_time = self._get_local_now()
         current_hour = current_time.strftime("%H:%M")
 
-        self.logger.info(f"Checking current state at {current_hour} for immediate application...")
+        self.logger.info(
+            f"Checking current state at {current_hour} for immediate application..."
+        )
 
         # We need to track scheduled periods to check if we're in one
         # This will be populated by the scheduling methods
         if not hasattr(self, "_scheduled_periods"):
-            self.logger.info("No scheduled periods found yet, skipping startup state sync")
+            self.logger.info(
+                "No scheduled periods found yet, skipping startup state sync"
+            )
             return
 
         # Check battery-first periods
@@ -135,7 +140,9 @@ class GrowattController(BaseModule):
                 in_period = start_time <= current_time_only < end_time
             else:
                 # Handle periods that cross midnight
-                in_period = current_time_only >= start_time or current_time_only < end_time
+                in_period = (
+                    current_time_only >= start_time or current_time_only < end_time
+                )
 
             if in_period:
                 self.logger.info(
@@ -168,7 +175,9 @@ class GrowattController(BaseModule):
             async with aiohttp.ClientSession() as session:
                 async with session.get(url) as response:
                     if response.status != 200:
-                        self.logger.error(f"Failed to fetch DAM prices: HTTP {response.status}")
+                        self.logger.error(
+                            f"Failed to fetch DAM prices: HTTP {response.status}"
+                        )
                         return {}
 
                     data = await response.json()
@@ -184,7 +193,9 @@ class GrowattController(BaseModule):
                     stop_time = f"{hour + 1:02d}:00"
                     hourly_prices[(start_time, stop_time)] = price
 
-            self.logger.info(f"Successfully fetched {len(hourly_prices)} DAM price points")
+            self.logger.info(
+                f"Successfully fetched {len(hourly_prices)} DAM price points"
+            )
             return hourly_prices
 
         except Exception as e:
@@ -212,7 +223,9 @@ class GrowattController(BaseModule):
         elif interval_duration == 60:
             intervals_per_hour = 1
         else:
-            self.logger.warning(f"Unknown interval duration: {interval_duration} minutes")
+            self.logger.warning(
+                f"Unknown interval duration: {interval_duration} minutes"
+            )
             return []
 
         intervals_needed = x * intervals_per_hour
@@ -230,7 +243,8 @@ class GrowattController(BaseModule):
             if price_sum < min_price_sum:
                 min_price_sum = price_sum
                 cheapest_window = [
-                    (interval[0], interval[1], prices[interval]) for interval in window_intervals
+                    (interval[0], interval[1], prices[interval])
+                    for interval in window_intervals
                 ]
 
         return cheapest_window
@@ -240,7 +254,8 @@ class GrowattController(BaseModule):
     ) -> List[Tuple[str, str, float]]:
         """Find N cheapest individual hours."""
         sorted_prices = sorted(
-            [(start, stop, price) for (start, stop), price in prices.items()], key=lambda x: x[2]
+            [(start, stop, price) for (start, stop), price in prices.items()],
+            key=lambda x: x[2],
         )
         return sorted_prices[:n]
 
@@ -275,7 +290,9 @@ class GrowattController(BaseModule):
 
         return quadrants
 
-    def _group_contiguous_hours(self, hours: List[Tuple[str, str, float]]) -> List[Tuple[str, str]]:
+    def _group_contiguous_hours(
+        self, hours: List[Tuple[str, str, float]]
+    ) -> List[Tuple[str, str]]:
         """Group contiguous hours into continuous ranges."""
         if not hours:
             return []
@@ -293,9 +310,9 @@ class GrowattController(BaseModule):
             current_price = hour[2]
 
             # Group if contiguous and price difference < 20%
-            if current_start == previous_end and abs(current_price - current_group_price) < abs(
-                current_group_price * 0.2
-            ):
+            if current_start == previous_end and abs(
+                current_price - current_group_price
+            ) < abs(current_group_price * 0.2):
                 current_group_end = hour[1]
             else:
                 groups.append((current_group_start, current_group_end))
@@ -347,7 +364,9 @@ class GrowattController(BaseModule):
         payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
 
         assert self.mqtt_client is not None
-        await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        await self.mqtt_client.publish(
+            self.config.battery_first_topic, json.dumps(payload)
+        )
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} "
@@ -358,7 +377,9 @@ class GrowattController(BaseModule):
         """Enable AC charging during battery-first mode."""
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"⚡ [SIMULATE] AC CHARGING ENABLED (simulated at {current_time})")
+            self.logger.info(
+                f"⚡ [SIMULATE] AC CHARGING ENABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"value": True}
@@ -373,7 +394,9 @@ class GrowattController(BaseModule):
         """Disable AC charging."""
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
+            self.logger.info(
+                f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"value": False}
@@ -395,7 +418,9 @@ class GrowattController(BaseModule):
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
-        await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        await self.mqtt_client.publish(
+            self.config.battery_first_topic, json.dumps(payload)
+        )
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → "
@@ -406,12 +431,16 @@ class GrowattController(BaseModule):
         """Enable electricity export to grid."""
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"⬆️ [SIMULATE] EXPORT ENABLED (simulated at {current_time})")
+            self.logger.info(
+                f"⬆️ [SIMULATE] EXPORT ENABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"value": True}
         assert self.mqtt_client is not None
-        await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
+        await self.mqtt_client.publish(
+            self.config.export_enable_topic, json.dumps(payload)
+        )
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"⬆️ EXPORT ENABLED at {current_time} → Topic: {self.config.export_enable_topic}"
@@ -421,12 +450,16 @@ class GrowattController(BaseModule):
         """Disable electricity export to grid."""
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
+            self.logger.info(
+                f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"value": False}
         assert self.mqtt_client is not None
-        await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
+        await self.mqtt_client.publish(
+            self.config.export_disable_topic, json.dumps(payload)
+        )
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"⬇️ EXPORT DISABLED at {current_time} → Topic: {self.config.export_disable_topic}"
@@ -488,7 +521,9 @@ class GrowattController(BaseModule):
         )
 
         # Combine cheapest hours
-        cheapest_individual_hours = cheapest_individual_hours.union(cheapest_quadrant_hours)
+        cheapest_individual_hours = cheapest_individual_hours.union(
+            cheapest_quadrant_hours
+        )
 
         cheapest_consecutive = set(
             (start, stop)
@@ -508,16 +543,16 @@ class GrowattController(BaseModule):
 
         # Calculate average prices for selected hours
         if cheapest_individual_hours:
-            individual_avg = sum(hourly_prices[hour] for hour in cheapest_individual_hours) / len(
-                cheapest_individual_hours
-            )
+            individual_avg = sum(
+                hourly_prices[hour] for hour in cheapest_individual_hours
+            ) / len(cheapest_individual_hours)
         else:
             individual_avg = 0.0
 
         if cheapest_consecutive:
-            consecutive_avg = sum(hourly_prices[hour] for hour in cheapest_consecutive) / len(
-                cheapest_consecutive
-            )
+            consecutive_avg = sum(
+                hourly_prices[hour] for hour in cheapest_consecutive
+            ) / len(cheapest_consecutive)
         else:
             consecutive_avg = 0.0
 
@@ -548,16 +583,22 @@ class GrowattController(BaseModule):
         )
 
         # Schedule battery-first mode
-        await self._schedule_battery_control(all_cheap_hours, cheapest_consecutive, hourly_prices)
+        await self._schedule_battery_control(
+            all_cheap_hours, cheapest_consecutive, hourly_prices
+        )
 
     async def _schedule_fallback_mode(self) -> None:
         """Schedule fallback mode when price data is unavailable."""
         # Schedule to disable battery-first at midnight
-        task = asyncio.create_task(self._schedule_at_time("00:00", self._disable_battery_first))
+        task = asyncio.create_task(
+            self._schedule_at_time("00:00", self._disable_battery_first)
+        )
         self._scheduled_tasks.append(task)
 
         # Schedule to disable export at midnight
-        task = asyncio.create_task(self._schedule_at_time("00:00", self._disable_export))
+        task = asyncio.create_task(
+            self._schedule_at_time("00:00", self._disable_export)
+        )
         self._scheduled_tasks.append(task)
 
     async def _schedule_battery_control(
@@ -569,23 +610,29 @@ class GrowattController(BaseModule):
         """Schedule battery control based on price analysis."""
         # Group battery-first hours into contiguous blocks
         battery_first_hours = [
-            (start, stop, hourly_prices[(start, stop)]) for start, stop in all_cheap_hours
+            (start, stop, hourly_prices[(start, stop)])
+            for start, stop in all_cheap_hours
         ]
         battery_first_groups = self._group_contiguous_hours_simple(battery_first_hours)
 
         # Schedule battery-first mode for each block
         for group_start, group_end in battery_first_groups:
-            self.logger.info(f"Scheduling battery-first mode from {group_start} to {group_end}")
+            self.logger.info(
+                f"Scheduling battery-first mode from {group_start} to {group_end}"
+            )
             self._scheduled_periods.append(("battery_first", group_start, group_end))
             task = asyncio.create_task(
-                self._schedule_at_time(group_start, self._set_battery_first, group_start, group_end)
+                self._schedule_at_time(
+                    group_start, self._set_battery_first, group_start, group_end
+                )
             )
             self._scheduled_tasks.append(task)
 
         # Schedule AC charging during cheapest consecutive hours
         if cheapest_consecutive:
             ac_charge_hours = [
-                (start, stop, hourly_prices[(start, stop)]) for start, stop in cheapest_consecutive
+                (start, stop, hourly_prices[(start, stop)])
+                for start, stop in cheapest_consecutive
             ]
             ac_charge_groups = self._group_contiguous_hours_simple(ac_charge_hours)
 
@@ -637,7 +684,9 @@ class GrowattController(BaseModule):
         # Schedule export control
         await self._schedule_export_control(hourly_prices)
 
-    async def _schedule_export_control(self, hourly_prices: Dict[Tuple[str, str], float]) -> None:
+    async def _schedule_export_control(
+        self, hourly_prices: Dict[Tuple[str, str], float]
+    ) -> None:
         """Schedule export enable/disable based on price thresholds."""
         # Convert threshold from CZK/kWh to EUR/MWh for comparison with API data
         # API prices are in EUR/MWh, threshold is in CZK/kWh
@@ -679,7 +728,8 @@ class GrowattController(BaseModule):
             group_prices = [
                 price
                 for start, stop, price in export_hours_with_price
-                if start >= group_start and stop <= (group_end if group_end != "23:59" else "24:00")
+                if start >= group_start
+                and stop <= (group_end if group_end != "23:59" else "24:00")
             ]
             if group_prices:
                 min_price = min(group_prices)
@@ -708,14 +758,20 @@ class GrowattController(BaseModule):
             self._scheduled_periods.append(("export", group_start, group_end))
 
             # Schedule export enable at start
-            task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
+            task = asyncio.create_task(
+                self._schedule_at_time(group_start, self._enable_export)
+            )
             self._scheduled_tasks.append(task)
 
             # Schedule export disable at end
-            task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
+            task = asyncio.create_task(
+                self._schedule_at_time(group_end, self._disable_export)
+            )
             self._scheduled_tasks.append(task)
 
-    async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
+    async def _schedule_at_time(
+        self, time_str: str, coro_func: Any, *args: Any
+    ) -> None:
         """Schedule a coroutine to run at a specific time."""
         try:
             target_time = datetime.strptime(time_str, "%H:%M").time()
@@ -733,7 +789,9 @@ class GrowattController(BaseModule):
                 await coro_func(*args)
 
         except Exception as e:
-            self.logger.error(f"Error in scheduled task at {time_str}: {e}", exc_info=True)
+            self.logger.error(
+                f"Error in scheduled task at {time_str}: {e}", exc_info=True
+            )
 
     async def _schedule_daily_calculation(self) -> None:
         """Schedule daily calculation at 23:59."""
@@ -749,15 +807,21 @@ class GrowattController(BaseModule):
             try:
                 # Calculate time until next scheduled time in local timezone
                 now = self._get_local_now()
-                target_time = dt_time(self.config.schedule_hour, self.config.schedule_minute)
-                target_datetime = datetime.combine(now.date(), target_time, self._local_tz)
+                target_time = dt_time(
+                    self.config.schedule_hour, self.config.schedule_minute
+                )
+                target_datetime = datetime.combine(
+                    now.date(), target_time, self._local_tz
+                )
 
                 if target_datetime <= now:
                     target_datetime += timedelta(days=1)
 
                 delay = (target_datetime - now).total_seconds()
 
-                self.logger.info(f"Next daily calculation scheduled in {delay/3600:.1f} hours")
+                self.logger.info(
+                    f"Next daily calculation scheduled in {delay/3600:.1f} hours"
+                )
                 await asyncio.sleep(delay)
 
                 # Run calculation
@@ -766,6 +830,8 @@ class GrowattController(BaseModule):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                self.logger.error(f"Error in daily calculation loop: {e}", exc_info=True)
+                self.logger.error(
+                    f"Error in daily calculation loop: {e}", exc_info=True
+                )
                 # Wait 1 hour before retrying
                 await asyncio.sleep(3600)

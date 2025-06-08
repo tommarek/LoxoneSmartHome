@@ -6,7 +6,6 @@ from typing import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-
 from config.settings import Settings
 from modules.mqtt_bridge import MQTTBridge
 
@@ -57,7 +56,9 @@ def mqtt_bridge(
 
 
 @pytest.mark.asyncio
-async def test_mqtt_bridge_init(mock_mqtt_client: MagicMock, mock_settings: Settings) -> None:
+async def test_mqtt_bridge_init(
+    mock_mqtt_client: MagicMock, mock_settings: Settings
+) -> None:
     """Test MQTT bridge initialization."""
     with patch("socket.socket") as mock_socket_class:
         mock_socket_instance = MagicMock()
@@ -92,7 +93,9 @@ async def test_start_subscribes_to_topics(
 
 
 @pytest.mark.asyncio
-async def test_stop_closes_socket(mqtt_bridge: MQTTBridge, mock_socket: MagicMock) -> None:
+async def test_stop_closes_socket(
+    mqtt_bridge: MQTTBridge, mock_socket: MagicMock
+) -> None:
     """Test that stop() closes the UDP socket."""
     await mqtt_bridge.stop()
     mock_socket.close.assert_called_once()

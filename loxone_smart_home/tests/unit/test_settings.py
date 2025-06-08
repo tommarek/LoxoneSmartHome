@@ -3,9 +3,9 @@
 from unittest.mock import patch
 
 import pytest
+from config.settings import (GrowattConfig, InfluxDBConfig, MQTTConfig,
+                             Settings, WeatherConfig)
 from pydantic import ValidationError
-
-from config.settings import GrowattConfig, InfluxDBConfig, MQTTConfig, Settings, WeatherConfig
 
 
 class TestSettings:
@@ -42,7 +42,9 @@ class TestSettings:
 
     def test_invalid_log_level(self) -> None:
         """Test invalid log level validation."""
-        with patch.dict("os.environ", {"LOG_LEVEL": "INVALID", "INFLUXDB_TOKEN": "test"}):
+        with patch.dict(
+            "os.environ", {"LOG_LEVEL": "INVALID", "INFLUXDB_TOKEN": "test"}
+        ):
             with pytest.raises(ValidationError):
                 Settings(influxdb_token="test")
 
@@ -81,7 +83,9 @@ class TestInfluxDBConfig:
     def test_required_fields(self) -> None:
         """Test required fields for InfluxDB config."""
         with pytest.raises(ValidationError):
-            InfluxDBConfig(url="http://localhost:8086", org="test", token="")  # Empty token
+            InfluxDBConfig(
+                url="http://localhost:8086", org="test", token=""
+            )  # Empty token
 
     def test_batch_size_validation(self) -> None:
         """Test batch size validation."""

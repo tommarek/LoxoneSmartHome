@@ -12,9 +12,8 @@ import sys
 from typing import Any, List, Optional
 
 import colorlog
-from dotenv import load_dotenv
-
 from config.settings import Settings
+from dotenv import load_dotenv
 from modules.growatt_controller import GrowattController
 from modules.mqtt_bridge import MQTTBridge
 from modules.ote_price_collector import OTEPriceCollector
