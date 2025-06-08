@@ -38,7 +38,7 @@ def pv_config():
 @pytest.fixture
 def sample_weather_data():
     """Create sample weather data."""
-    dates = pd.date_range("2024-01-01 00:00:00", "2024-01-30 23:00:00", freq="1h")
+    dates = pd.date_range("2024-01-01 00:00:00", "2024-01-02 23:45:00", freq="15min")
 
     weather_df = pd.DataFrame(
         {
@@ -60,9 +60,7 @@ def sample_weather_data():
 @pytest.fixture
 def sample_pv_data():
     """Create sample PV production data."""
-    # Use enough days to cover the longest lag (prev_week = 288*7 = 2016 periods)
-    # For hourly data, need at least 8+ days to cover weekly lag
-    dates = pd.date_range("2024-01-01 00:00:00", "2024-01-30 23:00:00", freq="1h")
+    dates = pd.date_range("2024-01-01 00:00:00", "2024-01-02 23:45:00", freq="15min")
 
     # Create realistic PV pattern (day/night cycle)
     hour = dates.hour
@@ -112,9 +110,7 @@ class TestPVPredictor:
         predictor = PVPredictor(pv_config)
 
         # Mock pvlib solar position calculation
-        with patch.object(
-            predictor.location, "get_solarposition"
-        ) as mock_solar_pos, patch.object(
+        with patch.object(predictor.location, "get_solarposition") as mock_solar_pos, patch.object(
             predictor.location, "get_clearsky"
         ) as mock_clear_sky:
             # Mock solar position data
@@ -122,9 +118,7 @@ class TestPVPredictor:
                 {
                     "elevation": np.random.uniform(0, 80, len(sample_weather_data)),
                     "azimuth": np.random.uniform(0, 360, len(sample_weather_data)),
-                    "apparent_zenith": np.random.uniform(
-                        0, 90, len(sample_weather_data)
-                    ),
+                    "apparent_zenith": np.random.uniform(0, 90, len(sample_weather_data)),
                 },
                 index=sample_weather_data.index,
             )
@@ -152,9 +146,7 @@ class TestPVPredictor:
         """Test temporal feature engineering."""
         predictor = PVPredictor(pv_config)
 
-        temporal_features = predictor.create_temporal_features(
-            sample_weather_data.index
-        )
+        temporal_features = predictor.create_temporal_features(sample_weather_data.index)
 
         # Check temporal features
         assert "hour" in temporal_features.columns
@@ -205,17 +197,13 @@ class TestPVPredictor:
         with patch.object(predictor.location, "get_solarposition") as mock_solar_pos:
             mock_solar_pos.return_value = pd.DataFrame(
                 {
-                    "apparent_zenith": np.random.uniform(
-                        0, 90, len(sample_weather_data)
-                    ),
+                    "apparent_zenith": np.random.uniform(0, 90, len(sample_weather_data)),
                     "azimuth": np.random.uniform(0, 360, len(sample_weather_data)),
                 },
                 index=sample_weather_data.index,
             )
 
-            physical_prediction = predictor.calculate_physical_model_baseline(
-                sample_weather_data
-            )
+            physical_prediction = predictor.calculate_physical_model_baseline(sample_weather_data)
 
             # Check output
             assert isinstance(physical_prediction, pd.Series)
@@ -223,70 +211,26 @@ class TestPVPredictor:
             assert physical_prediction.min() >= 0  # No negative power
             assert physical_prediction.max() <= predictor.capacity_kw  # Within capacity
 
-    def test_training_data_preparation(
-        self, pv_config, sample_pv_data, sample_weather_data
-    ):
+    def test_training_data_preparation(self, pv_config, sample_pv_data, sample_weather_data):
         """Test training data preparation."""
         predictor = PVPredictor(pv_config)
 
-        # Mock physical model calculation and lag features for hourly data
-        with patch.object(
-            predictor, "calculate_physical_model_baseline"
-        ) as mock_physical, patch.object(
-            predictor, "create_lag_features"
-        ) as mock_lag_features:
+        # Mock physical model calculation
+        with patch.object(predictor, "calculate_physical_model_baseline") as mock_physical:
             mock_physical.return_value = pd.Series(
                 np.random.uniform(0, 10, len(sample_pv_data)),
                 index=sample_pv_data.index,
             )
 
-            # Mock lag features to avoid the 5-minute assumption for test data
-            def mock_lag_func(data, target_col):
-                features = data.copy()
-                # Add simple hourly-appropriate lag features
-                features[f"{target_col}_lag_1"] = features[target_col].shift(1)
-                features[f"{target_col}_lag_2"] = features[target_col].shift(2)
-                features[f"{target_col}_lag_3"] = features[target_col].shift(3)
-                features[f"{target_col}_lag_6"] = features[target_col].shift(6)
-                features[f"{target_col}_lag_12"] = features[target_col].shift(12)
-                features[f"{target_col}_lag_24"] = features[target_col].shift(24)
-                features[f"{target_col}_rolling_mean_6"] = (
-                    features[target_col].rolling(6).mean()
-                )
-                features[f"{target_col}_rolling_std_6"] = (
-                    features[target_col].rolling(6).std()
-                )
-                features[f"{target_col}_rolling_mean_12"] = (
-                    features[target_col].rolling(12).mean()
-                )
-                features[f"{target_col}_rolling_std_12"] = (
-                    features[target_col].rolling(12).std()
-                )
-                features[f"{target_col}_rolling_mean_24"] = (
-                    features[target_col].rolling(24).mean()
-                )
-                features[f"{target_col}_rolling_std_24"] = (
-                    features[target_col].rolling(24).std()
-                )
-                features[f"{target_col}_prev_day"] = features[target_col].shift(24)
-                features[f"{target_col}_prev_week"] = features[target_col].shift(24 * 7)
-                return features
-
-            mock_lag_features.side_effect = mock_lag_func
-
             # Mock solar position and clear sky
             with patch.object(
                 predictor.location, "get_solarposition"
-            ) as mock_solar_pos, patch.object(
-                predictor.location, "get_clearsky"
-            ) as mock_clear_sky:
+            ) as mock_solar_pos, patch.object(predictor.location, "get_clearsky") as mock_clear_sky:
                 mock_solar_pos.return_value = pd.DataFrame(
                     {
                         "elevation": np.random.uniform(0, 80, len(sample_pv_data)),
                         "azimuth": np.random.uniform(0, 360, len(sample_pv_data)),
-                        "apparent_zenith": np.random.uniform(
-                            0, 90, len(sample_pv_data)
-                        ),
+                        "apparent_zenith": np.random.uniform(0, 90, len(sample_pv_data)),
                     },
                     index=sample_pv_data.index,
                 )
@@ -300,9 +244,7 @@ class TestPVPredictor:
                     index=sample_pv_data.index,
                 )
 
-                X, y = predictor.prepare_training_data(
-                    sample_pv_data, sample_weather_data
-                )
+                X, y = predictor.prepare_training_data(sample_pv_data, sample_weather_data)
 
                 # Check output shapes and content
                 assert isinstance(X, pd.DataFrame)
@@ -378,14 +320,10 @@ class TestPVPredictor:
         predictor.scaler = None
 
         # Mock prediction that exceeds capacity
-        predictor.ml_model.predict.return_value = np.array(
-            [15.0]
-        )  # 15 kW > 10 kW capacity
+        predictor.ml_model.predict.return_value = np.array([15.0])  # 15 kW > 10 kW capacity
 
         # Create simple test data
-        X_test = pd.DataFrame(
-            {"test_feature": [1.0]}, index=[pd.Timestamp("2024-01-01 12:00:00")]
-        )
+        X_test = pd.DataFrame({"test_feature": [1.0]}, index=[pd.Timestamp("2024-01-01 12:00:00")])
 
         # Mock metadata for version info
         predictor.metadata = MagicMock()
@@ -394,9 +332,7 @@ class TestPVPredictor:
         result = predictor.predict(X_test)
 
         # Check that prediction was clipped to capacity (converted back to watts)
-        assert (
-            result.predictions.iloc[0] <= predictor.capacity_kw * 1000
-        )  # Should be <= 10,000 W
+        assert result.predictions.iloc[0] <= predictor.capacity_kw * 1000  # Should be <= 10,000 W
 
 
 if __name__ == "__main__":

@@ -18,14 +18,87 @@ from scipy import stats
 
 
 class DataValidator:
-    """Validate data quality and integrity."""
+    """
+    Data Quality Validation and Integrity Checking for PEMS v2.
+
+    This class provides comprehensive data validation capabilities for the
+    Predictive Energy Management System, ensuring data quality and integrity
+    across all energy system data sources before analysis and ML model training.
+
+    Core Capabilities:
+    1. **PV Data Validation**: Photovoltaic production data quality checks
+    2. **Weather Data Validation**: Meteorological data consistency verification
+    3. **Consumption Data Validation**: Load and consumption pattern validation
+    4. **Temporal Validation**: Time series continuity and frequency checks
+    5. **Statistical Validation**: Outlier detection and statistical anomaly identification
+
+    Validation Categories:
+    - **Structural Validation**: Column presence, data types, index integrity
+    - **Range Validation**: Physical limits, reasonable value ranges
+    - **Consistency Validation**: Cross-variable relationships, logical constraints
+    - **Completeness Validation**: Missing data assessment, coverage analysis
+    - **Quality Scoring**: Overall data quality metrics and recommendations
+
+    Usage in PEMS v2 Workflow:
+    1. Data extraction from InfluxDB sources
+    2. Initial validation to identify data quality issues
+    3. Preprocessing pipeline with automated cleaning
+    4. ML model input validation before training
+    5. Real-time data validation for predictions
+
+    Integration Points:
+    - Input: Raw data from DataExtractor classes
+    - Output: Validation reports and cleaned datasets
+    - Monitoring: Data quality metrics for system health
+    - Configuration: Validation thresholds from energy_settings.py
+    """
 
     def __init__(self):
-        """Initialize the data validator."""
+        """
+        Initialize the comprehensive data validation system.
+
+        Sets up logging infrastructure and validation parameters for consistent
+        data quality assessment across all PEMS v2 data sources.
+
+        Initialization Process:
+        1. Configure specialized logger for validation tracking
+        2. Load validation thresholds from configuration
+        3. Initialize statistical validation parameters
+        4. Set up data quality scoring system
+
+        The validator is designed to be reusable across different data types
+        and validation scenarios while maintaining consistent quality standards.
+        """
         self.logger = logging.getLogger(f"{__name__}.DataValidator")
 
+        # Initialize validation configuration
+        self.pv_max_power_kw = 50.0  # Maximum reasonable PV power for residential
+        self.weather_temp_range = (-30, 50)  # Reasonable temperature range in Celsius
+        self.missing_data_threshold = 0.1  # Maximum acceptable missing data fraction
+        self.outlier_z_threshold = 3.0  # Z-score threshold for outlier detection
+
+        self.logger.info(
+            "DataValidator initialized with standard validation parameters"
+        )
+
     def validate_pv_data(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """Validate PV production data."""
+        """
+        Comprehensive validation of photovoltaic (PV) production data.
+
+        Performs detailed quality assessment of solar energy production data
+        to ensure accuracy, completeness, and reliability for analysis and
+        ML model training in the PEMS v2 system.
+
+        Args:
+            df: PV production DataFrame with columns like:
+                - InputPower: Total PV system power output (Watts)
+                - PV1InputPower, PV2InputPower: Individual string outputs
+                - PV1Voltage, PV2Voltage: String voltages
+                - Timestamp index for temporal analysis
+
+        Returns:
+            Dictionary containing validation results and quality metrics
+        """
         validation_results = {"valid": True, "warnings": [], "errors": []}
 
         if df.empty:

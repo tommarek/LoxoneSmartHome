@@ -16,102 +16,57 @@ def test_imports():
     """Test that all analysis modules can be imported."""
     print("🔬 Testing module imports...")
 
-    try:
-        from analysis.analyzers.pattern_analysis import PVAnalyzer
+    # Import and validate all modules
+    from pems_v2.analysis.analyzers.pattern_analysis import PVAnalyzer
 
-        assert PVAnalyzer is not None  # Use the import
-        print("✅ PVAnalyzer imported successfully")
-    except Exception as e:
-        print(f"❌ PVAnalyzer import failed: {e}")
-        return False
+    assert PVAnalyzer is not None
+    print("✅ PVAnalyzer imported successfully")
 
-    try:
-        from analysis.analyzers.thermal_analysis import ThermalAnalyzer
+    from pems_v2.analysis.analyzers.thermal_analysis import ThermalAnalyzer
 
-        assert ThermalAnalyzer is not None  # Use the import
-        print("✅ ThermalAnalyzer imported successfully")
-    except Exception as e:
-        print(f"❌ ThermalAnalyzer import failed: {e}")
-        return False
+    assert ThermalAnalyzer is not None
+    print("✅ ThermalAnalyzer imported successfully")
 
-    try:
-        from analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
+    from pems_v2.analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
 
-        assert BaseLoadAnalyzer is not None  # Use the import
-        print("✅ BaseLoadAnalyzer imported successfully")
-    except Exception as e:
-        print(f"❌ BaseLoadAnalyzer import failed: {e}")
-        return False
+    assert BaseLoadAnalyzer is not None
+    print("✅ BaseLoadAnalyzer imported successfully")
 
-    try:
-        from analysis.core.data_preprocessing import DataValidator
+    from pems_v2.analysis.core.data_preprocessing import DataValidator
 
-        assert DataValidator is not None  # Use the import
-        print("✅ DataValidator imported successfully")
-    except Exception as e:
-        print(f"❌ DataValidator import failed: {e}")
-        return False
+    assert DataValidator is not None
+    print("✅ DataValidator imported successfully")
 
-    try:
-        from analysis.core.data_extraction import DataExtractor
+    from pems_v2.analysis.core.data_extraction import DataExtractor
 
-        assert DataExtractor is not None  # Use the import
-        print("✅ DataExtractor imported successfully")
-    except Exception as e:
-        print(f"❌ DataExtractor import failed: {e}")
-        return False
-
-    return True
+    assert DataExtractor is not None
+    print("✅ DataExtractor imported successfully")
 
 
 def test_dependencies():
     """Test that required dependencies are available."""
     print("\n📦 Testing dependencies...")
 
-    missing_deps = []
+    # Test all required dependencies
+    import pandas as pd
 
-    try:
-        import pandas as pd
+    assert pd is not None
+    print("✅ pandas available")
 
-        assert pd is not None  # Use the import
-        print("✅ pandas available")
-    except ImportError:
-        print("❌ pandas not available")
-        missing_deps.append("pandas")
+    import numpy as np
 
-    try:
-        import numpy as np
+    assert np is not None
+    print("✅ numpy available")
 
-        assert np is not None  # Use the import
-        print("✅ numpy available")
-    except ImportError:
-        print("❌ numpy not available")
-        missing_deps.append("numpy")
+    import scipy
 
-    try:
-        import scipy
+    assert scipy is not None
+    print("✅ scipy available")
 
-        assert scipy is not None  # Use the import
-        print("✅ scipy available")
-    except ImportError:
-        print("❌ scipy not available")
-        missing_deps.append("scipy")
+    import sklearn
 
-    try:
-        import sklearn
-
-        assert sklearn is not None  # Use the import
-        print("✅ scikit-learn available")
-    except ImportError:
-        print("❌ scikit-learn not available")
-        missing_deps.append("scikit-learn")
-
-    if missing_deps:
-        print(f"\n⚠️  Missing dependencies: {', '.join(missing_deps)}")
-        print("Install with: pip install pandas numpy scipy scikit-learn")
-        return False
-
-    return True
+    assert sklearn is not None
+    print("✅ scikit-learn available")
 
 
 def test_directory_structure():
@@ -119,47 +74,30 @@ def test_directory_structure():
     print("\n📁 Testing directory structure...")
 
     required_dirs = ["analysis", "config", "utils", "tests"]
-
-    missing_dirs = []
     project_root = Path(__file__).parent.parent
 
     for dir_name in required_dirs:
         dir_path = project_root / dir_name
-        if dir_path.exists():
-            print(f"✅ {dir_name}/ exists")
-        else:
-            print(f"❌ {dir_name}/ missing")
-            missing_dirs.append(dir_name)
-
-    return len(missing_dirs) == 0
+        assert dir_path.exists(), f"Required directory '{dir_name}' not found"
+        print(f"✅ {dir_name}/ exists")
 
 
 def test_config_loading():
     """Test configuration loading."""
     print("\n⚙️  Testing configuration...")
 
-    try:
-        from config.settings import InfluxDBSettings, PEMSSettings
+    from pems_v2.config.settings import InfluxDBSettings, PEMSSettings
 
-        assert PEMSSettings is not None  # Use the import
-        print("✅ Settings class imported successfully")
+    assert PEMSSettings is not None
+    print("✅ Settings class imported successfully")
 
-        # Test InfluxDB settings directly with dummy token (no env loading)
-        influx_settings = InfluxDBSettings(token="test_token")
-        print("✅ InfluxDB settings created successfully")
+    # Test InfluxDB settings directly with dummy token (no env loading)
+    influx_settings = InfluxDBSettings(token="test_token")
+    print("✅ InfluxDB settings created successfully")
 
-        # Test that the settings classes have the expected structure
-        if hasattr(influx_settings, "token"):
-            print("✅ InfluxDB token field available")
-        else:
-            print("❌ InfluxDB token field missing")
-            return False
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Settings loading failed: {e}")
-        return False
+    # Test that the settings classes have the expected structure
+    assert hasattr(influx_settings, "token"), "InfluxDB token field missing"
+    print("✅ InfluxDB token field available")
 
 
 def main():

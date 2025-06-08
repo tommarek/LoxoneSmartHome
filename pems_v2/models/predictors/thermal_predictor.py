@@ -592,12 +592,12 @@ class ThermalPredictor(BasePredictor):
 
         # Set the trained model for persistence
         self.model = {
-            'physics_model': getattr(self, 'physics_model', None),
-            'ml_model': self.ml_model,
-            'feature_scaler': self.feature_scaler,
-            'thermal_parameters': getattr(self, 'thermal_parameters', None),
-            'zone_capacitance': getattr(self, 'zone_capacitance', None),
-            'zone_resistance': getattr(self, 'zone_resistance', None)
+            "physics_model": getattr(self, "physics_model", None),
+            "ml_model": self.ml_model,
+            "feature_scaler": self.feature_scaler,
+            "thermal_parameters": getattr(self, "thermal_parameters", None),
+            "zone_capacitance": getattr(self, "zone_capacitance", None),
+            "zone_resistance": getattr(self, "zone_resistance", None),
         }
 
         return performance

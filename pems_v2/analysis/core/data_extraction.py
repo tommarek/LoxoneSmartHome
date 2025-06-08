@@ -91,11 +91,11 @@ from influxdb_client import InfluxDBClient
 class DataExtractor:
     """
     Enhanced data extractor with comprehensive validation and error handling.
-    
+
     This class manages the extraction of time-series data from InfluxDB for the PEMS v2
     system. It provides a unified interface for accessing different data types while
     ensuring data quality and consistency across all extracted datasets.
-    
+
     Core Responsibilities:
     1. **Multi-source Data Extraction**: Extract from multiple InfluxDB buckets
     2. **Data Quality Validation**: Validate completeness, detect outliers, check ranges
@@ -103,14 +103,14 @@ class DataExtractor:
     4. **Error Recovery**: Implement retry logic and graceful error handling
     5. **Memory Management**: Process large datasets efficiently with chunking
     6. **Data Standardization**: Ensure consistent data formats and units
-    
+
     Supported Data Types:
     - Room temperature and heating relay states
     - Solar PV production and battery storage data
     - Weather forecasts and outdoor conditions
     - Electricity prices and market data
     - Energy consumption patterns by category
-    
+
     Architecture:
     - Async/await design for non-blocking I/O operations
     - Configurable retry policies for network resilience
@@ -122,49 +122,49 @@ class DataExtractor:
     def __init__(self, settings: Settings):
         """
         Initialize data extractor with comprehensive InfluxDB client and configuration setup.
-        
+
         Sets up the data extraction infrastructure with full configuration for reliable
         data retrieval from multiple InfluxDB buckets. Configures timezone handling,
         establishes database connections, and prepares data quality validation parameters.
-        
+
         Args:
             settings: PEMS system settings containing InfluxDB configuration,
                      bucket names, authentication tokens, and data quality thresholds
-                     
+
         Configuration Setup:
         - InfluxDB client with authentication and timeout handling
         - Timezone management for Prague (Loxone) and UTC (calculations)
         - Data output directory structure for parquet file storage
         - Logging configuration for debugging and monitoring
         - Data quality threshold initialization from settings
-        
+
         Connection Parameters:
         - URL: InfluxDB server endpoint with protocol and port
         - Token: Authentication token with read access to all buckets
         - Organization: InfluxDB organization for multi-tenant support
         - Timeout: Extended timeout (30s) for large query operations
-        
+
         Directory Structure:
         - data/raw/: Raw extracted data in parquet format
         - Automatic directory creation with parent path handling
         - Organized by data type and extraction date for easy access
-        
+
         Raises:
             ConnectionError: If InfluxDB connection cannot be established
             PermissionError: If data directory cannot be created
             ValueError: If settings contain invalid configuration
-            
+
         Example:
             from config.settings import PEMSSettings
             settings = PEMSSettings()
             extractor = DataExtractor(settings)
-            
+
             # Ready for data extraction
             pv_data = await extractor.extract_pv_data(start_date, end_date)
         """
         # Store settings for access throughout the class
         self.settings = settings
-        
+
         # Initialize logger with class-specific name for organized logging
         self.logger = logging.getLogger(f"{__name__}.DataExtractor")
         self.logger.info("Initializing DataExtractor with InfluxDB connection...")
@@ -180,7 +180,7 @@ class DataExtractor:
             # Initialize query API for data retrieval operations
             self.query_api = self.client.query_api()
             self.logger.info(f"Connected to InfluxDB at {settings.influxdb.url}")
-            
+
         except Exception as e:
             self.logger.error(f"Failed to initialize InfluxDB client: {e}")
             raise ConnectionError(f"Cannot connect to InfluxDB: {e}")
@@ -190,7 +190,9 @@ class DataExtractor:
         self.local_tz = pytz.timezone("Europe/Prague")
         # UTC timezone: Used for calculations and standardization
         self.utc_tz = pytz.UTC
-        self.logger.debug("Timezone handling configured: Prague (local) and UTC (calculations)")
+        self.logger.debug(
+            "Timezone handling configured: Prague (local) and UTC (calculations)"
+        )
 
         # Data output directory setup for parquet file storage
         try:
@@ -200,22 +202,26 @@ class DataExtractor:
         except Exception as e:
             self.logger.error(f"Failed to create data directory: {e}")
             raise PermissionError(f"Cannot create data directory: {e}")
-        
+
         # Data quality configuration from settings
         self.quality_thresholds = DATA_QUALITY_THRESHOLDS
         self.max_missing_percentage = self.quality_thresholds["max_missing_percentage"]
         self.max_gap_hours = self.quality_thresholds["max_gap_hours"]
-        self.min_data_points_per_day = self.quality_thresholds["min_data_points_per_day"]
-        
+        self.min_data_points_per_day = self.quality_thresholds[
+            "min_data_points_per_day"
+        ]
+
         # Operational parameters
-        self.chunk_size_hours = 24  # Process data in 24-hour chunks for memory efficiency
+        self.chunk_size_hours = (
+            24  # Process data in 24-hour chunks for memory efficiency
+        )
         self.max_retries = 3  # Maximum retry attempts for failed queries
         self.retry_delay_base = 1.0  # Base delay for exponential backoff (seconds)
-        
+
         # Query performance optimization
         self._query_cache = {}  # Cache for repeated queries within session
         self._last_query_time = {}  # Track query timing for performance monitoring
-        
+
         self.logger.info(
             f"DataExtractor initialized successfully with {len(self.quality_thresholds)} "
             f"quality thresholds and {self.chunk_size_hours}h chunk processing"
@@ -224,16 +230,16 @@ class DataExtractor:
     def __del__(self):
         """
         Cleanup method to ensure proper resource deallocation.
-        
+
         Safely closes the InfluxDB client connection to prevent resource leaks
         and ensure graceful shutdown. This method is called automatically by
         Python's garbage collector when the DataExtractor instance is destroyed.
-        
+
         Cleanup Operations:
         - Close InfluxDB client connection and release network resources
         - Clear query cache to free memory
         - Log cleanup completion for debugging
-        
+
         Safety Features:
         - Checks for client existence before attempting closure
         - Handles exceptions during cleanup to prevent shutdown failures
@@ -244,11 +250,11 @@ class DataExtractor:
                 self.client.close()
                 if hasattr(self, "logger"):
                     self.logger.debug("InfluxDB client connection closed successfully")
-            
+
             # Clear cache to free memory
             if hasattr(self, "_query_cache"):
                 self._query_cache.clear()
-                
+
         except Exception as e:
             # Use print instead of logger in case logger was not initialized
             print(f"Warning: Error during DataExtractor cleanup: {e}")
@@ -258,54 +264,54 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract comprehensive photovoltaic (PV) and energy storage system data from InfluxDB.
-        
+
         This method retrieves detailed solar generation, battery storage, and inverter
         performance data from the Growatt solar system. The data includes string-level
         monitoring for detailed analysis of PV array performance and comprehensive
         battery operation tracking for energy storage optimization.
-        
+
         Args:
             start_date: Beginning of extraction period (timezone-aware datetime)
             end_date: End of extraction period (timezone-aware datetime)
-            
+
         Data Sources:
         - InfluxDB measurement: "solar" from the configured solar bucket
         - Growatt inverter telemetry data via MQTT bridge
         - Real-time monitoring at 15-minute aggregation intervals
-        
+
         Core PV Generation Fields:
         - InputPower: Total DC input power from all PV strings (W)
         - PV1InputPower: DC power from PV string 1 (W) - enables string performance analysis
         - PV2InputPower: DC power from PV string 2 (W) - for system balance monitoring
         - PV1Voltage: DC voltage of PV string 1 (V) - for string health assessment
         - PV2Voltage: DC voltage of PV string 2 (V) - for system diagnostics
-        
+
         Inverter Output Fields:
         - INVPowerToLocalLoad: AC power delivered to house loads (W)
         - ACPowerToUser: Total AC power for consumption (W)
         - ACPowerToGrid: AC power exported to electrical grid (W)
         - InverterStatus: Operational status code (integer/enum)
         - InverterTemperature: Inverter internal temperature (°C)
-        
+
         Battery Storage Fields:
         - ChargePower: Power flowing into battery during charging (W, positive)
         - DischargePower: Power flowing from battery during discharge (W, positive)
         - SOC: State of charge percentage (0-100%)
         - BatteryTemperature: Battery pack temperature (°C)
-        
+
         Energy Accumulation Fields:
         - TodayGenerateEnergy: Cumulative energy generated today (kWh)
         - LocalLoadEnergyToday: Energy consumed by house today (kWh)
         - EnergyToGridToday: Energy exported to grid today (kWh)
         - EnergyToUserToday: Total energy delivered to user today (kWh)
-        
+
         Data Processing:
         1. **Query Construction**: Build InfluxDB Flux query with all relevant fields
         2. **Aggregation**: 15-minute mean aggregation for noise reduction
         3. **Pivot Operation**: Transform time-series data to columnar format
         4. **Derived Metrics**: Calculate additional metrics for analysis
         5. **Quality Validation**: Check data completeness and ranges
-        
+
         Calculated Derived Metrics:
         - solar_energy_kwh: Energy production per 15-min interval (InputPower * 0.25h / 1000)
         - total_ac_output: Combined AC output (ACPowerToGrid + ACPowerToUser)
@@ -313,36 +319,36 @@ class DataExtractor:
         - battery_energy_kwh: Battery energy change per interval
         - total_pv_power: Sum of all PV strings (PV1InputPower + PV2InputPower)
         - pv_string_balance: String balance factor (PV1 / total_pv) for array health
-        
+
         Returns:
             pd.DataFrame: PV and battery data with DatetimeIndex and comprehensive columns
                 Empty DataFrame if no data found in the specified time range
-                
+
         Raises:
             ConnectionError: If InfluxDB query fails after retries
             ValueError: If date range is invalid
-            
+
         Performance Considerations:
         - 15-minute aggregation reduces data volume while preserving trends
         - Efficient field selection minimizes network transfer
         - Automatic pivot operation for analysis-ready format
         - Memory-efficient processing for large time ranges
-        
+
         Data Quality Features:
         - Validates power values are within reasonable ranges (0-50kW typical)
         - Checks for string balance (PV1 vs PV2 should be similar under good conditions)
         - Monitors battery SOC bounds (typically 10-95%)
         - Temperature monitoring for thermal management assessment
-        
+
         Usage Example:
             # Extract one month of PV data
             start = datetime(2024, 1, 1, tzinfo=pytz.UTC)
             end = datetime(2024, 1, 31, tzinfo=pytz.UTC)
             pv_data = await extractor.extract_pv_data(start, end)
-            
+
             # Analyze daily energy production
             daily_energy = pv_data['solar_energy_kwh'].resample('D').sum()
-            
+
             # Check string performance balance
             string_balance = pv_data['pv_string_balance'].mean()
             if string_balance < 0.4 or string_balance > 0.6:
@@ -772,26 +778,26 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract comprehensive energy consumption data categorized by usage type from Loxone system.
-        
+
         This method focuses specifically on energy CONSUMPTION analysis, complementing the
         extract_pv_data() method which handles energy GENERATION. It retrieves heating relay
         states and converts them to actual power consumption using room-specific power ratings.
-        
+
         Key Distinctions from Other Methods:
         - extract_pv_data(): Solar generation, battery storage, and inverter output
         - extract_energy_consumption(): House load consumption by category
         - extract_battery_data(): Battery-specific charge/discharge analysis
-        
+
         Args:
             start_date: Beginning of extraction period (timezone-aware datetime)
             end_date: End of extraction period (timezone-aware datetime)
-            
+
         Data Sources:
         - InfluxDB measurement: "relay" from Loxone bucket
         - Heating relay states (tag1 == "heating") for each room
         - Room power ratings from energy_settings.py configuration
         - 15-minute aggregation for consistent time intervals
-        
+
         Consumption Categories (Current Implementation):
         - Heating: Room-by-room heating relay states converted to power consumption
         - Future categories could include:
@@ -799,7 +805,7 @@ class DataExtractor:
           * Lighting: Smart lighting system consumption
           * HVAC: Air conditioning and ventilation
           * EV Charging: Electric vehicle charging loads
-          
+
         Data Processing Pipeline:
         1. **Relay State Extraction**: Query heating relay on/off states by room
         2. **Power Calculation**: Convert binary relay state to actual power consumption
@@ -808,13 +814,13 @@ class DataExtractor:
         4. **Energy Integration**: Convert power to energy using time intervals
            - Formula: power (W) × 0.25h / 1000 = energy (kWh) for 15-min intervals
         5. **Category Totaling**: Sum all consumption categories for total load
-        
+
         Room Power Rating Application:
         - Each room has a configured power rating based on heating element capacity
         - Power ratings derived from actual measurement and system specifications
         - Examples: Living room (3.0 kW), Kitchen (1.8 kW), Bedrooms (1.2 kW each)
         - Total system heating capacity: ~18.12 kW across all rooms
-        
+
         Returns:
             pd.DataFrame: Consumption data with DatetimeIndex and columns:
                 - heating_power (float): Total heating power consumption (W)
@@ -822,47 +828,47 @@ class DataExtractor:
                 - total_consumption (float): Sum of all category powers (W)
                 - total_consumption_energy_kwh (float): Total energy consumption (kWh)
                 - Future: additional category columns as system expands
-                
+
         Data Quality Features:
         - Validates relay states are binary (0 or 1)
         - Checks room names against configured room list
         - Monitors for unexpected power spikes or drops
         - Logs data completeness and processing statistics
-        
+
         Performance Optimizations:
         - Efficient groupby operations for temporal aggregation
         - Memory-efficient room power lookup using pandas apply
         - Single query with filtered results reduces database load
         - Vectorized operations for power calculations
-        
+
         Usage Examples:
             # Extract heating consumption for winter analysis
             consumption_data = await extractor.extract_energy_consumption(
                 start_date=datetime(2024, 12, 1, tzinfo=pytz.UTC),
                 end_date=datetime(2024, 2, 29, tzinfo=pytz.UTC)
             )
-            
+
             # Analyze daily heating patterns
             daily_heating = consumption_data['heating_energy_kwh'].resample('D').sum()
-            
+
             # Calculate heating efficiency
             total_heating_energy = consumption_data['heating_energy_kwh'].sum()
             avg_power = consumption_data['heating_power'].mean()
-            
+
             # Identify peak consumption periods
             peak_hours = consumption_data.groupby(consumption_data.index.hour)['heating_power'].mean()
-            
+
         Integration with PEMS Optimization:
         - Consumption patterns feed into load prediction models
         - Historical data trains thermal comfort optimization
         - Peak load analysis informs demand response strategies
         - Category breakdown enables targeted efficiency improvements
-        
+
         Raises:
             ConnectionError: If InfluxDB query fails
             ValueError: If no valid consumption data found
             KeyError: If room configuration is missing or invalid
-            
+
         Notes:
         - Currently only heating consumption is tracked via relay states
         - Future expansion will include smart meter integration for total house load
@@ -1088,65 +1094,65 @@ class DataExtractor:
     def save_to_parquet(self, df: pd.DataFrame, filename: str) -> None:
         """
         Save DataFrame to compressed Parquet format for efficient storage and fast loading.
-        
+
         Parquet format provides significant advantages for time-series energy data:
         - **Compression**: 80-90% size reduction vs. CSV with snappy compression
         - **Speed**: 10-50x faster loading compared to CSV for large datasets
         - **Type Safety**: Preserves data types including timestamps and floats
         - **Columnar Storage**: Efficient for analytical queries on specific fields
         - **Schema Evolution**: Supports adding columns without breaking compatibility
-        
+
         Args:
             df: DataFrame to save (must have consistent schema)
             filename: Base filename without extension (will add .parquet)
-            
+
         File Organization:
         - Location: data/raw/ directory for organized data management
         - Naming: {filename}.parquet with descriptive names
         - Compression: Snappy algorithm for optimal speed/size balance
         - Metadata: Preserves pandas metadata including index information
-        
+
         Storage Optimizations:
         - **Snappy Compression**: Fast compression/decompression with good ratios
         - **Column Pruning**: Only specified columns stored (no unnecessary data)
         - **Data Type Optimization**: Efficient storage of timestamps and numerics
         - **Index Preservation**: Maintains DatetimeIndex for time-series operations
-        
+
         Error Handling:
         - Empty DataFrame check prevents saving invalid files
         - Directory creation ensures target path exists
         - File size logging for storage monitoring
         - Graceful error handling with informative logging
-        
+
         Usage Examples:
             # Save PV production data
             extractor.save_to_parquet(pv_data, "pv_production_2024_q1")
-            
+
             # Save room temperature data
             for room, data in room_temperatures.items():
                 extractor.save_to_parquet(data, f"temperature_{room}_2024")
-            
+
             # Save comprehensive energy data
             extractor.save_to_parquet(energy_consumption, "consumption_hourly_2024")
-            
+
         Performance Benefits:
         - Large datasets (>1M rows): 50x faster loading than CSV
         - Network transfer: 80% smaller files reduce transfer time
         - Memory usage: Efficient loading with column selection
         - Query performance: Direct column access without full scan
-        
+
         Data Integrity:
         - Checksums: Parquet includes built-in data integrity verification
         - Schema validation: Type checking prevents data corruption
         - Atomic writes: File is complete or not created (no partial files)
         - Version compatibility: Standard format ensures long-term accessibility
-        
+
         File Management:
         - Timestamped filenames prevent accidental overwrites
         - Logical organization by data type and time period
         - Easy integration with data analysis workflows
         - Compatible with pandas, polars, and other analysis tools
-        
+
         Notes:
         - Parquet is ideal for analytical workloads but not for streaming
         - Consider partitioning very large datasets by date
@@ -1157,21 +1163,21 @@ class DataExtractor:
         if df.empty:
             self.logger.warning(f"Not saving {filename} - DataFrame is empty")
             return
-        
+
         # Ensure data directory exists
         try:
             filepath = self.data_dir / f"{filename}.parquet"
-            
+
             # Save with optimal compression settings
             df.to_parquet(filepath, compression="snappy")
-            
+
             # Log success with file size information
             file_size_mb = filepath.stat().st_size / (1024 * 1024)
             self.logger.info(
                 f"Saved {len(df)} records to {filepath} "
                 f"({file_size_mb:.2f} MB, {len(df.columns)} columns)"
             )
-            
+
         except Exception as e:
             self.logger.error(f"Failed to save {filename} to parquet: {e}")
             raise
@@ -1179,82 +1185,82 @@ class DataExtractor:
     def load_from_parquet(self, filename: str) -> pd.DataFrame:
         """
         Load DataFrame from Parquet format with optimized performance and error handling.
-        
+
         This method provides efficient loading of previously saved time-series data
         with automatic schema validation and performance monitoring. Parquet loading
         is significantly faster than CSV and preserves all data types including
         complex timestamps and floating-point precision.
-        
+
         Args:
             filename: Base filename without extension (matches save_to_parquet)
-            
+
         Loading Optimizations:
         - **Fast Deserialization**: Parquet's columnar format enables rapid loading
         - **Selective Loading**: Can load specific columns if needed (future enhancement)
         - **Memory Efficiency**: Lazy loading reduces memory pressure for large files
         - **Type Preservation**: Maintains original data types without conversion
-        
+
         Performance Characteristics:
         - Small files (<10MB): Nearly instantaneous loading
         - Medium files (10-100MB): 2-5 second loading time
         - Large files (100MB-1GB): 10-30 second loading time
         - Very large files (>1GB): Consider chunked loading strategies
-        
+
         Error Handling:
         - **File Existence**: Graceful handling of missing files
         - **Schema Validation**: Automatic detection of schema changes
         - **Corruption Detection**: Parquet checksums detect data corruption
         - **Memory Management**: Efficient loading even for large datasets
-        
+
         Returns:
             pd.DataFrame: Loaded data with preserved schema and index
                 - Empty DataFrame if file doesn't exist or loading fails
                 - Original DatetimeIndex preserved for time-series operations
                 - All original column types and metadata restored
-                
+
         Data Integrity Features:
         - **Checksum Validation**: Automatic detection of file corruption
         - **Schema Consistency**: Validates expected data structure
         - **Missing Value Handling**: Preserves NaN values and data gaps
         - **Index Reconstruction**: Restores original DataFrame index
-        
+
         Usage Examples:
             # Load PV production data for analysis
             pv_data = extractor.load_from_parquet("pv_production_2024_q1")
             if not pv_data.empty:
                 daily_production = pv_data['solar_energy_kwh'].resample('D').sum()
-            
+
             # Load multiple room temperature files
             room_data = {}
             for room in ['living_room', 'kitchen', 'bedroom']:
                 data = extractor.load_from_parquet(f"temperature_{room}_2024")
                 if not data.empty:
                     room_data[room] = data
-            
+
             # Load consumption data with error handling
             try:
                 consumption = extractor.load_from_parquet("consumption_hourly_2024")
                 print(f"Loaded consumption data: {consumption.shape}")
             except Exception as e:
                 print(f"Failed to load consumption data: {e}")
-                
+
         Performance Monitoring:
         - Loading time logged for performance tracking
         - File size and record count reported
         - Memory usage can be monitored for optimization
         - Schema changes detected and logged
-        
+
         Caching Strategy:
         - Recently loaded files could be cached in memory (future enhancement)
         - Intelligent cache eviction based on file size and access patterns
         - Cache invalidation when files are updated
-        
+
         File Management:
         - Automatic path resolution using configured data directory
         - Consistent filename handling with save_to_parquet method
         - Support for subdirectory organization (future enhancement)
         - File metadata tracking for data lineage
-        
+
         Notes:
         - Parquet files are self-describing and platform-independent
         - Loading preserves all pandas-specific metadata and extensions
@@ -1263,7 +1269,7 @@ class DataExtractor:
         """
         # Construct full file path
         filepath = self.data_dir / f"{filename}.parquet"
-        
+
         # Check file existence
         if not filepath.exists():
             self.logger.warning(f"Parquet file not found: {filepath}")
@@ -1272,22 +1278,23 @@ class DataExtractor:
         try:
             # Load with performance monitoring
             import time
+
             start_time = time.time()
-            
+
             df = pd.read_parquet(filepath)
-            
+
             # Calculate and log performance metrics
             load_time = time.time() - start_time
             file_size_mb = filepath.stat().st_size / (1024 * 1024)
-            
+
             self.logger.info(
                 f"Loaded {len(df)} records from {filepath} "
                 f"({file_size_mb:.2f} MB, {len(df.columns)} columns) "
                 f"in {load_time:.2f} seconds"
             )
-            
+
             return df
-            
+
         except Exception as e:
             self.logger.error(f"Failed to load parquet file {filepath}: {e}")
             return pd.DataFrame()
@@ -1297,40 +1304,40 @@ class DataExtractor:
     ) -> Dict[str, Any]:
         """
         Generate comprehensive data quality assessment report for energy datasets.
-        
+
         This method performs detailed data quality analysis to identify issues that
         could impact energy optimization and machine learning model performance.
         It provides actionable insights for data preprocessing and cleaning strategies.
-        
+
         Quality Assessment Dimensions:
         1. **Completeness**: Missing data detection and quantification
         2. **Consistency**: Time gaps and irregular sampling identification
         3. **Validity**: Value range validation against physical constraints
         4. **Accuracy**: Outlier detection and anomaly identification
         5. **Timeliness**: Temporal coverage and recency assessment
-        
+
         Args:
             df: DataFrame to analyze (expected to have DatetimeIndex)
             data_type: Descriptive name for the dataset type
-            
+
         Missing Data Analysis:
         - **Overall Completeness**: Percentage of missing values across all fields
         - **Column-wise Analysis**: Missing data patterns by individual columns
         - **Temporal Patterns**: Missing data correlation with time periods
         - **Impact Assessment**: Critical vs. non-critical missing data
-        
+
         Time Gap Detection:
         - **Continuity Analysis**: Identifies breaks in expected time series
         - **Gap Classification**: Short gaps (<1h) vs. long gaps (>1h)
         - **Frequency Validation**: Confirms expected sampling intervals
         - **Business Impact**: Assesses impact on optimization accuracy
-        
+
         Statistical Quality Metrics:
         - **Value Range Validation**: Checks against physical constraints
         - **Outlier Detection**: Identifies values outside normal ranges
         - **Distribution Analysis**: Skewness and kurtosis for normality
         - **Correlation Integrity**: Cross-field relationship validation
-        
+
         Returns:
             Dict[str, Any]: Comprehensive quality report containing:
                 - data_type (str): Dataset identifier for reference
@@ -1344,52 +1351,52 @@ class DataExtractor:
                 - potential_outliers (dict): Outlier counts by column
                 - sampling_frequency (str): Detected time interval
                 - recommendations (list): Data quality improvement suggestions
-                
+
         Empty Dataset Handling:
         - Returns structured report indicating no data available
         - Provides appropriate defaults for downstream processing
         - Logs warning about missing data for monitoring
-        
+
         Quality Thresholds (from DATA_QUALITY_THRESHOLDS):
         - max_missing_percentage: 10% (triggers data quality warning)
         - max_gap_hours: 2 hours (acceptable gap duration)
         - min_data_points_per_day: 48 (for 15-minute intervals)
-        
+
         Usage Examples:
             # Generate quality report for PV data
             pv_quality = extractor.get_data_quality_report(pv_data, "pv_production")
-            
+
             if pv_quality['missing_percentage'] > 10:
                 print(f"Warning: {pv_quality['missing_percentage']:.1f}% missing data")
-            
+
             # Check for significant time gaps
-            large_gaps = [gap for gap in pv_quality['time_gaps'] 
+            large_gaps = [gap for gap in pv_quality['time_gaps']
                          if gap[1].total_seconds() > 7200]  # >2 hours
-            
+
             # Validate data coverage
             start_date, end_date = pv_quality['date_range']
             coverage_days = (end_date - start_date).days
             expected_records = coverage_days * 96  # 15-min intervals
             completeness = pv_quality['total_records'] / expected_records
-            
+
         Quality Reporting Applications:
         - **Model Training**: Assess data suitability for ML algorithms
         - **Optimization Input**: Validate data quality for energy optimization
         - **Monitoring Dashboards**: Track data quality over time
         - **Data Pipeline Health**: Identify collection and processing issues
-        
+
         Automated Quality Actions:
         - Flag datasets below quality thresholds
         - Recommend interpolation strategies for gaps
         - Suggest outlier handling approaches
         - Prioritize data collection improvements
-        
+
         Performance Considerations:
         - Efficient computation for large datasets
         - Memory-conscious analysis for time series data
         - Scalable algorithms for real-time quality monitoring
         - Configurable thresholds for different data types
-        
+
         Notes:
         - Quality requirements vary by use case (forecasting vs. control)
         - Real-time data may have different quality expectations
@@ -1398,7 +1405,9 @@ class DataExtractor:
         """
         # Handle empty datasets gracefully
         if df.empty:
-            self.logger.warning(f"Data quality report requested for empty {data_type} dataset")
+            self.logger.warning(
+                f"Data quality report requested for empty {data_type} dataset"
+            )
             return {
                 "data_type": data_type,
                 "total_records": 0,
@@ -1411,45 +1420,49 @@ class DataExtractor:
                 "potential_outliers": {},
                 "sampling_frequency": "unknown",
                 "recommendations": ["No data available - check data collection system"],
-                "quality_score": 0.0
+                "quality_score": 0.0,
             }
 
         # Basic dataset metrics
         total_records = len(df)
         total_cells = df.size
-        date_range = (df.index.min(), df.index.max()) if not df.index.empty else (None, None)
-        
+        date_range = (
+            (df.index.min(), df.index.max()) if not df.index.empty else (None, None)
+        )
+
         # Missing data analysis
         missing_cells = df.isnull().sum().sum()
-        missing_percentage = (missing_cells / total_cells * 100) if total_cells > 0 else 100
-        
+        missing_percentage = (
+            (missing_cells / total_cells * 100) if total_cells > 0 else 100
+        )
+
         # Column-wise completeness analysis
         column_completeness = {}
         value_ranges = {}
         potential_outliers = {}
-        
+
         for col in df.columns:
-            if df[col].dtype in ['float64', 'int64']:
+            if df[col].dtype in ["float64", "int64"]:
                 # Numerical column analysis
                 missing_pct = (df[col].isnull().sum() / len(df)) * 100
                 column_completeness[col] = round(100 - missing_pct, 2)
-                
+
                 # Value range analysis
                 if not df[col].dropna().empty:
                     value_ranges[col] = {
-                        'min': float(df[col].min()),
-                        'max': float(df[col].max()),
-                        'mean': float(df[col].mean()),
-                        'std': float(df[col].std())
+                        "min": float(df[col].min()),
+                        "max": float(df[col].max()),
+                        "mean": float(df[col].mean()),
+                        "std": float(df[col].std()),
                     }
-                    
+
                     # Simple outlier detection (3-sigma rule)
                     mean_val = df[col].mean()
                     std_val = df[col].std()
                     if std_val > 0:
                         outliers = df[col][
-                            (df[col] < mean_val - 3*std_val) | 
-                            (df[col] > mean_val + 3*std_val)
+                            (df[col] < mean_val - 3 * std_val)
+                            | (df[col] > mean_val + 3 * std_val)
                         ]
                         potential_outliers[col] = len(outliers)
                     else:
@@ -1458,56 +1471,60 @@ class DataExtractor:
                 # Non-numerical column
                 missing_pct = (df[col].isnull().sum() / len(df)) * 100
                 column_completeness[col] = round(100 - missing_pct, 2)
-                value_ranges[col] = {'unique_values': df[col].nunique()}
+                value_ranges[col] = {"unique_values": df[col].nunique()}
                 potential_outliers[col] = 0
 
         # Time gap analysis for time series data
         time_gaps = []
         sampling_frequency = "unknown"
-        
-        if not df.index.empty and hasattr(df.index, 'to_series'):
+
+        if not df.index.empty and hasattr(df.index, "to_series"):
             time_diffs = df.index.to_series().diff().dropna()
-            
+
             if not time_diffs.empty:
                 # Detect most common time interval
                 mode_interval = time_diffs.mode()
                 if not mode_interval.empty:
                     sampling_frequency = str(mode_interval.iloc[0])
-                
+
                 # Find significant gaps (>1 hour for energy data)
                 large_gaps = time_diffs[time_diffs > pd.Timedelta(hours=1)]
                 time_gaps = [
                     (gap_time, gap_duration)
                     for gap_time, gap_duration in large_gaps.items()
-                ][:10]  # Limit to first 10 gaps for readability
+                ][
+                    :10
+                ]  # Limit to first 10 gaps for readability
 
         # Generate quality recommendations
         recommendations = []
-        
-        if missing_percentage > self.quality_thresholds['max_missing_percentage']:
+
+        if missing_percentage > self.quality_thresholds["max_missing_percentage"]:
             recommendations.append(
                 f"High missing data ({missing_percentage:.1f}%) - consider interpolation or gap-filling"
             )
-        
+
         if len(time_gaps) > 0:
             max_gap_hours = max(gap[1].total_seconds() / 3600 for gap in time_gaps)
-            if max_gap_hours > self.quality_thresholds['max_gap_hours']:
+            if max_gap_hours > self.quality_thresholds["max_gap_hours"]:
                 recommendations.append(
                     f"Large time gaps detected (max {max_gap_hours:.1f}h) - check data collection"
                 )
-        
+
         total_outliers = sum(potential_outliers.values())
         if total_outliers > total_records * 0.01:  # >1% outliers
             recommendations.append(
                 f"Potential outliers detected ({total_outliers} values) - review data validation"
             )
-        
+
         # Calculate overall quality score (0-100)
         completeness_score = 100 - missing_percentage
         consistency_score = max(0, 100 - len(time_gaps) * 10)  # Penalize gaps
-        outlier_score = max(0, 100 - (total_outliers / total_records) * 1000)  # Penalize outliers
+        outlier_score = max(
+            0, 100 - (total_outliers / total_records) * 1000
+        )  # Penalize outliers
         quality_score = (completeness_score + consistency_score + outlier_score) / 3
-        
+
         if not recommendations:
             recommendations.append("Data quality appears good - suitable for analysis")
 
@@ -1523,7 +1540,7 @@ class DataExtractor:
             "potential_outliers": potential_outliers,
             "sampling_frequency": sampling_frequency,
             "recommendations": recommendations,
-            "quality_score": round(quality_score, 1)
+            "quality_score": round(quality_score, 1),
         }
 
     def validate_data_completeness(
@@ -1531,46 +1548,46 @@ class DataExtractor:
     ) -> Dict[str, Any]:
         """
         Comprehensive validation of data completeness and quality for PEMS optimization.
-        
+
         This method performs system-wide data validation to ensure all required
         datasets are available and meet quality standards for reliable energy
         optimization. It provides actionable recommendations for data quality
         improvements and identifies missing components that could impact performance.
-        
+
         Validation Framework:
         1. **Completeness Assessment**: Check for required vs. optional data sources
         2. **Quality Analysis**: Evaluate data quality against established thresholds
         3. **Integration Validation**: Ensure datasets can be properly combined
         4. **Impact Assessment**: Determine optimization capability with available data
         5. **Recommendation Generation**: Provide specific improvement actions
-        
+
         Args:
             data: Dictionary mapping data type names to their respective DataFrames
                   Expected keys: 'pv', 'weather', 'rooms', 'consumption', etc.
-                  
+
         Data Source Classification:
         **Required Sources** (Critical for basic optimization):
         - pv: Solar production data for generation forecasting
         - weather: Weather data for environmental modeling
         - rooms: Room temperature data for thermal modeling
         - consumption: Energy consumption patterns for load forecasting
-        
+
         **Optional Sources** (Enhanced optimization capabilities):
         - battery: Energy storage data for storage optimization
         - ev: Electric vehicle data for smart charging
         - energy_prices: Price data for economic optimization
-        
+
         Validation Criteria:
         - **Data Presence**: Source exists and contains data
         - **Data Quality**: Meets completeness and consistency thresholds
         - **Temporal Coverage**: Adequate time range for model training
         - **Field Completeness**: All expected columns are present
-        
+
         Quality Thresholds Applied:
         - max_missing_percentage: 10% (from DATA_QUALITY_THRESHOLDS)
         - max_gap_hours: 2 hours maximum acceptable data gaps
         - min_data_points_per_day: 48 points (15-minute intervals)
-        
+
         Returns:
             Dict[str, Any]: Comprehensive validation report containing:
                 - is_complete (bool): Whether all required data is available
@@ -1582,25 +1599,25 @@ class DataExtractor:
                 - optimization_capability (str): Assessment of optimization readiness
                 - critical_issues (list): Issues that must be resolved
                 - enhancement_opportunities (list): Optional improvements
-                
+
         Special Handling:
         **Room Data Validation**:
         - Handles dictionary structure with room-specific DataFrames
         - Validates each room individually for complete thermal modeling
         - Checks for consistent room coverage across time periods
         - Identifies rooms with insufficient data for thermal optimization
-        
+
         **Time Series Alignment**:
         - Ensures all data sources cover overlapping time periods
         - Validates consistent temporal resolution across sources
         - Identifies synchronization issues between data streams
-        
+
         Quality Assessment Levels:
         1. **Excellent (90-100%)**: Full optimization capability with high confidence
         2. **Good (75-89%)**: Reliable optimization with minor limitations
         3. **Fair (60-74%)**: Basic optimization possible with data quality concerns
         4. **Poor (<60%)**: Significant data issues limiting optimization effectiveness
-        
+
         Usage Examples:
             # Validate extracted data for optimization
             validation = extractor.validate_data_completeness({
@@ -1610,17 +1627,17 @@ class DataExtractor:
                 'consumption': consumption_data,
                 'battery': battery_data
             })
-            
+
             # Check if ready for optimization
             if validation['is_complete']:
                 print(f"Data validation passed: {validation['overall_score']:.1f}% ready")
             else:
                 print(f"Missing critical data: {validation['missing_required']}")
-            
+
             # Review recommendations
             for rec in validation['recommendations']:
                 print(f"Recommendation: {rec}")
-            
+
             # Assess optimization capability
             capability = validation['optimization_capability']
             if capability == 'full':
@@ -1629,35 +1646,35 @@ class DataExtractor:
                 proceed_with_basic_optimization()
             else:
                 fix_data_issues_first()
-                
+
         Optimization Impact Assessment:
         **Full Capability**: All required and most optional data available
         - Complete energy optimization with storage and price response
         - Advanced thermal comfort optimization
         - Predictive control with high accuracy
-        
+
         **Limited Capability**: Required data available, some optional missing
         - Basic energy optimization without storage optimization
         - Standard thermal control without advanced features
         - Reactive control with moderate accuracy
-        
+
         **Restricted Capability**: Some required data missing
         - Simplified optimization with reduced accuracy
         - Manual override may be necessary
         - Limited automated control capability
-        
+
         Automated Quality Actions:
         - Flag datasets requiring immediate attention
         - Prioritize data collection improvements by impact
         - Generate monitoring alerts for degrading data quality
         - Recommend interpolation strategies for gap filling
-        
+
         Performance Considerations:
         - Efficient validation for large datasets
         - Scalable quality assessment algorithms
         - Memory-efficient processing of multiple data sources
         - Fast validation for real-time optimization systems
-        
+
         Notes:
         - Validation results should guide optimization configuration
         - Regular validation monitoring prevents system degradation
@@ -1667,7 +1684,7 @@ class DataExtractor:
         # Define data source requirements and impact levels
         required_sources = ["pv", "weather", "rooms", "consumption"]
         optional_sources = ["battery", "ev", "energy_prices"]
-        
+
         # Initialize comprehensive validation results
         validation_results = {
             "is_complete": True,
@@ -1678,7 +1695,7 @@ class DataExtractor:
             "critical_issues": [],
             "enhancement_opportunities": [],
             "overall_score": 0.0,
-            "optimization_capability": "unknown"
+            "optimization_capability": "unknown",
         }
 
         # Validate required data sources (critical for operation)
@@ -1725,7 +1742,7 @@ class DataExtractor:
 
         # Detailed quality analysis for available data sources
         quality_scores = []
-        
+
         for source, df in data.items():
             # Special handling for room data (dictionary structure)
             if source == "rooms" and isinstance(df, dict):
@@ -1735,21 +1752,25 @@ class DataExtractor:
                         quality_report = self.get_data_quality_report(
                             room_df, f"{source}_{room_name}"
                         )
-                        validation_results["data_quality"][f"{source}_{room_name}"] = quality_report
+                        validation_results["data_quality"][
+                            f"{source}_{room_name}"
+                        ] = quality_report
                         room_quality_scores.append(quality_report["quality_score"])
-                        
+
                         # Room-specific quality checks
                         if quality_report["missing_percentage"] > 15:
                             validation_results["recommendations"].append(
                                 f"Room {room_name}: High missing data ({quality_report['missing_percentage']:.1f}%) - "
                                 "may affect thermal optimization"
                             )
-                
+
                 # Average room quality score
                 if room_quality_scores:
-                    avg_room_quality = sum(room_quality_scores) / len(room_quality_scores)
+                    avg_room_quality = sum(room_quality_scores) / len(
+                        room_quality_scores
+                    )
                     quality_scores.append(avg_room_quality)
-                    
+
             elif hasattr(df, "empty") and not df.empty:
                 quality_report = self.get_data_quality_report(df, source)
                 validation_results["data_quality"][source] = quality_report
@@ -1778,24 +1799,33 @@ class DataExtractor:
                             f"{source}: Large time gaps found (max {max_gap:.1f}h) - "
                             "check data collection system reliability"
                         )
-                        
+
                         if source in required_sources:
                             validation_results["critical_issues"].append(
                                 f"{source}: Time gaps may affect optimization continuity"
                             )
 
         # Calculate overall data readiness score
-        avg_quality_score = sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        avg_quality_score = (
+            sum(quality_scores) / len(quality_scores) if quality_scores else 0
+        )
         validation_results["overall_score"] = (
-            required_score * 0.7 +  # Required sources: 70% weight
-            optional_score * 0.2 +  # Optional sources: 20% weight
-            avg_quality_score * 0.1  # Quality score: 10% weight
+            required_score * 0.7
+            + optional_score * 0.2  # Required sources: 70% weight
+            + avg_quality_score
+            * 0.1  # Optional sources: 20% weight  # Quality score: 10% weight
         )
 
         # Determine optimization capability level
-        if validation_results["is_complete"] and validation_results["overall_score"] > 85:
+        if (
+            validation_results["is_complete"]
+            and validation_results["overall_score"] > 85
+        ):
             validation_results["optimization_capability"] = "full"
-        elif validation_results["is_complete"] and validation_results["overall_score"] > 70:
+        elif (
+            validation_results["is_complete"]
+            and validation_results["overall_score"] > 70
+        ):
             validation_results["optimization_capability"] = "good"
         elif len(validation_results["missing_required"]) <= 1:
             validation_results["optimization_capability"] = "limited"
@@ -1815,7 +1845,7 @@ class DataExtractor:
             validation_results["enhancement_opportunities"].append(
                 "EV data missing - smart EV charging optimization not available"
             )
-            
+
         if "energy_prices" in validation_results["missing_optional"]:
             validation_results["enhancement_opportunities"].append(
                 "Energy price data missing - cost optimization limited to self-consumption"
@@ -1827,7 +1857,7 @@ class DataExtractor:
                 f"Data validation successful - {validation_results['optimization_capability']} "
                 f"optimization capability with {validation_results['overall_score']:.1f}% readiness"
             )
-        
+
         # Log validation summary
         self.logger.info(
             f"Data validation complete: {validation_results['optimization_capability']} capability, "
@@ -1842,41 +1872,41 @@ class DataExtractor:
     ) -> Dict[str, pd.DataFrame]:
         """
         Extract comprehensive heating relay on/off states for all configured rooms.
-        
+
         This method provides detailed relay state tracking for heating system analysis
         and control optimization. It retrieves binary relay states and converts them
         to actual power consumption using room-specific power ratings for accurate
         energy accounting and thermal modeling.
-        
+
         Key Features:
         - Binary relay state tracking (0=OFF, 1=ON) for each heating zone
         - Automatic power consumption calculation using room power ratings
         - 5-minute temporal resolution for detailed heating pattern analysis
         - Room-specific data organization for zone-based optimization
         - Quality validation and data completeness checking
-        
+
         Args:
             start_date: Beginning of extraction period (timezone-aware datetime)
             end_date: End of extraction period (timezone-aware datetime)
-            
+
         Data Sources:
         - InfluxDB measurement: "relay" from Loxone bucket
         - Tag filter: tag1 == "heating" to isolate heating relays
         - Room identification via "room" tag for proper categorization
         - 5-minute aggregation using last() function for accurate state representation
-        
+
         Relay State Processing:
         1. **State Extraction**: Query binary relay states (0/1) by room
         2. **Power Mapping**: Apply room-specific power ratings from energy_settings
         3. **Temporal Alignment**: Ensure consistent timestamp indexing across rooms
         4. **Quality Validation**: Check for missing rooms or data gaps
         5. **Unit Conversion**: Provide both kW and W power values for flexibility
-        
+
         Power Calculation Methods:
         - Direct multiplication: relay_state (0/1) × room_power_rating (kW)
         - Safety validation: Ensure power values are within expected ranges
         - Missing room handling: Log warnings for unconfigured rooms
-        
+
         Returns:
             Dict[str, pd.DataFrame]: Dictionary mapping room names to DataFrames
                 Each DataFrame contains:
@@ -1884,55 +1914,55 @@ class DataExtractor:
                 - relay_state (int): Binary heating state (0=OFF, 1=ON)
                 - power_kw (float): Calculated heating power consumption in kW
                 - power_w (float): Calculated heating power consumption in W
-                
+
                 Empty dict if no relay data found in the specified time range
-                
+
         Data Quality Features:
         - Validates relay states are strictly binary (0 or 1)
         - Checks room names against configured ROOM_CONFIG
         - Monitors for relay switching frequency (short-cycling detection)
         - Logs data completeness statistics per room
-        
+
         Performance Optimizations:
         - Single database query with room-based grouping
         - Efficient pandas operations for power calculations
         - Memory-conscious processing for large time ranges
         - Parallel processing for multiple room calculations
-        
+
         Usage Examples:
             # Extract relay states for heating analysis
             relay_data = await extractor.extract_relay_states(
                 start_date=datetime(2024, 1, 1, tzinfo=pytz.UTC),
                 end_date=datetime(2024, 1, 31, tzinfo=pytz.UTC)
             )
-            
+
             # Analyze living room heating patterns
             living_room = relay_data['obyvak']
             daily_runtime = living_room['relay_state'].resample('D').sum() * 5  # minutes per day
-            
+
             # Calculate total heating power demand
             total_power = sum(
-                room_df['power_kw'].max() 
+                room_df['power_kw'].max()
                 for room_df in relay_data.values()
             )
-            
+
             # Identify simultaneous heating periods
             all_relays_on = all(
-                room_df['relay_state'].any() 
+                room_df['relay_state'].any()
                 for room_df in relay_data.values()
             )
-            
+
         Integration with PEMS Optimization:
         - Relay patterns train thermal comfort models
         - Historical runtime optimizes heating schedules
         - Power consumption feeds into load prediction
         - Room-specific analysis enables zone control strategies
-        
+
         Raises:
             ConnectionError: If InfluxDB query fails
             ValueError: If no relay data found in time range
             KeyError: If room power configuration is missing
-            
+
         Notes:
         - Relay switching frequency affects equipment lifetime
         - Consider minimum runtime constraints in optimization
@@ -2000,28 +2030,28 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract comprehensive real-time weather data from Loxone weather station.
-        
+
         This method retrieves actual measured weather conditions from the local Loxone
         weather station, complementing the forecast data from extract_weather_data().
         It provides real-time observations for model validation, PV production analysis,
         and thermal load calculations based on current environmental conditions.
-        
+
         Key Distinctions from Forecast Data:
         - extract_weather_data(): Future weather forecasts from meteorological services
         - extract_current_weather(): Real-time measurements from local weather station
         - Forecast data: Used for predictive optimization and planning
         - Current data: Used for real-time control and model validation
-        
+
         Args:
             start_date: Beginning of extraction period (timezone-aware datetime)
             end_date: End of extraction period (timezone-aware datetime)
-            
+
         Data Sources:
         - InfluxDB measurements: Multiple weather-related measurements from Loxone bucket
         - Local weather station: Direct sensor readings from site installation
         - Solar position calculator: Astronomical calculations for sun tracking
         - Meteorological sensors: Professional-grade environmental monitoring
-        
+
         Core Weather Parameters:
         - absolute_solar_irradiance: Actual solar radiation measured locally (W/m²)
         - current_temperature: Real-time outdoor air temperature (°C)
@@ -2029,32 +2059,32 @@ class DataExtractor:
         - relative_humidity: Air moisture content affecting thermal comfort (%)
         - wind_direction: Wind direction in degrees (0-360°, 0=North)
         - wind_speed: Wind velocity affecting heat loss and PV cooling
-        
+
         Solar Position Parameters:
         - sun_direction: Solar azimuth angle in degrees (0-360°, 0=North)
         - sun_elevation: Solar elevation angle in degrees (-90° to +90°)
         - minutes_past_midnight: Time reference for solar calculations
         - These enable precise PV production modeling and shading analysis
-        
+
         Precipitation and Visibility:
         - precipitation: Current precipitation rate affecting solar generation
         - rain: Rain sensor measurement for weather state classification
         - brightness: Ambient light level for correlation with solar irradiance
         - sunshine: Sunshine duration measurement for clear sky detection
-        
+
         Data Processing Pipeline:
         1. **Multi-measurement Query**: Retrieve from current_weather, brightness, rain, etc.
         2. **Field Mapping**: Normalize field names across different measurements
         3. **Temporal Aggregation**: 15-minute averaging for noise reduction
         4. **Pivot Operation**: Transform to columnar format for analysis
         5. **Quality Validation**: Check sensor ranges and detect anomalies
-        
+
         Solar Irradiance Analysis:
         - Direct measurement vs. calculated clear-sky irradiance
         - Cloud cover inference from irradiance variability
         - PV performance ratio calculation (actual/expected)
         - Shading detection through irradiance patterns
-        
+
         Returns:
             pd.DataFrame: Real-time weather data with DatetimeIndex and columns:
                 - absolute_solar_irradiance (float): Measured solar radiation (W/m²)
@@ -2070,50 +2100,50 @@ class DataExtractor:
                 - brightness (float): Ambient light measurement
                 - rain (float): Rain sensor reading
                 - sunshine (float): Sunshine duration measurement
-                
+
                 Empty DataFrame if no weather data found in the specified period
-                
+
         Data Quality Features:
         - Validates sensor readings against physical limits
         - Detects sensor malfunctions through consistency checks
         - Interpolates brief sensor outages using neighboring values
         - Flags extreme values for manual review
-        
+
         Performance Considerations:
         - 15-minute aggregation balances detail with processing efficiency
         - Multiple measurement types require careful query optimization
         - Large time ranges may need chunked processing
         - Solar position calculations are computationally lightweight
-        
+
         Usage Examples:
             # Extract current weather for PV analysis
             current_weather = await extractor.extract_current_weather(
                 start_date=datetime(2024, 6, 1, tzinfo=pytz.UTC),
                 end_date=datetime(2024, 6, 30, tzinfo=pytz.UTC)
             )
-            
+
             # Analyze PV performance vs. irradiance
             pv_efficiency = pv_production / current_weather['absolute_solar_irradiance']
-            
+
             # Correlate temperature with heating demand
             temp_load_correlation = current_weather['current_temperature'].corr(
                 heating_consumption
             )
-            
+
             # Detect weather pattern changes
             pressure_trend = current_weather['pressure'].rolling('6h').mean().diff()
             weather_fronts = pressure_trend[abs(pressure_trend) > 2.0]
-            
+
         Integration Applications:
         - **PV Prediction Validation**: Compare forecasts with actual irradiance
         - **Thermal Load Modeling**: Use real temperature for heating predictions
         - **Weather State Classification**: Identify sunny/cloudy/rainy periods
         - **System Performance Analysis**: Correlate energy efficiency with weather
-        
+
         Raises:
             ConnectionError: If weather station data is unavailable
             ValueError: If sensor readings are outside valid ranges
-            
+
         Notes:
         - Weather station requires regular calibration and maintenance
         - Solar position accuracy depends on correct geographic coordinates
@@ -2187,112 +2217,112 @@ class DataExtractor:
     ) -> pd.DataFrame:
         """
         Extract comprehensive shading and blind control relay states from InfluxDB.
-        
+
         This method retrieves the automated shading system relay states that control
         window blinds and external shading elements throughout the building. These
         systems significantly impact both solar heat gain and natural lighting, making
         them crucial for thermal comfort optimization and energy efficiency analysis.
-        
+
         Shading System Impact on Energy:
         - **Solar Heat Gain**: Closed blinds reduce cooling loads in summer
         - **Natural Lighting**: Open blinds reduce artificial lighting needs
         - **Thermal Comfort**: Shading affects perceived temperature and comfort
         - **PV Performance**: External shading can impact rooftop solar arrays
         - **Heating Loads**: Winter shading affects passive solar heating
-        
+
         Args:
             start_date: Beginning of extraction period (timezone-aware datetime)
             end_date: End of extraction period (timezone-aware datetime)
-            
+
         Data Sources:
         - InfluxDB measurement: "relay" from Loxone bucket
         - Tag filter: tag1 == "shading" to isolate shading control relays
         - Field names identify specific blind positions and orientations
         - 15-minute aggregation using last() for accurate position state
-        
+
         Shading Control Types:
         - **Window Blinds**: Interior blinds for glare control and privacy
         - **External Shutters**: Exterior shading for thermal protection
         - **Awnings**: Retractable shading for outdoor spaces
         - **Solar Screens**: Specialized shading for south-facing windows
-        
+
         Data Processing Pipeline:
         1. **Relay State Query**: Extract binary shading relay states (0=OPEN, 1=CLOSED)
         2. **Position Identification**: Map relay fields to specific shading elements
         3. **Temporal Aggregation**: 15-minute resolution for pattern analysis
         4. **Field Normalization**: Standardize naming convention for analysis
         5. **Data Validation**: Ensure relay states are binary and reasonable
-        
+
         Shading Position Encoding:
         - State 0: Shading OPEN/RETRACTED (maximum light/heat gain)
         - State 1: Shading CLOSED/EXTENDED (minimum light/heat gain)
         - Field names typically follow pattern: {room}_{orientation}_{element}
         - Examples: "living_south_blind", "kitchen_east_shutter"
-        
+
         Returns:
             pd.DataFrame: Shading relay states with DatetimeIndex and columns:
                 - timestamp (DatetimeIndex): 15-minute resolution timestamps
                 - shading_{field_name} (int): Binary shading state for each element
                   * 0 = OPEN/RETRACTED (allowing light/heat)
                   * 1 = CLOSED/EXTENDED (blocking light/heat)
-                
+
                 Column names prefixed with "shading_" for clear identification
                 Empty DataFrame if no shading relay data found
-                
+
         Data Applications:
         - **Thermal Modeling**: Shading affects solar heat gain calculations
         - **Lighting Analysis**: Natural light availability impacts electrical loads
         - **Comfort Optimization**: Balance daylight, glare, and temperature
         - **Energy Efficiency**: Coordinate shading with HVAC for optimal efficiency
-        
+
         Seasonal Considerations:
         - **Summer Strategy**: Close shading during peak sun hours to reduce cooling
         - **Winter Strategy**: Open shading during sunny periods for passive heating
         - **Shoulder Seasons**: Dynamic control based on temperature and irradiance
         - **Night Strategy**: Close for privacy and insulation benefits
-        
+
         Performance Metrics:
         - **Shading Utilization**: Percentage of time shading is deployed
         - **Response Patterns**: Correlation with irradiance and temperature
         - **Room-Specific Behavior**: Different strategies by orientation
         - **Seasonal Adaptation**: Changing patterns throughout the year
-        
+
         Usage Examples:
             # Extract shading data for thermal analysis
             shading_data = await extractor.extract_shading_relays(
                 start_date=datetime(2024, 6, 1, tzinfo=pytz.UTC),  # Summer analysis
                 end_date=datetime(2024, 8, 31, tzinfo=pytz.UTC)
             )
-            
+
             # Analyze south-facing shading patterns
             south_shading = shading_data.filter(regex='south')
             summer_deployment = south_shading.mean()  # Average deployment ratio
-            
+
             # Correlate shading with solar irradiance
             for col in shading_data.columns:
                 correlation = shading_data[col].corr(solar_irradiance)
                 print(f"{col}: {correlation:.3f} correlation with irradiance")
-            
+
             # Identify automatic vs. manual shading patterns
             hourly_patterns = shading_data.groupby(shading_data.index.hour).mean()
             peak_shading_hours = hourly_patterns.idxmax()
-            
+
         Integration with Energy Systems:
         - **HVAC Coordination**: Reduce cooling loads through strategic shading
         - **Lighting Control**: Adjust artificial lighting based on natural light
         - **PV Optimization**: Account for shading impacts on solar generation
         - **Comfort Control**: Balance visual and thermal comfort automatically
-        
+
         Optimization Opportunities:
         - **Predictive Shading**: Use weather forecasts for proactive control
         - **Zone-Based Control**: Coordinate shading across multiple rooms
         - **Occupancy Integration**: Adjust shading based on room usage
         - **Energy Price Response**: Use shading to reduce peak demand charges
-        
+
         Raises:
             ConnectionError: If InfluxDB query fails
             ValueError: If shading relay data format is unexpected
-            
+
         Notes:
         - Shading system maintenance affects relay operation reliability
         - Weather sensors (wind, rain) may override manual shading control

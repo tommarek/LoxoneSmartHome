@@ -23,11 +23,12 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import pandas as pd
 import pytz
-from config.energy_settings import DATA_QUALITY_THRESHOLDS, get_room_power
-from config.settings import PEMSSettings
 from influxdb_client import InfluxDBClient
 from influxdb_client.client.query_api import QueryApi
 from scipy import stats
+
+from ...config.energy_settings import DATA_QUALITY_THRESHOLDS, get_room_power
+from ...config.settings import PEMSSettings
 
 
 @dataclass
@@ -295,13 +296,25 @@ class UnifiedDataExtractor:
                 self.logger.error(f"Extraction failed for {config_name}: {result}")
                 continue
 
-            df = result
-            if df.empty:
-                self.logger.warning(f"No data extracted for {config_name}")
+            data = result
+
+            # Handle both DataFrame and dict results (room-based data)
+            if isinstance(data, pd.DataFrame):
+                if data.empty:
+                    self.logger.warning(f"No data extracted for {config_name}")
+                    continue
+            elif isinstance(data, dict):
+                if not data:  # Empty dict
+                    self.logger.warning(f"No data extracted for {config_name}")
+                    continue
+            else:
+                self.logger.warning(
+                    f"Unexpected data type for {config_name}: {type(data)}"
+                )
                 continue
 
             # Map results to dataset fields
-            self._populate_dataset_field(dataset, config_name, df)
+            self._populate_dataset_field(dataset, config_name, data)
 
         # Post-process data (calculate derived metrics, merge related data)
         self._post_process_dataset(dataset)
@@ -317,7 +330,7 @@ class UnifiedDataExtractor:
 
     async def _execute_single_extraction(
         self, config: QueryDefinition, start_date: datetime, end_date: datetime
-    ) -> pd.DataFrame:
+    ) -> Union[pd.DataFrame, Dict[str, pd.DataFrame]]:
         """Execute a single InfluxDB query based on configuration."""
         try:
             # Build Flux query
@@ -704,9 +717,17 @@ class UnifiedDataExtractor:
                 )
 
             elif isinstance(field_value, dict):
-                room_count = len([df for df in field_value.values() if not df.empty])
+                room_count = len(
+                    [
+                        df
+                        for df in field_value.values()
+                        if isinstance(df, pd.DataFrame) and not df.empty
+                    ]
+                )
                 room_records = sum(
-                    len(df) for df in field_value.values() if not df.empty
+                    len(df)
+                    for df in field_value.values()
+                    if isinstance(df, pd.DataFrame) and not df.empty
                 )
                 total_records += room_records
                 if room_records > 0:

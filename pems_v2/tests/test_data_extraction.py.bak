@@ -12,8 +12,9 @@ from pathlib import Path
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from config.settings import PEMSSettings
+
 from pems_v2.analysis.core.data_extraction import DataExtractor
-from pems_v2.config.settings import PEMSSettings
 
 
 async def test_data_extraction():
@@ -74,15 +75,11 @@ async def test_data_extraction():
             analyzer = relay_module.RelayAnalyzer()
             relay_data = await analyzer.extract_relay_data(start_date, end_date)
 
-            logger.info(
-                f"✓ Relay data extraction successful: {len(relay_data)} records"
-            )
+            logger.info(f"✓ Relay data extraction successful: {len(relay_data)} records")
             if not relay_data.empty:
                 logger.info(f"  Columns: {list(relay_data.columns)}")
                 logger.info(f"  Rooms found: {relay_data['room'].unique().tolist()}")
-                logger.info(
-                    f"  Date range: {relay_data.index.min()} to {relay_data.index.max()}"
-                )
+                logger.info(f"  Date range: {relay_data.index.min()} to {relay_data.index.max()}")
         except Exception as e:
             logger.error(f"✗ Relay data extraction failed: {e}")
 
@@ -93,9 +90,7 @@ async def test_data_extraction():
 
         try:
             room_data = await extractor.extract_room_temperatures(start_date, end_date)
-            logger.info(
-                f"✓ Temperature data extraction successful: {len(room_data)} rooms"
-            )
+            logger.info(f"✓ Temperature data extraction successful: {len(room_data)} rooms")
             for room_name, room_df in room_data.items():
                 logger.info(f"  Room '{room_name}': {len(room_df)} records")
         except Exception as e:
@@ -108,9 +103,7 @@ async def test_data_extraction():
 
         try:
             weather_data = await extractor.extract_weather_data(start_date, end_date)
-            logger.info(
-                f"✓ Weather data extraction successful: {len(weather_data)} records"
-            )
+            logger.info(f"✓ Weather data extraction successful: {len(weather_data)} records")
             if not weather_data.empty:
                 logger.info(f"  Columns: {list(weather_data.columns)}")
         except Exception as e:

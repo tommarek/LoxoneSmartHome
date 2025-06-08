@@ -13,8 +13,9 @@ import pandas as pd
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from config.settings import PEMSSettings
+
 from pems_v2.analysis.core.data_extraction import DataExtractor
-from pems_v2.config.settings import PEMSSettings
 
 
 def test_new_extraction_methods():
@@ -33,7 +34,7 @@ def test_new_extraction_methods():
     mock_settings.influxdb.bucket_solar = "solar"
 
     # Mock InfluxDB client
-    with patch("pems_v2.analysis.core.data_extraction.InfluxDBClient") as mock_client:
+    with patch("analysis.data_extraction.InfluxDBClient") as mock_client:
         extractor = DataExtractor(mock_settings)
 
         # Test 1: Check that new methods exist
@@ -66,9 +67,7 @@ def test_new_extraction_methods():
             import asyncio
 
             result = asyncio.run(
-                extractor.extract_pv_data(
-                    datetime.now() - timedelta(days=1), datetime.now()
-                )
+                extractor.extract_pv_data(datetime.now() - timedelta(days=1), datetime.now())
             )
             print("✅ Enhanced PV extraction method callable")
             print(f"   Returns DataFrame: {isinstance(result, pd.DataFrame)}")
@@ -96,9 +95,7 @@ def test_new_extraction_methods():
 
         try:
             result = asyncio.run(
-                extractor.extract_weather_data(
-                    datetime.now() - timedelta(days=1), datetime.now()
-                )
+                extractor.extract_weather_data(datetime.now() - timedelta(days=1), datetime.now())
             )
             print("✅ Enhanced weather extraction method callable")
             print(f"   Returns DataFrame: {isinstance(result, pd.DataFrame)}")

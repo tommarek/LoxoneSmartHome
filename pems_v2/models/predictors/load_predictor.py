@@ -151,7 +151,9 @@ class LoadPredictor(BasePredictor):
         features["day_of_week"] = data.index.dayofweek
         features["day_of_year"] = data.index.dayofyear
         features["month"] = data.index.month
-        features["week_of_year"] = data.index.isocalendar().week.astype(int)  # Convert to int
+        features["week_of_year"] = data.index.isocalendar().week.astype(
+            int
+        )  # Convert to int
 
         # Cyclical encoding
         features["hour_sin"] = np.sin(2 * np.pi * features["hour"] / 24)
@@ -699,16 +701,16 @@ class LoadPredictor(BasePredictor):
 
         # Set the trained model for persistence
         self.model = {
-            'base_model': self.base_model,
-            'pattern_model': self.pattern_model,
-            'trend_model': self.trend_model,
-            'feature_scaler': self.feature_scaler,
-            'target_scaler': self.target_scaler,
-            'pattern_scaler': self.pattern_scaler,
-            'trend_scaler': self.trend_scaler,
-            'ensemble_weights': self.ensemble_weights,
-            'baseline_load': self.baseline_load,
-            'component_contributions': self.component_contributions
+            "base_model": self.base_model,
+            "pattern_model": self.pattern_model,
+            "trend_model": self.trend_model,
+            "feature_scaler": self.feature_scaler,
+            "target_scaler": self.target_scaler,
+            "pattern_scaler": self.pattern_scaler,
+            "trend_scaler": self.trend_scaler,
+            "ensemble_weights": self.ensemble_weights,
+            "baseline_load": self.baseline_load,
+            "component_contributions": self.component_contributions,
         }
 
         return performance

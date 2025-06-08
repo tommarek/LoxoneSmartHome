@@ -535,12 +535,12 @@ class PVPredictor(BasePredictor):
 
         # Set the trained model for persistence
         self.model = {
-            'ml_model': self.ml_model,
-            'physics_model': getattr(self, 'physics_model', None),
-            'q10_model': getattr(self, 'q10_model', None),
-            'q90_model': getattr(self, 'q90_model', None),
-            'feature_scaler': self.feature_scaler,
-            'system_config': self.system_config
+            "ml_model": self.ml_model,
+            "physics_model": getattr(self, "physics_model", None),
+            "q10_model": getattr(self, "q10_model", None),
+            "q90_model": getattr(self, "q90_model", None),
+            "feature_scaler": self.feature_scaler,
+            "system_config": self.system_config,
         }
 
         return performance

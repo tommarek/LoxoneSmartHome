@@ -12,8 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pems_v2.models.predictors.thermal_predictor import (ThermalPredictor,
-                                                         ThermalZone)
+from pems_v2.models.predictors.thermal_predictor import ThermalPredictor, ThermalZone
 
 
 @pytest.fixture
@@ -63,9 +62,7 @@ def sample_thermal_data():
     timestamps = pd.date_range("2024-01-01 00:00:00", periods=864, freq="5min")
 
     # Outdoor temperature with daily cycle
-    outdoor_temp = (
-        5 + 8 * np.sin(2 * np.pi * np.arange(864) / 288) + np.random.normal(0, 1, 864)
-    )
+    outdoor_temp = 5 + 8 * np.sin(2 * np.pi * np.arange(864) / 288) + np.random.normal(0, 1, 864)
 
     # Solar radiation (zero at night, peak around noon)
     hour_of_day = (np.arange(864) % 288) / 12  # 0-24 hour cycle
@@ -76,9 +73,7 @@ def sample_thermal_data():
     solar_radiation[hour_of_day > 18] = 0  # No sun after 6 PM
 
     # Heating schedule (on during cold periods and night)
-    heating_schedule = (
-        (outdoor_temp < 3) | (hour_of_day < 6) | (hour_of_day > 22)
-    ).astype(float)
+    heating_schedule = ((outdoor_temp < 3) | (hour_of_day < 6) | (hour_of_day > 22)).astype(float)
     heating_power = heating_schedule * 1500 + np.random.normal(0, 100, 864)
     heating_power = np.maximum(0, heating_power)
 
@@ -154,9 +149,7 @@ class TestThermalZone:
         # Check components
         expected_loss = (indoor_temp - outdoor_temp) / zone.thermal_resistance
         expected_solar = solar_radiation * zone.window_area * zone.solar_gain_coeff
-        expected_total = (
-            heating_power + expected_solar + zone.internal_gains - expected_loss
-        )
+        expected_total = heating_power + expected_solar + zone.internal_gains - expected_loss
 
         assert abs(heat_flow - expected_total) < 1e-6
 
@@ -168,13 +161,9 @@ class TestThermalZone:
         indoor_temp = 22.0
         coupled_temps = {"loznice": 20.0}  # Colder adjacent room
 
-        heat_flow_with_coupling = zone.calculate_heat_flow(
-            indoor_temp, 10.0, 0, 0, coupled_temps
-        )
+        heat_flow_with_coupling = zone.calculate_heat_flow(indoor_temp, 10.0, 0, 0, coupled_temps)
 
-        heat_flow_without_coupling = zone.calculate_heat_flow(
-            indoor_temp, 10.0, 0, 0, {}
-        )
+        heat_flow_without_coupling = zone.calculate_heat_flow(indoor_temp, 10.0, 0, 0, {})
 
         # Should lose heat to colder coupled zone
         assert heat_flow_with_coupling < heat_flow_without_coupling
@@ -221,9 +210,7 @@ class TestThermalPredictor:
 
         # Check essential features
         assert "outdoor_temp" in features.columns
-        assert (
-            "solar_radiation" in features.columns
-        )  # Should be created from sample data
+        assert "solar_radiation" in features.columns  # Should be created from sample data
         assert "heating_power" in features.columns
         assert "hour" in features.columns
         assert "sin_hour" in features.columns
@@ -270,15 +257,11 @@ class TestThermalPredictor:
         assert len(simulated_temps) == len(data_subset)
         assert simulated_temps[0] == initial_temp
         # Temperature range check (allow for wider range since simulations can vary)
-        assert all(
-            0 <= temp <= 60 for temp in simulated_temps
-        )  # Reasonable temperature range
+        assert all(0 <= temp <= 60 for temp in simulated_temps)  # Reasonable temperature range
 
         # Temperature should change gradually (thermal mass effect)
         temp_changes = np.diff(simulated_temps)
-        assert all(
-            abs(change) < 10.0 for change in temp_changes
-        )  # Reasonable change per 5 min
+        assert all(abs(change) < 10.0 for change in temp_changes)  # Reasonable change per 5 min
 
     def test_parameter_optimization(self, thermal_config, sample_thermal_data):
         """Test thermal parameter optimization."""
@@ -290,9 +273,7 @@ class TestThermalPredictor:
         target_temps = data_subset["temperature_obyvak"].values
 
         # Mock scipy.optimize to avoid long optimization
-        with patch(
-            "models.predictors.thermal_predictor.optimize.minimize"
-        ) as mock_optimize:
+        with patch("models.predictors.thermal_predictor.optimize.minimize") as mock_optimize:
             mock_result = MagicMock()
             mock_result.success = True
             mock_result.x = [0.025, 4500000, 0.7]  # Optimized parameters
@@ -317,9 +298,7 @@ class TestThermalPredictor:
         predictor = ThermalPredictor(thermal_config)
 
         # Prepare training data (drop the temperature column)
-        features = sample_thermal_data.drop(
-            columns=["temperature_obyvak"], errors="ignore"
-        )
+        features = sample_thermal_data.drop(columns=["temperature_obyvak"], errors="ignore")
         target = sample_thermal_data["temperature_obyvak"]
 
         # Mock parameter optimization to speed up test
@@ -382,9 +361,7 @@ class TestThermalPredictor:
         with patch.object(predictor, "_simulate_thermal_response") as mock_simulate:
             mock_simulate.return_value = 22 + np.random.normal(0, 1, 100)
 
-            result = predictor.predict(
-                test_data, return_uncertainty=True, zone_name="obyvak"
-            )
+            result = predictor.predict(test_data, return_uncertainty=True, zone_name="obyvak")
 
         # Check prediction results
         assert len(result.predictions) == 100
@@ -392,8 +369,7 @@ class TestThermalPredictor:
         assert "lower_95" in result.confidence_intervals
         assert "upper_95" in result.confidence_intervals
         assert (
-            result.feature_contributions is not None
-            or result.feature_contributions is None
+            result.feature_contributions is not None or result.feature_contributions is None
         )  # May be None if no feature importance
 
         # Check that we have results
@@ -474,9 +450,7 @@ class TestThermalPredictor:
         # Check performance info
         perf_info = insights["prediction_performance"]
         assert perf_info["recent_error_count"] == 5
-        assert (
-            abs(perf_info["average_recent_error"] - 0.34) < 0.001
-        )  # Average of last 5 errors
+        assert abs(perf_info["average_recent_error"] - 0.34) < 0.001  # Average of last 5 errors
 
     def test_error_handling(self, thermal_config):
         """Test error handling for edge cases."""
@@ -528,15 +502,11 @@ class TestThermalPredictor:
         )
 
         # Warmer room should lose heat to cooler room
-        heat_flow_obyvak_uncoupled = obyvak_zone.calculate_heat_flow(
-            obyvak_temp, 10.0, 0, 0, {}
-        )
+        heat_flow_obyvak_uncoupled = obyvak_zone.calculate_heat_flow(obyvak_temp, 10.0, 0, 0, {})
         assert heat_flow_obyvak < heat_flow_obyvak_uncoupled
 
         # Cooler room should gain heat from warmer room
-        heat_flow_loznice_uncoupled = loznice_zone.calculate_heat_flow(
-            loznice_temp, 10.0, 0, 0, {}
-        )
+        heat_flow_loznice_uncoupled = loznice_zone.calculate_heat_flow(loznice_temp, 10.0, 0, 0, {})
         assert heat_flow_loznice > heat_flow_loznice_uncoupled
 
     def test_uncertainty_quantification(self, thermal_config, sample_thermal_data):
@@ -562,9 +532,7 @@ class TestThermalPredictor:
         with patch.object(predictor, "_simulate_thermal_response") as mock_simulate:
             mock_simulate.return_value = 22 + np.random.normal(0, 0.5, 50)
 
-            result = predictor.predict(
-                test_data, return_uncertainty=True, zone_name="obyvak"
-            )
+            result = predictor.predict(test_data, return_uncertainty=True, zone_name="obyvak")
 
         # Check uncertainty intervals
         assert result.confidence_intervals is not None

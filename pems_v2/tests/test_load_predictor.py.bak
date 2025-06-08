@@ -12,8 +12,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from pems_v2.models.predictors.load_predictor import (LoadComponent,
-                                                      LoadPredictor)
+from pems_v2.models.predictors.load_predictor import LoadComponent, LoadPredictor
 
 
 @pytest.fixture
@@ -50,9 +49,7 @@ def sample_load_data():
     weekend_effect = np.where(day_of_week >= 5, 1.2, 1.0)
 
     # Weather-dependent load (simplified)
-    outdoor_temp = (
-        10 + 8 * np.sin(2 * np.pi * np.arange(672) / 96) + np.random.normal(0, 2, 672)
-    )
+    outdoor_temp = 10 + 8 * np.sin(2 * np.pi * np.arange(672) / 96) + np.random.normal(0, 2, 672)
     weather_load = np.where(outdoor_temp > 25, 0.5, 0) + np.where(
         outdoor_temp < 5, 0.3, 0
     )  # AC and heating
@@ -63,9 +60,7 @@ def sample_load_data():
     )  # 30% chance of appliance use
 
     # Total load
-    total_load = (
-        base_load * daily_pattern * weekend_effect + weather_load + appliance_load
-    )
+    total_load = base_load * daily_pattern * weekend_effect + weather_load + appliance_load
     total_load = np.maximum(total_load, 0.5)  # Minimum load
 
     # Add some noise
@@ -235,9 +230,7 @@ class TestLoadPredictor:
             ]
         ]
 
-        occupancy_features = predictor._extract_occupancy_features(
-            sample_load_data, time_features
-        )
+        occupancy_features = predictor._extract_occupancy_features(sample_load_data, time_features)
 
         # Check occupancy features
         assert "occupancy_prob" in occupancy_features.columns
@@ -261,9 +254,7 @@ class TestLoadPredictor:
 
         # Check decomposition results
         assert isinstance(decomposed, dict)
-        assert (
-            len(decomposed) >= predictor.n_components + 2
-        )  # Components + baseline + variable
+        assert len(decomposed) >= predictor.n_components + 2  # Components + baseline + variable
         assert "baseline" in decomposed
         assert "variable" in decomposed
 
@@ -365,9 +356,7 @@ class TestLoadPredictor:
         predictor.feature_scaler = MagicMock()
         predictor.feature_scaler.transform.return_value = np.random.random((100, 20))
         predictor.target_scaler = MagicMock()
-        predictor.target_scaler.inverse_transform.return_value = np.random.random(
-            (100, 1)
-        )
+        predictor.target_scaler.inverse_transform.return_value = np.random.random((100, 1))
         predictor.pattern_scaler = MagicMock()
         predictor.pattern_scaler.transform.return_value = np.random.random((100, 8))
         predictor.trend_scaler = MagicMock()
@@ -406,9 +395,7 @@ class TestLoadPredictor:
 
         test_data = sample_load_data.iloc[:10]
 
-        with pytest.raises(
-            ValueError, match="Model must be trained before making predictions"
-        ):
+        with pytest.raises(ValueError, match="Model must be trained before making predictions"):
             predictor.predict(test_data)
 
     def test_online_update(self, load_config, sample_load_data):
@@ -496,9 +483,7 @@ class TestLoadPredictor:
         predictor_nmf = LoadPredictor(config_nmf)
 
         features = predictor_nmf._extract_load_features(sample_load_data)
-        decomposed_nmf = predictor_nmf._decompose_load(
-            sample_load_data["load"], features
-        )
+        decomposed_nmf = predictor_nmf._decompose_load(sample_load_data["load"], features)
         assert "nmf_component_0" in decomposed_nmf
 
         # Test PCA
@@ -506,9 +491,7 @@ class TestLoadPredictor:
         config_pca["decomposition_method"] = "pca"
         predictor_pca = LoadPredictor(config_pca)
 
-        decomposed_pca = predictor_pca._decompose_load(
-            sample_load_data["load"], features
-        )
+        decomposed_pca = predictor_pca._decompose_load(sample_load_data["load"], features)
         assert "pca_component_0" in decomposed_pca
 
         # Test Clustering
@@ -516,9 +499,7 @@ class TestLoadPredictor:
         config_cluster["decomposition_method"] = "clustering"
         predictor_cluster = LoadPredictor(config_cluster)
 
-        decomposed_cluster = predictor_cluster._decompose_load(
-            sample_load_data["load"], features
-        )
+        decomposed_cluster = predictor_cluster._decompose_load(sample_load_data["load"], features)
         assert "cluster_component_0" in decomposed_cluster
 
     def test_feature_engineering_edge_cases(self, load_config):
@@ -554,9 +535,7 @@ class TestLoadPredictor:
         predictor.feature_scaler = MagicMock()
         predictor.feature_scaler.transform.return_value = np.random.random((50, 20))
         predictor.target_scaler = MagicMock()
-        predictor.target_scaler.inverse_transform.return_value = np.random.random(
-            (50, 1)
-        )
+        predictor.target_scaler.inverse_transform.return_value = np.random.random((50, 1))
         predictor.pattern_scaler = MagicMock()
         predictor.pattern_scaler.transform.return_value = np.random.random((50, 8))
         predictor.trend_scaler = MagicMock()
@@ -608,9 +587,7 @@ class TestLoadPredictor:
             "include_occupancy": True,
         }
         predictor_no_weather = LoadPredictor(config_no_weather)
-        features_no_weather = predictor_no_weather._extract_load_features(
-            sample_load_data
-        )
+        features_no_weather = predictor_no_weather._extract_load_features(sample_load_data)
 
         # Should not have weather features but should have occupancy
         assert "outdoor_temp" not in features_no_weather.columns
@@ -624,9 +601,7 @@ class TestLoadPredictor:
             "include_occupancy": False,
         }
         predictor_no_occupancy = LoadPredictor(config_no_occupancy)
-        features_no_occupancy = predictor_no_occupancy._extract_load_features(
-            sample_load_data
-        )
+        features_no_occupancy = predictor_no_occupancy._extract_load_features(sample_load_data)
 
         # Should have weather features but not occupancy
         assert "outdoor_temp" in features_no_occupancy.columns

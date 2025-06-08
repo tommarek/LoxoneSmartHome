@@ -15,8 +15,9 @@ import pandas as pd
 # Add the project root to Python path
 sys.path.append(str(Path(__file__).parent.parent))
 
+from config.settings import PEMSSettings
+
 from pems_v2.analysis.core.data_extraction import DataExtractor
-from pems_v2.config.settings import PEMSSettings
 
 
 class MockRelayAnalyzer:
@@ -87,9 +88,7 @@ RelayAnalyzer = MockRelayAnalyzer
 async def test_relay_analysis():
     """Test the relay analysis functionality."""
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
     logger = logging.getLogger(__name__)
 
