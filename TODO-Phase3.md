@@ -1,10 +1,273 @@
 # TODO-Phase3.md: PEMS v2 Phase 3 Implementation Plan
 
+## 🚨 **CRITICAL PHASE 2 REMAINING ISSUES (5% completion)**
+
+### **ISSUE 1: ML Model Validation Indexing Error** ⚠️ **HIGH PRIORITY**
+
+**Problem Description**:
+The validation script fails with a pandas indexing error when trying to access ML model predictions:
+```
+❌ ML models validation failed: "None of [Index([12, 1, 2], dtype='int64', name='timestamp')] are in the [index]"
+```
+
+**Root Cause Analysis**:
+1. **Index Mismatch**: The ML model is returning predictions with integer indices `[12, 1, 2]` instead of datetime indices
+2. **DataFrame Join Issue**: The validation script expects datetime-indexed DataFrames for time series alignment
+3. **Model Output Format**: The predictions DataFrame has wrong index type/format for time series operations
+
+**Detailed Fix Required**:
+```python
+# File: validate_complete_system.py or models/predictors/*.py
+# Current problematic code likely looks like:
+predictions = model.predict(features)  # Returns int-indexed DataFrame
+aligned_data = original_data.loc[predictions.index]  # FAILS - index mismatch
+
+# SOLUTION 1: Fix in validation script
+async def validate_ml_models(self, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    """Validate ML model predictions with proper time alignment."""
+    
+    # Ensure consistent datetime indexing
+    for model_name, model in [("pv", self.pv_predictor), ("load", self.load_predictor)]:
+        # Create proper time index for predictions
+        start_time = data['pv'].index.min()
+        prediction_times = pd.date_range(
+            start=start_time, 
+            periods=len(predictions), 
+            freq='5min'
+        )
+        
+        # Reset prediction index to datetime
+        predictions.index = prediction_times
+        
+        # Now safe to align with original data
+        aligned_predictions = predictions.reindex(data['pv'].index, method='nearest')
+
+# SOLUTION 2: Fix in model predict methods
+class PVPredictor:
+    def predict(self, features: pd.DataFrame) -> pd.DataFrame:
+        """Ensure predictions maintain proper datetime index."""
+        predictions = self.model.predict(features.values)
+        
+        # Maintain original datetime index from features
+        result_df = pd.DataFrame(predictions, 
+                               index=features.index,  # Keep datetime index
+                               columns=['pv_power_prediction'])
+        return result_df
+```
+
+**Implementation Steps**:
+1. **Identify exact location** of the indexing error in validation script
+2. **Fix predict methods** in all ML models to maintain datetime indices
+3. **Add index validation** in DataPreprocessor to ensure consistent indexing
+4. **Test with various date ranges** to ensure robustness
+
+---
+
+### **ISSUE 2: Optimization Infeasibility Problem** ⚠️ **HIGH PRIORITY**
+
+**Problem Description**:
+Optimization solver returns `infeasible_inaccurate` status, causing optimization to fail:
+```
+⚠️ Optimization failed: Optimization failed: infeasible_inaccurate
+```
+
+**Root Cause Analysis**:
+1. **Over-constrained Problem**: Comfort constraints may be too strict for available heating power
+2. **Numerical Issues**: Constraint tolerances too tight causing numerical infeasibility
+3. **Data Issues**: Invalid input data (e.g., negative prices, extreme temperatures)
+4. **Solver Configuration**: ECOS_BB solver parameters may need tuning
+
+**Detailed Fix Required**:
+```python
+# File: modules/optimization/optimizer.py
+
+class EnergyOptimizer:
+    def _create_optimization_problem(self, problem_data: Dict) -> cp.Problem:
+        """Create optimization problem with robust constraint handling."""
+        
+        # SOLUTION 1: Add constraint relaxation
+        # Soft constraints for comfort with penalty terms
+        comfort_violations = {}
+        for room in self.rooms:
+            # Allow small comfort violations with high penalty
+            violation_penalty = 1000  # €/°C violation
+            
+            comfort_violations[f'{room}_low'] = cp.Variable(self.horizon, nonneg=True)
+            comfort_violations[f'{room}_high'] = cp.Variable(self.horizon, nonneg=True)
+            
+            # Soft comfort constraints
+            constraints.extend([
+                temp_vars[room][t] >= comfort_bounds[room]['min'][t] - comfort_violations[f'{room}_low'][t],
+                temp_vars[room][t] <= comfort_bounds[room]['max'][t] + comfort_violations[f'{room}_high'][t]
+            ])
+            
+            # Add violation penalties to objective
+            objective += violation_penalty * cp.sum(comfort_violations[f'{room}_low'])
+            objective += violation_penalty * cp.sum(comfort_violations[f'{room}_high'])
+        
+        # SOLUTION 2: Improve solver configuration
+        def solve_with_fallback(problem: cp.Problem) -> None:
+            """Solve with multiple solver configurations."""
+            
+            # Try primary solver (ECOS_BB) with relaxed tolerances
+            try:
+                problem.solve(
+                    solver=cp.ECOS_BB,
+                    verbose=False,
+                    mi_max_iters=1000,
+                    feastol=1e-6,      # Relaxed from 1e-8
+                    abstol=1e-6,       # Relaxed from 1e-8
+                    reltol=1e-6,       # Add relative tolerance
+                    max_iters=2000     # More iterations
+                )
+                if problem.status in [cp.OPTIMAL, cp.OPTIMAL_INACCURATE]:
+                    return
+            except Exception as e:
+                logger.warning(f"ECOS_BB failed: {e}")
+            
+            # Fallback 1: SCIP (if available)
+            try:
+                if cp.SCIP in cp.installed_solvers():
+                    problem.solve(solver=cp.SCIP, verbose=False)
+                    if problem.status == cp.OPTIMAL:
+                        return
+            except Exception as e:
+                logger.warning(f"SCIP fallback failed: {e}")
+            
+            # Fallback 2: Continuous relaxation with ECOS
+            logger.warning("Using continuous relaxation fallback")
+            self._solve_continuous_relaxation(problem)
+        
+        # SOLUTION 3: Input validation and preprocessing
+        def validate_problem_data(self, data: Dict) -> Dict:
+            """Validate and clean optimization input data."""
+            
+            # Price validation
+            if 'prices' in data:
+                prices = data['prices']
+                # Cap extreme prices
+                prices = np.clip(prices, -100, 500)  # €/MWh bounds
+                # Fill any NaN values
+                prices = prices.fillna(method='ffill').fillna(50)  # Default 50 €/MWh
+                data['prices'] = prices
+            
+            # Temperature validation
+            if 'outdoor_temp' in data:
+                temp = data['outdoor_temp']
+                # Reasonable temperature bounds
+                temp = np.clip(temp, -30, 50)  # °C bounds
+                data['outdoor_temp'] = temp
+            
+            # PV forecast validation
+            if 'pv_forecast' in data:
+                pv = data['pv_forecast']
+                # Non-negative and reasonable bounds
+                pv = np.clip(pv, 0, 12000)  # Max 12kW system
+                data['pv_forecast'] = pv
+            
+            return data
+
+        # SOLUTION 4: Add feasibility diagnostics
+        def diagnose_infeasibility(self, problem: cp.Problem) -> str:
+            """Diagnose why optimization problem is infeasible."""
+            
+            if problem.status == cp.INFEASIBLE:
+                # Check individual constraint groups
+                diagnostics = []
+                
+                # Test power balance constraints
+                if self._test_power_balance_feasibility():
+                    diagnostics.append("✓ Power balance constraints feasible")
+                else:
+                    diagnostics.append("❌ Power balance constraints infeasible")
+                
+                # Test comfort constraints
+                if self._test_comfort_constraints_feasibility():
+                    diagnostics.append("✓ Comfort constraints feasible")
+                else:
+                    diagnostics.append("❌ Comfort constraints infeasible")
+                
+                # Test battery constraints
+                if self._test_battery_constraints_feasibility():
+                    diagnostics.append("✓ Battery constraints feasible")
+                else:
+                    diagnostics.append("❌ Battery constraints infeasible")
+                
+                return "\n".join(diagnostics)
+            
+            return "Problem status: " + problem.status
+```
+
+**Implementation Steps**:
+1. **Add constraint relaxation** with penalty terms for comfort violations
+2. **Improve solver configuration** with fallback options and relaxed tolerances
+3. **Add input data validation** to prevent extreme values causing infeasibility
+4. **Implement feasibility diagnostics** to identify which constraints are problematic
+5. **Test with various scenarios** including extreme weather and price conditions
+
+---
+
+### **ISSUE 3: Production MQTT Integration Testing** 🔧 **MEDIUM PRIORITY**
+
+**Problem Description**:
+Control interfaces exist but need comprehensive testing with actual Loxone hardware to ensure reliable real-world operation.
+
+**Required Implementation**:
+```python
+# File: tests/integration/test_loxone_integration.py
+
+class LoxoneIntegrationTest:
+    """Comprehensive Loxone hardware integration testing."""
+    
+    async def test_heating_control_reliability(self):
+        """Test heating relay control with actual hardware."""
+        
+        # Test relay switching
+        for room in ["kuchyne", "obyvak", "loznice"]:
+            # Turn on heating
+            await self.heating_controller.set_heating_relay(room, True)
+            await asyncio.sleep(2)  # Allow hardware response time
+            
+            # Verify state change via MQTT feedback
+            actual_state = await self.heating_controller.get_relay_state(room)
+            assert actual_state == True, f"Heating relay {room} failed to turn on"
+            
+            # Turn off heating
+            await self.heating_controller.set_heating_relay(room, False)
+            await asyncio.sleep(2)
+            
+            actual_state = await self.heating_controller.get_relay_state(room)
+            assert actual_state == False, f"Heating relay {room} failed to turn off"
+    
+    async def test_mqtt_resilience(self):
+        """Test MQTT connection resilience and recovery."""
+        
+        # Simulate connection loss
+        await self.mqtt_client.disconnect()
+        
+        # Attempt control operation (should queue)
+        await self.heating_controller.set_heating_relay("kuchyne", True)
+        
+        # Reconnect and verify queued command executes
+        await self.mqtt_client.reconnect()
+        await asyncio.sleep(5)
+        
+        actual_state = await self.heating_controller.get_relay_state("kuchyne")
+        assert actual_state == True, "Queued command failed to execute after reconnection"
+```
+
+---
+
 ## 🎯 **PROJECT STATUS OVERVIEW**
 
 ### ✅ **Completed Phases**
 - **Phase 1**: Data Analysis & Feature Engineering [100% COMPLETE]
 - **Phase 2**: ML Model Development & Optimization [95% COMPLETE - Production Ready]
+  - ✅ All ML models implemented (PV, Load, Thermal)
+  - ✅ Optimization engine with ECOS_BB solver
+  - ✅ Control interfaces for heating, battery, inverter
+  - ✅ Comprehensive validation framework
+  - ❌ **2 critical bugs** preventing 100% completion (detailed above)
 
 ### 🚀 **Phase 3**: Production Deployment & System Integration
 
@@ -53,91 +316,155 @@ class HeatingController:
         # Subscribe and return current temperature
 ```
 
-**3.1.2 Battery Charging Control**
+**3.1.2 Unified Battery/Inverter Control**
 ```python
-# modules/control/battery_controller.py
-class BatteryController:
-    """Control Growatt battery charging and operation modes."""
+# modules/control/battery_inverter_controller.py
+class BatteryInverterController:
+    """Unified control for Growatt battery and inverter system.
     
-    async def charge_from_grid(self, target_soc: float = 100.0):
-        """Command battery to charge from grid to target SOC."""
-        command = {
-            "action": "charge_from_grid",
-            "target_soc": target_soc,
-            "power_limit": self.max_charge_power
-        }
-        await self._send_battery_command(command)
+    Note: Battery and inverter are controlled as single integrated unit.
+    The inverter cannot be disconnected from grid - only operation modes can be changed.
+    """
     
-    async def set_battery_mode(self, mode: str):
-        """Set battery operation priority mode."""
-        # Modes: "self_use" (normal), "backup", "time_of_use"
-        command = {"mode": mode}
-        await self._send_battery_command(command)
-```
-
-**3.1.3 Inverter Mode Control**
-```python
-# modules/control/inverter_controller.py
-class InverterController:
-    """Control Growatt inverter operation modes."""
-    
-    async def set_priority_mode(self, mode: str):
-        """Set inverter priority mode.
+    async def set_system_mode(self, mode: str):
+        """Set integrated battery/inverter system operation mode.
         
-        Modes:
-        - 'load_first': Load > Battery > Grid
-        - 'battery_first': Battery > Load > Grid  
-        - 'grid_first': Grid only (bypass mode)
+        Available Modes:
+        - 'load_first': PV > Load > Battery > Grid (standard self-consumption)
+        - 'battery_first': PV > Battery > Load > Grid (prioritize battery charging)  
+        - 'time_of_use': Scheduled charging/discharging based on time periods
+        - 'backup_reserve': Maintain minimum SOC for backup power
+        
+        Note: No 'grid_disconnect' mode - inverter always remains grid-tied
         """
-        valid_modes = ['load_first', 'battery_first', 'grid_first']
+        valid_modes = ['load_first', 'battery_first', 'time_of_use', 'backup_reserve']
         if mode not in valid_modes:
-            raise ValueError(f"Invalid mode: {mode}")
+            raise ValueError(f"Invalid mode: {mode}. Valid modes: {valid_modes}")
         
         command = {
-            "action": "set_priority",
+            "action": "set_system_mode",
             "mode": mode,
             "timestamp": datetime.now().isoformat()
         }
-        await self._send_inverter_command(command)
+        await self._send_growatt_command(command)
     
-    async def set_grid_export(self, enabled: bool, power_limit: Optional[float] = None):
-        """Enable/disable grid export with optional power limit."""
+    async def charge_from_grid(self, target_soc: float = 100.0, power_limit_kw: float = None):
+        """Command battery to charge from grid to target SOC.
+        
+        Args:
+            target_soc: Target state of charge (10-100%)
+            power_limit_kw: Maximum charging power (optional)
+        """
+        # Validate SOC range
+        target_soc = max(10, min(100, target_soc))
+        
         command = {
-            "action": "configure_export",
-            "enabled": enabled,
-            "power_limit_kw": power_limit if power_limit else self.max_export_power
+            "action": "charge_from_grid",
+            "target_soc": target_soc,
+            "power_limit_kw": power_limit_kw or self.max_charge_power_kw,
+            "priority": "grid_charging"
         }
-        await self._send_inverter_command(command)
+        await self._send_growatt_command(command)
+    
+    async def set_discharge_schedule(self, start_hour: int, end_hour: int, 
+                                   min_soc: float = 20.0):
+        """Schedule battery discharge during specific hours.
+        
+        Args:
+            start_hour: Hour to start discharging (0-23)
+            end_hour: Hour to stop discharging (0-23)  
+            min_soc: Minimum SOC to maintain (10-90%)
+        """
+        command = {
+            "action": "set_discharge_schedule",
+            "start_hour": start_hour,
+            "end_hour": end_hour,
+            "min_soc": max(10, min(90, min_soc)),
+            "enabled": True
+        }
+        await self._send_growatt_command(command)
+    
+    async def set_export_control(self, enabled: bool, power_limit_kw: float = None):
+        """Enable/disable grid export with optional power limit.
+        
+        Args:
+            enabled: Whether to allow grid export
+            power_limit_kw: Maximum export power (optional)
+        """
+        command = {
+            "action": "configure_export", 
+            "enabled": enabled,
+            "power_limit_kw": power_limit_kw or self.max_export_power_kw
+        }
+        await self._send_growatt_command(command)
+    
+    async def get_system_status(self) -> Dict[str, Any]:
+        """Get current battery and inverter status."""
+        status = await self._query_growatt_status()
+        return {
+            "battery_soc": status.get("soc", 0),
+            "battery_power": status.get("battery_power", 0),  # +charge, -discharge
+            "inverter_mode": status.get("system_mode", "unknown"),
+            "grid_export_enabled": status.get("export_enabled", False),
+            "pv_power": status.get("pv_input_power", 0),
+            "load_power": status.get("load_power", 0),
+            "grid_power": status.get("grid_power", 0),  # +import, -export
+            "system_online": status.get("online", False)
+        }
+    
+    async def emergency_stop(self):
+        """Emergency stop - set to safe backup mode."""
+        await self.set_system_mode('backup_reserve')
+        await self.set_export_control(enabled=False)
+        self.logger.warning("Emergency stop activated - system in backup reserve mode")
 ```
 
-**3.1.4 Unified Control Interface**
+**3.1.3 Unified Control Interface**
 ```python
 # modules/control/unified_controller.py
 class UnifiedEnergyController:
-    """Unified interface for all controllable loads."""
+    """Unified interface for all controllable systems."""
     
     def __init__(self, config: Dict[str, Any]):
         self.heating = HeatingController(config['heating'])
-        self.battery = BatteryController(config['battery'])
-        self.inverter = InverterController(config['inverter'])
+        self.battery_inverter = BatteryInverterController(config['battery_inverter'])
+        # Note: No separate inverter controller - integrated with battery
         
     async def execute_optimization_plan(self, plan: OptimizationResult):
         """Execute complete optimization plan across all systems."""
-        # 1. Set inverter mode based on time of day and prices
-        # 2. Control battery charging during cheap hours
-        # 3. Manage heating relays and temperature setpoints
-        # 4. Enable/disable grid export based on prices
+        # 1. Set battery/inverter system mode based on time and prices
+        # 2. Schedule battery charging during cheap hours
+        # 3. Manage heating relays and temperature setpoints  
+        # 4. Control grid export based on price signals
+        
+        for action in plan.control_actions:
+            if action.system == 'battery_inverter':
+                if action.command == 'set_mode':
+                    await self.battery_inverter.set_system_mode(action.mode)
+                elif action.command == 'charge_from_grid':
+                    await self.battery_inverter.charge_from_grid(
+                        target_soc=action.target_soc,
+                        power_limit_kw=action.power_limit
+                    )
+                elif action.command == 'set_export':
+                    await self.battery_inverter.set_export_control(
+                        enabled=action.enabled,
+                        power_limit_kw=action.power_limit
+                    )
+            elif action.system == 'heating':
+                await self._execute_heating_action(action)
 ```
 
 **Deliverables**:
 - ✅ Heating relay control via MQTT
 - ✅ Temperature setpoint control for each room
-- ✅ Battery charging control with grid charging capability
-- ✅ Inverter mode switching (load/battery/grid priority)
-- ✅ Grid export enable/disable control
+- ✅ Unified battery/inverter control (single integrated system)
+- ✅ Realistic system modes (load_first, battery_first, time_of_use, backup_reserve)
+- ✅ Grid charging control with scheduling capabilities
+- ✅ Grid export control (enable/disable with power limits)
 - ✅ Unified control interface for optimization integration
-- ✅ Emergency shutdown for all systems
-- ✅ State tracking and feedback monitoring
+- ✅ Emergency stop functionality (safe backup mode)
+- ✅ Comprehensive system status monitoring
 
 ---
 
@@ -146,11 +473,11 @@ class UnifiedEnergyController:
 
 **Task**: Optimize control strategy for available actuators
 - **File**: `modules/optimization/optimizer.py`
-- **Focus**: Optimize heating/AC, battery charging, inverter modes, grid export
-- **Enhancement**: Multi-stage optimization with mode selection
+- **Focus**: Optimize heating, battery/inverter system modes, grid export
+- **Enhancement**: Multi-stage optimization with realistic system constraints
 
 ```python
-# Enhanced optimization with specific control variables
+# Enhanced optimization with realistic control variables
 class EnergyOptimizer:
     def _define_control_variables(self, n_steps):
         """Define control variables for available systems."""
@@ -162,51 +489,72 @@ class EnergyOptimizer:
         temp_setpoints = {room: cp.Variable(n_steps) 
                          for room in self.rooms}
         
-        # Battery control variables
-        battery_charge_grid = cp.Variable(n_steps, boolean=True)  # Charge from grid?
-        battery_power = cp.Variable(n_steps)  # Charge/discharge power
+        # Unified battery/inverter system mode selection (one-hot encoding)
+        mode_load_first = cp.Variable(n_steps, boolean=True)      # Standard self-consumption
+        mode_battery_first = cp.Variable(n_steps, boolean=True)   # Prioritize battery charging
+        mode_time_of_use = cp.Variable(n_steps, boolean=True)     # Scheduled operation
+        mode_backup_reserve = cp.Variable(n_steps, boolean=True)  # Emergency backup mode
         
-        # Inverter mode selection (one-hot encoding)
-        mode_load_first = cp.Variable(n_steps, boolean=True)
-        mode_battery_first = cp.Variable(n_steps, boolean=True)
-        mode_grid_first = cp.Variable(n_steps, boolean=True)
+        # Battery/inverter control variables
+        battery_charge_grid = cp.Variable(n_steps, boolean=True)  # Grid charging enabled?
+        battery_target_soc = cp.Variable(n_steps)                 # Target state of charge
         
-        # Grid export control
+        # Grid export control (always grid-tied, no disconnect option)
         grid_export_enabled = cp.Variable(n_steps, boolean=True)
+        grid_export_limit = cp.Variable(n_steps)                  # Export power limit
         
         return {
             'heating': heating_vars,
             'temp_setpoints': temp_setpoints,
-            'battery_charge_grid': battery_charge_grid,
-            'battery_power': battery_power,
-            'inverter_modes': {
+            'system_modes': {
                 'load_first': mode_load_first,
-                'battery_first': mode_battery_first,
-                'grid_first': mode_grid_first
+                'battery_first': mode_battery_first, 
+                'time_of_use': mode_time_of_use,
+                'backup_reserve': mode_backup_reserve
             },
-            'grid_export': grid_export_enabled
+            'battery_charge_grid': battery_charge_grid,
+            'battery_target_soc': battery_target_soc,
+            'grid_export_enabled': grid_export_enabled,
+            'grid_export_limit': grid_export_limit
         }
     
     def _add_control_constraints(self, variables, n_steps):
         """Add constraints specific to available controls."""
         constraints = []
         
-        # Inverter mode: exactly one mode active at each time
+        # System mode: exactly one mode active at each time step
         for t in range(n_steps):
-            mode_sum = (variables['inverter_modes']['load_first'][t] +
-                       variables['inverter_modes']['battery_first'][t] +
-                       variables['inverter_modes']['grid_first'][t])
+            mode_sum = (variables['system_modes']['load_first'][t] +
+                       variables['system_modes']['battery_first'][t] +
+                       variables['system_modes']['time_of_use'][t] +
+                       variables['system_modes']['backup_reserve'][t])
             constraints.append(mode_sum == 1)
         
-        # Battery charging from grid only during low prices
+        # Battery SOC constraints (10-100%)
+        for t in range(n_steps):
+            constraints.append(variables['battery_target_soc'][t] >= 10)
+            constraints.append(variables['battery_target_soc'][t] <= 100)
+        
+        # Grid charging only during low price periods
         for t in range(n_steps):
             if self.price_forecast[t] > self.grid_charge_threshold:
                 constraints.append(variables['battery_charge_grid'][t] == 0)
         
-        # Grid export disabled during high price periods (if beneficial)
+        # Grid export power limits (0-15kW max export)
         for t in range(n_steps):
+            constraints.append(variables['grid_export_limit'][t] >= 0)
+            constraints.append(variables['grid_export_limit'][t] <= 15)  # kW
+            
+            # Enable export during high price periods
             if self.price_forecast[t] > self.export_threshold:
-                constraints.append(variables['grid_export'][t] == 1)  # Enable export
+                constraints.append(variables['grid_export_enabled'][t] == 1)
+        
+        # Backup reserve mode constraints - maintain minimum 50% SOC
+        for t in range(n_steps):
+            constraints.append(
+                variables['battery_target_soc'][t] >= 
+                50 * variables['system_modes']['backup_reserve'][t]
+            )
         
         return constraints
 ```
@@ -214,34 +562,37 @@ class EnergyOptimizer:
 **Optimization Strategy**:
 ```python
 def optimize_energy_system(self):
-    """Multi-stage optimization for limited control variables."""
+    """Multi-stage optimization for realistic control variables."""
     
-    # Stage 1: Optimize battery charging schedule
-    # - Identify cheapest hours for grid charging
-    # - Schedule full charge cycles during low prices
+    # Stage 1: Optimize battery/inverter system mode schedule
+    # - Use 'load_first' for standard self-consumption during normal times
+    # - Use 'battery_first' during expensive hours to prioritize battery charging from PV
+    # - Use 'time_of_use' for scheduled grid charging during cheapest hours
+    # - Use 'backup_reserve' during grid instability or emergency conditions
     
-    # Stage 2: Optimize inverter mode schedule  
-    # - Use 'battery_first' during expensive hours
-    # - Use 'load_first' during cheap hours with solar
-    # - Use 'grid_first' for maintenance/safety
+    # Stage 2: Optimize grid charging schedule
+    # - Identify cheapest 4-hour windows for grid charging
+    # - Schedule charging to reach 100% SOC before expensive periods
+    # - Respect battery SOC constraints (10-100%)
     
     # Stage 3: Optimize heating operation
-    # - Pre-heat during cheap hours
-    # - Adjust temperature setpoints based on prices
-    # - Maintain comfort constraints
+    # - Pre-heat during cheap hours using stored battery energy
+    # - Adjust temperature setpoints based on electricity prices
+    # - Maintain comfort constraints (±2°C from target)
     
     # Stage 4: Grid export optimization
-    # - Enable export during high feed-in tariffs
-    # - Disable during negative prices
+    # - Enable export during high feed-in tariffs (always grid-tied)
+    # - Set appropriate export power limits based on local consumption
+    # - Disable export during negative prices to avoid costs
 ```
 
 **Deliverables**:
 - ✅ Optimized control for heating relays and temperature setpoints
-- ✅ Multi-stage optimization with mode selection logic
-- ✅ Price-aware battery charging from grid
-- ✅ Dynamic inverter mode switching based on conditions
-- ✅ Grid export optimization based on price signals
-- ✅ Integrated control scheduling across all systems
+- ✅ Multi-stage optimization with realistic system mode selection
+- ✅ Price-aware battery charging from grid with SOC targeting
+- ✅ Unified battery/inverter system mode optimization
+- ✅ Grid export optimization with power limit control (always grid-tied)
+- ✅ Integrated control scheduling across all available systems
 
 ---
 
@@ -290,36 +641,46 @@ class ModelRegistry:
 class ControlStrategyExecutor:
     """Execute optimized control strategies for all available systems."""
     
-    async def execute_daily_battery_strategy(self, price_forecast: pd.Series):
-        """Execute battery control based on price signals."""
+    async def execute_daily_battery_inverter_strategy(self, price_forecast: pd.Series):
+        """Execute unified battery/inverter system control based on price signals."""
         
         # Find cheapest 4-hour window for grid charging
         rolling_avg = price_forecast.rolling(window=4).mean()
         cheapest_start = rolling_avg.idxmin()
         
-        # Schedule grid charging during cheap window
-        charge_schedule = []
+        # Schedule unified system operation
+        system_schedule = []
         for hour in range(24):
             if cheapest_start <= hour < cheapest_start + 4:
-                charge_schedule.append({
+                # Grid charging during cheapest hours
+                system_schedule.append({
                     'hour': hour,
-                    'action': 'charge_from_grid',
-                    'target_soc': 100.0
+                    'action': 'set_system_mode',
+                    'mode': 'time_of_use',  # Scheduled operation mode
+                    'enable_grid_charge': True,
+                    'target_soc': 100.0,
+                    'reason': 'cheap_grid_charging'
                 })
             elif price_forecast[hour] > self.high_price_threshold:
-                charge_schedule.append({
+                # Prioritize battery usage during expensive hours
+                system_schedule.append({
                     'hour': hour,
-                    'action': 'set_mode',
-                    'mode': 'battery_first'  # Use battery during expensive hours
+                    'action': 'set_system_mode',
+                    'mode': 'battery_first',  # Battery priority during expensive hours
+                    'enable_grid_charge': False,
+                    'reason': 'expensive_grid_prices'
                 })
             else:
-                charge_schedule.append({
+                # Normal self-consumption mode
+                system_schedule.append({
                     'hour': hour,
-                    'action': 'set_mode', 
-                    'mode': 'load_first'  # Normal self-consumption
+                    'action': 'set_system_mode', 
+                    'mode': 'load_first',  # Standard self-consumption
+                    'enable_grid_charge': False,
+                    'reason': 'normal_operation'
                 })
         
-        return charge_schedule
+        return system_schedule
     
     async def execute_heating_optimization(self, price_forecast: pd.Series, 
                                           weather_forecast: pd.DataFrame):
@@ -352,7 +713,7 @@ class ControlStrategyExecutor:
     
     async def execute_grid_export_strategy(self, price_forecast: pd.Series,
                                          pv_forecast: pd.Series):
-        """Control grid export based on economics."""
+        """Control grid export based on economics (always grid-tied system)."""
         
         export_schedule = []
         for hour in range(24):
@@ -361,6 +722,7 @@ class ControlStrategyExecutor:
                 export_schedule.append({
                     'hour': hour,
                     'export_enabled': True,
+                    'power_limit_kw': 15.0,  # Full system capacity
                     'reason': 'high_feed_in_tariff'
                 })
             # Disable export during negative prices
@@ -368,19 +730,23 @@ class ControlStrategyExecutor:
                 export_schedule.append({
                     'hour': hour,
                     'export_enabled': False,
+                    'power_limit_kw': 0.0,
                     'reason': 'negative_prices'
                 })
-            # Enable export if excess PV and reasonable price
+            # Enable limited export if excess PV and reasonable price
             elif pv_forecast[hour] > self.base_load_forecast[hour] + 2000:
+                excess_power = pv_forecast[hour] - self.base_load_forecast[hour]
                 export_schedule.append({
                     'hour': hour,
                     'export_enabled': True,
+                    'power_limit_kw': min(excess_power / 1000, 15.0),  # Limit to excess
                     'reason': 'excess_pv_production'
                 })
             else:
                 export_schedule.append({
                     'hour': hour,
                     'export_enabled': False,
+                    'power_limit_kw': 0.0,
                     'reason': 'maximize_self_consumption'
                 })
         
@@ -403,10 +769,10 @@ async def execute_daily_optimization(self):
     )
     
     # 3. Execute control strategies
-    # Battery control
-    battery_strategy = await self.execute_daily_battery_strategy(price_forecast)
-    for action in battery_strategy:
-        await self.schedule_battery_action(action)
+    # Unified battery/inverter system control
+    system_strategy = await self.execute_daily_battery_inverter_strategy(price_forecast)
+    for action in system_strategy:
+        await self.schedule_battery_inverter_action(action)
     
     # Heating optimization
     heating_strategy = await self.execute_heating_optimization(
@@ -427,12 +793,424 @@ async def execute_daily_optimization(self):
 ```
 
 **Deliverables**:
-- ✅ Price-based battery charging strategies
+- ✅ Unified battery/inverter system control strategies 
+- ✅ Realistic system mode scheduling (load_first, battery_first, time_of_use, backup_reserve)
 - ✅ Heating pre-conditioning and setpoint optimization
-- ✅ Dynamic grid export control based on economics
+- ✅ Dynamic grid export control with power limits (always grid-tied)
 - ✅ Integrated control flow for daily optimization
 - ✅ Real-time adjustment capabilities
 - ✅ Clear strategy documentation and examples
+
+---
+
+### **🌞 DUAL-ARRAY PHOTOVOLTAIC SYSTEM ENHANCEMENT (High Priority)**
+
+#### **3.4 Dual-Array PV Configuration Implementation**
+**Priority**: 🟡 **HIGH** | **Estimated**: 3-4 days
+
+**Task**: Update PV prediction and analysis modules to properly handle dual-array configuration with different orientations
+- **Current Limitation**: Single-array modeling with default 180° azimuth and 30° tilt
+- **New Configuration**: Two arrays with 143° SE and 233° SW azimuth, both at 35° tilt
+- **Impact**: Improved prediction accuracy, better string balance analysis, orientation-aware optimization
+
+**Physical Array Configuration**:
+```yaml
+Array Configuration:
+  Array 1 (PV1 String):
+    azimuth: 143°  # Southeast facing
+    tilt: 35°      # Roof slope
+    capacity: ~7.5 kW  # Estimated based on total 15kW system
+    
+  Array 2 (PV2 String):  
+    azimuth: 233°  # Southwest facing  
+    tilt: 35°      # Roof slope
+    capacity: ~7.5 kW  # Estimated based on total 15kW system
+    
+  Benefits:
+    - Extended daily production window (SE peaks morning, SW peaks afternoon)
+    - Better performance in variable weather conditions
+    - Reduced peak power stress on single inverter input
+    - More consistent daily energy yield
+```
+
+**3.4.1 PV Predictor Model Enhancement**
+**File**: `pems_v2/models/predictors/pv_predictor.py`
+
+```python
+# Enhanced dual-array PV prediction model
+class DualArrayPVPredictor(BasePredictor):
+    """Enhanced PV predictor supporting dual-array configuration."""
+    
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        
+        # Dual-array physical configuration
+        self.array_configs = {
+            'pv1': {
+                'azimuth': 143.0,    # Southeast facing
+                'tilt': 35.0,        # Roof slope
+                'capacity_kw': 7.5,  # Half of total system
+                'string_id': 'PV1'   # Maps to InfluxDB field
+            },
+            'pv2': {
+                'azimuth': 233.0,    # Southwest facing  
+                'tilt': 35.0,        # Roof slope
+                'capacity_kw': 7.5,  # Half of total system
+                'string_id': 'PV2'   # Maps to InfluxDB field
+            }
+        }
+        
+        # System location (Prague)
+        self.latitude = 49.2
+        self.longitude = 16.6
+        
+    def _calculate_array_specific_features(self, weather_data: pd.DataFrame) -> pd.DataFrame:
+        """Calculate PVLib features for each array separately."""
+        import pvlib
+        
+        features = weather_data.copy()
+        
+        # Create PVLib location
+        location = pvlib.location.Location(
+            latitude=self.latitude,
+            longitude=self.longitude,
+            tz='Europe/Prague'
+        )
+        
+        # Calculate solar position
+        solar_position = location.get_solarposition(weather_data.index)
+        
+        # Calculate array-specific irradiance for each orientation
+        for array_id, config in self.array_configs.items():
+            # Calculate plane-of-array irradiance for this specific orientation
+            poa_irradiance = pvlib.irradiance.get_total_irradiance(
+                surface_tilt=config['tilt'],
+                surface_azimuth=config['azimuth'], 
+                solar_zenith=solar_position['zenith'],
+                solar_azimuth=solar_position['azimuth'],
+                dni=weather_data.get('dni', weather_data.get('shortwave_radiation', 0)),
+                ghi=weather_data.get('ghi', weather_data.get('shortwave_radiation', 0)),
+                dhi=weather_data.get('dhi', weather_data.get('shortwave_radiation', 0) * 0.1)
+            )
+            
+            # Add array-specific features
+            features[f'{array_id}_poa_irradiance'] = poa_irradiance['poa_global']
+            features[f'{array_id}_incidence_angle'] = pvlib.irradiance.aoi(
+                surface_tilt=config['tilt'],
+                surface_azimuth=config['azimuth'],
+                solar_zenith=solar_position['zenith'], 
+                solar_azimuth=solar_position['azimuth']
+            )
+            
+            # Calculate array-specific cell temperature
+            cell_temp = pvlib.temperature.faiman(
+                poa_global=poa_irradiance['poa_global'],
+                temp_air=weather_data.get('temperature_2m', 20),
+                wind_speed=weather_data.get('windspeed_10m', 0)
+            )
+            features[f'{array_id}_cell_temperature'] = cell_temp
+            
+            # Calculate theoretical DC power for this array
+            features[f'{array_id}_theoretical_dc'] = self._calculate_dc_power(
+                poa_irradiance['poa_global'], 
+                cell_temp, 
+                config['capacity_kw']
+            )
+        
+        # Calculate combined system features
+        features['total_theoretical_dc'] = (
+            features['pv1_theoretical_dc'] + features['pv2_theoretical_dc']
+        )
+        
+        # Array balance feature (how much each array contributes)
+        total_irradiance = features['pv1_poa_irradiance'] + features['pv2_poa_irradiance']
+        features['array_balance'] = np.where(
+            total_irradiance > 0,
+            features['pv1_poa_irradiance'] / total_irradiance,
+            0.5  # Default balanced when no sun
+        )
+        
+        return features
+        
+    def _calculate_dc_power(self, poa_irradiance: pd.Series, cell_temp: pd.Series, 
+                           capacity_kw: float) -> pd.Series:
+        """Calculate DC power output for array using PVLib."""
+        # Standard Test Conditions (STC) parameters
+        temp_coeff = -0.004  # %/°C typical for crystalline silicon
+        stc_temp = 25.0      # °C
+        stc_irradiance = 1000 # W/m²
+        
+        # Temperature derating
+        temp_derating = 1 + temp_coeff * (cell_temp - stc_temp)
+        
+        # Irradiance scaling
+        irradiance_factor = poa_irradiance / stc_irradiance
+        
+        # DC power calculation with efficiency losses
+        dc_power = capacity_kw * irradiance_factor * temp_derating
+        
+        # Apply realistic system losses
+        system_losses = 0.85  # 15% losses (soiling, wiring, inverter, etc.)
+        
+        return np.maximum(0, dc_power * system_losses)
+    
+    def predict(self, features: pd.DataFrame) -> Dict[str, np.ndarray]:
+        """Enhanced prediction with array-specific outputs."""
+        
+        # Calculate array-specific PVLib features
+        enhanced_features = self._calculate_array_specific_features(features)
+        
+        # Get base predictions using ML model
+        base_predictions = super().predict(enhanced_features)
+        
+        # Add array-specific predictions
+        predictions = base_predictions.copy()
+        
+        # Predict individual array outputs if historical data supports it
+        for array_id in ['pv1', 'pv2']:
+            array_features = self._extract_array_features(enhanced_features, array_id)
+            predictions[f'{array_id}_power'] = self._predict_array_power(array_features)
+        
+        # Validate that sum of arrays matches total prediction
+        predicted_total = predictions['pv1_power'] + predictions['pv2_power']
+        # Apply scaling factor to maintain consistency
+        if predicted_total.sum() > 0:
+            scale_factor = base_predictions['power'].sum() / predicted_total.sum()
+            predictions['pv1_power'] *= scale_factor
+            predictions['pv2_power'] *= scale_factor
+        
+        return predictions
+```
+
+**3.4.2 Configuration Enhancement**
+**File**: `pems_v2/config/energy_settings.py`
+
+```python
+# Enhanced PV array configuration
+PV_ARRAY_CONFIGURATION = {
+    'total_capacity_kw': 15.0,
+    'arrays': {
+        'pv1': {
+            'name': 'Southeast Array',
+            'azimuth': 143.0,           # Degrees from North (Southeast)
+            'tilt': 35.0,               # Degrees from horizontal  
+            'capacity_kw': 7.5,         # Nominal DC capacity
+            'string_id': 'PV1',         # InfluxDB field mapping
+            'technology': 'crystalline_silicon',
+            'mounting': 'roof_mounted',
+            'orientation_description': 'Morning optimized - peaks 9-11 AM'
+        },
+        'pv2': {
+            'name': 'Southwest Array', 
+            'azimuth': 233.0,           # Degrees from North (Southwest)
+            'tilt': 35.0,               # Degrees from horizontal
+            'capacity_kw': 7.5,         # Nominal DC capacity  
+            'string_id': 'PV2',         # InfluxDB field mapping
+            'technology': 'crystalline_silicon',
+            'mounting': 'roof_mounted',
+            'orientation_description': 'Afternoon optimized - peaks 1-3 PM'
+        }
+    },
+    'system_location': {
+        'latitude': 49.2,            # Prague coordinates
+        'longitude': 16.6,
+        'timezone': 'Europe/Prague',
+        'elevation_m': 200           # Approximate elevation
+    },
+    'performance_parameters': {
+        'system_losses': 0.15,       # 15% total system losses
+        'inverter_efficiency': 0.96, # 96% inverter efficiency
+        'dc_ac_ratio': 1.2,          # DC to AC sizing ratio
+        'temperature_coefficient': -0.004  # %/°C power loss
+    }
+}
+
+def get_array_configuration(array_id: str) -> Dict[str, Any]:
+    """Get configuration for specific PV array."""
+    if array_id not in PV_ARRAY_CONFIGURATION['arrays']:
+        raise ValueError(f"Unknown array ID: {array_id}")
+    return PV_ARRAY_CONFIGURATION['arrays'][array_id]
+
+def get_optimal_production_windows() -> Dict[str, Dict[str, int]]:
+    """Get expected optimal production windows for each array."""
+    return {
+        'pv1': {  # Southeast array - morning peak
+            'peak_start_hour': 9,
+            'peak_end_hour': 11, 
+            'production_start_hour': 6,
+            'production_end_hour': 15
+        },
+        'pv2': {  # Southwest array - afternoon peak  
+            'peak_start_hour': 13,
+            'peak_end_hour': 15,
+            'production_start_hour': 10, 
+            'production_end_hour': 19
+        }
+    }
+```
+
+**3.4.3 Analysis Module Enhancement**
+**File**: `pems_v2/analysis/analyzers/pattern_analysis.py`
+
+```python
+def analyze_dual_array_performance(self, pv_data: pd.DataFrame) -> Dict[str, Any]:
+    """Analyze performance patterns for dual-array system."""
+    
+    analysis = {
+        'array_performance': {},
+        'system_balance': {},
+        'optimization_opportunities': {}
+    }
+    
+    # Individual array analysis
+    for array_id in ['pv1', 'pv2']:
+        power_field = f'{array_id.upper()}InputPower'
+        if power_field in pv_data.columns:
+            array_data = pv_data[power_field]
+            config = get_array_configuration(array_id)
+            
+            analysis['array_performance'][array_id] = {
+                'daily_peak_hour': array_data.groupby(array_data.index.hour).mean().idxmax(),
+                'capacity_factor': array_data.mean() / (config['capacity_kw'] * 1000),
+                'production_hours_per_day': (array_data > 100).groupby(array_data.index.date).sum().mean(),
+                'weather_sensitivity': self._calculate_weather_correlation(array_data),
+                'expected_peak_hours': get_optimal_production_windows()[array_id],
+                'performance_vs_expected': self._compare_to_theoretical(array_data, array_id)
+            }
+    
+    # System balance analysis
+    if 'PV1InputPower' in pv_data.columns and 'PV2InputPower' in pv_data.columns:
+        pv1_power = pv_data['PV1InputPower']
+        pv2_power = pv_data['PV2InputPower'] 
+        total_power = pv1_power + pv2_power
+        
+        # Calculate balance ratio (ideally should vary throughout day)
+        balance_ratio = np.where(total_power > 100, pv1_power / total_power, np.nan)
+        
+        analysis['system_balance'] = {
+            'daily_balance_pattern': pd.Series(balance_ratio, index=pv_data.index).groupby(
+                pv_data.index.hour
+            ).mean().to_dict(),
+            'morning_dominance': balance_ratio[pv_data.index.hour.isin([8, 9, 10])].mean(),
+            'afternoon_dominance': 1 - balance_ratio[pv_data.index.hour.isin([14, 15, 16])].mean(),
+            'ideal_morning_ratio': 0.6,  # SE array should dominate morning
+            'ideal_afternoon_ratio': 0.4, # SW array should dominate afternoon
+            'balance_health_score': self._calculate_balance_health_score(balance_ratio)
+        }
+    
+    return analysis
+
+def _calculate_balance_health_score(self, balance_ratio: np.ndarray) -> float:
+    """Calculate health score for array balance (0-1, higher is better)."""
+    # Good balance means arrays complement each other throughout day
+    # Morning hours (6-12): PV1 should dominate (ratio > 0.5)
+    # Afternoon hours (12-18): PV2 should dominate (ratio < 0.5) 
+    
+    morning_mask = pd.Series(balance_ratio).index.hour < 12
+    afternoon_mask = pd.Series(balance_ratio).index.hour >= 12
+    
+    morning_score = (balance_ratio[morning_mask] > 0.5).mean() if morning_mask.any() else 0
+    afternoon_score = (balance_ratio[afternoon_mask] < 0.5).mean() if afternoon_mask.any() else 0
+    
+    return (morning_score + afternoon_score) / 2
+```
+
+**3.4.4 Database Schema Enhancement**
+**File**: `pems_v2/analysis/db_data_docs/SOLAR_BUCKET.md`
+
+```markdown
+# Enhanced Solar Data Schema - Dual Array Support
+
+## Array Configuration Metadata
+
+### Array Specifications
+- **PV1 (Southeast Array)**: 143° azimuth, 35° tilt, ~7.5kW capacity
+- **PV2 (Southwest Array)**: 233° azimuth, 35° tilt, ~7.5kW capacity  
+- **Total System**: 15kW DC capacity, roof-mounted crystalline silicon
+
+## String-Specific Analysis Fields
+
+### Individual Array Performance
+- `PV1InputPower`: DC power from Southeast array (W)
+- `PV2InputPower`: DC power from Southwest array (W) 
+- `PV1Voltage`: String voltage for Southeast array (V)
+- `PV2Voltage`: String voltage for Southwest array (V)
+
+### Calculated Dual-Array Metrics
+- `array_balance_ratio`: PV1/(PV1+PV2) production ratio
+- `morning_production_dominance`: SE array advantage in AM hours
+- `afternoon_production_dominance`: SW array advantage in PM hours
+- `daily_production_window_hours`: Total productive hours across both arrays
+- `complementary_production_score`: How well arrays complement each other
+```
+
+**3.4.5 Testing Enhancement**
+**File**: `pems_v2/tests/test_pv_predictor.py`
+
+```python
+def test_dual_array_prediction_accuracy(self):
+    """Test prediction accuracy for dual-array configuration."""
+    # Create test data with realistic dual-array patterns
+    test_data = self._create_dual_array_test_data()
+    
+    predictor = DualArrayPVPredictor(self.config)
+    predictions = predictor.predict(test_data)
+    
+    # Verify array-specific predictions
+    assert 'pv1_power' in predictions
+    assert 'pv2_power' in predictions
+    
+    # Check that PV1 (SE) peaks in morning
+    morning_hours = [9, 10, 11]
+    pv1_morning_avg = predictions['pv1_power'][morning_hours].mean()
+    pv2_morning_avg = predictions['pv2_power'][morning_hours].mean()
+    assert pv1_morning_avg > pv2_morning_avg
+    
+    # Check that PV2 (SW) peaks in afternoon  
+    afternoon_hours = [13, 14, 15]
+    pv1_afternoon_avg = predictions['pv1_power'][afternoon_hours].mean()
+    pv2_afternoon_avg = predictions['pv2_power'][afternoon_hours].mean()
+    assert pv2_afternoon_avg > pv1_afternoon_avg
+
+def test_array_configuration_validation(self):
+    """Test that array configurations are properly validated."""
+    config = get_array_configuration('pv1')
+    assert config['azimuth'] == 143.0
+    assert config['tilt'] == 35.0
+    
+    config = get_array_configuration('pv2') 
+    assert config['azimuth'] == 233.0
+    assert config['tilt'] == 35.0
+```
+
+**Implementation Priority & Dependencies**:
+```yaml
+Phase 3.4 Implementation Order:
+  1. Update energy_settings.py with dual-array configuration (1 day)
+  2. Enhance PV predictor model with PVLib dual-array support (2 days) 
+  3. Update pattern analysis for array-specific performance (1 day)
+  4. Add comprehensive testing for dual-array scenarios (0.5 days)
+  5. Update documentation and database schema (0.5 days)
+
+Dependencies:
+  - pvlib-python library for solar calculations
+  - Enhanced weather data (DNI, GHI, DHI) for accurate irradiance modeling
+  - Historical PV1/PV2 string data for model training and validation
+
+Benefits:
+  - Improved prediction accuracy (estimated 15-20% RMSE reduction)
+  - Better understanding of production patterns throughout day
+  - Array-specific performance monitoring and fault detection
+  - Optimization opportunities for time-of-use scenarios
+```
+
+**Deliverables**:
+- ✅ Dual-array PV configuration system with 143°/233° azimuth support
+- ✅ Enhanced PVLib-based modeling for realistic irradiance calculations  
+- ✅ Array-specific performance analysis and monitoring
+- ✅ Improved prediction accuracy for both morning and afternoon production
+- ✅ String balance analysis considering different optimal production times
+- ✅ Updated database schema and documentation for dual-array system
 
 ---
 
