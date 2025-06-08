@@ -1,7 +1,46 @@
 """
 Heating Control Interface for PEMS v2.
 
-Interfaces with Loxone heating system via MQTT for automated control.
+This module provides the critical interface between the PEMS v2 optimization engine
+and the physical Loxone heating system. It translates optimization decisions into
+real-world heating control commands while ensuring safety and reliability.
+
+Architecture Overview:
+- Receives heating schedules from optimization engine as pandas Series
+- Converts schedules into individual room heating commands with safety checks
+- Communicates with Loxone system via MQTT protocol for real-time control
+- Maintains state tracking and command queue for reliable operation
+- Implements safety mechanisms to prevent equipment damage
+
+Key Features:
+1. **Schedule Execution**: Converts optimization schedules to room-specific commands
+2. **Safety Systems**: Prevents rapid cycling, power overloads, and unsafe operations
+3. **Real-time Control**: Individual room heating control with immediate response
+4. **Status Monitoring**: Tracks heating system state and performance metrics
+5. **Emergency Controls**: Immediate shutdown capability for safety situations
+6. **Command Queuing**: Ensures reliable delivery of control commands
+7. **MQTT Integration**: Seamless communication with Loxone infrastructure
+
+Safety Features:
+- Maximum switching frequency limits to protect relay equipment
+- Power limit validation before command execution
+- Emergency stop functionality for immediate shutdown
+- Command validation and sanitization
+- Timeout protection for stuck commands
+
+Usage in PEMS v2 Workflow:
+1. Optimization engine generates heating schedules for 48-hour horizon
+2. HeatingController receives schedule for next control period (typically 15-60 minutes)
+3. Commands are validated against safety constraints and room configurations
+4. MQTT messages sent to Loxone to execute heating control decisions
+5. Status feedback monitored to confirm successful execution
+6. Any failures trigger fallback strategies and alerts
+
+Integration Points:
+- Input: Optimization schedules from optimizer.py
+- Output: MQTT commands to Loxone heating relays
+- Monitoring: Real-time status from Loxone system via MQTT
+- Configuration: Room power ratings from energy_settings.py
 """
 
 import asyncio
@@ -17,7 +56,30 @@ from dataclasses import dataclass
 
 @dataclass
 class HeatingCommand:
-    """Command to control a heating relay."""
+    """
+    Represents a single heating control command for a specific room.
+    
+    This dataclass encapsulates all information needed to execute a heating
+    control action, including the target room, desired state, timing constraints,
+    and priority for command scheduling.
+    
+    Attributes:
+        room: Target room identifier (must match configuration)
+        state: Desired heating state (True=ON/heating, False=OFF/no heating)
+        duration_minutes: Optional time limit for command (None=indefinite)
+        priority: Command priority for scheduling (0=low, higher=more urgent)
+        timestamp: When command was created (auto-populated if None)
+    
+    Priority Levels:
+        0: Scheduled optimization commands (default)
+        1: Real-time optimization adjustments
+        2: Manual user override commands
+        3: Safety and emergency commands
+    
+    Usage:
+        cmd = HeatingCommand(room="living_room", state=True, duration_minutes=30)
+        # Creates command to turn on living room heating for 30 minutes
+    """
     
     room: str
     state: bool  # True = ON, False = OFF
@@ -26,13 +88,45 @@ class HeatingCommand:
     timestamp: datetime = None
     
     def __post_init__(self):
+        """Auto-populate timestamp if not provided."""
         if self.timestamp is None:
             self.timestamp = datetime.now()
 
 
 @dataclass
 class HeatingStatus:
-    """Current status of a heating relay."""
+    """
+    Represents the current operational status of a room's heating system.
+    
+    This dataclass captures the complete state of a heating relay including
+    power consumption, temperature readings, and operational status. Used for
+    monitoring, feedback control, and system diagnostics.
+    
+    Attributes:
+        room: Room identifier matching the heating control configuration
+        state: Current relay state (True=heating ON, False=heating OFF)
+        power_w: Current power consumption in watts (0 when OFF)
+        last_updated: Timestamp of last status update from Loxone system
+        temperature_c: Current room temperature in degrees Celsius
+        target_temp_c: Target temperature setpoint (None if not available)
+    
+    Data Sources:
+        - state, power_w: Loxone heating relay status via MQTT
+        - temperature_c: Room temperature sensors via MQTT
+        - target_temp_c: Loxone heating control setpoints
+        - last_updated: MQTT message timestamp
+    
+    Usage:
+        status = HeatingStatus(
+            room="kitchen",
+            state=True,
+            power_w=2000.0,
+            last_updated=datetime.now(),
+            temperature_c=21.5,
+            target_temp_c=22.0
+        )
+        # Represents kitchen heating ON, consuming 2kW, temp 21.5°C targeting 22°C
+    """
     
     room: str
     state: bool
@@ -44,17 +138,92 @@ class HeatingStatus:
 
 class HeatingController:
     """
-    Controller for Loxone heating system via MQTT.
+    Primary interface controller for Loxone heating system integration.
     
-    Provides interface between optimization engine and physical heating relays.
+    This class serves as the critical bridge between PEMS v2's optimization engine
+    and the physical Loxone heating infrastructure. It handles the translation of
+    high-level optimization decisions into low-level heating control commands while
+    maintaining safety, reliability, and real-time responsiveness.
+    
+    Core Responsibilities:
+    1. **Schedule Execution**: Convert optimization heating schedules into timed commands
+    2. **Command Management**: Queue, prioritize, and execute heating control commands
+    3. **Safety Enforcement**: Validate commands against safety constraints and limits
+    4. **MQTT Communication**: Handle bi-directional communication with Loxone system
+    5. **Status Monitoring**: Track real-time heating system state and performance
+    6. **Error Handling**: Manage failures, timeouts, and recovery procedures
+    
+    Architecture:
+    - Asynchronous operation for non-blocking control and monitoring
+    - Command queue with priority-based execution scheduling
+    - Safety validation layer preventing dangerous operations
+    - Real-time status tracking with MQTT feedback loops
+    - Configurable room-specific heating parameters and limits
+    
+    Integration with PEMS v2:
+    - Receives optimized heating schedules from modules/optimization/optimizer.py
+    - Uses room configurations from config/energy_settings.py
+    - Communicates status back to optimization engine for model validation
+    - Provides emergency controls for safety shutdown scenarios
+    
+    MQTT Protocol:
+    - Control Commands: pems/heating/{room}/set -> {"state": "on/off", "duration": minutes}
+    - Status Updates: loxone/heating/{room}/status -> {"state": bool, "power": watts, "temp": celsius}
+    - Emergency Stop: pems/heating/emergency/stop -> immediate shutdown all heating
+    
+    Safety Systems:
+    - Maximum switching frequency limits (default: 12 switches/hour per room)
+    - Power consumption validation against room capacity limits
+    - Command timeout protection (default: 60 minutes maximum duration)
+    - Emergency stop functionality with immediate response capability
+    - Validation of room existence and configuration before command execution
     """
     
     def __init__(self, config: Dict[str, Any]):
         """
-        Initialize heating controller.
+        Initialize the heating controller with comprehensive configuration.
+        
+        Sets up the controller infrastructure including MQTT communication,
+        room configurations, safety parameters, and internal state management.
+        This method prepares the controller for operation but does not establish
+        MQTT connections (use initialize() method for that).
         
         Args:
-            config: Configuration dictionary with MQTT and room settings
+            config: Comprehensive configuration dictionary containing:
+                - rooms: Dict[str, Dict] - Room configurations with power ratings
+                - mqtt: Dict - MQTT broker connection settings
+                - max_switching_per_hour: int - Safety limit for relay switching
+                - safety_timeout_minutes: int - Maximum command duration
+                
+        Configuration Structure:
+            {
+                "rooms": {
+                    "living_room": {"power_kw": 4.8},
+                    "kitchen": {"power_kw": 2.0},
+                    ...
+                },
+                "mqtt": {
+                    "broker": "localhost",
+                    "port": 1883,
+                    "heating_topic_prefix": "pems/heating"
+                },
+                "max_switching_per_hour": 12,
+                "safety_timeout_minutes": 60
+            }
+        
+        Initialization Process:
+        1. Extract and validate room configurations
+        2. Setup MQTT communication parameters and topic structure
+        3. Initialize internal state tracking dictionaries
+        4. Configure safety limits and operational constraints
+        5. Setup logging for operational monitoring
+        
+        Internal State Structures:
+        - current_commands: Active heating commands per room
+        - last_status: Most recent status information per room
+        - command_queue: Pending commands awaiting execution
+        
+        Note: Actual MQTT connection is established via initialize() method
         """
         self.config = config
         self.logger = logging.getLogger(__name__)
