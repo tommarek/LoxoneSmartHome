@@ -174,24 +174,70 @@ class BaseLoadAnalyzer:
                 base_load_data["ev_consumption"] = ev_aligned.fillna(0)
                 base_load_data["base_load"] -= ev_aligned.fillna(0)
 
-        # Subtract battery consumption (charging losses)
+        # Account for battery charge/discharge impact on consumption
         if battery_data is not None and not battery_data.empty:
-            battery_cols = [
-                col for col in battery_data.columns if "power" in col.lower()
+            # Look for charge and discharge power columns first
+            charge_cols = [
+                col
+                for col in battery_data.columns
+                if "charge" in col.lower() and "power" in col.lower()
             ]
-            if battery_cols:
-                battery_power = battery_data[battery_cols[0]]
-                battery_resampled = battery_power.resample(
+            discharge_cols = [
+                col
+                for col in battery_data.columns
+                if "discharge" in col.lower() and "power" in col.lower()
+            ]
+
+            if charge_cols and discharge_cols:
+                # Use separate charge/discharge data
+                charge_power = battery_data[charge_cols[0]]
+                discharge_power = battery_data[discharge_cols[0]]
+
+                # Calculate net battery power (positive = charging, negative = discharging)
+                net_battery_power = charge_power.fillna(0) - discharge_power.fillna(0)
+
+                battery_resampled = net_battery_power.resample(
                     total_consumption.index.freq or "15T"
                 ).mean()
                 battery_aligned = battery_resampled.reindex(
                     base_load_data.index, method="nearest"
+                ).fillna(0)
+
+                # Battery charging: subtract from base load (grid powers battery)
+                # Battery discharging: add to base load (battery supplements grid)
+                base_load_data["battery_charge_power"] = np.maximum(battery_aligned, 0)
+                base_load_data["battery_discharge_power"] = np.maximum(
+                    -battery_aligned, 0
+                )
+                base_load_data["net_battery_power"] = battery_aligned
+
+                # Adjust base load: subtract charging, add discharging
+                base_load_data["base_load"] = (
+                    base_load_data["base_load"]
+                    - base_load_data["battery_charge_power"]  # Grid charges battery
+                    + base_load_data[
+                        "battery_discharge_power"
+                    ]  # Battery supplements load
                 )
 
-                # Only subtract when battery is charging (positive power)
-                battery_charging = np.maximum(battery_aligned.fillna(0), 0)
-                base_load_data["battery_consumption"] = battery_charging
-                base_load_data["base_load"] -= battery_charging
+            else:
+                # Fallback: look for generic power column (legacy behavior)
+                battery_cols = [
+                    col for col in battery_data.columns if "power" in col.lower()
+                ]
+                if battery_cols:
+                    battery_power = battery_data[battery_cols[0]]
+                    battery_resampled = battery_power.resample(
+                        total_consumption.index.freq or "15T"
+                    ).mean()
+                    battery_aligned = battery_resampled.reindex(
+                        base_load_data.index, method="nearest"
+                    )
+
+                    # Assume positive = charging, subtract from base load
+                    battery_charging = np.maximum(battery_aligned.fillna(0), 0)
+                    base_load_data["battery_consumption"] = battery_charging
+                    base_load_data["base_load"] -= battery_charging
 
         # Ensure base load is non-negative
         base_load_data["base_load"] = np.maximum(base_load_data["base_load"], 0)
@@ -286,7 +332,9 @@ class BaseLoadAnalyzer:
                 "pv_self_consumption",
                 "heating_consumption",
                 "ev_consumption",
-                "battery_consumption",
+                "battery_consumption",  # Legacy battery column
+                "battery_charge_power",  # New battery charging
+                "battery_discharge_power",  # New battery discharging
             ]
             for component in components:
                 if component in base_load_data.columns:
@@ -296,6 +344,25 @@ class BaseLoadAnalyzer:
                         if total_consumption.sum() > 0
                         else 0
                     )
+
+            # Special handling for net battery impact
+            if "net_battery_power" in base_load_data.columns:
+                net_battery_sum = base_load_data["net_battery_power"].sum()
+                stats["net_battery_impact_percentage"] = (
+                    (net_battery_sum / total_consumption.sum() * 100)
+                    if total_consumption.sum() > 0
+                    else 0
+                )
+                stats["battery_charging_energy_kwh"] = (
+                    base_load_data.get("battery_charge_power", pd.Series()).sum()
+                    * 0.25
+                    / 1000
+                )
+                stats["battery_discharging_energy_kwh"] = (
+                    base_load_data.get("battery_discharge_power", pd.Series()).sum()
+                    * 0.25
+                    / 1000
+                )
 
         # Time-based statistics
         hourly_avg = base_load.groupby(base_load.index.hour).mean()

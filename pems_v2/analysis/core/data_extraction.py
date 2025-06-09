@@ -777,15 +777,15 @@ class DataExtractor:
         self, start_date: datetime, end_date: datetime
     ) -> pd.DataFrame:
         """
-        Extract comprehensive energy consumption data categorized by usage type from Loxone system.
+        Extract comprehensive energy consumption data from the energy system.
 
-        This method focuses specifically on energy CONSUMPTION analysis, complementing the
-        extract_pv_data() method which handles energy GENERATION. It retrieves heating relay
-        states and converts them to actual power consumption using room-specific power ratings.
+        This method provides TOTAL CONSUMPTION data (not just heating) as expected by
+        BaseLoadAnalyzer and other consumers. It extracts ACPowerToUser from the solar
+        inverter which represents total household consumption from the grid.
 
         Key Distinctions from Other Methods:
         - extract_pv_data(): Solar generation, battery storage, and inverter output
-        - extract_energy_consumption(): House load consumption by category
+        - extract_energy_consumption(): TOTAL house consumption from grid (ACPowerToUser)
         - extract_battery_data(): Battery-specific charge/discharge analysis
 
         Args:
@@ -793,172 +793,117 @@ class DataExtractor:
             end_date: End of extraction period (timezone-aware datetime)
 
         Data Sources:
-        - InfluxDB measurement: "relay" from Loxone bucket
-        - Heating relay states (tag1 == "heating") for each room
-        - Room power ratings from energy_settings.py configuration
+        - InfluxDB measurement: "solar" from solar bucket (total consumption via ACPowerToUser)
         - 15-minute aggregation for consistent time intervals
 
-        Consumption Categories (Current Implementation):
-        - Heating: Room-by-room heating relay states converted to power consumption
-        - Future categories could include:
-          * Appliances: Major appliance power monitoring
-          * Lighting: Smart lighting system consumption
-          * HVAC: Air conditioning and ventilation
-          * EV Charging: Electric vehicle charging loads
-
         Data Processing Pipeline:
-        1. **Relay State Extraction**: Query heating relay on/off states by room
-        2. **Power Calculation**: Convert binary relay state to actual power consumption
-           - Formula: relay_state (0/1) × room_power_rating (kW) × 1000 = power (W)
-        3. **Temporal Aggregation**: Group by timestamp and sum across all rooms
-        4. **Energy Integration**: Convert power to energy using time intervals
+        1. **Total Consumption Extraction**: Query ACPowerToUser from solar inverter data
+        2. **Temporal Aggregation**: 15-minute mean aggregation for consistent intervals
+        3. **Energy Integration**: Convert power to energy using time intervals
            - Formula: power (W) × 0.25h / 1000 = energy (kWh) for 15-min intervals
-        5. **Category Totaling**: Sum all consumption categories for total load
-
-        Room Power Rating Application:
-        - Each room has a configured power rating based on heating element capacity
-        - Power ratings derived from actual measurement and system specifications
-        - Examples: Living room (3.0 kW), Kitchen (1.8 kW), Bedrooms (1.2 kW each)
-        - Total system heating capacity: ~18.12 kW across all rooms
 
         Returns:
-            pd.DataFrame: Consumption data with DatetimeIndex and columns:
-                - heating_power (float): Total heating power consumption (W)
-                - heating_energy_kwh (float): Heating energy consumption per interval (kWh)
-                - total_consumption (float): Sum of all category powers (W)
+            pd.DataFrame: Total consumption data with DatetimeIndex and columns:
+                - total_consumption (float): Total household power consumption from grid (W)
                 - total_consumption_energy_kwh (float): Total energy consumption (kWh)
-                - Future: additional category columns as system expands
 
         Data Quality Features:
-        - Validates relay states are binary (0 or 1)
-        - Checks room names against configured room list
-        - Monitors for unexpected power spikes or drops
-        - Logs data completeness and processing statistics
+        - Validates power values are non-negative
+        - Monitors for data gaps and reports completeness
+        - Logs extraction statistics for verification
 
         Performance Optimizations:
-        - Efficient groupby operations for temporal aggregation
-        - Memory-efficient room power lookup using pandas apply
-        - Single query with filtered results reduces database load
-        - Vectorized operations for power calculations
+        - Single optimized query to solar bucket
+        - Vectorized operations for energy calculations
+        - Efficient time series indexing
 
         Usage Examples:
-            # Extract heating consumption for winter analysis
+            # Extract total consumption for base load analysis
             consumption_data = await extractor.extract_energy_consumption(
                 start_date=datetime(2024, 12, 1, tzinfo=pytz.UTC),
                 end_date=datetime(2024, 2, 29, tzinfo=pytz.UTC)
             )
 
-            # Analyze daily heating patterns
-            daily_heating = consumption_data['heating_energy_kwh'].resample('D').sum()
+            # Calculate daily consumption patterns
+            daily_consumption = consumption_data['total_consumption_energy_kwh'].resample('D').sum()
 
-            # Calculate heating efficiency
-            total_heating_energy = consumption_data['heating_energy_kwh'].sum()
-            avg_power = consumption_data['heating_power'].mean()
-
-            # Identify peak consumption periods
-            peak_hours = consumption_data.groupby(consumption_data.index.hour)['heating_power'].mean()
+            # Find peak consumption periods
+            peak_hours = consumption_data.groupby(consumption_data.index.hour)['total_consumption'].mean()
 
         Integration with PEMS Optimization:
-        - Consumption patterns feed into load prediction models
-        - Historical data trains thermal comfort optimization
+        - Total consumption feeds into base load calculation (total - heating = base)
+        - Historical patterns train load prediction models
         - Peak load analysis informs demand response strategies
-        - Category breakdown enables targeted efficiency improvements
 
         Raises:
             ConnectionError: If InfluxDB query fails
             ValueError: If no valid consumption data found
-            KeyError: If room configuration is missing or invalid
 
         Notes:
-        - Currently only heating consumption is tracked via relay states
-        - Future expansion will include smart meter integration for total house load
-        - Consider adding sub-metering for major appliances and circuits
-        - EV charging detection requires load disaggregation analysis
+        - ACPowerToUser represents total household consumption from grid
+        - This replaces the previous heating-only implementation
+        - For heating-specific data, use extract_room_data() instead
         """
         self.logger.info(
             f"Extracting energy consumption data from {start_date} to {end_date}"
         )
 
-        # Query specifically for heating relay data (only category we track)
+        # Query for total consumption data from solar inverter (ACPowerToUser)
         query = f"""
-        from(bucket: "{self.settings.influxdb.bucket_loxone}")
+        from(bucket: "{self.settings.influxdb.bucket_solar}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
-          |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "heating")
+          |> filter(fn: (r) => r["_measurement"] == "solar")
+          |> filter(fn: (r) => r["_field"] == "ACPowerToUser")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
-          |> keep(columns: ["_time", "_value", "_field", "room"])
+          |> keep(columns: ["_time", "_value", "_field"])
         """
 
         tables = self.query_api.query(query)
 
         if not tables:
-            self.logger.warning("No energy consumption data found")
+            self.logger.warning("No total consumption data found")
             return pd.DataFrame()
 
-        # Convert to DataFrame - simpler structure for heating only
+        # Convert to DataFrame
         records = []
         for table in tables:
             for record in table.records:
-                room_name = record.values.get("room", "unknown")
-
                 records.append(
                     {
                         "timestamp": record.get_time(),
+                        "field": record.get_field(),
                         "value": record.get_value(),
-                        "room": room_name,
                     }
                 )
 
         if not records:
-            self.logger.warning("No relay/power/energy records found in database")
+            self.logger.warning("No total consumption records found in database")
             return pd.DataFrame()
 
         df = pd.DataFrame(records)
-        self.logger.info(f"Found {len(df)} heating relay records")
+        self.logger.info(f"Found {len(df)} total consumption records")
 
-        # Calculate heating consumption
-        consumption_data = {}
+        # Pivot to get field as columns
+        df_pivot = df.pivot_table(
+            index="timestamp", columns="field", values="value", aggfunc="mean"
+        ).reset_index()
 
-        if not df.empty:
-            # Add room power ratings
-            df = df.copy()
-            df["power_kw"] = df["room"].apply(get_room_power)
-            # Convert relay state (0/1) to actual power consumption
-            df["actual_power"] = df["value"] * df["power_kw"] * 1000  # Convert to W
+        df_pivot["timestamp"] = pd.to_datetime(df_pivot["timestamp"])
+        df_pivot.set_index("timestamp", inplace=True)
 
-            # Group by timestamp and sum all rooms
-            heating_consumption = df.groupby("timestamp")["actual_power"].sum()
-            consumption_data["heating_power"] = heating_consumption
-            self.logger.info(
-                f"Calculated heating consumption for {len(heating_consumption)} time points"
-            )
+        # Rename column for consistency with expected interface
+        if "ACPowerToUser" in df_pivot.columns:
+            df_pivot["total_consumption"] = df_pivot["ACPowerToUser"]
+            df_pivot = df_pivot.drop("ACPowerToUser", axis=1)
 
-        # Combine all consumption categories
-        if consumption_data:
-            df_consumption = pd.DataFrame(consumption_data)
-            df_consumption.index = pd.to_datetime(df_consumption.index)
+        # Calculate energy consumption (15-minute intervals)
+        if "total_consumption" in df_pivot.columns:
+            df_pivot["total_consumption_energy_kwh"] = (
+                df_pivot["total_consumption"] * 0.25 / 1000
+            )  # Convert W*0.25h to kWh
 
-            # Calculate total consumption
-            power_columns = [
-                col for col in df_consumption.columns if col.endswith("_power")
-            ]
-            df_consumption["total_consumption"] = df_consumption[power_columns].sum(
-                axis=1
-            )
-
-            # Calculate energy consumption (15-minute intervals)
-            for col in power_columns + ["total_consumption"]:
-                energy_col = col.replace("_power", "_energy_kwh")
-                df_consumption[energy_col] = (
-                    df_consumption[col] * 0.25 / 1000
-                )  # Convert W*0.25h to kWh
-        else:
-            df_consumption = pd.DataFrame()
-
-        self.logger.info(
-            f"Extracted {len(df_consumption)} energy consumption points "
-            f"with categories: {list(consumption_data.keys())}"
-        )
-        return df_consumption
+        self.logger.info(f"Extracted {len(df_pivot)} total consumption points")
+        return df_pivot
 
     async def extract_battery_data(
         self, start_date: datetime, end_date: datetime
