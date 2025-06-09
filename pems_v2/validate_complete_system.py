@@ -195,11 +195,9 @@ class SystemValidator:
                 # Quick training test
                 data = datasets["consumption"].tail(1000).copy()  # Last 1000 records
 
-                # Reset index to avoid timezone issues
-                data = data.reset_index()
-                data["hour"] = pd.to_datetime(data["timestamp"]).dt.hour
-                data["day_of_week"] = pd.to_datetime(data["timestamp"]).dt.dayofweek
-                data = data.set_index("timestamp")
+                # Extract time features while preserving datetime index
+                data["hour"] = data.index.hour
+                data["day_of_week"] = data.index.dayofweek
 
                 if "heating_power" in data.columns:
                     X = data[["hour", "day_of_week"]].dropna()
@@ -260,8 +258,8 @@ class SystemValidator:
 
                 if len(merged) > 50 and "temperature" in merged.columns:
                     merged = merged.copy()  # Avoid SettingWithCopyWarning
-                    merged.loc[:, "hour"] = merged.index.hour
-                    merged.loc[:, "temp_lag"] = merged["temperature"].shift(1)
+                    merged["hour"] = merged.index.hour
+                    merged["temp_lag"] = merged["temperature"].shift(1)
 
                     X = merged[["hour", "temp_lag", "outdoor_temp"]].dropna()
                     y = merged.loc[X.index, "temperature"]

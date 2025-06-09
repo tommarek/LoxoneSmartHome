@@ -141,10 +141,29 @@ class EnergyOptimizer:
             for room in self.rooms:
                 temp_vars[room] = cp.Variable(n_steps + 1, name=f"temp_{room}")
 
-            # Objective function
+            # Comfort violation variables (soft constraints)
+            comfort_violations = {}
+            violation_penalty = 1000  # €/°C violation
+            for room in self.rooms:
+                if room in problem.comfort_bounds:
+                    comfort_violations[room] = {
+                        "low": cp.Variable(
+                            n_steps, nonneg=True, name=f"viol_low_{room}"
+                        ),
+                        "high": cp.Variable(
+                            n_steps, nonneg=True, name=f"viol_high_{room}"
+                        ),
+                    }
+
+            # Objective function with violation penalties
             objective = self._build_objective(
                 problem, heating_vars, battery_power, grid_import, grid_export, n_steps
             )
+
+            # Add comfort violation penalties to objective
+            for room, violations in comfort_violations.items():
+                objective += violation_penalty * cp.sum(violations["low"])
+                objective += violation_penalty * cp.sum(violations["high"])
 
             # Constraints
             constraints = []
@@ -166,9 +185,11 @@ class EnergyOptimizer:
                 self._battery_constraints(problem, battery_power, n_steps)
             )
 
-            # Thermal constraints
+            # Thermal constraints with soft violations
             constraints.extend(
-                self._thermal_constraints(problem, heating_vars, temp_vars, n_steps)
+                self._thermal_constraints(
+                    problem, heating_vars, temp_vars, n_steps, comfort_violations
+                )
             )
 
             # Grid constraints
@@ -192,17 +213,19 @@ class EnergyOptimizer:
                 solver_options = {
                     "verbose": False,
                     "mi_max_iters": 1000,
-                    "feastol": 1e-8,
-                    "abstol": 1e-8,
+                    "feastol": 1e-6,  # Relaxed from 1e-8
+                    "abstol": 1e-6,  # Relaxed from 1e-8
+                    "reltol": 1e-6,  # Add relative tolerance
                 }
                 prob.solve(solver=cp.ECOS_BB, **solver_options)
             else:
                 # Use ECOS for continuous problems
                 solver_options = {
                     "verbose": False,
-                    "max_iters": 1000,
-                    "feastol": 1e-8,
-                    "abstol": 1e-8,
+                    "max_iters": 2000,  # More iterations
+                    "feastol": 1e-6,  # Relaxed from 1e-8
+                    "abstol": 1e-6,  # Relaxed from 1e-8
+                    "reltol": 1e-6,  # Add relative tolerance
                 }
                 prob.solve(solver=cp.ECOS, **solver_options)
 
@@ -351,8 +374,10 @@ class EnergyOptimizer:
 
         return constraints
 
-    def _thermal_constraints(self, problem, heating_vars, temp_vars, n_steps):
-        """Thermal dynamics and comfort constraints."""
+    def _thermal_constraints(
+        self, problem, heating_vars, temp_vars, n_steps, comfort_violations=None
+    ):
+        """Thermal dynamics and comfort constraints with soft violations."""
 
         constraints = []
         dt_hours = problem.time_step_minutes / 60
@@ -385,17 +410,31 @@ class EnergyOptimizer:
                 # Temperature dynamics: T[t+1] = alpha * T[t] + (1-alpha) * (T_out + R * P_heat)
                 alpha = np.exp(-dt_hours / tau) if tau > 0 else 0.9
 
-                constraints.append(
-                    temp_vars[room][t + 1]
-                    == alpha * temp_vars[room][t]
-                    + (1 - alpha) * (T_out + R * heating_vars[room][t] * room_power)
-                )
+                if t < n_steps - 1:  # Avoid index out of bounds
+                    constraints.append(
+                        temp_vars[room][t + 1]
+                        == alpha * temp_vars[room][t]
+                        + (1 - alpha) * (T_out + R * heating_vars[room][t] * room_power)
+                    )
 
-                # Comfort bounds
+                # Comfort bounds with soft violations
                 if room in problem.comfort_bounds:
                     T_min, T_max = problem.comfort_bounds[room]
-                    constraints.append(temp_vars[room][t] >= T_min)
-                    constraints.append(temp_vars[room][t] <= T_max)
+
+                    if comfort_violations and room in comfort_violations:
+                        # Soft constraints with violation variables
+                        constraints.append(
+                            temp_vars[room][t]
+                            >= T_min - comfort_violations[room]["low"][t]
+                        )
+                        constraints.append(
+                            temp_vars[room][t]
+                            <= T_max + comfort_violations[room]["high"][t]
+                        )
+                    else:
+                        # Hard constraints (original behavior)
+                        constraints.append(temp_vars[room][t] >= T_min)
+                        constraints.append(temp_vars[room][t] <= T_max)
 
         return constraints
 
@@ -579,6 +618,11 @@ def create_optimization_problem(
         pv_forecast = pd.Series(
             np.maximum(0, 8000 * np.sin(np.pi * (hours - 6) / 12)), index=time_index
         )
+    else:
+        # Validate PV forecast
+        pv_forecast = pd.Series(pv_forecast)
+        pv_forecast = pv_forecast.clip(lower=0, upper=15000)  # Max 15kW system
+        pv_forecast = pv_forecast.fillna(0)
 
     if load_forecast is None:
         # Constant base load
@@ -593,6 +637,11 @@ def create_optimization_problem(
             0.08,  # 8 cents/kWh night rate
         )
         price_forecast = pd.Series(prices, index=time_index)
+    else:
+        # Validate price forecast (Czech market can see -10 to 40 CZK/kWh)
+        price_forecast = pd.Series(price_forecast)
+        price_forecast = price_forecast.clip(lower=-0.5, upper=2.0)  # -0.5 to 2.0 €/kWh (~-12 to 48 CZK/kWh at 24 CZK/EUR)
+        price_forecast = price_forecast.fillna(0.15)  # Default 0.15 €/kWh (~3.6 CZK/kWh)
 
     if weather_forecast is None:
         # Simple weather forecast
@@ -603,6 +652,15 @@ def create_optimization_problem(
             },
             index=time_index,
         )
+    else:
+        # Validate weather forecast
+        if "temperature_2m" in weather_forecast.columns:
+            weather_forecast["temperature_2m"] = weather_forecast[
+                "temperature_2m"
+            ].clip(lower=-30, upper=50)
+            weather_forecast["temperature_2m"] = weather_forecast[
+                "temperature_2m"
+            ].fillna(15.0)
 
     if initial_temperatures is None:
         initial_temperatures = {
