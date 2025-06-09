@@ -74,7 +74,7 @@ pems_v2/
 │   ├── [ ] __init__.py                              # Modules package marker
 │   ├── control/                                    # Control systems
 │   │   ├── [ ] __init__.py                          # Control package marker
-│   │   ├── [ ] battery_controller.py               # Battery control interface
+│   │   ├── [x] battery_controller.py               # Battery control interface
 │   │   ├── [ ] control_strategies.py               # Control strategy algorithms
 │   │   ├── [x] heating_controller.py               # Heating system control
 │   │   ├── [ ] inverter_controller.py              # Inverter control interface
@@ -89,7 +89,7 @@ pems_v2/
 ├── tests/                                          # Test suite
 │   ├── [ ] README.md                                # Test documentation
 │   ├── [ ] __init__.py                              # Tests package marker
-│   ├── [ ] test_basic_structure.py                 # Basic structure tests
+│   ├── [x] test_basic_structure.py                 # Basic structure tests
 │   ├── [ ] test_data_extraction.py                 # Data extraction tests
 │   ├── [ ] test_new_extractors.py                  # New extractor tests
 │   └── [ ] test_relay_analysis.py                  # Relay analysis tests
@@ -625,32 +625,39 @@ R = 1/(cooling_factor × C)  # Solve mathematically ✅
 ---
 
 ### ✅ **analysis/analyzers/base_load_analysis.py** - The Background Energy Detective ⚡ **CRITICAL FIXES APPLIED**
-**What it does**: This analyzer separates your "background" energy use (lights, appliances, electronics) from controllable loads (heating, EV charging) to understand your basic consumption patterns with **accurate energy accounting**.
+**What it does**: This analyzer separates your "background" energy use (lights, appliances, electronics) from controllable loads (heating, EV charging) to understand your basic consumption patterns with **physics-based energy conservation**.
 
 **Simple explanation**: Your house uses energy for many things:
 - **Controllable** (you can schedule): Heating, EV charging, battery charging
 - **Base load** (always needed): Fridge, WiFi, lights, TV, computer, etc.
 
-This analyzer figures out your base load with **corrected math**: **Total grid consumption** - Heating - EV - Battery flows = Accurate base load
+This analyzer figures out your base load using **energy conservation principles**: Energy flowing into house - Energy flowing out - Controllable loads = True base load
 
-### **🔥 CRITICAL FIX: Proper Energy Accounting**
-**Problem Solved**: Previously used heating consumption data instead of total household consumption, leading to meaningless calculations (heating - heating ≈ 0).
+### **🔥 CRITICAL FIX: Energy Conservation Approach**
+**Problem Solved**: Previous approach incorrectly double-counted battery discharge power by adding it to an already self-consumption-adjusted load, creating inaccurate base load calculations.
 
-**New Energy Balance Equation**:
+**New Physics-Based Energy Balance**:
 ```python
-# OLD WAY (broken):
-# base_load = heating_consumption - heating_consumption ≈ 0 ❌
+# Energy Conservation Principle: Energy In = Energy Out + Energy Stored
+# House Load = (Grid Import + PV Production + Battery Discharge) - (Grid Export + Battery Charge)
 
-# NEW WAY (accurate):
-total_consumption = ACPowerToUser  # Total grid consumption
-base_load = total_consumption - heating - EV - net_battery_flows ✅
+# Step 1: Calculate total house energy consumption
+power_sources = pv_production + grid_import + battery_discharge
+power_sinks = grid_export + battery_charge
+total_house_load = power_sources - power_sinks
+
+# Step 2: Subtract controllable loads to get base load
+base_load = total_house_load - heating_load - ev_charge
+
+# Result: Physically accurate base load calculation ✅
 ```
 
-**Enhanced Battery Accounting**:
+**Enhanced Data Processing**:
 ```python
-# Battery charging: Grid → Battery (subtract from base load)
-# Battery discharging: Battery → House (add to base load)
-base_load = base_load - battery_charge_power + battery_discharge_power
+# Multi-source data alignment with common time indexing
+# Robust column detection with fallback mechanisms
+# Improved heating consumption estimation from room data
+# Validation of data quality and time coverage
 ```
 
 #### **📊 BaseLoadAnalyzer - The Consumption Pattern Expert** 
@@ -1291,10 +1298,38 @@ This controller makes sure they all work in harmony.
 
 ---
 
-### ✅ **modules/control/battery_controller.py** - The Battery Brain
-**What it does**: This is the smart controller that manages your battery storage system - when to charge, when to discharge, and how to keep everything safe.
+### ✅ **modules/control/battery_controller.py** - The Battery Brain ⚡ **RACE CONDITION PROTECTION ADDED**
+**What it does**: This is the smart controller that manages your battery storage system - when to charge, when to discharge, and how to keep everything safe with **real-time state validation**.
 
-**Simple explanation**: Think of this as the battery's personal manager that makes all the decisions about energy storage:
+**Simple explanation**: Think of this as the battery's personal manager that makes all the decisions about energy storage, but now with a **"double-check before acting"** safety system:
+
+### **🔥 NEW SAFETY FEATURE: Check-Act Pattern**
+**Problem Solved**: In distributed systems, the battery state can change between when an optimization decision is made and when the command is executed (race conditions).
+
+**Check-Act Pattern Implementation**:
+```python
+async def enable_grid_charging(self, power_kw: float = None) -> bool:
+    # 1. FINAL STATE CHECK - Get the absolute latest status
+    latest_status = await self.get_status()
+    
+    # 2. SAFETY VALIDATION - Re-check critical conditions
+    if latest_status.soc_percent >= self.max_soc:
+        self.logger.warning("Aborting: Battery already full!")
+        return False
+        
+    if not (self.min_temp <= latest_status.temperature_c <= self.max_temp):
+        self.logger.warning("Aborting: Temperature unsafe!")
+        return False
+    
+    # 3. EXECUTE ONLY IF SAFE - Command executes only when still valid
+    await self._enable_ac_charge(power_kw)
+```
+
+**Race Condition Prevention**:
+- **Time Gap Elimination**: Final checks happen milliseconds before execution
+- **Stale Data Protection**: Never acts on outdated battery information
+- **Safety-First**: Commands aborted if conditions become unsafe
+- **Enhanced Logging**: Clear reasons when commands are rejected
 
 #### **🔋 ChargingMode Options** (The Battery's Operating Instructions):
 
@@ -1303,39 +1338,43 @@ This controller makes sure they all work in harmony.
 - Safety: System can't accidentally drain or overcharge
 - Like: Putting the battery in "park" mode
 
-**GRID Mode**: Charge from electricity grid at specific power levels
+**GRID Mode**: Charge from electricity grid at specific power levels ⚡ **Now with final state checks**
 - Use for: Cheap electricity periods, emergency charging when solar isn't available
 - Smart features: Time-window scheduling, automatic stop at max capacity
 - Economic benefit: Buy cheap electricity at night, use during expensive evening hours
+- **New Safety**: Validates SOC and temperature before every charge command
 
 **PV_ONLY Mode**: Charge only from solar panels
 - Use for: Environmental optimization, avoiding electricity costs
 - Green benefit: 100% renewable energy storage
 - Limitation: Only works when sun is shining
 
-**AUTO Mode**: Intelligent automatic decision-making
+**AUTO Mode**: Intelligent automatic decision-making ⚡ **Enhanced with state validation**
 - Use for: Hands-off operation, balanced optimization
 - Smart features: Considers prices, weather, battery state, and your usage patterns
 - Adaptive: Changes strategy based on conditions
+- **New Safety**: Real-time state checks before mode transitions
 
 #### **🧠 BatteryController Intelligence**:
-**Safety Systems**:
-- **SOC Protection**: Never discharge below 10% or charge above 95%
-- **Temperature Monitoring**: Stops operation if battery gets too hot/cold
+**Enhanced Safety Systems**:
+- **SOC Protection**: Never discharge below 10% or charge above 95% (real-time verified)
+- **Temperature Monitoring**: Stops operation if battery gets too hot/cold (checked before every command)
 - **Power Limiting**: Prevents charging faster than battery can safely handle
 - **Emergency Stop**: Can immediately shut down all operations
+- **Check-Act Pattern**: Validates current state before executing any command ⚡ **NEW**
 
 **MQTT Integration** (follows same pattern as Growatt system):
 - **Battery-First Mode Control**: Coordinates with solar inverter
-- **AC Charging Control**: Precise power level management
+- **AC Charging Control**: Precise power level management with state validation
 - **Status Monitoring**: Real-time battery health and performance
-- **Command Validation**: Ensures all commands are safe before execution
+- **Command Validation**: Ensures all commands are safe before execution ⚡ **Enhanced**
 
 **Smart Features**:
 - **Optimal Charging**: Learns your patterns to charge at best times
 - **Price Integration**: Automatically charges during cheap electricity periods
 - **Weather Awareness**: Coordinates with solar production forecasts
 - **Load Balancing**: Manages power flow to avoid grid overload
+- **Distributed Safety**: Prevents unsafe operations in multi-component systems ⚡ **NEW**
 
 **Real Usage Example**:
 ```
