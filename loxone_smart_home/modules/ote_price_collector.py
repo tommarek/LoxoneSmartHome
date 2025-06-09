@@ -348,7 +348,6 @@ class OTEPriceCollector(BaseModule):
         for (start_hour, _), price_eur_mwh in prices.items():
             # Create timestamp for this hour
             hour = int(start_hour.split(":")[0])
-            
             # Handle DST transitions by adding hours to base date instead of using replace
             if hour == 24:
                 # Hour 24 means next day at 00:00

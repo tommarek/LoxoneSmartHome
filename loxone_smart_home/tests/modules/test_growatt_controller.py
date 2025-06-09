@@ -234,7 +234,7 @@ async def test_export_control_commands(
     # Test disable export
     await growatt_controller._disable_export()
     mock_mqtt_client.publish.assert_called_with(
-        "energy/solar/command/export/disable", json.dumps({"value": False})
+        "energy/solar/command/export/disable", json.dumps({"value": True})
     )
 
 
@@ -314,11 +314,12 @@ async def test_schedule_export_control(
     with patch.object(growatt_controller, "_schedule_at_time") as mock_schedule:
         await growatt_controller._schedule_export_control(hourly_prices)
 
-        # Should schedule enable at 02:00 and disable at 04:00
+        # Should schedule disable at 00:00, enable at 02:00 and disable at 04:00
         calls = mock_schedule.call_args_list
-        assert len(calls) == 2
-        assert calls[0][0][0] == "02:00"  # Enable time
-        assert calls[1][0][0] == "04:00"  # Disable time
+        assert len(calls) == 3
+        assert calls[0][0][0] == "00:00"  # Daily disable at midnight
+        assert calls[1][0][0] == "02:00"  # Enable time
+        assert calls[2][0][0] == "04:00"  # Disable time
 
 
 @pytest.mark.asyncio
