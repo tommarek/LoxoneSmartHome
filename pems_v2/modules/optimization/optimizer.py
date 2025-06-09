@@ -640,8 +640,12 @@ def create_optimization_problem(
     else:
         # Validate price forecast (Czech market can see -10 to 40 CZK/kWh)
         price_forecast = pd.Series(price_forecast)
-        price_forecast = price_forecast.clip(lower=-0.5, upper=2.0)  # -0.5 to 2.0 €/kWh (~-12 to 48 CZK/kWh at 24 CZK/EUR)
-        price_forecast = price_forecast.fillna(0.15)  # Default 0.15 €/kWh (~3.6 CZK/kWh)
+        price_forecast = price_forecast.clip(
+            lower=-0.5, upper=2.0
+        )  # -0.5 to 2.0 €/kWh (~-12 to 48 CZK/kWh at 24 CZK/EUR)
+        price_forecast = price_forecast.fillna(
+            0.15
+        )  # Default 0.15 €/kWh (~3.6 CZK/kWh)
 
     if weather_forecast is None:
         # Simple weather forecast

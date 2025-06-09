@@ -693,42 +693,60 @@ class ThermalAnalyzer:
                 "warning": f"Missing required columns for RC estimation: {missing_cols}"
             }
 
-        # Method 1: Cooldown Analysis (Relay OFF periods)
+        # Step 1: Analyze cooldown periods to get the cooling factor (1/RC)
         cooldown_results = self._analyze_cooldown_periods(data)
-        if "thermal_resistance" in cooldown_results:
+        if "cooling_rate_factor" in cooldown_results:
             results["cooldown_analysis"] = cooldown_results
             self.logger.info(
-                f"Cooldown analysis complete: R = {cooldown_results['thermal_resistance']:.2f} °C/W"
+                f"Cooldown analysis complete: 1/(RC) = {cooldown_results['cooling_rate_factor']:.4f} 1/h"
             )
 
-        # Method 2: Heatup Analysis (Relay ON periods)
+        # Step 2: Analyze heatup periods to get thermal capacitance (C)
         heatup_results = self._analyze_heatup_periods(data)
-        if "thermal_capacitance" in heatup_results:
+        if (
+            "thermal_capacitance_j_per_k" in heatup_results
+            and heatup_results["thermal_capacitance_j_per_k"] is not None
+        ):
             results["heatup_analysis"] = heatup_results
             self.logger.info(
-                f"Heatup analysis complete: C = {heatup_results['thermal_capacitance']:.0f} Wh/°C"
+                f"Heatup analysis complete: C = {heatup_results['thermal_capacitance_j_per_k']/1e6:.2f} MJ/K"
             )
 
-        # Method 3: Combined RC estimation using both periods
+        # Step 3: Solve for R and C if both analyses were successful
+        if "cooldown_analysis" in results and "heatup_analysis" in results:
+            solved_params = self._solve_for_rc_parameters(
+                results["heatup_analysis"], results["cooldown_analysis"]
+            )
+            if solved_params:
+                results["decoupled_estimation"] = solved_params
+                self.logger.info(
+                    f"Decoupled estimation: R={solved_params['R']:.4f} K/W, "
+                    f"C={solved_params['C']/1e6:.2f} MJ/K, "
+                    f"τ={solved_params['time_constant']:.1f}h"
+                )
+
+        # Step 4: Also run the legacy combined method for comparison (now identified as flawed)
         combined_results = self._combined_rc_estimation(data)
         if "R" in combined_results and "C" in combined_results:
-            results["combined_estimation"] = combined_results
+            results["legacy_combined_estimation"] = combined_results
             time_const = combined_results.get("time_constant", 0)
             self.logger.info(
-                f"Combined analysis: R={combined_results['R']:.2f} °C/W, C={combined_results['C']:.0f} Wh/°C, τ={time_const:.1f}h"
+                f"Legacy combined analysis: R={combined_results['R']:.2f} °C/W, C={combined_results['C']:.0f} Wh/°C, τ={time_const:.1f}h"
             )
 
-        # Method 4: State-space identification for relay systems
+        # Step 5: Also run the more advanced state-space model as an alternative
         ss_results = self._relay_state_space_identification(data)
         if "thermal_parameters" in ss_results:
             results["state_space"] = ss_results
             self.logger.info("State-space identification complete")
 
-        # Select best estimate based on confidence metrics
+        # Step 6: Select the best estimate
         best_estimate = self._select_best_rc_estimate(results)
         if best_estimate:
             results["recommended_parameters"] = best_estimate
-            self.logger.info(f"Recommended parameters: {best_estimate}")
+            self.logger.info(
+                f"Recommended parameters from '{best_estimate.get('method')}': {best_estimate}"
+            )
 
         self.logger.info("RC parameter estimation completed")
         return results
@@ -737,28 +755,59 @@ class ThermalAnalyzer:
         """Select the best RC parameter estimate based on confidence metrics."""
         candidates = []
 
-        # Evaluate each method
-        if "combined_estimation" in results:
-            combined = results["combined_estimation"]
-            confidence = combined.get("confidence_score", 0)
-            candidates.append(("combined", confidence, combined))
+        # PRIORITY 1: Decoupled simultaneous estimation (logically sound)
+        if "decoupled_estimation" in results:
+            decoupled = results["decoupled_estimation"]
+            # High base confidence for logically sound method
+            cooldown_r2 = results.get("cooldown_analysis", {}).get("r_squared", 0)
+            heating_events = results.get("heatup_analysis", {}).get(
+                "heating_events_analyzed", 0
+            )
+            confidence = 0.8 + (cooldown_r2 * 0.15) + min(heating_events / 20, 0.05)
+            candidates.append(("decoupled", confidence, decoupled))
 
+        # PRIORITY 2: State-space identification
         if "state_space" in results and "model_quality" in results["state_space"]:
             ss = results["state_space"]
             r2 = ss["model_quality"].get("r_squared", 0)
-            candidates.append(("state_space", r2, ss.get("thermal_parameters", {})))
+            candidates.append(
+                ("state_space", r2 * 0.7, ss.get("thermal_parameters", {}))
+            )
 
+        # PRIORITY 3: Legacy combined estimation (known to be flawed)
+        if "legacy_combined_estimation" in results:
+            combined = results["legacy_combined_estimation"]
+            confidence = (
+                combined.get("confidence_score", 0) * 0.5
+            )  # Penalize flawed method
+            candidates.append(("legacy_combined", confidence, combined))
+
+        # FALLBACK: Manual combination from individual analyses
         if "cooldown_analysis" in results and "heatup_analysis" in results:
-            # Create manual combination
             cooldown = results["cooldown_analysis"]
             heatup = results["heatup_analysis"]
 
-            if "thermal_resistance" in cooldown and "thermal_capacitance" in heatup:
+            # For legacy compatibility, handle old field names
+            if (
+                "cooling_rate_factor" in cooldown
+                and "thermal_capacitance_j_per_k" in heatup
+            ):
+                # Use the new decoupled method if not already processed
+                if "decoupled_estimation" not in results:
+                    solved_params = self._solve_for_rc_parameters(heatup, cooldown)
+                    if solved_params:
+                        confidence = (
+                            0.6  # Lower than proper decoupled but higher than legacy
+                        )
+                        candidates.append(
+                            ("fallback_decoupled", confidence, solved_params)
+                        )
+
+            elif "thermal_resistance" in cooldown and "thermal_capacitance" in heatup:
+                # Legacy fields - create manual combination with low confidence
                 R = cooldown["thermal_resistance"]
                 C = heatup["thermal_capacitance"]
-                confidence = (
-                    cooldown.get("r_squared", 0) + 0.5
-                ) / 2  # Lower confidence for manual
+                confidence = 0.3  # Very low confidence for potentially flawed data
 
                 manual = {
                     "R": R,
@@ -797,59 +846,45 @@ class ThermalAnalyzer:
         if "outdoor_temp" in data.columns:
             try:
                 self.logger.info(
-                    f"Attempting to merge outdoor temp data. Available columns in data: {list(data.columns)}"
-                )
-                self.logger.info(
-                    f"Cooling periods shape before merge: {cooling_periods.shape}"
+                    f"Outdoor temp data available. Cooling periods columns: {list(cooling_periods.columns)}"
                 )
 
-                cooling_periods = cooling_periods.merge(
-                    data[["outdoor_temp"]],
-                    left_index=True,
-                    right_index=True,
-                    how="inner",
-                )
-
-                self.logger.info(
-                    f"Cooling periods shape after merge: {cooling_periods.shape}"
-                )
-                self.logger.info(
-                    f"Cooling periods columns: {list(cooling_periods.columns)}"
-                )
-
+                # Check if cooling_periods already has outdoor_temp (it should, since it's a subset of data)
                 if "outdoor_temp" not in cooling_periods.columns:
                     self.logger.error(
-                        f"outdoor_temp column missing after merge. Available columns: {list(cooling_periods.columns)}"
+                        f"outdoor_temp column missing in cooling periods. Available columns: {list(cooling_periods.columns)}"
                     )
-                    return {"warning": "outdoor_temp column missing after merge"}
+                    return {"warning": "outdoor_temp column missing in cooling periods"}
 
                 temp_diff = (
                     cooling_periods["room_temp"] - cooling_periods["outdoor_temp"]
                 )
                 decay_rate = -cooling_periods["temp_change_rate"]  # Make positive
             except Exception as e:
-                self.logger.error(f"Error in outdoor temp merge: {e}")
-                return {"warning": f"Error merging outdoor temperature data: {str(e)}"}
+                self.logger.error(f"Error processing outdoor temp data: {e}")
+                return {
+                    "warning": f"Error processing outdoor temperature data: {str(e)}"
+                }
 
             # Linear regression: decay_rate = temp_diff / (R*C)
-            # Assuming typical C for room, estimate R
+            # Instead of assuming C, return the cooling rate factor (1/RC)
             if len(temp_diff) > 10:
                 slope, intercept, r_value, p_value, _ = linregress(
                     temp_diff, decay_rate
                 )
 
-                # Estimate thermal capacitance (typical room values)
-                estimated_C = 15000  # Wh/°C (conservative estimate for room)
-                thermal_resistance = 1 / (slope * estimated_C) if slope > 0 else None
+                # The slope of this regression is our cooling rate factor, 1/(R*C)
+                # The unit is 1/hours, as decay_rate is in °C/hour
+                cooling_rate_factor = slope if slope > 0 else None
 
-                return {
-                    "thermal_resistance": thermal_resistance,  # °C/W
-                    "assumed_capacitance": estimated_C,
-                    "r_squared": r_value**2,
-                    "p_value": p_value,
-                    "cooling_samples": len(cooling_periods),
-                    "method": "cooldown_exponential_decay",
-                }
+                if cooling_rate_factor is not None:
+                    return {
+                        "cooling_rate_factor": cooling_rate_factor,  # This is 1 / (R*C) in 1/h
+                        "r_squared": r_value**2,
+                        "p_value": p_value,
+                        "cooling_samples": len(cooling_periods),
+                        "method": "cooldown_regression",
+                    }
 
         return {"warning": "Could not estimate thermal resistance from cooldown"}
 
@@ -894,18 +929,24 @@ class ThermalAnalyzer:
         if initial_heating_rates:
             mean_initial_rate = np.mean(initial_heating_rates)
 
-            # Estimate heating power and thermal capacitance
             # Use actual room power rating from configuration
             room_name = getattr(self, "_current_room_name", "unknown")
-            estimated_power = get_room_power(room_name) * 1000  # Convert kW to W
-            thermal_capacitance = (
-                estimated_power / mean_initial_rate if mean_initial_rate > 0 else None
-            )
+            heating_power_w = get_room_power(room_name) * 1000  # Convert kW to W
+
+            # The rate of temperature change (dT/dt) is approximately P_heating / C
+            # So, C = P_heating / (dT/dt)
+            # We will return the capacitance and the power used to estimate it.
+            if mean_initial_rate > 0:
+                thermal_capacitance_j_per_k = (
+                    heating_power_w * 3600
+                ) / mean_initial_rate
+            else:
+                thermal_capacitance_j_per_k = None
 
             return {
-                "thermal_capacitance": thermal_capacitance,  # Wh/°C
-                "assumed_power": estimated_power,
-                "mean_initial_heating_rate": mean_initial_rate,
+                "thermal_capacitance_j_per_k": thermal_capacitance_j_per_k,  # This is C in Joules/Kelvin
+                "heating_power_w": heating_power_w,
+                "mean_initial_heating_rate_c_per_hr": mean_initial_rate,
                 "heating_events_analyzed": len(initial_heating_rates),
                 "method": "initial_heating_response",
             }
@@ -939,6 +980,47 @@ class ThermalAnalyzer:
             }
 
         return {"warning": "Could not combine RC estimates"}
+
+    def _solve_for_rc_parameters(
+        self, heatup_results: Dict[str, Any], cooldown_results: Dict[str, Any]
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Solves for R and C using decoupled results from heating and cooling phases.
+        """
+        C_j_per_k = heatup_results.get("thermal_capacitance_j_per_k")
+        cooling_factor = cooldown_results.get(
+            "cooling_rate_factor"
+        )  # This is 1 / (R * C) in 1/hours
+
+        if C_j_per_k is None or cooling_factor is None:
+            self.logger.warning(
+                "Missing C or cooling factor, cannot solve for R and C."
+            )
+            return None
+
+        # C is already calculated in Joules per Kelvin
+        # cooling_factor is in 1/hours, so C needs to be in Watt-hours/Kelvin
+        # C_wh_per_k = C_j_per_k / 3600
+        # R (in K/W) = 1 / (cooling_factor * C_wh_per_k)
+
+        # Let's keep units consistent. R*C = tau (in seconds)
+        # cooling_factor is in 1/hours, so 1/cooling_factor is tau in hours.
+        # tau_seconds = (1 / cooling_factor) * 3600
+        tau_seconds = (1 / cooling_factor) * 3600 if cooling_factor > 0 else 0
+
+        # R = tau / C
+        if C_j_per_k > 0:
+            R_k_per_w = tau_seconds / C_j_per_k
+        else:
+            self.logger.warning("Invalid capacitance value, cannot calculate R.")
+            return None
+
+        return {
+            "R": R_k_per_w,  # Units: K/W or °C/W
+            "C": C_j_per_k,  # Units: J/K
+            "time_constant": tau_seconds / 3600,  # Units: hours
+            "method": "decoupled_simultaneous_estimation",
+        }
 
     def _relay_state_space_identification(self, data: pd.DataFrame) -> Dict[str, Any]:
         """State-space identification specifically for relay-controlled systems."""
