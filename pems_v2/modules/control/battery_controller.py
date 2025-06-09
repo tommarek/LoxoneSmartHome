@@ -42,6 +42,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from config.settings import BatterySettings, MQTTSettings
+
 
 class ChargingMode(Enum):
     """
@@ -730,36 +732,37 @@ class BatteryController:
     - Temperature limits: 0-45°C operating range
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, battery_settings: BatterySettings, mqtt_settings: Optional[MQTTSettings] = None, config: Optional[Dict[str, Any]] = None):
         """
-        Initialize battery controller with system configuration.
+        Initialize battery controller with typed configuration.
 
         Args:
-            config: Configuration dictionary containing:
-                - battery: Battery system specifications
-                - mqtt: MQTT broker connection settings
-                - safety: Safety limits and thresholds
+            battery_settings: Battery system specifications from settings
+            mqtt_settings: Optional MQTT configuration for communication
+            config: Optional additional configuration for topics and safety overrides
         """
-        self.config = config
+        self.battery_settings = battery_settings
+        self.mqtt_settings = mqtt_settings
+        self.config = config or {}
         self.logger = logging.getLogger(__name__)
 
-        # Battery system configuration
-        self.battery_config = config.get("battery", {})
-        self.capacity_kwh = self.battery_config.get("capacity_kwh", 10.0)
-        self.max_charge_power = self.battery_config.get("max_charge_power_kw", 5.0)
-        self.max_discharge_power = self.battery_config.get("max_discharge_power_kw", 5.0)
+        # Battery system configuration from typed settings
+        self.capacity_kwh = battery_settings.capacity_kwh
+        self.max_charge_power = battery_settings.max_power_kw
+        self.max_discharge_power = battery_settings.max_power_kw
 
-        # MQTT configuration
-        self.mqtt_config = config.get("mqtt", {})
-        self.control_topic = self.mqtt_config.get("battery_control_topic", "pems/battery/set")
-        self.status_topic = self.mqtt_config.get("battery_status_topic", "growatt/battery/status")
+        # MQTT configuration from settings or config
+        if mqtt_settings:
+            self.mqtt_broker = mqtt_settings.broker
+            self.mqtt_port = mqtt_settings.port
+        self.control_topic = self.config.get("battery_control_topic", "pems/battery/set")
+        self.status_topic = self.config.get("battery_status_topic", "growatt/battery/status")
 
-        # Safety limits
-        self.safety_config = config.get("safety", {})
-        self.max_soc = self.safety_config.get("max_soc_percent", 95.0)
-        self.min_soc = self.safety_config.get("min_soc_percent", 10.0)
-        self.max_temp = self.safety_config.get("max_temperature_c", 45.0)
-        self.min_temp = self.safety_config.get("min_temperature_c", 0.0)
+        # Safety limits from typed settings
+        self.max_soc = battery_settings.max_soc * 100  # Convert to percentage
+        self.min_soc = battery_settings.min_soc * 100  # Convert to percentage
+        self.max_temp = self.config.get("max_temperature_c", 45.0)
+        self.min_temp = self.config.get("min_temperature_c", 0.0)
 
         # Control state
         self.current_command: Optional[BatteryCommand] = None

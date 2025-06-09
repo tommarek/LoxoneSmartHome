@@ -14,7 +14,7 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from config.energy_settings import ROOM_CONFIG
+from config.settings import PEMSSettings
 from sklearn.preprocessing import StandardScaler
 
 
@@ -25,6 +25,10 @@ class FeatureEngineer:
         """Initialize the feature engineer."""
         self.logger = logging.getLogger(f"{__name__}.FeatureEngineer")
         self.scalers: Dict[str, StandardScaler] = {}
+        
+        # Load room power ratings from settings
+        settings = PEMSSettings()
+        self.room_power_ratings = settings.room_power_ratings_kw
 
     def create_pv_features(
         self, pv_data: pd.DataFrame, weather_data: pd.DataFrame
@@ -245,7 +249,7 @@ class FeatureEngineer:
                 continue
 
             room_aligned = room_df.reindex(features.index, method="nearest")
-            room_power = ROOM_CONFIG["rooms"].get(room_name, {}).get("power_kw", 1.0)
+            room_power = self.room_power_ratings.get(room_name, 1.0)
 
             # Temperature features
             if "temperature" in room_aligned.columns:
@@ -325,8 +329,8 @@ class FeatureEngineer:
             features["total_heating_power"] = features[heating_cols].sum(axis=1)
             features["heating_power_ratio"] = features["total_heating_power"] / (
                 sum(
-                    ROOM_CONFIG["rooms"][room]["power_kw"]
-                    for room in ROOM_CONFIG["rooms"]
+                    self.room_power_ratings[room]
+                    for room in self.room_power_ratings
                 )
                 * 1000
             )  # Fraction of total capacity
@@ -636,7 +640,7 @@ class FeatureEngineer:
                 continue
 
             relay_aligned = relay_df.reindex(features.index, method="nearest")
-            room_power = ROOM_CONFIG["rooms"].get(room_name, {}).get("power_kw", 1.0)
+            room_power = self.room_power_ratings.get(room_name, 1.0)
 
             # Individual room relay state
             relay_col = f"{room_name}_relay"
@@ -669,7 +673,7 @@ class FeatureEngineer:
         features["total_heating_demand"] = total_heating_demand
         features["active_relay_count"] = active_relays
         features["heating_load_factor"] = total_heating_demand / sum(
-            ROOM_CONFIG["rooms"][room]["power_kw"] for room in ROOM_CONFIG["rooms"]
+            self.room_power_ratings[room] for room in self.room_power_ratings
         )
 
         # Heating patterns

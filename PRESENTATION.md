@@ -60,8 +60,8 @@ pems_v2/
 │       └── [x] loxone_adapter.py                   # Loxone data adapter
 ├── config/                                         # Configuration management
 │   ├── [ ] __init__.py                              # Config package marker
-│   ├── [x] energy_settings.py                      # Energy-specific settings
-│   └── [x] settings.py                             # Main configuration
+│   ├── [x] system_config.json                      # Centralized system configuration
+│   └── [x] settings.py                             # JSON-based typed settings with Pydantic
 ├── models/                                         # Machine learning models
 │   ├── [ ] __init__.py                              # Models package marker
 │   ├── [x] base.py                                  # Base model infrastructure
@@ -224,104 +224,137 @@ Imagine your house is like a smart robot that needs to make decisions about elec
 
 ---
 
-### ✅ **config/settings.py** - The Master Control Panel
-**What it does**: This is the master control panel where you configure every aspect of how your smart home system works.
+### ✅ **config/settings.py** - The Advanced JSON-Based Configuration System
+**What it does**: This is a revolutionary **tiered configuration system** that combines the best of JSON structure with environment variable flexibility and enterprise-grade validation.
 
-**Simple explanation**: Think of this like the settings menu in your smartphone, but for your entire smart home system. It's organized into different sections:
+**Simple explanation**: Think of this like a modern smartphone that can load its settings from multiple sources:
+1. **📋 Main settings file** (`system_config.json`) - Like your phone's default settings
+2. **🔐 Secret settings** (`.env` file) - Like your passwords and account info  
+3. **🎛️ Override settings** (environment variables) - Like temporary developer mode
 
-#### **🏠 InfluxDBSettings - The Data Storage Configuration**
-**What it does**: Tells the system where and how to store all your energy data.
-- **Like**: Setting up different filing cabinets for different types of documents
-- **Buckets explained**:
-  - `loxone`: Your actual house sensor data (temperature, power usage)
-  - `weather_forecast`: Weather predictions for solar forecasting
-  - `predictions`: What the AI thinks will happen
-  - `optimization`: The decisions the system makes
+### **🏗️ Tiered Configuration Architecture**
 
-#### **📡 MQTTSettings - The Communication System**
-**What it does**: Configures how different devices talk to each other in real-time.
-- **Like**: Setting up a walkie-talkie network for all your smart devices
-- **Key settings**: Broker address, authentication, client identification
+#### **📋 Primary: config/system_config.json - The System Blueprint**
+**What it contains**: All non-sensitive system configuration in a clean, maintainable JSON structure:
 
-#### **☀️ PVPredictionSettings - The Solar Crystal Ball**
-**What it does**: Configures how the system predicts solar energy production.
-- **Algorithms**: Uses machine learning to predict "tomorrow it will be sunny, so solar panels will make X kWh"
-- **Confidence levels**: Like weather forecast confidence - 10%, 50%, 90% chance scenarios
-- **Update frequency**: How often to make new predictions (default: every hour)
+```json
+{
+  "system": {
+    "simulation_mode": false,
+    "advisory_mode": false,
+    "optimization_interval_seconds": 3600,
+    "control_interval_seconds": 300
+  },
+  "thermal_settings": {
+    "comfort_band_celsius": 0.5,
+    "room_setpoints": {
+      "obyvak": { "day": 21.5, "night": 20.0 },
+      "kuchyne": { "day": 21.0, "night": 19.5 },
+      "loznice": { "day": 20.5, "night": 19.0 },
+      "default": { "day": 21.0, "night": 19.0 }
+    }
+  },
+  "room_power_ratings_kw": {
+    "obyvak": 4.8, "kuchyne": 1.8, "loznice": 1.2
+  }
+}
+```
 
-#### **🌡️ ThermalSettings - The Comfort Manager**
-**What it does**: Manages room temperatures and heating to keep you comfortable while saving energy.
-- **Setpoints**: Day temperature (21°C), night temperature (19°C)
-- **Comfort band**: How much temperature can vary (±0.5°C)
-- **Algorithm**: Uses physics equations (thermal mass, heat transfer) to predict heating needs
+#### **🔐 Secondary: .env file - Secrets and Server Addresses**
+**What it contains**: Only sensitive information and deployment-specific settings:
+```bash
+# InfluxDB Connection (REQUIRED)
+INFLUXDB_URL=http://localhost:8086
+INFLUXDB_TOKEN=your_secret_token_here
+INFLUXDB_ORG=your_org
 
-#### **⚡ OptimizationSettings - The Smart Decision Maker**
-**What it does**: Configures the mathematical brain that makes all the energy decisions.
-- **Algorithm**: Uses CVXPY (Convex optimization) - like a super-smart calculator that finds the best possible solution
-- **Horizon**: Looks ahead 48 hours (like planning a weekend trip)
-- **Time steps**: Makes decisions every hour
-- **Multi-objective weights**: Balances different goals:
-  - Cost weight (1.0): Prioritizes saving money
-  - Self-consumption weight (0.3): Prefers using your own solar power
-  - Comfort weight (0.5): Keeps you comfortable
+# MQTT Connection (REQUIRED)
+MQTT_BROKER=localhost
+MQTT_PORT=1883
+```
 
-#### **🔋 BatterySettings - The Energy Storage Manager**
-**What it does**: Defines how the battery storage system works.
-- **Technical specs**: 10 kWh capacity, 5 kW max power
-- **Safety limits**: Never discharge below 10% or charge above 90%
-- **Efficiency**: 95% round-trip (lose 5% when storing/retrieving energy)
+#### **🎛️ Override System: Environment Variables**
+**What it enables**: Any JSON setting can be overridden using nested environment variables:
+```bash
+# Override JSON settings via environment variables
+PEMS_SYSTEM__SIMULATION_MODE=true
+PEMS_BATTERY__CAPACITY_KWH=15.0
+PEMS_THERMAL_SETTINGS__ROOM_SETPOINTS__OBYVAK__DAY=22.0
+```
 
-#### **🚗 EVSettings - The Electric Car Charging Manager**
-**What it does**: Optimizes when to charge your electric car.
-- **Smart charging**: Charges during cheap electricity hours or when solar is producing
-- **Departure planning**: Ensures car is ready by 7:00 AM
-- **Technical specs**: 11 kW charging power, 60 kWh battery
+### **🔍 Advanced Configuration Components**
 
-#### **🎛️ PEMSSettings - The Master System Controller**
-**What it does**: Controls the overall system behavior and operating modes.
-- **Simulation mode**: For testing without controlling real devices
-- **Advisory mode**: Gives recommendations but doesn't automatically control
-- **Timing**: Optimization every hour, control updates every 5 minutes
+#### **🏠 InfluxDBSettings - Enhanced Database Configuration**
+**New features**: 
+- **JSON-based bucket configuration** with validation
+- **bucket_prices**: Added for energy price data extraction
+- **Environment-only secrets**: Tokens and URLs kept secure
+- **Comprehensive validation**: Ensures all bucket names are valid
 
-**Configuration Architecture**:
-- **Environment variables**: All settings can be configured via `.env` file
-- **Type validation**: Pydantic ensures all settings are correct and safe
-- **Modular design**: Each subsystem has its own configuration section
-- **Security**: Passwords and tokens are securely handled
+#### **🌡️ ThermalSettings - Revolutionary Per-Room Control**
+**Major advancement**: 
+- **Per-room setpoints**: Each room has custom day/night temperatures
+- **Zone-based intelligence**: Living rooms vs storage rooms have different priorities
+- **Smart scheduling**: Automatic temperature adjustment based on time of day
+- **Validation**: Ensures temperature ranges are safe and logical
 
-This settings system is like having a master control panel where you can adjust every aspect of how your smart home thinks and behaves!
+#### **🤖 ModelSettings - Centralized AI Configuration**
+**What it manages**:
+- **PV Model**: Solar prediction model path, update intervals, confidence levels
+- **Load Model**: Base load forecasting configuration
+- **Thermal Model**: Room temperature prediction settings
+- **Unified management**: All AI models configured in one place
+
+#### **⚡ OptimizationSettings - Smart Decision Engine**
+**Enhanced features**:
+- **Multi-objective weights**: Cost, comfort, self-consumption, peak shaving
+- **Advanced validation**: Ensures weights are mathematically valid
+- **Flexible horizons**: Optimization and control horizons with validation
+- **Solver configuration**: APOPT, IPOPT, or custom solvers
+
+#### **🔋 BatterySettings - Intelligent Energy Storage**
+**Safety enhancements**:
+- **C-rate validation**: Prevents dangerous charging rates (max 5C)
+- **SOC range validation**: Ensures min < max with realistic bounds
+- **Efficiency validation**: 50%-100% range with physics validation
+- **Capacity checks**: Positive values with realistic power limits
+
+### **🚀 Enterprise-Grade Features**
+
+#### **✅ Comprehensive Validation**
+**Pydantic model validators ensure**:
+- **Temperature ranges**: 10-30°C for day, 10-25°C for night setpoints
+- **Time constraints**: Control interval ≤ optimization interval, min 60 seconds
+- **Battery safety**: SOC ranges, C-rates, efficiency bounds
+- **EV parameters**: Valid departure times (HH:MM), reasonable capacities
+
+#### **🔄 Fail-Fast Configuration**
+**Benefits**:
+- **Startup validation**: Catches configuration errors before system operation
+- **Clear error messages**: Exactly what's wrong and how to fix it
+- **Type safety**: All configuration typed and validated
+- **Runtime stability**: No configuration-related crashes
+
+#### **🧪 Test-Friendly Architecture**
+**Features**:
+- **Mock configuration fixtures**: Isolated test environments
+- **Temporary config files**: Tests don't interfere with real settings
+- **Comprehensive test coverage**: All validation scenarios tested
+- **CI/CD ready**: Configuration validation in automated testing
+
+### **🎯 Why This Architecture is Revolutionary**
+
+1. **🎯 Maintainability**: All non-sensitive settings in readable JSON
+2. **🔒 Security**: Secrets properly separated from system configuration
+3. **✅ Reliability**: Fail-fast validation prevents runtime errors
+4. **🔄 Flexibility**: Environment overrides for deployment scenarios
+5. **🧪 Testability**: Complete isolation for testing environments
+6. **📚 Documentation**: Self-documenting configuration structure
+
+This represents a **professional, enterprise-grade configuration management system** that dramatically improves maintainability while ensuring security and reliability!
 
 ---
 
-### ✅ **config/energy_settings.py** - The Physical World Configuration
-**What it does**: This file contains the exact specifications of your real house - like a blueprint that tells the system how your home is physically built.
-
-**Simple explanation**: Think of this as a detailed inventory of your house that tells the smart system:
-1. **How much power each room needs** - Like knowing each room's "heater size"
-2. **How big each room is** - So the system knows how much air to heat
-3. **What type of room it is** - Living room (important) vs storage room (less important)
-
-**Key Data - Your Actual House**:
-- **17 rooms total** with **18.12 kW total heating power**
-- **Living spaces** (highest priority): Kitchen (1.8kW), Living room (3.0kW), Guest room (2.02kW)
-- **Bedrooms** (comfort at night): Each bedroom (1.2kW)
-- **Utility rooms** (lowest priority): Storage, technical rooms (0.22-0.82kW each)
-
-**Smart Zones Explained**:
-- **"living"** zone: Where people spend most time - highest comfort priority
-- **"sleeping"** zone: Comfort important during sleep hours
-- **"wet"** zone: Bathrooms need consistent heating to prevent moisture problems
-- **"circulation"** zone: Hallways can be cooler to save energy
-- **"storage"** zone: Lowest priority - can be much cooler
-
-**System Specifications**:
-- **Battery**: 10 kWh capacity, 5 kW charge/discharge power
-- **Solar panels**: 15 kW peak power
-- **Heating rules**: Minimum 15-minute cycles to prevent equipment damage
-
-**Why this matters**: The AI uses this data to make smart decisions like "living room is important, storage room can wait" or "don't run all 18kW at once, spread it out over time."
-
----
 
 ### ✅ **analysis/core/data_extraction.py** - The Data Collection Brain ⚡ **CRITICAL DATA PIPELINE FIXED**
 **What it does**: This is like a super-smart librarian that knows exactly where to find every piece of information about your house and brings it all together with **accurate energy accounting**.

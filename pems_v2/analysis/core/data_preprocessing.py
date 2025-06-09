@@ -13,7 +13,7 @@ import pandas as pd
 # Import Loxone adapter for field standardization
 from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
                                            LoxoneFieldAdapter)
-from config.energy_settings import ROOM_CONFIG
+from config.settings import PEMSSettings
 from scipy import stats
 
 
@@ -445,15 +445,11 @@ class RelayDataProcessor:
         """Initialize the relay data processor."""
         self.logger = logging.getLogger(f"{__name__}.RelayDataProcessor")
 
-        # Import room power ratings from configuration
-        from config.energy_settings import ROOM_CONFIG
-
-        self.room_power_ratings = {
-            room_name: config["power_kw"]
-            for room_name, config in ROOM_CONFIG["rooms"].items()
-        }
+        # Get room power ratings from settings
+        settings = PEMSSettings()
+        self.room_power_ratings = settings.room_power_ratings_kw
         self.logger.info(
-            f"Loaded power ratings for {len(self.room_power_ratings)} rooms from energy_settings.py"
+            f"Loaded power ratings for {len(self.room_power_ratings)} rooms from system_config.json"
         )
 
     def process_relay_data(self, relay_data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:

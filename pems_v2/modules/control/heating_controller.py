@@ -52,6 +52,8 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
+from config.settings import ThermalSettings, MQTTSettings, PEMSSettings
+
 # Note: In production, these would import from the main project's MQTT client
 # from utils.async_mqtt_client import AsyncMQTTClient
 
@@ -183,9 +185,9 @@ class HeatingController:
     - Validation of room existence and configuration before command execution
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, settings: PEMSSettings, config: Optional[Dict[str, Any]] = None):
         """
-        Initialize the heating controller with comprehensive configuration.
+        Initialize the heating controller with typed configuration.
 
         Sets up the controller infrastructure including MQTT communication,
         room configurations, safety parameters, and internal state management.
@@ -193,11 +195,8 @@ class HeatingController:
         MQTT connections (use initialize() method for that).
 
         Args:
-            config: Comprehensive configuration dictionary containing:
-                - rooms: Dict[str, Dict] - Room configurations with power ratings
-                - mqtt: Dict - MQTT broker connection settings
-                - max_switching_per_hour: int - Safety limit for relay switching
-                - safety_timeout_minutes: int - Maximum command duration
+            settings: PEMS settings containing room power ratings and thermal setpoints
+            config: Optional additional configuration for MQTT topics and safety overrides
 
         Configuration Structure:
             {
@@ -229,15 +228,18 @@ class HeatingController:
 
         Note: Actual MQTT connection is established via initialize() method
         """
-        self.config = config
+        self.settings = settings
+        self.config = config or {}
         self.logger = logging.getLogger(__name__)
 
-        # Room configuration
-        self.rooms = config.get("rooms", {})
+        # Room configuration from settings
+        self.rooms = {room: {"power_kw": power} for room, power in settings.room_power_ratings_kw.items()}
 
-        # MQTT configuration
-        self.mqtt_config = config.get("mqtt", {})
-        self.topic_prefix = self.mqtt_config.get("heating_topic_prefix", "pems/heating")
+        # MQTT configuration from settings
+        if settings.mqtt:
+            self.mqtt_broker = settings.mqtt.broker
+            self.mqtt_port = settings.mqtt.port
+        self.topic_prefix = self.config.get("heating_topic_prefix", "pems/heating")
 
         # Control state
         self.current_commands: Dict[str, HeatingCommand] = {}
@@ -252,6 +254,25 @@ class HeatingController:
         self.mqtt_client = None
 
         self.logger.info(f"Heating controller initialized for {len(self.rooms)} rooms")
+
+    def get_target_temp(self, room_name: str, hour: int) -> float:
+        """Get target temperature for a room at a specific hour.
+        
+        Args:
+            room_name: Name of the room
+            hour: Hour of day (0-23)
+            
+        Returns:
+            Target temperature in °C
+        """
+        if self.settings.thermal_settings:
+            return self.settings.thermal_settings.get_target_temp(room_name, hour)
+        else:
+            # Fallback to default setpoints
+            if 6 <= hour < 22:  # Daytime
+                return 21.0
+            else:  # Nighttime
+                return 19.0
 
     async def initialize(self):
         """Initialize MQTT connection and subscribe to status topics."""

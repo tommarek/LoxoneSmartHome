@@ -46,7 +46,7 @@ class ComprehensiveAnalyzer:
 
         # Initialize analyzers
         self.pv_analyzer = PVAnalyzer()
-        self.thermal_analyzer = ThermalAnalyzer()
+        self.thermal_analyzer = ThermalAnalyzer(settings)
         self.base_load_analyzer = BaseLoadAnalyzer()
         self.relay_analyzer = RelayPatternAnalyzer()
 

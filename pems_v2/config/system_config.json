@@ -1,0 +1,83 @@
+{
+  "system": {
+    "simulation_mode": false,
+    "advisory_mode": true,
+    "optimization_interval_seconds": 3600,
+    "control_interval_seconds": 300
+  },
+  "models": {
+    "pv": {
+      "model_path": "models/pv_predictor.pkl",
+      "update_interval_seconds": 3600,
+      "horizon_hours": 48,
+      "confidence_levels": [0.1, 0.5, 0.9]
+    },
+    "load": {
+      "model_path": "models/load_predictor.pkl",
+      "horizon_hours": 24
+    },
+    "thermal": {
+      "model_path": "models/thermal_predictor.pkl"
+    }
+  },
+  "thermal_settings": {
+    "comfort_band_celsius": 0.5,
+    "room_setpoints": {
+      "obyvak":    { "day": 21.5, "night": 20.0 },
+      "kuchyne":   { "day": 21.0, "night": 19.5 },
+      "loznice":   { "day": 20.5, "night": 19.0 },
+      "pracovna":  { "day": 22.0, "night": 19.0 },
+      "hosti":     { "day": 20.0, "night": 18.0 },
+      "chodba_dole": { "day": 20.0, "night": 18.5 },
+      "chodba_nahore": { "day": 20.0, "night": 18.5 },
+      "koupelna_dole": { "day": 22.0, "night": 20.0 },
+      "koupelna_nahore": { "day": 22.0, "night": 20.0 },
+      "default":   { "day": 21.0, "night": 19.0 }
+    }
+  },
+  "optimization": {
+    "horizon_hours": 48,
+    "control_hours": 24,
+    "time_step_minutes": 60,
+    "solver": "APOPT",
+    "max_solve_time_seconds": 30,
+    "weights": {
+      "cost": 1.0,
+      "self_consumption": 0.3,
+      "peak_shaving": 0.1,
+      "comfort": 0.5
+    }
+  },
+  "battery": {
+    "capacity_kwh": 10.0,
+    "max_power_kw": 5.0,
+    "efficiency": 0.95,
+    "min_soc": 0.1,
+    "max_soc": 0.9
+  },
+  "ev": {
+    "max_power_kw": 11.0,
+    "battery_capacity_kwh": 60.0,
+    "default_target_soc": 0.8,
+    "departure_time": "07:00"
+  },
+  "room_power_ratings_kw": {
+    "obyvak": 4.8,
+    "hosti": 2.02,
+    "chodba_dole": 1.8,
+    "chodba_nahore": 1.2,
+    "loznice": 1.2,
+    "pokoj_1": 1.2,
+    "pokoj_2": 1.2,
+    "pracovna": 0.82,
+    "satna_dole": 0.82,
+    "zadveri": 0.82,
+    "technicka_mistnost": 0.82,
+    "koupelna_nahore": 0.62,
+    "satna_nahore": 0.56,
+    "spajz": 0.46,
+    "koupelna_dole": 0.47,
+    "zachod": 0.22,
+    "kuchyne": 1.8
+  }
+}

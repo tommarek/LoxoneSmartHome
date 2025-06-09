@@ -31,6 +31,7 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
+from config.settings import LoadModelSettings
 from ..base import BasePredictor, PerformanceMetrics, PredictionResult
 
 
@@ -92,9 +93,23 @@ class LoadPredictor(BasePredictor):
     to predict non-controllable electricity consumption.
     """
 
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize load predictor with configuration."""
-        super().__init__(config)
+    def __init__(self, load_settings: LoadModelSettings, config: Optional[Dict[str, Any]] = None):
+        """Initialize load predictor with configuration.
+        
+        Args:
+            load_settings: Load model configuration from system settings
+            config: Optional additional configuration for model-specific parameters
+        """
+        # Merge settings with additional config
+        merged_config = {
+            "model_path": load_settings.model_path,
+            "horizon_hours": load_settings.horizon_hours,
+        }
+        if config:
+            merged_config.update(config)
+        
+        super().__init__(merged_config)
+        self.load_settings = load_settings
         self.logger = logging.getLogger(f"{__name__}.LoadPredictor")
 
         # Model configuration
@@ -102,7 +117,7 @@ class LoadPredictor(BasePredictor):
             "decomposition_method", "nmf"
         )  # 'nmf', 'pca', 'clustering'
         self.n_components = config.get("n_components", 5)
-        self.prediction_horizon = config.get("prediction_horizon", 24)  # hours
+        self.prediction_horizon = load_settings.horizon_hours  # hours from settings
         self.include_weather = config.get("include_weather", True)
         self.include_occupancy = config.get("include_occupancy", True)
 

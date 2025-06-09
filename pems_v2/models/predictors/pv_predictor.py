@@ -21,6 +21,7 @@ import xgboost as xgb
 from sklearn.linear_model import QuantileRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
+from config.settings import PVModelSettings
 from ..base import (BasePredictor, ModelMetadata, PerformanceMetrics,
                     PredictionResult)
 
@@ -33,14 +34,26 @@ class PVPredictor(BasePredictor):
     for accurate and interpretable photovoltaic power forecasting.
     """
 
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, pv_settings: PVModelSettings, config: Optional[Dict[str, Any]] = None):
         """
         Initialize PV predictor.
 
         Args:
-            config: Configuration dictionary with PV system and model parameters
+            pv_settings: PV model configuration from system settings
+            config: Optional additional configuration for system-specific parameters
         """
-        super().__init__(config)
+        # Merge settings with additional config
+        merged_config = {
+            "model_path": pv_settings.model_path,
+            "update_interval": pv_settings.update_interval_seconds,
+            "horizon_hours": pv_settings.horizon_hours,
+            "quantiles": pv_settings.confidence_levels,
+        }
+        if config:
+            merged_config.update(config)
+        
+        super().__init__(merged_config)
+        self.pv_settings = pv_settings
 
         # PV system configuration
         self.system_config = config.get("pv_system", {})
@@ -87,9 +100,9 @@ class PVPredictor(BasePredictor):
         self.physics_weight = config.get("physics_weight", 0.3)
 
         # Training configuration
-        self.quantiles = config.get("quantiles", [0.1, 0.5, 0.9])  # P10, P50, P90
-        self.lookback_hours = config.get("lookback_hours", 24)
-        self.forecast_horizon = config.get("forecast_horizon", 48)
+        self.quantiles = pv_settings.confidence_levels  # P10, P50, P90 from settings
+        self.lookback_hours = merged_config.get("lookback_hours", 24)
+        self.forecast_horizon = pv_settings.horizon_hours
 
         # Setup PVLib location
         self.location = pvlib.location.Location(

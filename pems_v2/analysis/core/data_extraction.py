@@ -82,8 +82,6 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 import pytz
-from config.energy_settings import (CONSUMPTION_CATEGORIES,
-                                    DATA_QUALITY_THRESHOLDS, get_room_power)
 from config.settings import PEMSSettings as Settings
 from influxdb_client import InfluxDBClient
 
@@ -203,13 +201,18 @@ class DataExtractor:
             self.logger.error(f"Failed to create data directory: {e}")
             raise PermissionError(f"Cannot create data directory: {e}")
 
-        # Data quality configuration from settings
-        self.quality_thresholds = DATA_QUALITY_THRESHOLDS
+        # Data quality configuration (constants)
+        self.quality_thresholds = {
+            "max_missing_percentage": 10.0,  # Maximum acceptable missing data (10%)
+            "max_gap_hours": 2.0,  # Maximum time gap between measurements
+            "min_data_points_per_day": 48,  # Minimum data points per day (15min intervals)
+            "temperature_range": (-20.0, 50.0),  # Valid temperature range in °C
+            "power_range": (0.0, 50000.0),  # Valid power range in W (0-50kW)
+            "soc_range": (0.0, 100.0),  # Valid state of charge range in %
+        }
         self.max_missing_percentage = self.quality_thresholds["max_missing_percentage"]
         self.max_gap_hours = self.quality_thresholds["max_gap_hours"]
-        self.min_data_points_per_day = self.quality_thresholds[
-            "min_data_points_per_day"
-        ]
+        self.min_data_points_per_day = self.quality_thresholds["min_data_points_per_day"]
 
         # Operational parameters
         self.chunk_size_hours = (
@@ -730,7 +733,7 @@ class DataExtractor:
 
         # Query for energy price data from the correct bucket
         query = f"""
-        from(bucket: "ote_prices")
+        from(bucket: "{self.settings.influxdb.bucket_prices}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
           |> filter(fn: (r) => r["_field"] == "price_czk_kwh")
@@ -934,7 +937,7 @@ class DataExtractor:
         """
         self.logger.info(f"Extracting battery data from {start_date} to {end_date}")
 
-        # Query for battery data from loxone bucket
+        # Query for battery data from solar bucket
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
           |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
@@ -943,7 +946,9 @@ class DataExtractor:
                               r["_field"] == "DischargePower" or
                               r["_field"] == "SOC" or
                               r["_field"] == "BatteryVoltage" or
-                              r["_field"] == "BatteryCurrent")
+                              r["_field"] == "BatteryTemperature" or
+                              r["_field"] == "ChargeEnergyToday" or
+                              r["_field"] == "DischargeEnergyToday")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
           |> keep(columns: ["_time", "_value", "_field"])
         """
@@ -1302,7 +1307,7 @@ class DataExtractor:
         - Provides appropriate defaults for downstream processing
         - Logs warning about missing data for monitoring
 
-        Quality Thresholds (from DATA_QUALITY_THRESHOLDS):
+        Quality Thresholds (configured in DataExtractor):
         - max_missing_percentage: 10% (triggers data quality warning)
         - max_gap_hours: 2 hours (acceptable gap duration)
         - min_data_points_per_day: 48 (for 15-minute intervals)
@@ -1529,7 +1534,7 @@ class DataExtractor:
         - **Field Completeness**: All expected columns are present
 
         Quality Thresholds Applied:
-        - max_missing_percentage: 10% (from DATA_QUALITY_THRESHOLDS)
+        - max_missing_percentage: 10% (configured threshold)
         - max_gap_hours: 2 hours maximum acceptable data gaps
         - min_data_points_per_day: 48 points (15-minute intervals)
 
@@ -1723,7 +1728,7 @@ class DataExtractor:
 
                 # Apply quality thresholds and generate recommendations
                 missing_pct = quality_report["missing_percentage"]
-                if missing_pct > DATA_QUALITY_THRESHOLDS["max_missing_percentage"]:
+                if missing_pct > self.quality_thresholds["max_missing_percentage"]:
                     if source in required_sources:
                         validation_results["critical_issues"].append(
                             f"{source}: Critical missing data ({missing_pct:.1f}%) exceeds threshold"
@@ -1739,7 +1744,7 @@ class DataExtractor:
                         gap[1].total_seconds() / 3600
                         for gap in quality_report["time_gaps"]
                     )
-                    if max_gap > DATA_QUALITY_THRESHOLDS["max_gap_hours"]:
+                    if max_gap > self.quality_thresholds["max_gap_hours"]:
                         validation_results["recommendations"].append(
                             f"{source}: Large time gaps found (max {max_gap:.1f}h) - "
                             "check data collection system reliability"
@@ -1959,7 +1964,7 @@ class DataExtractor:
             room_pivot.index = pd.to_datetime(room_pivot.index)
 
             # Add calculated power consumption
-            room_power_kw = get_room_power(room_name)
+            room_power_kw = self.settings.get_room_power(room_name)
             room_pivot["power_kw"] = room_pivot["relay_state"] * room_power_kw
             room_pivot["power_w"] = room_pivot["power_kw"] * 1000
 

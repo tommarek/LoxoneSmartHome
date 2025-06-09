@@ -91,8 +91,8 @@ pems_v2/                   # 📁 PEMS v2 Framework (Phase 1 & 2 Complete)
 │   └── control/          # Device control interfaces
 │       └── heating_controller.py # Async MQTT heating control
 ├── config/               # ⚙️ Configuration management
-│   ├── settings.py       # Main settings with Pydantic
-│   └── energy_settings.py # Room power configurations
+│   ├── settings.py       # JSON-based typed settings with Pydantic
+│   └── system_config.json # Central non-sensitive configuration
 ├── utils/                # 🔧 Shared utilities  
 │   └── logging.py        # Logging configuration
 ├── tests/                # 🧪 Comprehensive test suite
@@ -130,32 +130,69 @@ pip install -r requirements.txt
 
 ### 2. Configuration
 
-Create a `.env` file in the project root with your system configuration:
+PEMS v2 uses a **tiered configuration system** for maximum maintainability and security:
+
+#### **📋 Primary Configuration: `config/system_config.json`**
+This is the main configuration file for all non-sensitive system settings. **Edit this file first:**
+
+```json
+{
+  "system": {
+    "simulation_mode": false,
+    "advisory_mode": false,
+    "optimization_interval_seconds": 3600,
+    "control_interval_seconds": 300
+  },
+  "thermal_settings": {
+    "comfort_band_celsius": 0.5,
+    "room_setpoints": {
+      "obyvak": { "day": 21.5, "night": 20.0 },
+      "kuchyne": { "day": 21.0, "night": 19.5 },
+      "loznice": { "day": 20.5, "night": 19.0 },
+      "default": { "day": 21.0, "night": 19.0 }
+    }
+  },
+  "battery": {
+    "capacity_kwh": 10.0,
+    "max_power_kw": 5.0,
+    "efficiency": 0.95,
+    "min_soc": 0.1,
+    "max_soc": 0.9
+  }
+  // ... see config/system_config.json for complete example
+}
+```
+
+#### **🔐 Environment Variables: `.env` file**
+For secrets and environment-specific server addresses only:
 
 ```bash
-# InfluxDB Configuration
+# InfluxDB Connection (REQUIRED)
 INFLUXDB_URL=http://localhost:8086
-INFLUXDB_TOKEN=your_influxdb_token
-INFLUXDB_ORG=your_organization
-INFLUXDB_BUCKET_LOXONE=loxone_data
-INFLUXDB_BUCKET_WEATHER=weather_forecast
-INFLUXDB_BUCKET_SOLAR=solar_data
-INFLUXDB_BUCKET_PRICES=ote_prices
+INFLUXDB_TOKEN=your_secret_token_here
+INFLUXDB_ORG=your_org
 
-# MQTT Configuration
+# MQTT Connection (REQUIRED)  
 MQTT_BROKER=localhost
 MQTT_PORT=1883
-MQTT_TOPICS=weather,growatt/status
-
-# System Location (for weather/solar calculations)
-LOCATION_LATITUDE=49.4949522
-LOCATION_LONGITUDE=16.6068371
-
-# Energy System Configuration
-PV_CAPACITY_KW=10.0
-BATTERY_CAPACITY_KWH=10.0
-BATTERY_MAX_POWER_KW=5.0
+MQTT_USERNAME=
+MQTT_PASSWORD=
 ```
+
+#### **🎛️ Override System**: Environment Variables
+Any setting can be overridden via environment variables using nested paths:
+
+```bash
+# Override JSON settings via environment variables
+PEMS_SYSTEM__SIMULATION_MODE=true
+PEMS_BATTERY__CAPACITY_KWH=15.0
+PEMS_THERMAL_SETTINGS__ROOM_SETPOINTS__OBYVAK__DAY=22.0
+```
+
+#### **⚡ Quick Start**
+1. Copy `config/system_config.json` and customize for your home
+2. Copy `.env.example` to `.env` and add your database credentials  
+3. Run `python -c "from config.settings import PEMSSettings; print('✅ Configuration valid!')"` to validate
 
 ### 3. System Validation & Testing
 

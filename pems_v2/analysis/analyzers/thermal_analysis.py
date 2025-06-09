@@ -21,21 +21,49 @@ from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
+from config.settings import PEMSSettings
+
 try:
-    from config.energy_settings import get_room_power
+    from analysis.utils.loxone_adapter import LoxoneFieldAdapter
 except ImportError:
-    # Fallback if config not available
-    def get_room_power(room_name: str) -> float:
-        return LoxoneFieldAdapter._get_room_power_rating(room_name)
+    # Fallback if adapter not available
+    class LoxoneFieldAdapter:
+        @staticmethod
+        def _get_room_power_rating(room_name: str) -> float:
+            return 1.0  # Default fallback
 
 
 class ThermalAnalyzer:
     """Analyze thermal dynamics for each room."""
 
-    def __init__(self):
-        """Initialize the thermal analyzer."""
+    def __init__(self, settings: Optional[PEMSSettings] = None):
+        """Initialize the thermal analyzer.
+        
+        Args:
+            settings: PEMS settings containing room power ratings and thermal setpoints
+        """
         self.logger = logging.getLogger(f"{__name__}.ThermalAnalyzer")
         self.loxone_integrator = LoxoneDataIntegrator()
+        self.settings = settings
+
+    def get_target_temp(self, room_name: str, hour: int) -> float:
+        """Get target temperature for a room at a specific hour.
+        
+        Args:
+            room_name: Name of the room
+            hour: Hour of day (0-23)
+            
+        Returns:
+            Target temperature in °C
+        """
+        if self.settings and self.settings.thermal_settings:
+            return self.settings.thermal_settings.get_target_temp(room_name, hour)
+        else:
+            # Fallback to default setpoints
+            if 6 <= hour < 22:  # Daytime
+                return 21.0
+            else:  # Nighttime
+                return 19.0
 
     def analyze_room_dynamics(
         self,
@@ -931,7 +959,11 @@ class ThermalAnalyzer:
 
             # Use actual room power rating from configuration
             room_name = getattr(self, "_current_room_name", "unknown")
-            heating_power_w = get_room_power(room_name) * 1000  # Convert kW to W
+            # Get room power from settings or fallback
+            if self.settings:
+                heating_power_w = self.settings.get_room_power(room_name) * 1000  # Convert kW to W
+            else:
+                heating_power_w = LoxoneFieldAdapter._get_room_power_rating(room_name) * 1000
 
             # The rate of temperature change (dT/dt) is approximately P_heating / C
             # So, C = P_heating / (dT/dt)
