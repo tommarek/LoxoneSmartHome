@@ -747,18 +747,12 @@ class BatteryController:
         self.battery_config = config.get("battery", {})
         self.capacity_kwh = self.battery_config.get("capacity_kwh", 10.0)
         self.max_charge_power = self.battery_config.get("max_charge_power_kw", 5.0)
-        self.max_discharge_power = self.battery_config.get(
-            "max_discharge_power_kw", 5.0
-        )
+        self.max_discharge_power = self.battery_config.get("max_discharge_power_kw", 5.0)
 
         # MQTT configuration
         self.mqtt_config = config.get("mqtt", {})
-        self.control_topic = self.mqtt_config.get(
-            "battery_control_topic", "pems/battery/set"
-        )
-        self.status_topic = self.mqtt_config.get(
-            "battery_status_topic", "growatt/battery/status"
-        )
+        self.control_topic = self.mqtt_config.get("battery_control_topic", "pems/battery/set")
+        self.status_topic = self.mqtt_config.get("battery_status_topic", "growatt/battery/status")
 
         # Safety limits
         self.safety_config = config.get("safety", {})
@@ -803,7 +797,11 @@ class BatteryController:
         duration_minutes: Optional[int] = None,
     ) -> bool:
         """
-        Set battery charging mode using battery-first mode control (matching growatt pattern).
+        Set battery charging mode with final state validation to prevent race conditions.
+
+        This method implements the "Check-Act" pattern for modes that involve charging
+        (GRID and AUTO), ensuring the battery state is still safe at the moment of
+        command execution.
 
         Args:
             mode: Target charging mode
@@ -818,8 +816,33 @@ class BatteryController:
             if power_kw is not None:
                 if power_kw < 0 or power_kw > self.max_charge_power:
                     self.logger.error(
-                        f"Invalid charging power: {power_kw}kW "
-                        f"(max: {self.max_charge_power}kW)"
+                        f"Invalid charging power: {power_kw}kW " f"(max: {self.max_charge_power}kW)"
+                    )
+                    return False
+
+            # For charging modes, perform final state check
+            if mode in [ChargingMode.GRID, ChargingMode.AUTO]:
+                latest_status = await self.get_status()
+
+                if latest_status and latest_status.is_online:
+                    # Check SOC limits before enabling charging
+                    if latest_status.soc_percent >= self.max_soc:
+                        self.logger.warning(
+                            f"Aborting {mode.value} mode: Current SOC ({latest_status.soc_percent}%) "
+                            f"is at or above max ({self.max_soc}%)."
+                        )
+                        return False
+
+                    # Check temperature limits
+                    if not (self.min_temp <= latest_status.temperature_c <= self.max_temp):
+                        self.logger.warning(
+                            f"Aborting {mode.value} mode: Current temperature ({latest_status.temperature_c}°C) "
+                            f"is outside safe range ({self.min_temp}-{self.max_temp}°C)."
+                        )
+                        return False
+                elif not latest_status:
+                    self.logger.warning(
+                        f"Cannot set {mode.value} mode: Battery status unavailable."
                     )
                     return False
 
@@ -829,9 +852,9 @@ class BatteryController:
                 start_time = current_time.strftime("%H:%M")
 
                 if duration_minutes:
-                    end_time = (
-                        current_time + timedelta(minutes=duration_minutes)
-                    ).strftime("%H:%M")
+                    end_time = (current_time + timedelta(minutes=duration_minutes)).strftime(
+                        "%H:%M"
+                    )
                 else:
                     end_time = "23:59"  # Until end of day
 
@@ -874,7 +897,12 @@ class BatteryController:
 
     async def enable_grid_charging(self, power_kw: float = None) -> bool:
         """
-        Enable grid charging using AC charge control (matching growatt_controller.py pattern).
+        Enable grid charging with a final state check to prevent race conditions.
+
+        This method implements the "Check-Act" pattern by re-checking the battery's
+        current state just before executing the charging command. This prevents
+        race conditions where the system state may have changed between when the
+        optimization decision was made and when the command is executed.
 
         Args:
             power_kw: Charging power in kW (uses system default if None)
@@ -885,17 +913,40 @@ class BatteryController:
         if power_kw is None:
             power_kw = self.max_charge_power
 
+        # --- 1. Final State Check (Check-Act Pattern) ---
+        # Get the absolute latest status before acting.
+        latest_status = await self.get_status()
+
+        if not latest_status or not latest_status.is_online:
+            self.logger.warning("Cannot enable charging: Battery is offline.")
+            return False
+
+        # Re-run critical safety check with the latest data.
+        if latest_status.soc_percent >= self.max_soc:
+            self.logger.warning(
+                f"Aborting charge command: Current SOC ({latest_status.soc_percent}%) is at or above max ({self.max_soc}%)."
+            )
+            return False
+
+        if not (self.min_temp <= latest_status.temperature_c <= self.max_temp):
+            self.logger.warning(
+                f"Aborting charge command: Current temperature ({latest_status.temperature_c}°C) is outside safe range."
+            )
+            return False
+
+        # --- 2. Execute Command if Checks Pass ---
         try:
-            # Follow growatt_controller.py pattern for AC charging
             if self.config.get("simulation_mode", False):
-                current_time = datetime.now().strftime("%H:%M:%S")
-                self.logger.info(
-                    f"⚡ [SIMULATE] AC CHARGING ENABLED at {power_kw}kW (simulated at {current_time})"
-                )
+                self.logger.info(f"⚡ [SIMULATE] AC CHARGING ENABLED at {power_kw}kW")
                 return True
 
-            # Send MQTT command to enable AC charging (matches growatt pattern)
+            # Send MQTT command (matches growatt pattern)
             await self._enable_ac_charge(power_kw)
+
+            # Update internal state
+            self.current_command = BatteryCommand(mode=ChargingMode.GRID, power_kw=power_kw)
+            self.command_history.append(self.current_command)
+
             return True
 
         except Exception as e:
@@ -904,20 +955,32 @@ class BatteryController:
 
     async def disable_grid_charging(self) -> bool:
         """
-        Disable charging from grid (PV-only mode).
+        Disable charging from grid (PV-only mode) with state verification.
 
         Returns:
             True if successful
         """
+        # Final state check before switching to PV-only mode
+        latest_status = await self.get_status()
+        if latest_status and not latest_status.is_online:
+            self.logger.warning("Cannot change mode: Battery is offline.")
+            return False
+
         return await self.set_charging_mode(ChargingMode.PV_ONLY)
 
     async def stop_charging(self) -> bool:
         """
-        Stop all battery charging.
+        Stop all battery charging with state verification.
 
         Returns:
             True if successful
         """
+        # Final state check before stopping charging
+        latest_status = await self.get_status()
+        if latest_status and not latest_status.is_online:
+            self.logger.warning("Cannot stop charging: Battery is offline.")
+            return False
+
         return await self.set_charging_mode(ChargingMode.OFF)
 
     async def get_status(self) -> Optional[BatteryStatus]:
@@ -993,9 +1056,7 @@ class BatteryController:
             await self._disable_ac_charge()
 
             # Store command
-            command = BatteryCommand(
-                mode=ChargingMode.OFF, priority=3
-            )  # Emergency priority
+            command = BatteryCommand(mode=ChargingMode.OFF, priority=3)  # Emergency priority
 
             self.current_command = command
             self.command_history.append(command)
@@ -1106,9 +1167,7 @@ class BatteryController:
             return
 
         payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
-        battery_first_topic = self.mqtt_config.get(
-            "battery_first_topic", "pems/battery/mode"
-        )
+        battery_first_topic = self.mqtt_config.get("battery_first_topic", "pems/battery/mode")
 
         if self.mqtt_client:
             await self.mqtt_client.publish(battery_first_topic, json.dumps(payload))
@@ -1128,9 +1187,7 @@ class BatteryController:
             return
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
-        battery_first_topic = self.mqtt_config.get(
-            "battery_first_topic", "pems/battery/mode"
-        )
+        battery_first_topic = self.mqtt_config.get("battery_first_topic", "pems/battery/mode")
 
         if self.mqtt_client:
             await self.mqtt_client.publish(battery_first_topic, json.dumps(payload))
@@ -1150,9 +1207,7 @@ class BatteryController:
             return
 
         payload = {"value": True, "power_kw": power_kw}
-        ac_charge_topic = self.mqtt_config.get(
-            "ac_charge_topic", "pems/battery/ac_charge"
-        )
+        ac_charge_topic = self.mqtt_config.get("ac_charge_topic", "pems/battery/ac_charge")
 
         if self.mqtt_client:
             await self.mqtt_client.publish(ac_charge_topic, json.dumps(payload))
@@ -1165,22 +1220,16 @@ class BatteryController:
         """Disable AC charging (matches growatt pattern)."""
         if self.config.get("simulation_mode", False):
             current_time = datetime.now().strftime("%H:%M:%S")
-            self.logger.info(
-                f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})"
-            )
+            self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
             return
 
         payload = {"value": False}
-        ac_charge_topic = self.mqtt_config.get(
-            "ac_charge_topic", "pems/battery/ac_charge"
-        )
+        ac_charge_topic = self.mqtt_config.get("ac_charge_topic", "pems/battery/ac_charge")
 
         if self.mqtt_client:
             await self.mqtt_client.publish(ac_charge_topic, json.dumps(payload))
             current_time = datetime.now().strftime("%H:%M:%S")
-            self.logger.info(
-                f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {ac_charge_topic}"
-            )
+            self.logger.info(f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {ac_charge_topic}")
 
 
 def create_battery_controller(
