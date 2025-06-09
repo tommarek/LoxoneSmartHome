@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from config.settings import ThermalModelSettings
 from scipy import optimize
 from scipy.integrate import odeint
 from sklearn.ensemble import RandomForestRegressor
@@ -27,7 +28,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
 
-from config.settings import ThermalModelSettings
 from ..base import BasePredictor, PerformanceMetrics, PredictionResult
 
 
@@ -131,9 +131,13 @@ class ThermalPredictor(BasePredictor):
     temperature prediction and heating demand forecasting.
     """
 
-    def __init__(self, thermal_settings: ThermalModelSettings, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        thermal_settings: ThermalModelSettings,
+        config: Optional[Dict[str, Any]] = None,
+    ):
         """Initialize thermal predictor with configuration.
-        
+
         Args:
             thermal_settings: Thermal model configuration from system settings
             config: Optional additional configuration for model-specific parameters
@@ -144,7 +148,7 @@ class ThermalPredictor(BasePredictor):
         }
         if config:
             merged_config.update(config)
-        
+
         super().__init__(merged_config)
         self.thermal_settings = thermal_settings
         self.logger = logging.getLogger(f"{__name__}.ThermalPredictor")

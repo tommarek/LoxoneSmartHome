@@ -1,273 +1,268 @@
-Objective: Centralize Model and Thermal Configurations
-The primary goal is to move all non-sensitive, model-related configurations and the newly required per-room thermal comfort settings from environment variables (.env) and hardcoded Python dictionaries into a single, structured JSON file: config/system_config.json. This will dramatically improve maintainability.
-
-Phase 1: Establish the Central Configuration File
-This phase is foundational. We will create the single source of truth for all system configurations that are not secret or environment-specific.
-
-1. Create the New Configuration File:
-
-Action: In the pems_v2/config/ directory, create a new file named system_config.json.
-
-2. Define and Populate the JSON Structure:
-
-Action: Copy the complete structure below into config/system_config.json. This file now contains all settings previously found in .env.example (except for secrets and server URLs) and adds the new per-room temperature settings.
-
-{
-  "system": {
-    "simulation_mode": false,
-    "advisory_mode": false,
-    "optimization_interval_seconds": 3600,
-    "control_interval_seconds": 300
-  },
-  "models": {
-    "pv": {
-      "model_path": "models/pv_predictor.pkl",
-      "update_interval_seconds": 3600,
-      "horizon_hours": 48,
-      "confidence_levels": [0.1, 0.5, 0.9]
-    },
-    "load": {
-      "model_path": "models/load_predictor.pkl",
-      "horizon_hours": 24
-    },
-    "thermal": {
-      "model_path": "models/thermal_predictor.pkl"
-    }
-  },
-  "thermal_settings": {
-    "comfort_band_celsius": 0.5,
-    "room_setpoints": {
-      "obyvak":    { "day": 21.5, "night": 20.0 },
-      "kuchyne":   { "day": 21.0, "night": 19.5 },
-      "loznice":   { "day": 20.5, "night": 19.0 },
-      "pracovna":  { "day": 22.0, "night": 19.0 },
-      "hosti":     { "day": 20.0, "night": 18.0 },
-      "chodba_dole": { "day": 20.0, "night": 18.5 },
-      "chodba_nahore": { "day": 20.0, "night": 18.5 },
-      "koupelna_dole": { "day": 22.0, "night": 20.0 },
-      "koupelna_nahore": { "day": 22.0, "night": 20.0 },
-      "default":   { "day": 21.0, "night": 19.0 }
-    }
-  },
-  "optimization": {
-    "horizon_hours": 48,
-    "control_hours": 24,
-    "time_step_minutes": 60,
-    "solver": "APOPT",
-    "max_solve_time_seconds": 30,
-    "weights": {
-      "cost": 1.0,
-      "self_consumption": 0.3,
-      "peak_shaving": 0.1,
-      "comfort": 0.5
-    }
-  },
-  "battery": {
-    "capacity_kwh": 10.0,
-    "max_power_kw": 5.0,
-    "efficiency": 0.95,
-    "min_soc": 0.1,
-    "max_soc": 0.9
-  },
-  "ev": {
-    "max_power_kw": 11.0,
-    "battery_capacity_kwh": 60.0,
-    "default_target_soc": 0.8,
-    "departure_time": "07:00"
-  },
-  "room_power_ratings_kw": {
-    "obyvak": 4.8,
-    "hosti": 2.02,
-    "chodba_dole": 1.8,
-    "chodba_nahore": 1.2,
-    "loznice": 1.2,
-    "pokoj_1": 1.2,
-    "pokoj_2": 1.2,
-    "pracovna": 0.82,
-    "satna_dole": 0.82,
-    "zadveri": 0.82,
-    "technicka_mistnost": 0.82,
-    "koupelna_nahore": 0.62,
-    "satna_nahore": 0.56,
-    "spajz": 0.46,
-    "koupelna_dole": 0.47,
-    "zachod": 0.22,
-    "kuchyne": 1.8
-  }
-}
+Of course. Here is a more detailed, code-centric TODO list with specific snippets to guide you through fixing the issues in your `pems_v2` project.
 
-Rationale: We've also moved ROOM_CONFIG from energy_settings.py into this JSON as room_power_ratings_kw. This fully centralizes the physical properties of the house.
+The following plan provides code modifications for each identified problem.
 
-Phase 2: Refactor Pydantic Settings and Configuration Files
-Now we'll update the Python code to read from our new central configuration file.
+---
 
-1. Refactor pems_v2/config/settings.py:
+### ✅ **Detailed TODO with Code Implementation**
 
-Action: Replace the entire content of this file with the code below. This new structure mirrors the JSON file, uses modern Pydantic features to load the JSON, and still allows for overrides via environment variables.
+#### **Phase 1: Critical Bug Fixes & Refactoring**
 
-I will provide the refactored code for pems_v2/config/settings.py in a separate code block for clarity.
+These fixes address the immediate crashes and are essential for the system to run.
 
-2. Refactor pems_v2/config/energy_settings.py:
+**1.1. Fix `TypeError` in `BaseLoadAnalyzer` Call**
 
-Action: This file is now redundant. Its contents (ROOM_CONFIG, get_room_power) have been moved into the JSON file and the new settings.py.
+* **File**: `pems_v2/analysis/pipelines/comprehensive_analysis.py`
+* **Problem**: The `BaseLoadAnalyzer.analyze_base_load` method is called without the `pv_data` and `room_data` it requires.
+* **Solution**: Pass the missing DataFrame arguments to the method within the `ComprehensiveAnalyzer` pipeline.
 
-Action: Delete the file pems_v2/config/energy_settings.py. We will create a new helper function later or access the power ratings directly from the settings object where needed.
+**💻 Code Implementation:**
 
-Phase 3: Update Application Code to Use New Settings
-This is the most detailed phase, involving changes across the application. The main principle is to pass the PEMSSettings object to any class that needs configuration, rather than passing a generic dictionary.
+```python
+# In pems_v2/analysis/pipelines/comprehensive_analysis.py, method run_analysis
 
-1. Refactor Data Extraction (analysis/core/data_extraction.py):
+# --- BEFORE ---
+# Around line 379
+base_load_results = self.base_load_analyzer.analyze_base_load(
+    grid_data=preprocessed_data["grid"]
+)
 
-Problem: The DataExtractor currently hardcodes the ote_prices bucket name.
+# --- AFTER ---
+# Pass the required dataframes to the analyzer.
+base_load_results = self.base_load_analyzer.analyze_base_load(
+    grid_data=preprocessed_data["grid"],
+    pv_data=preprocessed_data["pv"],
+    room_data=preprocessed_data["room_sensors"],
+    relay_data=preprocessed_data["relays"],
+    settings=self.settings
+)
+```
 
-Action: Modify the extract_energy_prices method.
+**1.2. Correct Data Handling in `LoxoneFieldAdapter`**
 
-Before: from(bucket: "ote_prices")
+* **File**: `pems_v2/analysis/utils/loxone_adapter.py`
+* **Problem**: `standardize_relay_data` fails with `AttributeError: 'Series' object has no attribute 'columns'` when only one relay is processed.
+* **Solution**: Check if the input is a pandas Series and, if so, convert it to a DataFrame.
 
-After: from(bucket: "{self.settings.influxdb.bucket_prices}")
-(Note: You'll need to add bucket_prices: str to InfluxDBSettings in settings.py as planned).
+**💻 Code Implementation:**
 
-2. Refactor Model Predictors (models/predictors/*.py):
+```python
+# In pems_v2/analysis/utils/loxone_adapter.py, method standardize_relay_data
 
-Problem: Predictors are initialized with a generic config dict.
+import pandas as pd
 
-Action: Change the __init__ signature and internal logic.
+# --- BEFORE ---
+# Around line 210
+def standardize_relay_data(self, relay_df: pd.DataFrame) -> pd.DataFrame:
+    # This fails if relay_df is a Series
+    if not all(col in relay_df.columns for col in self.expected_relay_cols):
+        # ...
+    
+# --- AFTER ---
+def standardize_relay_data(self, relay_df: pd.DataFrame | pd.Series) -> pd.DataFrame:
+    """Standardizes relay data, ensuring it is always a DataFrame."""
+    if isinstance(relay_df, pd.Series):
+        relay_df = relay_df.to_frame() # Convert Series to DataFrame
 
-File: models/predictors/pv_predictor.py
+    if not all(col in relay_df.columns for col in self.expected_relay_cols):
+        # ...
+```
+
+**1.3. Update Configuration Imports and Access**
+
+* **Files**: `pems_v2/analysis/analyzers/pattern_analysis.py`, `pems_v2/analysis/utils/loxone_adapter.py`
+* **Problem**: The code uses an outdated import `from config.energy_settings import get_room_power`. Configuration should be accessed from the `PEMSSettings` object.
+* **Solution**:
+    1.  Pass the `settings` object to the `RelayPatternAnalyzer`.
+    2.  Pass the settings down to the utility functions in `loxone_adapter`.
+    3.  Replace the `get_room_power` call with a direct lookup from `settings.room_power_ratings_kw`.
 
-Before: def __init__(self, config: Dict[str, Any]):
+**💻 Code Implementation:**
 
-After: def __init__(self, pv_settings: PVPredictionSettings):
+**Step 1: Update `RelayPatternAnalyzer` to accept settings**
 
-Logic Change: Replace self.config.get("capacity_kw") with pv_settings.capacity_kw.
+```python
+# In pems_v2/analysis/analyzers/pattern_analysis.py
 
-Repeat this pattern for LoadPredictor and ThermalPredictor, passing them LoadModelSettings and ThermalModelSettings respectively.
+class RelayPatternAnalyzer:
+    # --- BEFORE ---
+    def __init__(self, loxone_adapter: LoxoneFieldAdapter):
+        self.loxone_adapter = loxone_adapter
+        # ...
 
-3. Refactor Thermal Analysis (analysis/analyzers/thermal_analysis.py):
+    # --- AFTER ---
+    def __init__(self, loxone_adapter: LoxoneFieldAdapter, settings: PEMSSettings):
+        self.loxone_adapter = loxone_adapter
+        self.settings = settings # Store settings
+        # ...
 
-Problem: Needs to use the new per-room temperature setpoints.
+    def _analyze_relay_energy(self, relay_patterns: pd.DataFrame) -> pd.DataFrame:
+        # Pass settings to the adapter method
+        return self.loxone_adapter.calculate_energy_consumption(relay_patterns, self.settings)
+
+```
 
-Action: The ThermalAnalyzer's methods that deal with comfort or setpoints must now access settings.thermal_settings.room_setpoints.
+**Step 2: Update `LoxoneFieldAdapter` to use settings**
+
+```python
+# In pems_v2/analysis/utils/loxone_adapter.py
 
-Logic Example:
+# --- BEFORE ---
+# Around line 385
+from config.energy_settings import get_room_power
+
+def calculate_energy_consumption(self, relay_df: pd.DataFrame) -> pd.DataFrame:
+    for room, power_kw in get_room_power().items():
+        # ...
+
+# --- AFTER ---
+# REMOVE the old import at the top of the file
+
+def calculate_energy_consumption(self, relay_df: pd.DataFrame, settings: PEMSSettings) -> pd.DataFrame:
+    """Calculates energy consumption for relays using power ratings from settings."""
+    # Access power ratings directly from the settings object
+    room_power_ratings = settings.room_power_ratings_kw.dict()
+
+    for room, power_kw in room_power_ratings.items():
+        if room in relay_df.columns:
+            # ...
+```
+
+**1.4. Fix `KeyError: 'price'` in Economic Analysis**
+
+* **File**: `pems_v2/analysis/analyzers/pattern_analysis.py`
+* **Problem**: The `_analyze_economic_patterns` method fails because the price column is not found. The likely correct column name is `price_czk_kwh`.
+* **Solution**: Use the correct column name in the `pd.merge_asof` call and add defensive checks for empty price data.
+
+**💻 Code Implementation:**
+
+```python
+# In pems_v2/analysis/analyzers/pattern_analysis.py, method _analyze_economic_patterns
 
-# Inside a method in ThermalAnalyzer
-def get_target_temp(self, room_name: str, hour: int) -> float:
-    setpoints = self.settings.thermal_settings.room_setpoints
-    room_specific = setpoints.get(room_name, setpoints["default"])
-
-    if 6 <= hour < 22: # Daytime
-        return room_specific["day"]
-    else: # Nighttime
-        return room_specific["night"]
-
-4. Refactor Control Modules (modules/control/*.py):
-
-Problem: Controllers are hardcoding logic or using old config structures.
-
-Action (HeatingController): Update any strategy logic (e.g., in _create_comfort_heating_schedule) to use the new get_target_temp logic shown above. It must be initialized with the main PEMSSettings object to have access to this.
-
-Action (BatteryController): Its __init__ should take battery_settings: BatterySettings.
-
-Before: self.capacity_kwh = config.get("battery", {}).get("capacity_kwh", 10.0)
-
-After: self.capacity_kwh = battery_settings.capacity_kwh
-
-5. Refactor Main Analysis Runner (analysis/run_analysis.py):
-
-Problem: The script instantiates analyzers and passes them generic configs.
-
-Action:
-
-The run_analysis function should be the single point of PEMSSettings instantiation.
-
-settings = PEMSSettings()
-
-Pass the specific sub-settings to each component.
-
-Example: analyzer = ComprehensiveAnalyzer(settings)
-
-Inside ComprehensiveAnalyzer, when it creates ThermalAnalyzer, it will pass settings to it.
-
-Phase 4: Update Documentation & Supporting Files
-1. Update .env.example:
-
-Action: This file will be significantly cleaned up. Remove all variables that were moved to system_config.json.
-
-Result: The new .env.example should only contain secrets and server addresses.
-
-Before (.env.example):
-
-INFLUXDB_URL=...
-INFLUXDB_TOKEN=...
-MQTT_BROKER=...
-PV_MODEL_PATH=...
-THERMAL_DEFAULT_SETPOINT_DAY=...
-OPT_COST_WEIGHT=...
-BATTERY_CAPACITY_KWH=...
-# ... and many more
-
-After (.env.example):
-
-# Environment-specific settings and secrets for PEMS v2
-
-# InfluxDB Connection (REQUIRED)
-INFLUXDB_URL=http://localhost:8086
-INFLUXDB_TOKEN=your_secret_token_here
-INFLUXDB_ORG=your_org
-
-# MQTT Connection (REQUIRED)
-MQTT_BROKER=localhost
-MQTT_PORT=1883
-MQTT_USERNAME=
-MQTT_PASSWORD=
-
-2. Update README.md:
-
-Action: Add a new section called "System Configuration" right after "Prerequisites".
-
-Content Snippet for README.md:
-
-Configuration
-PEMS v2 uses a tiered configuration system:
-
-config/system_config.json: This is the primary file for configuring the physical properties of your home, model parameters, and optimization settings. You should edit this file first. It includes per-room heating setpoints, battery capacity, PV model paths, etc.
-
-.env file: This file is for secrets and environment-specific server addresses. Create it by copying .env.example. It should contain your INFLUXDB_TOKEN, INFLUXDB_URL, and MQTT_BROKER address.
-
-Environment Variables: Any setting can be overridden by setting an environment variable (e.g., PEMS_SYSTEM__SIMULATION_MODE=true).
-
-3. Update Tests:
-
-Problem: Tests that rely on the old settings structure will fail.
-
-Strategy: Use pytest fixtures and monkeypatch to create a temporary system_config.json for each test run. This ensures tests are isolated and don't depend on a real file.
-
-Example Test Fixture (tests/conftest.py):
-
-import json
-import pytest
-
-@pytest.fixture
-def mock_system_config(tmp_path):
-    config_dir = tmp_path / "config"
-    config_dir.mkdir()
-    config_file = config_dir / "system_config.json"
-
-    # Create a minimal, valid config for testing
-    test_config = {"system": {"simulation_mode": True}, ...} 
-
-    with open(config_file, 'w') as f:
-        json.dump(test_config, f)
-
-    return config_file
-
-# In your test function:
-def test_something(mock_system_config, monkeypatch):
-    # Temporarily point the settings loader to our test config
-    monkeypatch.setenv("PEMS_CONFIG_PATH", str(mock_system_config))
-    from pems_v2.config.settings import PEMSSettings
-    settings = PEMSSettings()
-    assert settings.system.simulation_mode is True
-
-This detailed plan provides a clear, actionable roadmap. The next logical step is to generate the refactored code for pems_v2/config/settings.py.
+# --- BEFORE ---
+# Around line 1166
+merged_df = pd.merge_asof(
+    sorted_energy, price_data, left_index=True, right_index=True
+)
+merged_df["cost"] = merged_df["energy_kwh"] * merged_df["price"]
+
+# --- AFTER ---
+def _analyze_economic_patterns(self, energy_df: pd.DataFrame, price_data: pd.DataFrame) -> pd.DataFrame:
+    """Analyzes the economic impact of relay energy consumption."""
+    if price_data is None or price_data.empty:
+        logger.warning("Price data is empty, skipping economic pattern analysis.")
+        return pd.DataFrame() # Return empty df
+
+    # Ensure the price column exists, assuming 'price_czk_kwh' is the correct name
+    if "price_czk_kwh" not in price_data.columns:
+        logger.error("Price column 'price_czk_kwh' not found in price_data.")
+        return pd.DataFrame()
+
+    sorted_energy = energy_df.sort_index()
+    
+    # Use the correct column name for merging and calculation
+    merged_df = pd.merge_asof(
+        sorted_energy, price_data[['price_czk_kwh']], left_index=True, right_index=True
+    )
+    
+    # Forward-fill any gaps in the merged price data
+    merged_df['price_czk_kwh'] = merged_df['price_czk_kwh'].ffill()
+    
+    merged_df["cost_czk"] = merged_df["energy_kwh"] * merged_df["price_czk_kwh"]
+    return merged_df
+```
+
+---
+
+#### **Phase 2: Logic Improvements & Robustness**
+
+These changes will make your calculations more accurate and the code more reliable.
+
+**2.1. Refine Base Load Calculation Logic**
+
+* **File**: `pems_v2/analysis/analyzers/base_load_analysis.py`
+* **Problem**: The base load calculation relies on a potentially flawed energy conservation model.
+* **Solution**: Set the more robust `statistical_minimum` method as the primary calculation. Improve its parameters for better accuracy.
+
+**💻 Code Implementation:**
+
+```python
+# In pems_v2/analysis/analyzers/base_load_analysis.py, method _calculate_base_load
+
+# --- BEFORE ---
+# Logic arbitrarily chooses between two methods.
+def _calculate_base_load(self, house_load: pd.Series, controllable_load: pd.Series) -> pd.DataFrame:
+    # ... complex logic to switch between methods ...
+
+# --- AFTER ---
+def _calculate_base_load(self, house_load: pd.Series, controllable_load: pd.Series) -> pd.DataFrame:
+    """
+    Calculates the base load using a robust statistical method as the primary approach.
+    """
+    logger.info("Calculating base load using statistical minimum method.")
+
+    # Primary method: Use a rolling quantile to find the baseline consumption
+    # A 24-hour window and a low quantile (e.g., 5%) are robust settings
+    statistical_base_load = house_load.rolling(window='24h', min_periods=1).quantile(0.05)
+    statistical_base_load.name = "statistical_base_load_kw"
+
+    # Secondary method (for comparison or specific use cases)
+    conservation_base_load = (house_load - controllable_load).clip(lower=0)
+    conservation_base_load.name = "conservation_base_load_kw"
+    
+    # Combine results into a single DataFrame
+    base_load_df = pd.concat([statistical_base_load, conservation_base_load], axis=1)
+    
+    # The primary reported value should be the statistical one
+    base_load_df["base_load_kw"] = statistical_base_load
+    
+    avg_base_load = base_load_df["base_load_kw"].mean()
+    logger.info(f"Average statistical base load calculated: {avg_base_load:.3f} kW")
+
+    return base_load_df
+
+```
+
+**2.2. Add Input Validation with Logging**
+
+* **Files**: All analyzer entry-point methods.
+* **Problem**: It's hard to debug when data passed between components is incorrect.
+* **Solution**: Add logging at the beginning of major functions to inspect the received data.
+
+**💻 Code Implementation (Example for `BaseLoadAnalyzer`)**
+
+```python
+# In pems_v2/analysis/analyzers/base_load_analysis.py
+
+import logging
+logger = logging.getLogger(__name__)
+
+# --- BEFORE ---
+def analyze_base_load(self, grid_data: pd.DataFrame, **kwargs) -> dict:
+    # Starts calculation immediately
+
+# --- AFTER ---
+def analyze_base_load(
+    self, 
+    grid_data: pd.DataFrame, 
+    pv_data: pd.DataFrame, 
+    room_data: pd.DataFrame,
+    **kwargs
+) -> dict:
+    """Analyzes the building's base load."""
+    logger.info("Starting base load analysis...")
+    
+    # --- Input Validation Logging ---
+    if grid_data.empty:
+        logger.error("Grid data is empty. Aborting base load analysis.")
+        return {"error": "Empty grid data"}
+    if pv_data.empty:
+        logger.warning("PV data is empty. Base load calculation may be less accurate.")
+    if room_data.empty:
+        logger.warning("Room data is empty. Controllable load cannot be determined.")
+
+    logger.debug(f"Grid data shape: {grid_data.shape}, columns: {grid_data.columns.tolist()}")
+    logger.debug(f"PV data shape: {pv_data.shape}, columns: {pv_data.columns.tolist()}")
+    
+    # ... rest of the calculation
+```

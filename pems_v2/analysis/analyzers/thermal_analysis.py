@@ -16,12 +16,11 @@ import pandas as pd
 # Import Loxone adapter for field standardization
 from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
                                            LoxoneFieldAdapter)
+from config.settings import PEMSSettings
 from scipy import optimize
 from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
-
-from config.settings import PEMSSettings
 
 try:
     from analysis.utils.loxone_adapter import LoxoneFieldAdapter
@@ -38,7 +37,7 @@ class ThermalAnalyzer:
 
     def __init__(self, settings: Optional[PEMSSettings] = None):
         """Initialize the thermal analyzer.
-        
+
         Args:
             settings: PEMS settings containing room power ratings and thermal setpoints
         """
@@ -48,11 +47,11 @@ class ThermalAnalyzer:
 
     def get_target_temp(self, room_name: str, hour: int) -> float:
         """Get target temperature for a room at a specific hour.
-        
+
         Args:
             room_name: Name of the room
             hour: Hour of day (0-23)
-            
+
         Returns:
             Target temperature in °C
         """
@@ -82,11 +81,34 @@ class ThermalAnalyzer:
         Returns:
             Dictionary with thermal analysis results for each room
         """
-        self.logger.info("Starting thermal dynamics analysis with Loxone integration")
+        self.logger.info(
+            "Starting thermal dynamics analysis with Loxone integration..."
+        )
 
+        # --- Input Validation Logging ---
         if not room_data:
-            self.logger.warning("No room data provided")
-            return {}
+            self.logger.error("Room data is empty. Aborting thermal analysis.")
+            return {"error": "Empty room data"}
+        if weather_data.empty:
+            self.logger.warning(
+                "Weather data is empty. Outdoor temperature correlation will be limited."
+            )
+
+        self.logger.debug(f"Room data rooms: {list(room_data.keys())}")
+        for room, df in room_data.items():
+            if isinstance(df, pd.DataFrame):
+                self.logger.debug(
+                    f"Room {room} data shape: {df.shape}, columns: {df.columns.tolist()}"
+                )
+
+        if not weather_data.empty:
+            self.logger.debug(
+                f"Weather data shape: {weather_data.shape}, columns: {weather_data.columns.tolist()}"
+            )
+        if relay_data:
+            self.logger.debug(f"Relay data rooms: {list(relay_data.keys())}")
+        else:
+            self.logger.debug("No relay data provided for heating period detection")
 
         # Prepare data using Loxone integrator if relay data is provided
         if relay_data is not None:
@@ -111,8 +133,26 @@ class ThermalAnalyzer:
 
         results = {}
 
-        # Analyze each room individually using standardized data
-        for room_name, room_df in standardized_rooms.items():
+        # Filter out external environment data (not actual rooms)
+        external_environments = [
+            "outside",
+            "outdoor",
+            "external",
+            "environment",
+            "weather",
+        ]
+        interior_rooms = {
+            room_name: room_df
+            for room_name, room_df in standardized_rooms.items()
+            if not any(env in room_name.lower() for env in external_environments)
+        }
+
+        self.logger.info(
+            f"Filtered to {len(interior_rooms)} interior rooms (excluded external environment data)"
+        )
+
+        # Analyze each interior room individually using standardized data
+        for room_name, room_df in interior_rooms.items():
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
 
             try:
@@ -252,7 +292,7 @@ class ThermalAnalyzer:
                 try:
                     weather_resampled = (
                         weather_data[[temp_column]]
-                        .resample("5T")
+                        .resample("5min")
                         .interpolate(method="linear")
                     )
                     weather_resampled.columns = ["outdoor_temp"]
@@ -961,9 +1001,13 @@ class ThermalAnalyzer:
             room_name = getattr(self, "_current_room_name", "unknown")
             # Get room power from settings or fallback
             if self.settings:
-                heating_power_w = self.settings.get_room_power(room_name) * 1000  # Convert kW to W
+                heating_power_w = (
+                    self.settings.get_room_power(room_name) * 1000
+                )  # Convert kW to W
             else:
-                heating_power_w = LoxoneFieldAdapter._get_room_power_rating(room_name) * 1000
+                heating_power_w = (
+                    LoxoneFieldAdapter._get_room_power_rating(room_name) * 1000
+                )
 
             # The rate of temperature change (dT/dt) is approximately P_heating / C
             # So, C = P_heating / (dT/dt)

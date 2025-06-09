@@ -594,18 +594,29 @@ Your system has conditional export (only exports when prices are high). This ana
 
 ---
 
-### ✅ **analysis/analyzers/thermal_analysis.py** - The Room Heating Scientist
-**What it does**: This is like a thermal engineer that studies how each room in your house heats up and cools down, then creates a mathematical model of each room's behavior.
+### ✅ **analysis/analyzers/thermal_analysis.py** - The Room Heating Scientist ⚡ **CRITICAL ROOM FILTERING**
+**What it does**: This is like a thermal engineer that studies how each **interior room** in your house heats up and cools down, then creates a mathematical model of each room's behavior. **Now correctly excludes outdoor environment sensors.**
 
-**Simple explanation**: Every room in your house has its own "thermal personality":
+**Simple explanation**: Every **interior room** in your house has its own "thermal personality":
 - **Fast rooms**: Heat up quickly when heating turns on, cool down quickly when off
 - **Slow rooms**: Take forever to heat up, but stay warm for a long time
 - **Efficient rooms**: Need little energy to maintain temperature
 - **Problematic rooms**: Always need heating, never stay warm
 
-#### **🏠 ThermalAnalyzer - The Room Physicist** ⚡ **UPDATED WITH CRITICAL FIXES**
+#### **🏠 ThermalAnalyzer - The Room Physicist** ⚡ **CRITICAL FIXES APPLIED**
 
-**What it calculates for each room**:
+**🔥 CRITICAL FIX: Interior Room Filtering**:
+```python
+# Filter out external environment data (not actual rooms)
+external_environments = ['outside', 'outdoor', 'external', 'environment', 'weather']
+interior_rooms = {
+    room_name: room_df for room_name, room_df in standardized_rooms.items()
+    if not any(env in room_name.lower() for env in external_environments)
+}
+# Result: 17 interior rooms analyzed (excludes outdoor sensors) ✅
+```
+
+**What it calculates for each interior room**:
 - **R (Thermal Resistance)**: How well the room holds heat (like insulation quality)
 - **C (Thermal Capacitance)**: How much energy the room can store (like thermal mass)
 - **Time Constant (τ)**: How long it takes to heat up (τ = R × C)
@@ -761,46 +772,86 @@ base_load = total_house_load - heating_load - ev_charge
 
 ---
 
-### ✅ **analysis/run_analysis.py** - The Master Control Script
-**What it does**: This is the conductor of the orchestra - it coordinates all the different analysis modules to create a complete picture of your energy system.
+### ✅ **analysis/run_analysis.py** - The Master Control Script ⚡ **ENHANCED WITH CLI**
+**What it does**: This is the conductor of the orchestra - it coordinates all the different analysis modules to create a complete picture of your energy system. **Now with powerful command-line interface for flexible analysis windows.**
 
 **Simple explanation**: Like a project manager that says:
-1. "Data team, get me 2 years of house data"
+1. "Data team, get me 2 years of house data" (or any period you specify)
 2. "PV team, analyze the solar panels"
-3. "Thermal team, figure out the heating patterns"
+3. "Thermal team, figure out the heating patterns for 17 interior rooms" (excludes outdoor sensors)
 4. "Report team, make beautiful charts"
 5. "All teams, combine your findings into one comprehensive report"
 
-#### **🎯 ComprehensiveAnalyzer Orchestra**
+#### **🎯 ComprehensiveAnalyzer Orchestra - NEW COMMAND LINE INTERFACE**
+
+**🚀 Flexible Time Windows**:
+```bash
+# Time deltas (from now backwards)
+python run_analysis.py --days 60        # Last 2 months
+python run_analysis.py --months 6       # Last 6 months
+python run_analysis.py --weeks 4        # Last month
+python run_analysis.py --years 1        # Last year
+
+# Specific date ranges
+python run_analysis.py --start 2024-01-01 --end 2024-03-01
+python run_analysis.py --start 2024-06-01  # From June to now
+
+# Preset options
+python run_analysis.py --quick           # Last 30 days
+python run_analysis.py --seasonal        # Last 6 months
+python run_analysis.py --full            # Full 2 years
+```
+
+**🔧 Analysis Type Control**:
+```bash
+# Focused analysis
+python run_analysis.py --months 3 --pv-only        # Only solar analysis
+python run_analysis.py --months 2 --thermal-only   # Only heating analysis
+python run_analysis.py --days 60 --base-load-only  # Only consumption analysis
+
+# Skip specific analyses
+python run_analysis.py --months 2 --no-thermal     # Skip heating analysis
+python run_analysis.py --days 30 --no-pv          # Skip solar analysis
+```
 
 **What it coordinates**:
 - **Data extraction**: Gets data from InfluxDB (millions of data points)
-- **PV analysis**: Solar production patterns and economics
-- **Thermal analysis**: Room-by-room heating behavior
-- **Base load analysis**: Background consumption patterns
-- **Relay patterns**: Heating system coordination
+- **PV analysis**: Solar production patterns and weather correlations
+- **Thermal analysis**: 17 interior rooms (outdoor sensors excluded) 
+- **Base load analysis**: Physics-based energy conservation approach
+- **Relay patterns**: Heating system coordination analysis
 - **Weather correlation**: How weather affects your energy use
 
-**Analysis Configuration**:
+**🔥 CRITICAL FIXES APPLIED**:
+- **Thermal analysis**: Now correctly excludes 'outside' outdoor sensors (17 rooms vs 18)
+- **Base load analysis**: Fixed method signature for proper data handling
+- **Relay analysis**: Fixed DataFrame/dictionary handling for pattern analysis
+- **Future warnings**: Updated deprecated pandas frequency strings ('T'→'min', 'H'→'h')
+- **STL decomposition**: Improved data validation and period selection
+
+**Enhanced Analysis Configuration**:
 ```python
 analysis_types = {
-    "pv": True,                    # Solar panel analysis
-    "thermal": True,               # Room heating analysis
-    "base_load": True,             # Background consumption
-    "relay_patterns": True,        # Heating coordination
+    "pv": True,                    # Solar panel analysis with weather correlation
+    "thermal": True,               # 17 interior room heating analysis
+    "base_load": True,             # Physics-based consumption analysis
+    "relay_patterns": True,        # Heating coordination patterns
     "weather_correlation": True,   # Weather impact analysis
 }
 ```
 
-**Default Analysis Period**: 2 years (730 days) of historical data
+**Smart Default**: 2 months (60 days) for optimal balance of data completeness and processing speed
 
 **Output Generation**:
 - **Interactive dashboards**: HTML files you can open in browser
 - **Data files**: Parquet format for further analysis
 - **Reports**: Executive summaries with recommendations
-- **Logs**: Detailed analysis progress and any issues
+- **Analysis logs**: Detailed progress tracking and error handling
 
-**Performance**: Processes ~2 years of data (10M+ data points) in 15-20 minutes
+**Performance**: 
+- **2 months**: 2-3 minutes (optimal for regular monitoring)
+- **6 months**: 5-8 minutes (seasonal analysis)
+- **2 years**: 15-20 minutes (full comprehensive analysis)
 
 ---
 
@@ -2186,11 +2237,23 @@ This validation script is the final "seal of approval" that PEMS v2 is ready to 
 
 **Simple explanation**: This document is your complete guide to getting the most out of PEMS v2's analysis capabilities:
 
-#### **🚀 Quick Start Guide**:
-- **Complete 2-Year Analysis**: `python analysis/run_analysis.py` (10-15 minutes)
-- **Recent 60 Days**: Quick performance check (2-3 minutes)
-- **Heating Season Only**: Winter analysis Oct-Mar (5-8 minutes)
-- **PV Season Only**: Summer analysis Apr-Sep (3-5 minutes)
+#### **🚀 Enhanced Quick Start Guide** ⚡ **NEW CLI INTERFACE**:
+```bash
+# Quick options
+python run_analysis.py --quick           # Last 30 days (2-3 minutes)
+python run_analysis.py --days 60         # Last 2 months (3-5 minutes)
+python run_analysis.py --seasonal        # Last 6 months (8-12 minutes)
+python run_analysis.py --full            # Complete 2-year analysis (15-20 minutes)
+
+# Focused analysis
+python run_analysis.py --months 2 --pv-only       # Solar analysis only
+python run_analysis.py --months 3 --thermal-only  # Heating analysis only
+python run_analysis.py --days 60 --no-thermal     # Skip heating analysis
+
+# Custom periods
+python run_analysis.py --start 2024-06-01 --end 2024-08-01  # Summer period
+python run_analysis.py --start 2023-12-01 --end 2024-02-28  # Winter period
+```
 
 #### **📊 What You Get After Analysis**:
 **Executive Summary Reports**:

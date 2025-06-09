@@ -735,7 +735,7 @@ class RelayDataProcessor:
         """Calculate system-wide relay statistics."""
         # Peak demand analysis
         daily_peak = total_power.resample("D").max()
-        monthly_peak = total_power.resample("M").max()
+        monthly_peak = total_power.resample("ME").max()
 
         # Simultaneous operation analysis
         simultaneous_rooms = 0
@@ -881,7 +881,7 @@ class PVDataProcessor:
         daily_production = (
             production_clean.resample("D").sum() * 0.25 / 1000
         )  # Convert to kWh
-        monthly_production = daily_production.resample("M").sum()
+        monthly_production = daily_production.resample("ME").sum()
 
         # Identify peak production periods
         peak_days = daily_production.nlargest(30)  # Top 30 production days
@@ -1067,7 +1067,7 @@ class PVDataProcessor:
             "max_daily_curtailment_kwh": daily_curtailment.max(),
             "curtailment_ratio": curtailment_ratio.mean(),
             "high_curtailment_days": daily_curtailment.nlargest(10).index.tolist(),
-            "curtailment_by_month": daily_curtailment.resample("M").sum().to_dict(),
+            "curtailment_by_month": daily_curtailment.resample("ME").sum().to_dict(),
         }
 
         return analysis

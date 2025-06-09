@@ -35,6 +35,7 @@ class BaseLoadAnalyzer:
         grid_data: pd.DataFrame,  # Changed from consumption_data
         pv_data: pd.DataFrame,
         room_data: Dict[str, pd.DataFrame],
+        relay_data: Optional[Dict[str, pd.DataFrame]] = None,
         ev_data: Optional[pd.DataFrame] = None,
         battery_data: Optional[pd.DataFrame] = None,
     ) -> Dict[str, Any]:
@@ -45,22 +46,55 @@ class BaseLoadAnalyzer:
             grid_data: Grid import/export data
             pv_data: PV production data
             room_data: Room temperature data for heating estimation
+            relay_data: Room relay states for accurate heating calculation
             ev_data: EV charging data (optional)
             battery_data: Battery charge/discharge data (optional)
 
         Returns:
             Dictionary with base load analysis results
         """
-        self.logger.info("Starting base load analysis")
+        self.logger.info("Starting base load analysis...")
 
+        # --- Input Validation Logging ---
         if grid_data.empty:
-            self.logger.warning("No grid data provided")
-            return {}
+            self.logger.error("Grid data is empty. Aborting base load analysis.")
+            return {"error": "Empty grid data"}
+        if pv_data.empty:
+            self.logger.warning(
+                "PV data is empty. Base load calculation may be less accurate."
+            )
+        if not room_data or all(
+            df.empty for df in room_data.values() if isinstance(df, pd.DataFrame)
+        ):
+            self.logger.warning(
+                "Room data is empty. Controllable load cannot be determined."
+            )
+
+        self.logger.debug(
+            f"Grid data shape: {grid_data.shape}, columns: {grid_data.columns.tolist()}"
+        )
+        self.logger.debug(
+            f"PV data shape: {pv_data.shape}, columns: {pv_data.columns.tolist()}"
+        )
+        self.logger.debug(
+            f"Room data rooms: {list(room_data.keys()) if room_data else 'None'}"
+        )
+
+        if relay_data:
+            self.logger.debug(f"Relay data rooms: {list(relay_data.keys())}")
+        if ev_data is not None and not ev_data.empty:
+            self.logger.debug(
+                f"EV data shape: {ev_data.shape}, columns: {ev_data.columns.tolist()}"
+            )
+        if battery_data is not None and not battery_data.empty:
+            self.logger.debug(
+                f"Battery data shape: {battery_data.shape}, columns: {battery_data.columns.tolist()}"
+            )
 
         results = {}
 
-        # Prepare heating data from room data
-        heating_data = self._prepare_heating_data(room_data)
+        # Prepare heating data from room data and relay states
+        heating_data = self._prepare_heating_data(room_data, relay_data)
 
         # Calculate base load using energy conservation approach
         base_load = self._calculate_base_load(
@@ -111,27 +145,77 @@ class BaseLoadAnalyzer:
         """
         self.logger.info("Calculating base load with new energy conservation logic.")
 
-        # --- 1. Align all data to a common time index (e.g., 15 minutes) ---
+        # --- 1. Ensure proper datetime index and align data ---
+        # Convert index to datetime if needed
+        if not isinstance(grid_data.index, pd.DatetimeIndex):
+            if "timestamp" in grid_data.index.names or "timestamp" in grid_data.columns:
+                grid_data = grid_data.reset_index().set_index("timestamp")
+            else:
+                self.logger.warning("Grid data does not have proper datetime index")
+                return pd.DataFrame()
+
+        if not isinstance(pv_data.index, pd.DatetimeIndex):
+            if "timestamp" in pv_data.index.names or "timestamp" in pv_data.columns:
+                pv_data = pv_data.reset_index().set_index("timestamp")
+            else:
+                self.logger.warning("PV data does not have proper datetime index")
+                return pd.DataFrame()
+
+        if (
+            heating_data is not None
+            and not heating_data.empty
+            and not isinstance(heating_data.index, pd.DatetimeIndex)
+        ):
+            if (
+                "timestamp" in heating_data.index.names
+                or "timestamp" in heating_data.columns
+            ):
+                heating_data = heating_data.reset_index().set_index("timestamp")
+
+        if (
+            battery_data is not None
+            and not battery_data.empty
+            and not isinstance(battery_data.index, pd.DatetimeIndex)
+        ):
+            if (
+                "timestamp" in battery_data.index.names
+                or "timestamp" in battery_data.columns
+            ):
+                battery_data = battery_data.reset_index().set_index("timestamp")
+
         # Find a common time range across all essential data sources
         common_index = grid_data.index.intersection(pv_data.index)
         if battery_data is not None and not battery_data.empty:
             common_index = common_index.intersection(battery_data.index)
         if common_index.empty:
-            self.logger.warning("No common time index found between grid, PV, and battery data.")
+            self.logger.warning(
+                "No common time index found between grid, PV, and battery data."
+            )
             return pd.DataFrame()
 
         # Resample and align all data sources
-        freq = "15T"
+        freq = "15min"  # Updated to use new pandas frequency string
         grid = grid_data.resample(freq).mean().reindex(common_index, method="nearest")
         pv = pv_data.resample(freq).mean().reindex(common_index, method="nearest")
-        heating = (
-            heating_data.resample(freq).sum().reindex(common_index, method="nearest")
-        )  # Sum power from all rooms
+
+        # Handle heating data
+        if heating_data is not None and not heating_data.empty:
+            heating = (
+                heating_data.resample(freq)
+                .sum()
+                .reindex(common_index, method="nearest")
+            )
+        else:
+            heating = pd.DataFrame(index=common_index)
 
         # --- 2. Extract individual energy flows (in Watts) ---
         # Use specific column names from your documentation
-        grid_import = grid.get("ACPowerToUser", pd.Series(0, index=common_index)).fillna(0)
-        grid_export = grid.get("ACPowerToGrid", pd.Series(0, index=common_index)).fillna(0)
+        grid_import = grid.get(
+            "ACPowerToUser", pd.Series(0, index=common_index)
+        ).fillna(0)
+        grid_export = grid.get(
+            "ACPowerToGrid", pd.Series(0, index=common_index)
+        ).fillna(0)
         pv_production = pv.get("InputPower", pd.Series(0, index=common_index)).fillna(0)
 
         # If specific columns don't exist, fall back to generic column detection
@@ -151,7 +235,10 @@ class BaseLoadAnalyzer:
             grid_export_cols = [
                 col
                 for col in grid.columns
-                if any(keyword in col.lower() for keyword in ["grid_export", "export", "to_grid"])
+                if any(
+                    keyword in col.lower()
+                    for keyword in ["grid_export", "export", "to_grid"]
+                )
             ]
             if grid_export_cols:
                 grid_export = grid[grid_export_cols[0]].fillna(0)
@@ -165,11 +252,17 @@ class BaseLoadAnalyzer:
         battery_discharge = pd.Series(0, index=common_index)
 
         if battery_data is not None and not battery_data.empty:
-            battery = battery_data.resample(freq).mean().reindex(common_index, method="nearest")
+            battery = (
+                battery_data.resample(freq)
+                .mean()
+                .reindex(common_index, method="nearest")
+            )
 
             # Look for specific charge/discharge columns
             charge_cols = [
-                col for col in battery.columns if "charge" in col.lower() and "power" in col.lower()
+                col
+                for col in battery.columns
+                if "charge" in col.lower() and "power" in col.lower()
             ]
             discharge_cols = [
                 col
@@ -189,18 +282,22 @@ class BaseLoadAnalyzer:
                     "DischargePower", pd.Series(0, index=common_index)
                 ).fillna(0)
 
-        heating_load = heating.get("total_heating_power", pd.Series(0, index=common_index)).fillna(
-            0
-        )
+        heating_load = heating.get(
+            "total_heating_power", pd.Series(0, index=common_index)
+        ).fillna(0)
 
         # If total_heating_power doesn't exist, calculate it from room data
         if heating_load.sum() == 0 and not heating.empty:
-            heating_load = self._estimate_heating_consumption_from_df(heating, common_index)
+            heating_load = self._estimate_heating_consumption_from_df(
+                heating, common_index
+            )
 
         # Handle optional EV data
         ev_charge = pd.Series(0, index=common_index)
         if ev_data is not None and not ev_data.empty:
-            ev_resampled = ev_data.resample(freq).mean().reindex(common_index, method="nearest")
+            ev_resampled = (
+                ev_data.resample(freq).mean().reindex(common_index, method="nearest")
+            )
             ev_cols = [
                 col
                 for col in ev_resampled.columns
@@ -219,18 +316,57 @@ class BaseLoadAnalyzer:
         # The remainder is the total power consumed by the house
         total_house_load = power_sources - power_sinks
 
-        # --- 4. Calculate Base Load by subtracting controllable loads ---
-        # Base load is what remains after subtracting heating and EV charging
-        base_load = total_house_load - heating_load - ev_charge
+        # --- 4. Calculate Base Load using statistical approach ---
+        # Base load should be the minimum baseline consumption, not total minus other loads
+        # Use a rolling minimum approach to identify the true baseline
 
-        # Ensure base load is non-negative
-        base_load_clipped = base_load.clip(lower=0)
+        # First, try the energy conservation approach
+        controllable_load = heating_load + ev_charge
+        conservation_base_load = total_house_load - controllable_load
+        conservation_base_load_clipped = conservation_base_load.clip(lower=0)
+
+        # Second, use statistical approach: rolling quantile for robust baseline detection
+        # A 24-hour window and a low quantile (5%) are robust settings for base load identification
+        window_hours = 24
+        window_size = (
+            window_hours * 4
+        )  # 24 hours * 4 (15-min intervals per hour) = 96 periods
+        window_size = min(window_size, len(total_house_load))
+        if window_size < 4:
+            window_size = 4
+
+        # Use 24-hour rolling window with 5% quantile for robust base load estimation
+        statistical_base_load = total_house_load.rolling(
+            window=window_size, center=True, min_periods=max(1, window_size // 4)
+        ).quantile(0.05)
+
+        # Primary method: Use statistical approach as more robust
+        # Statistical method is more reliable as it doesn't depend on accurate controllable load estimates
+        base_load_clipped = statistical_base_load.clip(lower=0)
+        calculation_method = "statistical_minimum"
+
+        # Secondary validation: Check conservation approach for comparison
+        if (
+            controllable_load.sum() > total_house_load.sum() * 0.1
+        ):  # If controllable loads are > 10%
+            conservation_diff = abs(
+                conservation_base_load_clipped.mean() - statistical_base_load.mean()
+            )
+            statistical_std = statistical_base_load.std()
+
+            # Log significant differences for analysis
+            if conservation_diff > statistical_std:
+                self.logger.warning(
+                    f"Large difference between methods: conservation={conservation_base_load_clipped.mean():.1f}W, "
+                    f"statistical={statistical_base_load.mean():.1f}W (diff={conservation_diff:.1f}W)"
+                )
 
         # --- 5. Assemble the final DataFrame for analysis ---
         analysis_df = pd.DataFrame(index=common_index)
         analysis_df["total_house_load"] = total_house_load
         analysis_df["heating_load"] = heating_load
         analysis_df["ev_load"] = ev_charge
+        analysis_df["controllable_load"] = controllable_load
         analysis_df["base_load"] = base_load_clipped  # This is the corrected base load
 
         # Add time features for subsequent analysis
@@ -239,40 +375,88 @@ class BaseLoadAnalyzer:
         analysis_df["is_weekend"] = analysis_df["weekday"].isin([5, 6])
         analysis_df["month"] = analysis_df.index.month
 
+        # Add metadata about calculation method
+        analysis_df.attrs["calculation_method"] = calculation_method
+        analysis_df.attrs["controllable_load_percentage"] = (
+            controllable_load.sum() / total_house_load.sum() * 100
+            if total_house_load.sum() > 0
+            else 0
+        )
+
+        avg_base_load = base_load_clipped.mean()
         self.logger.info(
-            f"Successfully calculated base load. Average: {analysis_df['base_load'].mean():.2f}W"
+            f"Successfully calculated base load using {calculation_method} method. "
+            f"Average statistical base load: {avg_base_load:.1f}W. "
+            f"Average: {analysis_df['base_load'].mean():.2f}W, "
+            f"Controllable load: {analysis_df.attrs['controllable_load_percentage']:.1f}%"
         )
 
         return analysis_df
 
-    def _prepare_heating_data(self, room_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-        """Prepare heating data from room data dictionary."""
-        if not room_data:
-            return pd.DataFrame()
-
-        # Combine all room data into a single DataFrame
+    def _prepare_heating_data(
+        self,
+        room_data: Dict[str, pd.DataFrame],
+        relay_data: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> pd.DataFrame:
+        """Prepare heating data from room data and relay states."""
         heating_data_dict = {}
 
-        for room_name, room_df in room_data.items():
-            if room_df.empty:
-                continue
+        # Prioritize relay data if available (more accurate for heating states)
+        if relay_data:
+            self.logger.info(
+                f"Using relay data for heating calculation from {len(relay_data)} rooms"
+            )
+            for room_name, relay_df in relay_data.items():
+                if relay_df.empty:
+                    continue
 
-            # Look for heating status columns
-            heating_cols = [
-                col
-                for col in room_df.columns
-                if any(keyword in col.lower() for keyword in ["heating", "heat", "state"])
-            ]
+                # Look for heating relay columns
+                heating_cols = [
+                    col
+                    for col in relay_df.columns
+                    if any(
+                        keyword in col.lower()
+                        for keyword in ["heating", "heat", "state", "relay"]
+                    )
+                ]
 
-            for col in heating_cols:
-                # Use room name as prefix for column name
-                new_col_name = f"{room_name}_{col}"
-                heating_data_dict[new_col_name] = room_df[col]
+                for col in heating_cols:
+                    # Use room name as prefix for column name
+                    new_col_name = f"{room_name}_{col}"
+                    heating_data_dict[new_col_name] = relay_df[col]
+
+        # Fallback to room data if relay data not available or insufficient
+        elif room_data:
+            self.logger.info(
+                f"Using room temperature data for heating estimation from {len(room_data)} rooms"
+            )
+            for room_name, room_df in room_data.items():
+                if room_df.empty:
+                    continue
+
+                # Look for heating status columns
+                heating_cols = [
+                    col
+                    for col in room_df.columns
+                    if any(
+                        keyword in col.lower()
+                        for keyword in ["heating", "heat", "state"]
+                    )
+                ]
+
+                for col in heating_cols:
+                    # Use room name as prefix for column name
+                    new_col_name = f"{room_name}_{col}"
+                    heating_data_dict[new_col_name] = room_df[col]
 
         if not heating_data_dict:
+            self.logger.warning("No heating data found in either relay or room data")
             return pd.DataFrame()
 
         heating_df = pd.DataFrame(heating_data_dict)
+        self.logger.info(
+            f"Prepared heating data with {len(heating_df.columns)} heating columns"
+        )
         return heating_df
 
     def _estimate_heating_consumption_from_df(
@@ -285,7 +469,10 @@ class BaseLoadAnalyzer:
         heating_cols = [
             col
             for col in heating_df.columns
-            if any(keyword in col.lower() for keyword in ["heating", "heat", "state", "power"])
+            if any(
+                keyword in col.lower()
+                for keyword in ["heating", "heat", "state", "power"]
+            )
         ]
 
         for col in heating_cols:
@@ -296,9 +483,10 @@ class BaseLoadAnalyzer:
                 # Assume it's a status column, estimate power based on room
                 room_name = col.split("_")[0] if "_" in col else "unknown"
                 try:
-                    from pems_v2.config.energy_settings import get_room_power
+                    from config.settings import PEMSSettings
 
-                    room_power_kw = get_room_power(room_name)
+                    settings = PEMSSettings()
+                    room_power_kw = settings.get_room_power(room_name)
                     heating_power = (
                         heating_df[col].fillna(0) * room_power_kw * 1000
                     )  # Convert kW to W
@@ -328,25 +516,34 @@ class BaseLoadAnalyzer:
             heating_cols = [
                 col
                 for col in room_df.columns
-                if any(keyword in col.lower() for keyword in ["heating", "heat", "state"])
+                if any(
+                    keyword in col.lower() for keyword in ["heating", "heat", "state"]
+                )
             ]
 
             if heating_cols:
                 heating_status = room_df[heating_cols[0]]
 
                 # Resample to target frequency
-                heating_resampled = heating_status.resample(target_index.freq or "15T").mean()
-                heating_aligned = heating_resampled.reindex(target_index, method="nearest")
+                heating_resampled = heating_status.resample(
+                    target_index.freq or "15min"
+                ).mean()
+                heating_aligned = heating_resampled.reindex(
+                    target_index, method="nearest"
+                )
 
                 # Use actual room power rating from configuration
                 try:
-                    from pems_v2.config.energy_settings import get_room_power
+                    from config.settings import PEMSSettings
 
-                    room_power_kw = get_room_power(room_name)
+                    settings = PEMSSettings()
+                    room_power_kw = settings.get_room_power(room_name)
                 except ImportError:
                     # Fallback to default room power
                     room_power_kw = 1.0  # 1 kW default
-                heating_power = heating_aligned.fillna(0) * room_power_kw * 1000  # Convert kW to W
+                heating_power = (
+                    heating_aligned.fillna(0) * room_power_kw * 1000
+                )  # Convert kW to W
 
                 if total_heating is None:
                     total_heating = heating_power
@@ -355,7 +552,9 @@ class BaseLoadAnalyzer:
 
         return total_heating
 
-    def _calculate_base_load_stats(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _calculate_base_load_stats(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Calculate basic base load statistics."""
         base_load = base_load_data["base_load"]
 
@@ -366,34 +565,39 @@ class BaseLoadAnalyzer:
             "min_base_load": base_load.min(),
             "max_base_load": base_load.max(),
             "std_base_load": base_load.std(),
-            "total_energy_kwh": (base_load.sum() * 0.25) / 1000,  # 15-min intervals to kWh
-            "base_load_factor": base_load.mean() / base_load.max() if base_load.max() > 0 else 0,
+            "total_energy_kwh": (base_load.sum() * 0.25)
+            / 1000,  # 15-min intervals to kWh
+            "base_load_factor": base_load.mean() / base_load.max()
+            if base_load.max() > 0
+            else 0,
+            "calculation_method": base_load_data.attrs.get(
+                "calculation_method", "unknown"
+            ),
+            "controllable_load_detected": base_load_data.attrs.get(
+                "controllable_load_percentage", 0
+            ),
         }
 
         # Percentage of total consumption
-        if "total_consumption" in base_load_data.columns:
-            total_consumption = base_load_data["total_consumption"]
+        if "total_house_load" in base_load_data.columns:
+            total_house_load = base_load_data["total_house_load"]
             stats["base_load_percentage"] = (
-                (base_load.sum() / total_consumption.sum() * 100)
-                if total_consumption.sum() > 0
+                (base_load.sum() / total_house_load.sum() * 100)
+                if total_house_load.sum() > 0
                 else 0
             )
 
             # Breakdown of other components
             components = [
-                "pv_self_consumption",
-                "heating_consumption",
-                "ev_consumption",
-                "battery_consumption",  # Legacy battery column
-                "battery_charge_power",  # New battery charging
-                "battery_discharge_power",  # New battery discharging
+                "heating_load",
+                "ev_load",
             ]
             for component in components:
                 if component in base_load_data.columns:
                     component_sum = base_load_data[component].sum()
                     stats[f"{component}_percentage"] = (
-                        (component_sum / total_consumption.sum() * 100)
-                        if total_consumption.sum() > 0
+                        (component_sum / total_house_load.sum() * 100)
+                        if total_house_load.sum() > 0
                         else 0
                     )
 
@@ -401,15 +605,19 @@ class BaseLoadAnalyzer:
             if "net_battery_power" in base_load_data.columns:
                 net_battery_sum = base_load_data["net_battery_power"].sum()
                 stats["net_battery_impact_percentage"] = (
-                    (net_battery_sum / total_consumption.sum() * 100)
-                    if total_consumption.sum() > 0
+                    (net_battery_sum / total_house_load.sum() * 100)
+                    if total_house_load.sum() > 0
                     else 0
                 )
                 stats["battery_charging_energy_kwh"] = (
-                    base_load_data.get("battery_charge_power", pd.Series()).sum() * 0.25 / 1000
+                    base_load_data.get("battery_charge_power", pd.Series()).sum()
+                    * 0.25
+                    / 1000
                 )
                 stats["battery_discharging_energy_kwh"] = (
-                    base_load_data.get("battery_discharge_power", pd.Series()).sum() * 0.25 / 1000
+                    base_load_data.get("battery_discharge_power", pd.Series()).sum()
+                    * 0.25
+                    / 1000
                 )
 
         # Time-based statistics
@@ -421,7 +629,9 @@ class BaseLoadAnalyzer:
                 "peak_load": hourly_avg.max(),
                 "minimum_load": hourly_avg.min(),
                 "peak_to_minimum_ratio": (
-                    hourly_avg.max() / hourly_avg.min() if hourly_avg.min() > 0 else float("inf")
+                    hourly_avg.max() / hourly_avg.min()
+                    if hourly_avg.min() > 0
+                    else float("inf")
                 ),
             }
         )
@@ -435,7 +645,9 @@ class BaseLoadAnalyzer:
         patterns = {}
 
         # Hourly patterns
-        hourly_profile = base_load.groupby(base_load.index.hour).agg(["mean", "std", "min", "max"])
+        hourly_profile = base_load.groupby(base_load.index.hour).agg(
+            ["mean", "std", "min", "max"]
+        )
         patterns["hourly_profile"] = hourly_profile.to_dict()
 
         # Weekday vs weekend patterns
@@ -450,8 +662,12 @@ class BaseLoadAnalyzer:
                 if weekday_load.mean() > 0
                 else 0
             ),
-            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour).mean().idxmax(),
-            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour).mean().idxmax(),
+            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour)
+            .mean()
+            .idxmax(),
+            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour)
+            .mean()
+            .idxmax(),
         }
 
         # Day of week patterns
@@ -469,7 +685,9 @@ class BaseLoadAnalyzer:
         patterns["daily_profile"] = daily_profile.to_dict()
 
         # Monthly patterns
-        monthly_profile = base_load.groupby(base_load.index.month).agg(["mean", "std", "sum"])
+        monthly_profile = base_load.groupby(base_load.index.month).agg(
+            ["mean", "std", "sum"]
+        )
         patterns["monthly_profile"] = monthly_profile.to_dict()
 
         # Identify peak and off-peak periods
@@ -483,34 +701,55 @@ class BaseLoadAnalyzer:
             "peak_hours": peak_hours,
             "off_peak_hours": off_peak_hours,
             "peak_load_avg": hourly_mean[peak_hours].mean() if peak_hours else None,
-            "off_peak_load_avg": hourly_mean[off_peak_hours].mean() if off_peak_hours else None,
+            "off_peak_load_avg": hourly_mean[off_peak_hours].mean()
+            if off_peak_hours
+            else None,
         }
 
         return patterns
 
-    def _analyze_seasonal_patterns(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _analyze_seasonal_patterns(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Analyze seasonal patterns using decomposition."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 365 * 24 * 4:  # Less than 1 year of 15-min data
-            return {"warning": "Insufficient data for seasonal analysis (need at least 1 year)"}
+            return {
+                "warning": "Insufficient data for seasonal analysis (need at least 1 year)"
+            }
 
         try:
             # Resample to daily data for seasonal analysis
-            daily_load = base_load.resample("D").mean()
+            daily_load = base_load.resample("D").mean().dropna()
+
+            # Check if we have enough non-null daily data points
+            if (
+                len(daily_load) < 730
+            ):  # At least 2 years of daily data for reliable seasonal patterns
+                return {
+                    "warning": f"Insufficient daily data points for seasonal analysis (have {len(daily_load)}, need at least 730)"
+                }
 
             # STL decomposition
-            stl = STL(daily_load.dropna(), seasonal=365)  # Annual seasonality
+            # Use a smaller seasonal period if we don't have enough data for annual seasonality
+            seasonal_period = min(365, len(daily_load) // 3)  # At least 3 cycles
+            if seasonal_period < 7:  # If less than a week, try weekly pattern
+                seasonal_period = 7
+
+            stl = STL(daily_load, seasonal=seasonal_period)
             result = stl.fit()
 
             seasonal_analysis = {
                 "seasonal_strength": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var()),
-                "trend_strength": 1 - (result.resid.var() / (result.trend + result.resid).var()),
+                "trend_strength": 1
+                - (result.resid.var() / (result.trend + result.resid).var()),
                 "has_strong_seasonal": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var())
                 > 0.6,
-                "has_strong_trend": 1 - (result.resid.var() / (result.trend + result.resid).var())
+                "has_strong_trend": 1
+                - (result.resid.var() / (result.trend + result.resid).var())
                 > 0.6,
             }
 
@@ -528,9 +767,15 @@ class BaseLoadAnalyzer:
                 if not season_data.empty:
                     seasonal_profiles[season] = {
                         "mean_load": season_data.mean(),
-                        "peak_hour": season_data.groupby(season_data.index.hour).mean().idxmax(),
-                        "peak_load": season_data.groupby(season_data.index.hour).mean().max(),
-                        "min_load": season_data.groupby(season_data.index.hour).mean().min(),
+                        "peak_hour": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .idxmax(),
+                        "peak_load": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .max(),
+                        "min_load": season_data.groupby(season_data.index.hour)
+                        .mean()
+                        .min(),
                     }
 
             seasonal_analysis["seasonal_profiles"] = seasonal_profiles
@@ -581,7 +826,7 @@ class BaseLoadAnalyzer:
             day_data = base_load[base_load.index.date == date]
             if len(day_data) >= 80:  # At least 80 data points (20 hours of 15-min data)
                 # Resample to hourly and interpolate missing values
-                hourly_data = day_data.resample("H").mean().interpolate()
+                hourly_data = day_data.resample("h").mean().interpolate()
                 if len(hourly_data) == 24:
                     daily_profiles.append(hourly_data.values)
                     dates.append(date)
@@ -649,7 +894,9 @@ class BaseLoadAnalyzer:
     def _find_optimal_clusters(self, data: np.ndarray, max_k: int = 10) -> int:
         """Find optimal number of clusters using elbow method."""
         inertias = []
-        k_range = range(2, min(max_k + 1, len(data) // 5))  # Ensure reasonable cluster sizes
+        k_range = range(
+            2, min(max_k + 1, len(data) // 5)
+        )  # Ensure reasonable cluster sizes
 
         for k in k_range:
             kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -664,7 +911,9 @@ class BaseLoadAnalyzer:
         delta_deltas = np.diff(deltas)
 
         if len(delta_deltas) > 0:
-            elbow_idx = np.argmax(delta_deltas) + 2  # +2 because of double diff and 0-indexing
+            elbow_idx = (
+                np.argmax(delta_deltas) + 2
+            )  # +2 because of double diff and 0-indexing
             return k_range[elbow_idx] if elbow_idx < len(k_range) else k_range[-1]
         else:
             return 3  # Default
@@ -684,13 +933,17 @@ class BaseLoadAnalyzer:
         lower_bound = Q1 - 1.5 * IQR
         upper_bound = Q3 + 1.5 * IQR
 
-        statistical_anomalies = base_load[(base_load < lower_bound) | (base_load > upper_bound)]
+        statistical_anomalies = base_load[
+            (base_load < lower_bound) | (base_load > upper_bound)
+        ]
 
         # Isolation Forest for more sophisticated anomaly detection
         if len(base_load) > 200:
             try:
                 # Prepare features for anomaly detection
-                features = base_load_data[["base_load", "hour", "weekday", "month"]].copy()
+                features = base_load_data[
+                    ["base_load", "hour", "weekday", "month"]
+                ].copy()
                 features["hour_sin"] = np.sin(2 * np.pi * features["hour"] / 24)
                 features["hour_cos"] = np.cos(2 * np.pi * features["hour"] / 24)
                 features["weekday_sin"] = np.sin(2 * np.pi * features["weekday"] / 7)
@@ -732,8 +985,12 @@ class BaseLoadAnalyzer:
             },
             "ml_anomalies": {
                 "count": len(ml_anomalies),
-                "percentage": len(ml_anomalies) / len(base_load) * 100 if len(base_load) > 0 else 0,
-                "sample_dates": ml_anomalies.index[:10].tolist() if not ml_anomalies.empty else [],
+                "percentage": len(ml_anomalies) / len(base_load) * 100
+                if len(base_load) > 0
+                else 0,
+                "sample_dates": ml_anomalies.index[:10].tolist()
+                if not ml_anomalies.empty
+                else [],
             },
             "low_consumption_events": {
                 "count": len(low_consumption_anomalies),
@@ -747,12 +1004,16 @@ class BaseLoadAnalyzer:
             },
         }
 
-    def _evaluate_prediction_models(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _evaluate_prediction_models(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Evaluate different prediction models for base load."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 200:
-            return {"warning": "Insufficient data for model evaluation (need at least 200 records)"}
+            return {
+                "warning": "Insufficient data for model evaluation (need at least 200 records)"
+            }
 
         # Prepare features
         features = base_load_data[["hour", "weekday", "month"]].copy()
@@ -770,8 +1031,12 @@ class BaseLoadAnalyzer:
             features[f"load_lag_{lag}"] = base_load.shift(lag)
 
         # Add rolling statistics
-        features["load_rolling_mean_24"] = base_load.rolling(window=24, min_periods=1).mean()
-        features["load_rolling_std_24"] = base_load.rolling(window=24, min_periods=1).std()
+        features["load_rolling_mean_24"] = base_load.rolling(
+            window=24, min_periods=1
+        ).mean()
+        features["load_rolling_std_24"] = base_load.rolling(
+            window=24, min_periods=1
+        ).std()
 
         # Remove original categorical features
         features = features.drop(["hour", "weekday", "month"], axis=1)
@@ -819,7 +1084,10 @@ class BaseLoadAnalyzer:
                     scores["r2"].append(r2_score(y_test, y_pred))
 
                     # MAPE calculation with handling for zero values
-                    mape = np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1))) * 100
+                    mape = (
+                        np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1)))
+                        * 100
+                    )
                     scores["mape"].append(mape)
 
                 results[name] = {
@@ -836,9 +1104,13 @@ class BaseLoadAnalyzer:
                 # Feature importance for Random Forest
                 if name == "Random Forest":
                     model.fit(X_scaled, y_clean)
-                    feature_importance = dict(zip(X_clean.columns, model.feature_importances_))
+                    feature_importance = dict(
+                        zip(X_clean.columns, model.feature_importances_)
+                    )
                     sorted_importance = dict(
-                        sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
+                        sorted(
+                            feature_importance.items(), key=lambda x: x[1], reverse=True
+                        )
                     )
                     results[name]["feature_importance"] = sorted_importance
 
@@ -864,14 +1136,16 @@ class BaseLoadAnalyzer:
 
         return results
 
-    def _analyze_energy_efficiency(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
+    def _analyze_energy_efficiency(
+        self, base_load_data: pd.DataFrame
+    ) -> Dict[str, Any]:
         """Analyze energy efficiency patterns."""
         base_load = base_load_data["base_load"]
 
         # Calculate efficiency metrics
-        hourly_consumption = base_load.resample("H").sum()
+        hourly_consumption = base_load.resample("h").sum()
         daily_consumption = base_load.resample("D").sum()
-        monthly_consumption = base_load.resample("M").sum()
+        monthly_consumption = base_load.resample("ME").sum()
 
         efficiency_metrics = {
             "mean_hourly_consumption": hourly_consumption.mean(),
@@ -905,11 +1179,15 @@ class BaseLoadAnalyzer:
                 {
                     "most_efficient_days": {
                         "mean_consumption": most_efficient_days.mean(),
-                        "sample_dates": most_efficient_days.index.strftime("%Y-%m-%d").tolist(),
+                        "sample_dates": most_efficient_days.index.strftime(
+                            "%Y-%m-%d"
+                        ).tolist(),
                     },
                     "least_efficient_days": {
                         "mean_consumption": least_efficient_days.mean(),
-                        "sample_dates": least_efficient_days.index.strftime("%Y-%m-%d").tolist(),
+                        "sample_dates": least_efficient_days.index.strftime(
+                            "%Y-%m-%d"
+                        ).tolist(),
                     },
                     "efficiency_ratio": (
                         least_efficient_days.mean() / most_efficient_days.mean()
@@ -928,7 +1206,9 @@ class BaseLoadAnalyzer:
                 "mean_night_consumption": night_consumption.mean(),
                 "min_night_consumption": night_consumption.min(),
                 "night_load_factor": (
-                    night_consumption.mean() / base_load.mean() if base_load.mean() > 0 else 0
+                    night_consumption.mean() / base_load.mean()
+                    if base_load.mean() > 0
+                    else 0
                 ),
             }
 
@@ -991,7 +1271,9 @@ class BaseLoadAnalyzer:
             if z_score < -1.5:  # Lower threshold for low consumption
                 current_low_streak.append(idx)
             else:
-                if len(current_low_streak) >= 48:  # At least 12 hours of low consumption
+                if (
+                    len(current_low_streak) >= 48
+                ):  # At least 12 hours of low consumption
                     consecutive_low.append(
                         {
                             "start": current_low_streak[0],
@@ -1018,14 +1300,18 @@ class BaseLoadAnalyzer:
                 "count": len(high_consumption_events),
                 "sample_dates": high_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    high_consumption_events.mean() if not high_consumption_events.empty else None
+                    high_consumption_events.mean()
+                    if not high_consumption_events.empty
+                    else None
                 ),
             },
             "low_consumption_events": {
                 "count": len(low_consumption_events),
                 "sample_dates": low_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    low_consumption_events.mean() if not low_consumption_events.empty else None
+                    low_consumption_events.mean()
+                    if not low_consumption_events.empty
+                    else None
                 ),
             },
             "consecutive_high_consumption": {

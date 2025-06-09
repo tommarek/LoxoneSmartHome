@@ -51,8 +51,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-
-from config.settings import ThermalSettings, MQTTSettings, PEMSSettings
+from config.settings import MQTTSettings, PEMSSettings, ThermalSettings
 
 # Note: In production, these would import from the main project's MQTT client
 # from utils.async_mqtt_client import AsyncMQTTClient
@@ -233,7 +232,10 @@ class HeatingController:
         self.logger = logging.getLogger(__name__)
 
         # Room configuration from settings
-        self.rooms = {room: {"power_kw": power} for room, power in settings.room_power_ratings_kw.items()}
+        self.rooms = {
+            room: {"power_kw": power}
+            for room, power in settings.room_power_ratings_kw.items()
+        }
 
         # MQTT configuration from settings
         if settings.mqtt:
@@ -257,11 +259,11 @@ class HeatingController:
 
     def get_target_temp(self, room_name: str, hour: int) -> float:
         """Get target temperature for a room at a specific hour.
-        
+
         Args:
             room_name: Name of the room
             hour: Hour of day (0-23)
-            
+
         Returns:
             Target temperature in °C
         """

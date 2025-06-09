@@ -25,7 +25,7 @@ class FeatureEngineer:
         """Initialize the feature engineer."""
         self.logger = logging.getLogger(f"{__name__}.FeatureEngineer")
         self.scalers: Dict[str, StandardScaler] = {}
-        
+
         # Load room power ratings from settings
         settings = PEMSSettings()
         self.room_power_ratings = settings.room_power_ratings_kw
@@ -328,10 +328,7 @@ class FeatureEngineer:
         if heating_cols:
             features["total_heating_power"] = features[heating_cols].sum(axis=1)
             features["heating_power_ratio"] = features["total_heating_power"] / (
-                sum(
-                    self.room_power_ratings[room]
-                    for room in self.room_power_ratings
-                )
+                sum(self.room_power_ratings[room] for room in self.room_power_ratings)
                 * 1000
             )  # Fraction of total capacity
 

@@ -212,7 +212,9 @@ class DataExtractor:
         }
         self.max_missing_percentage = self.quality_thresholds["max_missing_percentage"]
         self.max_gap_hours = self.quality_thresholds["max_gap_hours"]
-        self.min_data_points_per_day = self.quality_thresholds["min_data_points_per_day"]
+        self.min_data_points_per_day = self.quality_thresholds[
+            "min_data_points_per_day"
+        ]
 
         # Operational parameters
         self.chunk_size_hours = (

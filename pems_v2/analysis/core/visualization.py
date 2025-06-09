@@ -557,7 +557,7 @@ class AnalysisVisualizer:
         # 4. Economic Opportunity Analysis
         # Calculate potential revenue from curtailed energy
         if "curtailment" in pre_export.columns:
-            monthly_curtailment = pre_export.resample("M")["curtailment"].sum()
+            monthly_curtailment = pre_export.resample("ME")["curtailment"].sum()
 
             # Estimate potential revenue at average market price
             avg_price = (
@@ -621,7 +621,7 @@ class AnalysisVisualizer:
             axes[0, 1].set_xlabel("Power (kW)")
 
             # Monthly averages
-            monthly_avg = pv_data.resample("M")["InputPower"].mean()
+            monthly_avg = pv_data.resample("ME")["InputPower"].mean()
             axes[1, 0].bar(range(len(monthly_avg)), monthly_avg.values)
             axes[1, 0].set_title("Monthly Average Production")
             axes[1, 0].set_ylabel("Power (kW)")
@@ -1036,8 +1036,8 @@ class AnalysisVisualizer:
 
         # 3. Monthly Load Patterns
         if len(load_data) > 30 * 24 * 12:  # At least 30 days
-            monthly_avg = load_data.resample("M").mean()
-            monthly_max = load_data.resample("M").max()
+            monthly_avg = load_data.resample("ME").mean()
+            monthly_max = load_data.resample("ME").max()
 
             fig.add_trace(
                 go.Scatter(

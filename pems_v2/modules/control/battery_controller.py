@@ -732,7 +732,12 @@ class BatteryController:
     - Temperature limits: 0-45°C operating range
     """
 
-    def __init__(self, battery_settings: BatterySettings, mqtt_settings: Optional[MQTTSettings] = None, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        battery_settings: BatterySettings,
+        mqtt_settings: Optional[MQTTSettings] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ):
         """
         Initialize battery controller with typed configuration.
 
@@ -755,8 +760,12 @@ class BatteryController:
         if mqtt_settings:
             self.mqtt_broker = mqtt_settings.broker
             self.mqtt_port = mqtt_settings.port
-        self.control_topic = self.config.get("battery_control_topic", "pems/battery/set")
-        self.status_topic = self.config.get("battery_status_topic", "growatt/battery/status")
+        self.control_topic = self.config.get(
+            "battery_control_topic", "pems/battery/set"
+        )
+        self.status_topic = self.config.get(
+            "battery_status_topic", "growatt/battery/status"
+        )
 
         # Safety limits from typed settings
         self.max_soc = battery_settings.max_soc * 100  # Convert to percentage
@@ -819,7 +828,8 @@ class BatteryController:
             if power_kw is not None:
                 if power_kw < 0 or power_kw > self.max_charge_power:
                     self.logger.error(
-                        f"Invalid charging power: {power_kw}kW " f"(max: {self.max_charge_power}kW)"
+                        f"Invalid charging power: {power_kw}kW "
+                        f"(max: {self.max_charge_power}kW)"
                     )
                     return False
 
@@ -837,7 +847,9 @@ class BatteryController:
                         return False
 
                     # Check temperature limits
-                    if not (self.min_temp <= latest_status.temperature_c <= self.max_temp):
+                    if not (
+                        self.min_temp <= latest_status.temperature_c <= self.max_temp
+                    ):
                         self.logger.warning(
                             f"Aborting {mode.value} mode: Current temperature ({latest_status.temperature_c}°C) "
                             f"is outside safe range ({self.min_temp}-{self.max_temp}°C)."
@@ -855,9 +867,9 @@ class BatteryController:
                 start_time = current_time.strftime("%H:%M")
 
                 if duration_minutes:
-                    end_time = (current_time + timedelta(minutes=duration_minutes)).strftime(
-                        "%H:%M"
-                    )
+                    end_time = (
+                        current_time + timedelta(minutes=duration_minutes)
+                    ).strftime("%H:%M")
                 else:
                     end_time = "23:59"  # Until end of day
 
@@ -947,7 +959,9 @@ class BatteryController:
             await self._enable_ac_charge(power_kw)
 
             # Update internal state
-            self.current_command = BatteryCommand(mode=ChargingMode.GRID, power_kw=power_kw)
+            self.current_command = BatteryCommand(
+                mode=ChargingMode.GRID, power_kw=power_kw
+            )
             self.command_history.append(self.current_command)
 
             return True
@@ -1059,7 +1073,9 @@ class BatteryController:
             await self._disable_ac_charge()
 
             # Store command
-            command = BatteryCommand(mode=ChargingMode.OFF, priority=3)  # Emergency priority
+            command = BatteryCommand(
+                mode=ChargingMode.OFF, priority=3
+            )  # Emergency priority
 
             self.current_command = command
             self.command_history.append(command)
@@ -1170,7 +1186,9 @@ class BatteryController:
             return
 
         payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
-        battery_first_topic = self.mqtt_config.get("battery_first_topic", "pems/battery/mode")
+        battery_first_topic = self.mqtt_config.get(
+            "battery_first_topic", "pems/battery/mode"
+        )
 
         if self.mqtt_client:
             await self.mqtt_client.publish(battery_first_topic, json.dumps(payload))
@@ -1190,7 +1208,9 @@ class BatteryController:
             return
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
-        battery_first_topic = self.mqtt_config.get("battery_first_topic", "pems/battery/mode")
+        battery_first_topic = self.mqtt_config.get(
+            "battery_first_topic", "pems/battery/mode"
+        )
 
         if self.mqtt_client:
             await self.mqtt_client.publish(battery_first_topic, json.dumps(payload))
@@ -1210,7 +1230,9 @@ class BatteryController:
             return
 
         payload = {"value": True, "power_kw": power_kw}
-        ac_charge_topic = self.mqtt_config.get("ac_charge_topic", "pems/battery/ac_charge")
+        ac_charge_topic = self.mqtt_config.get(
+            "ac_charge_topic", "pems/battery/ac_charge"
+        )
 
         if self.mqtt_client:
             await self.mqtt_client.publish(ac_charge_topic, json.dumps(payload))
@@ -1223,16 +1245,22 @@ class BatteryController:
         """Disable AC charging (matches growatt pattern)."""
         if self.config.get("simulation_mode", False):
             current_time = datetime.now().strftime("%H:%M:%S")
-            self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
+            self.logger.info(
+                f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})"
+            )
             return
 
         payload = {"value": False}
-        ac_charge_topic = self.mqtt_config.get("ac_charge_topic", "pems/battery/ac_charge")
+        ac_charge_topic = self.mqtt_config.get(
+            "ac_charge_topic", "pems/battery/ac_charge"
+        )
 
         if self.mqtt_client:
             await self.mqtt_client.publish(ac_charge_topic, json.dumps(payload))
             current_time = datetime.now().strftime("%H:%M:%S")
-            self.logger.info(f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {ac_charge_topic}")
+            self.logger.info(
+                f"⚡ AC CHARGING DISABLED at {current_time} → Topic: {ac_charge_topic}"
+            )
 
 
 def create_battery_controller(

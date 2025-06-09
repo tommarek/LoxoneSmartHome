@@ -374,10 +374,18 @@ class ComprehensiveAnalyzer:
         ):
             self.logger.info("Running base load analysis...")
             try:
+                # Get required data for base load analysis
+                grid_data = self.processed_data["consumption"]
+                pv_data = self.processed_data.get("pv", pd.DataFrame())
+                room_data = self.processed_data.get("rooms", {})
+                relay_data = self.processed_data.get("relay_states", {})
+                ev_data = self.processed_data.get("ev", None)
+                battery_data = self.processed_data.get("battery", None)
+
                 self.analysis_results[
                     "base_load_analysis"
-                ] = await self.base_load_analyzer.analyze_base_load(
-                    self.processed_data["consumption"]
+                ] = self.base_load_analyzer.analyze_base_load(
+                    grid_data, pv_data, room_data, relay_data, ev_data, battery_data
                 )
                 self.logger.info("Base load analysis completed successfully")
             except Exception as e:
@@ -391,24 +399,17 @@ class ComprehensiveAnalyzer:
         ):
             self.logger.info("Running relay pattern analysis...")
             try:
-                relay_results = {}
-                for room_name, relay_data in self.processed_data[
-                    "relay_states"
-                ].items():
-                    if not relay_data.empty:
-                        room_temp_data = self.processed_data.get("rooms", {}).get(
-                            room_name
-                        )
-                        relay_results[
-                            room_name
-                        ] = await self.relay_analyzer.analyze_relay_patterns(
-                            relay_data, room_temp_data, room_name
-                        )
+                # Pass all relay data at once instead of per-room
+                relay_data = self.processed_data["relay_states"]
+                weather_data = self.processed_data.get("weather")
+                price_data = self.processed_data.get("prices")
 
-                self.analysis_results["relay_analysis"] = relay_results
-                self.logger.info(
-                    f"Relay pattern analysis completed for {len(relay_results)} rooms"
+                self.analysis_results[
+                    "relay_analysis"
+                ] = self.relay_analyzer.analyze_relay_patterns(
+                    relay_data, weather_data, price_data
                 )
+                self.logger.info("Relay pattern analysis completed successfully")
             except Exception as e:
                 self.logger.error(f"Relay pattern analysis failed: {e}", exc_info=True)
                 self.analysis_results["relay_analysis"] = {"error": str(e)}

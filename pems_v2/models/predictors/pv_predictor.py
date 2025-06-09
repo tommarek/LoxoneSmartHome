@@ -18,10 +18,10 @@ import numpy as np
 import pandas as pd
 import pvlib
 import xgboost as xgb
+from config.settings import PVModelSettings
 from sklearn.linear_model import QuantileRegressor
 from sklearn.multioutput import MultiOutputRegressor
 
-from config.settings import PVModelSettings
 from ..base import (BasePredictor, ModelMetadata, PerformanceMetrics,
                     PredictionResult)
 
@@ -34,7 +34,9 @@ class PVPredictor(BasePredictor):
     for accurate and interpretable photovoltaic power forecasting.
     """
 
-    def __init__(self, pv_settings: PVModelSettings, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self, pv_settings: PVModelSettings, config: Optional[Dict[str, Any]] = None
+    ):
         """
         Initialize PV predictor.
 
@@ -51,7 +53,7 @@ class PVPredictor(BasePredictor):
         }
         if config:
             merged_config.update(config)
-        
+
         super().__init__(merged_config)
         self.pv_settings = pv_settings
 

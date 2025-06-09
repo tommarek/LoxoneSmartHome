@@ -53,24 +53,24 @@ test:
 
 lint:
 	@echo "🔧 Formatting code with black..."
-	. venv/bin/activate && black .
+	. venv/bin/activate && black . --exclude="venv/"
 	@echo "🔧 Organizing imports with isort..."
-	. venv/bin/activate && isort .
+	. venv/bin/activate && isort . --skip=venv
 	@echo "🔍 Running flake8 linter..."
-	. venv/bin/activate && flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-	. venv/bin/activate && flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --ignore=C901 --statistics
+	. venv/bin/activate && flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv
+	. venv/bin/activate && flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --ignore=C901 --statistics --exclude=venv
 	@echo "✅ Linting complete!"
 
 lint-check:
 	@echo "🔍 Checking code formatting (no changes)..."
-	. venv/bin/activate && black --check .
-	. venv/bin/activate && isort --check-only .
-	. venv/bin/activate && flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-	. venv/bin/activate && flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --ignore=C901 --statistics
+	. venv/bin/activate && black --check . --exclude="venv/"
+	. venv/bin/activate && isort --check-only . --skip=venv
+	. venv/bin/activate && flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv
+	. venv/bin/activate && flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --ignore=C901 --statistics --exclude=venv
 
 format:
-	. venv/bin/activate && black .
-	. venv/bin/activate && isort .
+	. venv/bin/activate && black . --exclude="venv/"
+	. venv/bin/activate && isort . --skip=venv
 
 clean:
 	find . -type f -name "*.pyc" -delete

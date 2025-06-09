@@ -382,9 +382,14 @@ class LoxoneFieldAdapter:
         Returns:
             Power rating in kW (default 1.0 kW if not found)
         """
-        from config.energy_settings import get_room_power
+        from config.settings import PEMSSettings
 
-        return get_room_power(room_name)
+        try:
+            settings = PEMSSettings()
+            return settings.get_room_power(room_name)
+        except Exception:
+            # Fallback to default if settings can't be loaded
+            return 1.0
 
     @classmethod
     def validate_data_structure(cls, data: Dict[str, Any]) -> Dict[str, Any]:

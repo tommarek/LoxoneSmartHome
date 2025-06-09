@@ -47,11 +47,23 @@ class PVAnalyzer:
         Returns:
             Dictionary with analysis results
         """
-        self.logger.info("Starting PV production analysis")
+        self.logger.info("Starting PV production analysis...")
 
+        # --- Input Validation Logging ---
         if pv_data.empty:
-            self.logger.warning("No PV data provided")
-            return {}
+            self.logger.error("PV data is empty. Aborting PV analysis.")
+            return {"error": "Empty PV data"}
+        if weather_data.empty:
+            self.logger.warning(
+                "Weather data is empty. Weather correlation analysis will be limited."
+            )
+
+        self.logger.debug(
+            f"PV data shape: {pv_data.shape}, columns: {pv_data.columns.tolist()}"
+        )
+        self.logger.debug(
+            f"Weather data shape: {weather_data.shape}, columns: {weather_data.columns.tolist()}"
+        )
 
         results = {}
 
@@ -91,7 +103,7 @@ class PVAnalyzer:
         )
 
         # Export policy detection (if price data available in weather_data)
-        if not weather_data.empty and "price" in weather_data.columns:
+        if not weather_data.empty and "price_czk_kwh" in weather_data.columns:
             self.logger.info("Analyzing export policy periods...")
             results["export_policy"] = self._identify_export_periods(
                 pv_data, weather_data
@@ -337,11 +349,24 @@ class PVAnalyzer:
             }
 
         # Resample to daily data for seasonal analysis
-        daily_data = data["pv_power"].resample("D").mean()
+        daily_data = data["pv_power"].resample("D").mean().dropna()
+
+        # Check if we have enough non-null daily data points
+        if (
+            len(daily_data) < 730
+        ):  # At least 2 years of daily data for reliable seasonal patterns
+            return {
+                "warning": f"Insufficient daily data points for seasonal analysis (have {len(daily_data)}, need at least 730)"
+            }
 
         # STL decomposition
         try:
-            stl = STL(daily_data.dropna(), seasonal=365)  # Annual seasonality
+            # Use a smaller seasonal period if we don't have enough data for annual seasonality
+            seasonal_period = min(365, len(daily_data) // 3)  # At least 3 cycles
+            if seasonal_period < 7:  # If less than a week, try weekly pattern
+                seasonal_period = 7
+
+            stl = STL(daily_data, seasonal=seasonal_period)
             result = stl.fit()
 
             seasonal_patterns = {
@@ -735,7 +760,7 @@ class PVAnalyzer:
         ]
 
         # Calculate seasonal patterns
-        monthly_production = pre_export.resample("M")["InputPower"].sum()
+        monthly_production = pre_export.resample("ME")["InputPower"].sum()
         peak_production_months = monthly_production.nlargest(3).index.month.tolist()
 
         return {
@@ -781,8 +806,8 @@ class PVAnalyzer:
         export_threshold = 100  # CZK/MWh - adjust based on your system
 
         # Categorize by price levels
-        high_price_mask = aligned_data["price"] >= export_threshold
-        low_price_mask = aligned_data["price"] < export_threshold
+        high_price_mask = aligned_data["price_czk_kwh"] >= export_threshold
+        low_price_mask = aligned_data["price_czk_kwh"] < export_threshold
 
         high_price_data = aligned_data[high_price_mask]
         low_price_data = aligned_data[low_price_mask]
@@ -824,7 +849,7 @@ class PVAnalyzer:
 
         # Price correlation analysis
         if "ExportPower" in aligned_data.columns:
-            price_export_correlation = aligned_data["price"].corr(
+            price_export_correlation = aligned_data["price_czk_kwh"].corr(
                 aligned_data["ExportPower"]
             )
             export_stats["price_export_correlation"] = price_export_correlation
@@ -833,7 +858,11 @@ class PVAnalyzer:
         if "ExportPower" in aligned_data.columns:
             # Estimate revenue (simplified calculation)
             aligned_data["export_revenue"] = (
-                aligned_data["ExportPower"] * aligned_data["price"] * 0.25 / 1000 / 1000
+                aligned_data["ExportPower"]
+                * aligned_data["price_czk_kwh"]
+                * 0.25
+                / 1000
+                / 1000
             )  # CZK
             total_revenue = aligned_data["export_revenue"].sum()
             export_stats["estimated_total_revenue_czk"] = total_revenue
@@ -876,7 +905,7 @@ class PVAnalyzer:
                 pre_export_period.index[0] : pre_export_period.index[-1]
             ]
             avg_price_pre = (
-                aligned_pre["price"].mean() if not aligned_pre.empty else 2.0
+                aligned_pre["price_czk_kwh"].mean() if not aligned_pre.empty else 2.0
             )  # CZK/kWh fallback
         else:
             avg_price_pre = 2.0  # CZK/kWh fallback
@@ -943,15 +972,52 @@ class RelayPatternAnalyzer:
         Returns:
             Dictionary with pattern analysis results
         """
-        # Handle different types of relay_data input
+        self.logger.info("Starting relay pattern analysis...")
+
+        # --- Input Validation Logging ---
         if relay_data is None:
+            self.logger.error("Relay data is None. Aborting relay pattern analysis.")
             return {"error": "No relay data provided"}
 
         if isinstance(relay_data, pd.DataFrame) and relay_data.empty:
+            self.logger.error(
+                "Relay data DataFrame is empty. Aborting relay pattern analysis."
+            )
             return {"error": "No relay data provided"}
 
         if isinstance(relay_data, dict) and not relay_data:
+            self.logger.error(
+                "Relay data dictionary is empty. Aborting relay pattern analysis."
+            )
             return {"error": "No relay data provided"}
+
+        if weather_data is None or weather_data.empty:
+            self.logger.warning(
+                "Weather data is empty. Weather correlation analysis will be limited."
+            )
+        if price_data is None or price_data.empty:
+            self.logger.warning(
+                "Price data is empty. Economic optimization analysis will be limited."
+            )
+
+        if isinstance(relay_data, dict):
+            self.logger.debug(f"Relay data rooms: {list(relay_data.keys())}")
+            for room, df in relay_data.items():
+                if isinstance(df, pd.DataFrame):
+                    self.logger.debug(f"Room {room} data shape: {df.shape}")
+        elif isinstance(relay_data, pd.DataFrame):
+            self.logger.debug(
+                f"Relay data shape: {relay_data.shape}, columns: {relay_data.columns.tolist()}"
+            )
+
+        if weather_data is not None and not weather_data.empty:
+            self.logger.debug(
+                f"Weather data shape: {weather_data.shape}, columns: {weather_data.columns.tolist()}"
+            )
+        if price_data is not None and not price_data.empty:
+            self.logger.debug(
+                f"Price data shape: {price_data.shape}, columns: {price_data.columns.tolist()}"
+            )
 
         # Standardize relay data using Loxone adapter
         self.logger.info("Standardizing relay data for analysis")
@@ -1152,29 +1218,31 @@ class RelayPatternAnalyzer:
 
         # Calculate current operating costs
         aligned_data["cost"] = (
-            aligned_data["load_w"] * aligned_data["price"] / 1000000
+            aligned_data["load_w"] * aligned_data["price_czk_kwh"] / 1000000
         )  # Convert to CZK
 
         # Analyze price-load correlation
-        price_load_correlation = aligned_data["load_w"].corr(aligned_data["price"])
+        price_load_correlation = aligned_data["load_w"].corr(
+            aligned_data["price_czk_kwh"]
+        )
 
         # Price-based operation analysis
-        price_quartiles = aligned_data["price"].quantile([0.25, 0.5, 0.75])
+        price_quartiles = aligned_data["price_czk_kwh"].quantile([0.25, 0.5, 0.75])
 
         load_by_price_quartile = {
             "Q1_lowest_prices": aligned_data[
-                aligned_data["price"] <= price_quartiles[0.25]
+                aligned_data["price_czk_kwh"] <= price_quartiles[0.25]
             ]["load_w"].mean(),
             "Q2_low_prices": aligned_data[
-                (aligned_data["price"] > price_quartiles[0.25])
-                & (aligned_data["price"] <= price_quartiles[0.5])
+                (aligned_data["price_czk_kwh"] > price_quartiles[0.25])
+                & (aligned_data["price_czk_kwh"] <= price_quartiles[0.5])
             ]["load_w"].mean(),
             "Q3_high_prices": aligned_data[
-                (aligned_data["price"] > price_quartiles[0.5])
-                & (aligned_data["price"] <= price_quartiles[0.75])
+                (aligned_data["price_czk_kwh"] > price_quartiles[0.5])
+                & (aligned_data["price_czk_kwh"] <= price_quartiles[0.75])
             ]["load_w"].mean(),
             "Q4_highest_prices": aligned_data[
-                aligned_data["price"] > price_quartiles[0.75]
+                aligned_data["price_czk_kwh"] > price_quartiles[0.75]
             ]["load_w"].mean(),
         }
 
@@ -1189,15 +1257,15 @@ class RelayPatternAnalyzer:
 
         # Optimization potential calculation
         # Simulate shifting 30% of high-price load to low-price periods
-        high_price_mask = aligned_data["price"] > price_quartiles[0.75]
-        low_price_mask = aligned_data["price"] <= price_quartiles[0.25]
+        high_price_mask = aligned_data["price_czk_kwh"] > price_quartiles[0.75]
+        low_price_mask = aligned_data["price_czk_kwh"] <= price_quartiles[0.25]
 
         high_price_load = aligned_data.loc[high_price_mask, "load_w"].sum()
         shifted_load = high_price_load * 0.3
 
         # Calculate savings from load shifting
-        avg_high_price = aligned_data.loc[high_price_mask, "price"].mean()
-        avg_low_price = aligned_data.loc[low_price_mask, "price"].mean()
+        avg_high_price = aligned_data.loc[high_price_mask, "price_czk_kwh"].mean()
+        avg_low_price = aligned_data.loc[low_price_mask, "price_czk_kwh"].mean()
 
         potential_savings_czk = (
             shifted_load * (avg_high_price - avg_low_price) * (5 / 60) / 1000000

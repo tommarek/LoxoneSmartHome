@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from config.settings import LoadModelSettings
 from scipy import signal, stats
 from scipy.fft import fft, fftfreq
 from sklearn.cluster import KMeans
@@ -31,7 +32,6 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
 
-from config.settings import LoadModelSettings
 from ..base import BasePredictor, PerformanceMetrics, PredictionResult
 
 
@@ -93,9 +93,11 @@ class LoadPredictor(BasePredictor):
     to predict non-controllable electricity consumption.
     """
 
-    def __init__(self, load_settings: LoadModelSettings, config: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self, load_settings: LoadModelSettings, config: Optional[Dict[str, Any]] = None
+    ):
         """Initialize load predictor with configuration.
-        
+
         Args:
             load_settings: Load model configuration from system settings
             config: Optional additional configuration for model-specific parameters
@@ -107,7 +109,7 @@ class LoadPredictor(BasePredictor):
         }
         if config:
             merged_config.update(config)
-        
+
         super().__init__(merged_config)
         self.load_settings = load_settings
         self.logger = logging.getLogger(f"{__name__}.LoadPredictor")
