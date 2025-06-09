@@ -8,8 +8,8 @@ import logging
 import sys
 from pathlib import Path
 
-# Add the project root to Python path
-sys.path.append(str(Path(__file__).parent.parent))
+# Add the project root to Python path (parent of pems_v2)
+sys.path.append(str(Path(__file__).parent.parent.parent))
 
 
 def test_imports():

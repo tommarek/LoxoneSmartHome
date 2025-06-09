@@ -32,7 +32,7 @@ class BaseLoadAnalyzer:
 
     def analyze_base_load(
         self,
-        consumption_data: pd.DataFrame,
+        grid_data: pd.DataFrame,  # Changed from consumption_data
         pv_data: pd.DataFrame,
         room_data: Dict[str, pd.DataFrame],
         ev_data: Optional[pd.DataFrame] = None,
@@ -42,8 +42,8 @@ class BaseLoadAnalyzer:
         Analyze base load patterns.
 
         Args:
-            consumption_data: Total energy consumption data
-            pv_data: PV production data for self-consumption calculation
+            grid_data: Grid import/export data
+            pv_data: PV production data
             room_data: Room temperature data for heating estimation
             ev_data: EV charging data (optional)
             battery_data: Battery charge/discharge data (optional)
@@ -53,15 +53,18 @@ class BaseLoadAnalyzer:
         """
         self.logger.info("Starting base load analysis")
 
-        if consumption_data.empty:
-            self.logger.warning("No consumption data provided")
+        if grid_data.empty:
+            self.logger.warning("No grid data provided")
             return {}
 
         results = {}
 
-        # Calculate base load by subtracting controllable loads
+        # Prepare heating data from room data
+        heating_data = self._prepare_heating_data(room_data)
+
+        # Calculate base load using energy conservation approach
         base_load = self._calculate_base_load(
-            consumption_data, pv_data, room_data, ev_data, battery_data
+            grid_data, pv_data, heating_data, ev_data, battery_data
         )
 
         if base_load.empty:
@@ -97,158 +100,216 @@ class BaseLoadAnalyzer:
 
     def _calculate_base_load(
         self,
-        consumption_data: pd.DataFrame,
+        grid_data: pd.DataFrame,  # Changed from consumption_data
         pv_data: pd.DataFrame,
-        room_data: Dict[str, pd.DataFrame],
-        ev_data: Optional[pd.DataFrame],
-        battery_data: Optional[pd.DataFrame],
+        heating_data: pd.DataFrame,  # Changed from room_data
+        ev_data: Optional[pd.DataFrame] = None,
+        battery_data: Optional[pd.DataFrame] = None,
     ) -> pd.DataFrame:
-        """Calculate base load by subtracting controllable loads."""
+        """
+        Calculate base load using an energy conservation approach.
+        """
+        self.logger.info("Calculating base load with new energy conservation logic.")
 
-        # Find total consumption column
-        consumption_cols = [
-            col
-            for col in consumption_data.columns
-            if any(
-                keyword in col.lower()
-                for keyword in ["consumption", "total", "load", "grid_import"]
-            )
-        ]
-
-        if not consumption_cols:
-            self.logger.warning("No consumption columns found")
+        # --- 1. Align all data to a common time index (e.g., 15 minutes) ---
+        # Find a common time range across all essential data sources
+        common_index = grid_data.index.intersection(pv_data.index)
+        if battery_data is not None and not battery_data.empty:
+            common_index = common_index.intersection(battery_data.index)
+        if common_index.empty:
+            self.logger.warning("No common time index found between grid, PV, and battery data.")
             return pd.DataFrame()
 
-        total_consumption = consumption_data[consumption_cols[0]].copy()
+        # Resample and align all data sources
+        freq = "15T"
+        grid = grid_data.resample(freq).mean().reindex(common_index, method="nearest")
+        pv = pv_data.resample(freq).mean().reindex(common_index, method="nearest")
+        heating = (
+            heating_data.resample(freq).sum().reindex(common_index, method="nearest")
+        )  # Sum power from all rooms
 
-        # Start with total consumption
-        base_load_data = pd.DataFrame(index=total_consumption.index)
-        base_load_data["total_consumption"] = total_consumption
-        base_load_data["base_load"] = total_consumption.copy()
+        # --- 2. Extract individual energy flows (in Watts) ---
+        # Use specific column names from your documentation
+        grid_import = grid.get("ACPowerToUser", pd.Series(0, index=common_index)).fillna(0)
+        grid_export = grid.get("ACPowerToGrid", pd.Series(0, index=common_index)).fillna(0)
+        pv_production = pv.get("InputPower", pd.Series(0, index=common_index)).fillna(0)
 
-        # Subtract PV self-consumption
-        if not pv_data.empty:
-            pv_power_cols = [col for col in pv_data.columns if "power" in col.lower()]
-            if pv_power_cols:
-                pv_power = pv_data[pv_power_cols[0]]
-                # Resample to match consumption data frequency
-                pv_resampled = pv_power.resample(
-                    total_consumption.index.freq or "15T"
-                ).mean()
-
-                # Self-consumption = min(PV_production, total_consumption)
-                pv_aligned = pv_resampled.reindex(
-                    base_load_data.index, method="nearest"
-                )
-                pv_self_consumption = np.minimum(
-                    pv_aligned.fillna(0), base_load_data["total_consumption"]
-                )
-
-                base_load_data["pv_self_consumption"] = pv_self_consumption
-                base_load_data["base_load"] -= pv_self_consumption
-
-        # Subtract heating consumption
-        heating_consumption = self._estimate_heating_consumption(
-            room_data, base_load_data.index
-        )
-        if heating_consumption is not None:
-            base_load_data["heating_consumption"] = heating_consumption
-            base_load_data["base_load"] -= heating_consumption
-
-        # Subtract EV charging
-        if ev_data is not None and not ev_data.empty:
-            ev_cols = [
+        # If specific columns don't exist, fall back to generic column detection
+        if grid_import.sum() == 0:
+            grid_import_cols = [
                 col
-                for col in ev_data.columns
-                if any(keyword in col.lower() for keyword in ["power", "charge"])
+                for col in grid.columns
+                if any(
+                    keyword in col.lower()
+                    for keyword in ["grid_import", "import", "to_user", "consumption"]
+                )
             ]
-            if ev_cols:
-                ev_power = ev_data[ev_cols[0]]
-                ev_resampled = ev_power.resample(
-                    total_consumption.index.freq or "15T"
-                ).mean()
-                ev_aligned = ev_resampled.reindex(
-                    base_load_data.index, method="nearest"
-                )
+            if grid_import_cols:
+                grid_import = grid[grid_import_cols[0]].fillna(0)
 
-                base_load_data["ev_consumption"] = ev_aligned.fillna(0)
-                base_load_data["base_load"] -= ev_aligned.fillna(0)
-
-        # Account for battery charge/discharge impact on consumption
-        if battery_data is not None and not battery_data.empty:
-            # Look for charge and discharge power columns first
-            charge_cols = [
+        if grid_export.sum() == 0:
+            grid_export_cols = [
                 col
-                for col in battery_data.columns
-                if "charge" in col.lower() and "power" in col.lower()
+                for col in grid.columns
+                if any(keyword in col.lower() for keyword in ["grid_export", "export", "to_grid"])
+            ]
+            if grid_export_cols:
+                grid_export = grid[grid_export_cols[0]].fillna(0)
+
+        if pv_production.sum() == 0:
+            pv_power_cols = [col for col in pv.columns if "power" in col.lower()]
+            if pv_power_cols:
+                pv_production = pv[pv_power_cols[0]].fillna(0)
+
+        battery_charge = pd.Series(0, index=common_index)
+        battery_discharge = pd.Series(0, index=common_index)
+
+        if battery_data is not None and not battery_data.empty:
+            battery = battery_data.resample(freq).mean().reindex(common_index, method="nearest")
+
+            # Look for specific charge/discharge columns
+            charge_cols = [
+                col for col in battery.columns if "charge" in col.lower() and "power" in col.lower()
             ]
             discharge_cols = [
                 col
-                for col in battery_data.columns
+                for col in battery.columns
                 if "discharge" in col.lower() and "power" in col.lower()
             ]
 
             if charge_cols and discharge_cols:
-                # Use separate charge/discharge data
-                charge_power = battery_data[charge_cols[0]]
-                discharge_power = battery_data[discharge_cols[0]]
-
-                # Calculate net battery power (positive = charging, negative = discharging)
-                net_battery_power = charge_power.fillna(0) - discharge_power.fillna(0)
-
-                battery_resampled = net_battery_power.resample(
-                    total_consumption.index.freq or "15T"
-                ).mean()
-                battery_aligned = battery_resampled.reindex(
-                    base_load_data.index, method="nearest"
+                battery_charge = battery[charge_cols[0]].fillna(0)
+                battery_discharge = battery[discharge_cols[0]].fillna(0)
+            else:
+                # Try generic ChargePower/DischargePower columns
+                battery_charge = battery.get(
+                    "ChargePower", pd.Series(0, index=common_index)
+                ).fillna(0)
+                battery_discharge = battery.get(
+                    "DischargePower", pd.Series(0, index=common_index)
                 ).fillna(0)
 
-                # Battery charging: subtract from base load (grid powers battery)
-                # Battery discharging: add to base load (battery supplements grid)
-                base_load_data["battery_charge_power"] = np.maximum(battery_aligned, 0)
-                base_load_data["battery_discharge_power"] = np.maximum(
-                    -battery_aligned, 0
-                )
-                base_load_data["net_battery_power"] = battery_aligned
+        heating_load = heating.get("total_heating_power", pd.Series(0, index=common_index)).fillna(
+            0
+        )
 
-                # Adjust base load: subtract charging, add discharging
-                base_load_data["base_load"] = (
-                    base_load_data["base_load"]
-                    - base_load_data["battery_charge_power"]  # Grid charges battery
-                    + base_load_data[
-                        "battery_discharge_power"
-                    ]  # Battery supplements load
-                )
+        # If total_heating_power doesn't exist, calculate it from room data
+        if heating_load.sum() == 0 and not heating.empty:
+            heating_load = self._estimate_heating_consumption_from_df(heating, common_index)
 
-            else:
-                # Fallback: look for generic power column (legacy behavior)
-                battery_cols = [
-                    col for col in battery_data.columns if "power" in col.lower()
-                ]
-                if battery_cols:
-                    battery_power = battery_data[battery_cols[0]]
-                    battery_resampled = battery_power.resample(
-                        total_consumption.index.freq or "15T"
-                    ).mean()
-                    battery_aligned = battery_resampled.reindex(
-                        base_load_data.index, method="nearest"
-                    )
+        # Handle optional EV data
+        ev_charge = pd.Series(0, index=common_index)
+        if ev_data is not None and not ev_data.empty:
+            ev_resampled = ev_data.resample(freq).mean().reindex(common_index, method="nearest")
+            ev_cols = [
+                col
+                for col in ev_resampled.columns
+                if any(keyword in col.lower() for keyword in ["power", "charge", "ev"])
+            ]
+            if ev_cols:
+                ev_charge = ev_resampled[ev_cols[0]].fillna(0)
 
-                    # Assume positive = charging, subtract from base load
-                    battery_charging = np.maximum(battery_aligned.fillna(0), 0)
-                    base_load_data["battery_consumption"] = battery_charging
-                    base_load_data["base_load"] -= battery_charging
+        # --- 3. Calculate Total House Load using energy conservation ---
+        # Total energy supplied to the house
+        power_sources = pv_production + grid_import + battery_discharge
+
+        # Energy directed away from the house loads
+        power_sinks = grid_export + battery_charge
+
+        # The remainder is the total power consumed by the house
+        total_house_load = power_sources - power_sinks
+
+        # --- 4. Calculate Base Load by subtracting controllable loads ---
+        # Base load is what remains after subtracting heating and EV charging
+        base_load = total_house_load - heating_load - ev_charge
 
         # Ensure base load is non-negative
-        base_load_data["base_load"] = np.maximum(base_load_data["base_load"], 0)
+        base_load_clipped = base_load.clip(lower=0)
 
-        # Add time features
-        base_load_data["hour"] = base_load_data.index.hour
-        base_load_data["weekday"] = base_load_data.index.weekday
-        base_load_data["month"] = base_load_data.index.month
-        base_load_data["is_weekend"] = base_load_data["weekday"].isin([5, 6])
+        # --- 5. Assemble the final DataFrame for analysis ---
+        analysis_df = pd.DataFrame(index=common_index)
+        analysis_df["total_house_load"] = total_house_load
+        analysis_df["heating_load"] = heating_load
+        analysis_df["ev_load"] = ev_charge
+        analysis_df["base_load"] = base_load_clipped  # This is the corrected base load
 
-        return base_load_data
+        # Add time features for subsequent analysis
+        analysis_df["hour"] = analysis_df.index.hour
+        analysis_df["weekday"] = analysis_df.index.weekday
+        analysis_df["is_weekend"] = analysis_df["weekday"].isin([5, 6])
+        analysis_df["month"] = analysis_df.index.month
+
+        self.logger.info(
+            f"Successfully calculated base load. Average: {analysis_df['base_load'].mean():.2f}W"
+        )
+
+        return analysis_df
+
+    def _prepare_heating_data(self, room_data: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+        """Prepare heating data from room data dictionary."""
+        if not room_data:
+            return pd.DataFrame()
+
+        # Combine all room data into a single DataFrame
+        heating_data_dict = {}
+
+        for room_name, room_df in room_data.items():
+            if room_df.empty:
+                continue
+
+            # Look for heating status columns
+            heating_cols = [
+                col
+                for col in room_df.columns
+                if any(keyword in col.lower() for keyword in ["heating", "heat", "state"])
+            ]
+
+            for col in heating_cols:
+                # Use room name as prefix for column name
+                new_col_name = f"{room_name}_{col}"
+                heating_data_dict[new_col_name] = room_df[col]
+
+        if not heating_data_dict:
+            return pd.DataFrame()
+
+        heating_df = pd.DataFrame(heating_data_dict)
+        return heating_df
+
+    def _estimate_heating_consumption_from_df(
+        self, heating_df: pd.DataFrame, target_index: pd.DatetimeIndex
+    ) -> pd.Series:
+        """Estimate heating consumption from a heating DataFrame."""
+        total_heating = pd.Series(0, index=target_index)
+
+        # Look for heating-related columns
+        heating_cols = [
+            col
+            for col in heating_df.columns
+            if any(keyword in col.lower() for keyword in ["heating", "heat", "state", "power"])
+        ]
+
+        for col in heating_cols:
+            # If it's a power column, use directly
+            if "power" in col.lower():
+                total_heating += heating_df[col].fillna(0)
+            else:
+                # Assume it's a status column, estimate power based on room
+                room_name = col.split("_")[0] if "_" in col else "unknown"
+                try:
+                    from pems_v2.config.energy_settings import get_room_power
+
+                    room_power_kw = get_room_power(room_name)
+                    heating_power = (
+                        heating_df[col].fillna(0) * room_power_kw * 1000
+                    )  # Convert kW to W
+                    total_heating += heating_power
+                except ImportError:
+                    # Fallback to default power estimate
+                    default_power_w = 1000  # 1kW default
+                    heating_power = heating_df[col].fillna(0) * default_power_w
+                    total_heating += heating_power
+
+        return total_heating
 
     def _estimate_heating_consumption(
         self, room_data: Dict[str, pd.DataFrame], target_index: pd.DatetimeIndex
@@ -267,29 +328,25 @@ class BaseLoadAnalyzer:
             heating_cols = [
                 col
                 for col in room_df.columns
-                if any(
-                    keyword in col.lower() for keyword in ["heating", "heat", "state"]
-                )
+                if any(keyword in col.lower() for keyword in ["heating", "heat", "state"])
             ]
 
             if heating_cols:
                 heating_status = room_df[heating_cols[0]]
 
                 # Resample to target frequency
-                heating_resampled = heating_status.resample(
-                    target_index.freq or "15T"
-                ).mean()
-                heating_aligned = heating_resampled.reindex(
-                    target_index, method="nearest"
-                )
+                heating_resampled = heating_status.resample(target_index.freq or "15T").mean()
+                heating_aligned = heating_resampled.reindex(target_index, method="nearest")
 
                 # Use actual room power rating from configuration
-                from config.energy_settings import get_room_power
+                try:
+                    from pems_v2.config.energy_settings import get_room_power
 
-                room_power_kw = get_room_power(room_name)
-                heating_power = (
-                    heating_aligned.fillna(0) * room_power_kw * 1000
-                )  # Convert kW to W
+                    room_power_kw = get_room_power(room_name)
+                except ImportError:
+                    # Fallback to default room power
+                    room_power_kw = 1.0  # 1 kW default
+                heating_power = heating_aligned.fillna(0) * room_power_kw * 1000  # Convert kW to W
 
                 if total_heating is None:
                     total_heating = heating_power
@@ -298,9 +355,7 @@ class BaseLoadAnalyzer:
 
         return total_heating
 
-    def _calculate_base_load_stats(
-        self, base_load_data: pd.DataFrame
-    ) -> Dict[str, Any]:
+    def _calculate_base_load_stats(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
         """Calculate basic base load statistics."""
         base_load = base_load_data["base_load"]
 
@@ -311,11 +366,8 @@ class BaseLoadAnalyzer:
             "min_base_load": base_load.min(),
             "max_base_load": base_load.max(),
             "std_base_load": base_load.std(),
-            "total_energy_kwh": (base_load.sum() * 0.25)
-            / 1000,  # 15-min intervals to kWh
-            "base_load_factor": base_load.mean() / base_load.max()
-            if base_load.max() > 0
-            else 0,
+            "total_energy_kwh": (base_load.sum() * 0.25) / 1000,  # 15-min intervals to kWh
+            "base_load_factor": base_load.mean() / base_load.max() if base_load.max() > 0 else 0,
         }
 
         # Percentage of total consumption
@@ -354,14 +406,10 @@ class BaseLoadAnalyzer:
                     else 0
                 )
                 stats["battery_charging_energy_kwh"] = (
-                    base_load_data.get("battery_charge_power", pd.Series()).sum()
-                    * 0.25
-                    / 1000
+                    base_load_data.get("battery_charge_power", pd.Series()).sum() * 0.25 / 1000
                 )
                 stats["battery_discharging_energy_kwh"] = (
-                    base_load_data.get("battery_discharge_power", pd.Series()).sum()
-                    * 0.25
-                    / 1000
+                    base_load_data.get("battery_discharge_power", pd.Series()).sum() * 0.25 / 1000
                 )
 
         # Time-based statistics
@@ -373,9 +421,7 @@ class BaseLoadAnalyzer:
                 "peak_load": hourly_avg.max(),
                 "minimum_load": hourly_avg.min(),
                 "peak_to_minimum_ratio": (
-                    hourly_avg.max() / hourly_avg.min()
-                    if hourly_avg.min() > 0
-                    else float("inf")
+                    hourly_avg.max() / hourly_avg.min() if hourly_avg.min() > 0 else float("inf")
                 ),
             }
         )
@@ -389,9 +435,7 @@ class BaseLoadAnalyzer:
         patterns = {}
 
         # Hourly patterns
-        hourly_profile = base_load.groupby(base_load.index.hour).agg(
-            ["mean", "std", "min", "max"]
-        )
+        hourly_profile = base_load.groupby(base_load.index.hour).agg(["mean", "std", "min", "max"])
         patterns["hourly_profile"] = hourly_profile.to_dict()
 
         # Weekday vs weekend patterns
@@ -406,12 +450,8 @@ class BaseLoadAnalyzer:
                 if weekday_load.mean() > 0
                 else 0
             ),
-            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour)
-            .mean()
-            .idxmax(),
-            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour)
-            .mean()
-            .idxmax(),
+            "weekday_peak_hour": weekday_load.groupby(weekday_load.index.hour).mean().idxmax(),
+            "weekend_peak_hour": weekend_load.groupby(weekend_load.index.hour).mean().idxmax(),
         }
 
         # Day of week patterns
@@ -429,9 +469,7 @@ class BaseLoadAnalyzer:
         patterns["daily_profile"] = daily_profile.to_dict()
 
         # Monthly patterns
-        monthly_profile = base_load.groupby(base_load.index.month).agg(
-            ["mean", "std", "sum"]
-        )
+        monthly_profile = base_load.groupby(base_load.index.month).agg(["mean", "std", "sum"])
         patterns["monthly_profile"] = monthly_profile.to_dict()
 
         # Identify peak and off-peak periods
@@ -445,23 +483,17 @@ class BaseLoadAnalyzer:
             "peak_hours": peak_hours,
             "off_peak_hours": off_peak_hours,
             "peak_load_avg": hourly_mean[peak_hours].mean() if peak_hours else None,
-            "off_peak_load_avg": hourly_mean[off_peak_hours].mean()
-            if off_peak_hours
-            else None,
+            "off_peak_load_avg": hourly_mean[off_peak_hours].mean() if off_peak_hours else None,
         }
 
         return patterns
 
-    def _analyze_seasonal_patterns(
-        self, base_load_data: pd.DataFrame
-    ) -> Dict[str, Any]:
+    def _analyze_seasonal_patterns(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
         """Analyze seasonal patterns using decomposition."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 365 * 24 * 4:  # Less than 1 year of 15-min data
-            return {
-                "warning": "Insufficient data for seasonal analysis (need at least 1 year)"
-            }
+            return {"warning": "Insufficient data for seasonal analysis (need at least 1 year)"}
 
         try:
             # Resample to daily data for seasonal analysis
@@ -474,13 +506,11 @@ class BaseLoadAnalyzer:
             seasonal_analysis = {
                 "seasonal_strength": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var()),
-                "trend_strength": 1
-                - (result.resid.var() / (result.trend + result.resid).var()),
+                "trend_strength": 1 - (result.resid.var() / (result.trend + result.resid).var()),
                 "has_strong_seasonal": 1
                 - (result.resid.var() / (result.seasonal + result.resid).var())
                 > 0.6,
-                "has_strong_trend": 1
-                - (result.resid.var() / (result.trend + result.resid).var())
+                "has_strong_trend": 1 - (result.resid.var() / (result.trend + result.resid).var())
                 > 0.6,
             }
 
@@ -498,15 +528,9 @@ class BaseLoadAnalyzer:
                 if not season_data.empty:
                     seasonal_profiles[season] = {
                         "mean_load": season_data.mean(),
-                        "peak_hour": season_data.groupby(season_data.index.hour)
-                        .mean()
-                        .idxmax(),
-                        "peak_load": season_data.groupby(season_data.index.hour)
-                        .mean()
-                        .max(),
-                        "min_load": season_data.groupby(season_data.index.hour)
-                        .mean()
-                        .min(),
+                        "peak_hour": season_data.groupby(season_data.index.hour).mean().idxmax(),
+                        "peak_load": season_data.groupby(season_data.index.hour).mean().max(),
+                        "min_load": season_data.groupby(season_data.index.hour).mean().min(),
                     }
 
             seasonal_analysis["seasonal_profiles"] = seasonal_profiles
@@ -625,9 +649,7 @@ class BaseLoadAnalyzer:
     def _find_optimal_clusters(self, data: np.ndarray, max_k: int = 10) -> int:
         """Find optimal number of clusters using elbow method."""
         inertias = []
-        k_range = range(
-            2, min(max_k + 1, len(data) // 5)
-        )  # Ensure reasonable cluster sizes
+        k_range = range(2, min(max_k + 1, len(data) // 5))  # Ensure reasonable cluster sizes
 
         for k in k_range:
             kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
@@ -642,9 +664,7 @@ class BaseLoadAnalyzer:
         delta_deltas = np.diff(deltas)
 
         if len(delta_deltas) > 0:
-            elbow_idx = (
-                np.argmax(delta_deltas) + 2
-            )  # +2 because of double diff and 0-indexing
+            elbow_idx = np.argmax(delta_deltas) + 2  # +2 because of double diff and 0-indexing
             return k_range[elbow_idx] if elbow_idx < len(k_range) else k_range[-1]
         else:
             return 3  # Default
@@ -664,17 +684,13 @@ class BaseLoadAnalyzer:
         lower_bound = Q1 - 1.5 * IQR
         upper_bound = Q3 + 1.5 * IQR
 
-        statistical_anomalies = base_load[
-            (base_load < lower_bound) | (base_load > upper_bound)
-        ]
+        statistical_anomalies = base_load[(base_load < lower_bound) | (base_load > upper_bound)]
 
         # Isolation Forest for more sophisticated anomaly detection
         if len(base_load) > 200:
             try:
                 # Prepare features for anomaly detection
-                features = base_load_data[
-                    ["base_load", "hour", "weekday", "month"]
-                ].copy()
+                features = base_load_data[["base_load", "hour", "weekday", "month"]].copy()
                 features["hour_sin"] = np.sin(2 * np.pi * features["hour"] / 24)
                 features["hour_cos"] = np.cos(2 * np.pi * features["hour"] / 24)
                 features["weekday_sin"] = np.sin(2 * np.pi * features["weekday"] / 7)
@@ -716,12 +732,8 @@ class BaseLoadAnalyzer:
             },
             "ml_anomalies": {
                 "count": len(ml_anomalies),
-                "percentage": len(ml_anomalies) / len(base_load) * 100
-                if len(base_load) > 0
-                else 0,
-                "sample_dates": ml_anomalies.index[:10].tolist()
-                if not ml_anomalies.empty
-                else [],
+                "percentage": len(ml_anomalies) / len(base_load) * 100 if len(base_load) > 0 else 0,
+                "sample_dates": ml_anomalies.index[:10].tolist() if not ml_anomalies.empty else [],
             },
             "low_consumption_events": {
                 "count": len(low_consumption_anomalies),
@@ -735,16 +747,12 @@ class BaseLoadAnalyzer:
             },
         }
 
-    def _evaluate_prediction_models(
-        self, base_load_data: pd.DataFrame
-    ) -> Dict[str, Any]:
+    def _evaluate_prediction_models(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
         """Evaluate different prediction models for base load."""
         base_load = base_load_data["base_load"]
 
         if len(base_load) < 200:
-            return {
-                "warning": "Insufficient data for model evaluation (need at least 200 records)"
-            }
+            return {"warning": "Insufficient data for model evaluation (need at least 200 records)"}
 
         # Prepare features
         features = base_load_data[["hour", "weekday", "month"]].copy()
@@ -762,12 +770,8 @@ class BaseLoadAnalyzer:
             features[f"load_lag_{lag}"] = base_load.shift(lag)
 
         # Add rolling statistics
-        features["load_rolling_mean_24"] = base_load.rolling(
-            window=24, min_periods=1
-        ).mean()
-        features["load_rolling_std_24"] = base_load.rolling(
-            window=24, min_periods=1
-        ).std()
+        features["load_rolling_mean_24"] = base_load.rolling(window=24, min_periods=1).mean()
+        features["load_rolling_std_24"] = base_load.rolling(window=24, min_periods=1).std()
 
         # Remove original categorical features
         features = features.drop(["hour", "weekday", "month"], axis=1)
@@ -815,10 +819,7 @@ class BaseLoadAnalyzer:
                     scores["r2"].append(r2_score(y_test, y_pred))
 
                     # MAPE calculation with handling for zero values
-                    mape = (
-                        np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1)))
-                        * 100
-                    )
+                    mape = np.mean(np.abs((y_test - y_pred) / np.maximum(y_test, 0.1))) * 100
                     scores["mape"].append(mape)
 
                 results[name] = {
@@ -835,13 +836,9 @@ class BaseLoadAnalyzer:
                 # Feature importance for Random Forest
                 if name == "Random Forest":
                     model.fit(X_scaled, y_clean)
-                    feature_importance = dict(
-                        zip(X_clean.columns, model.feature_importances_)
-                    )
+                    feature_importance = dict(zip(X_clean.columns, model.feature_importances_))
                     sorted_importance = dict(
-                        sorted(
-                            feature_importance.items(), key=lambda x: x[1], reverse=True
-                        )
+                        sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
                     )
                     results[name]["feature_importance"] = sorted_importance
 
@@ -867,9 +864,7 @@ class BaseLoadAnalyzer:
 
         return results
 
-    def _analyze_energy_efficiency(
-        self, base_load_data: pd.DataFrame
-    ) -> Dict[str, Any]:
+    def _analyze_energy_efficiency(self, base_load_data: pd.DataFrame) -> Dict[str, Any]:
         """Analyze energy efficiency patterns."""
         base_load = base_load_data["base_load"]
 
@@ -910,15 +905,11 @@ class BaseLoadAnalyzer:
                 {
                     "most_efficient_days": {
                         "mean_consumption": most_efficient_days.mean(),
-                        "sample_dates": most_efficient_days.index.strftime(
-                            "%Y-%m-%d"
-                        ).tolist(),
+                        "sample_dates": most_efficient_days.index.strftime("%Y-%m-%d").tolist(),
                     },
                     "least_efficient_days": {
                         "mean_consumption": least_efficient_days.mean(),
-                        "sample_dates": least_efficient_days.index.strftime(
-                            "%Y-%m-%d"
-                        ).tolist(),
+                        "sample_dates": least_efficient_days.index.strftime("%Y-%m-%d").tolist(),
                     },
                     "efficiency_ratio": (
                         least_efficient_days.mean() / most_efficient_days.mean()
@@ -937,9 +928,7 @@ class BaseLoadAnalyzer:
                 "mean_night_consumption": night_consumption.mean(),
                 "min_night_consumption": night_consumption.min(),
                 "night_load_factor": (
-                    night_consumption.mean() / base_load.mean()
-                    if base_load.mean() > 0
-                    else 0
+                    night_consumption.mean() / base_load.mean() if base_load.mean() > 0 else 0
                 ),
             }
 
@@ -1002,9 +991,7 @@ class BaseLoadAnalyzer:
             if z_score < -1.5:  # Lower threshold for low consumption
                 current_low_streak.append(idx)
             else:
-                if (
-                    len(current_low_streak) >= 48
-                ):  # At least 12 hours of low consumption
+                if len(current_low_streak) >= 48:  # At least 12 hours of low consumption
                     consecutive_low.append(
                         {
                             "start": current_low_streak[0],
@@ -1031,18 +1018,14 @@ class BaseLoadAnalyzer:
                 "count": len(high_consumption_events),
                 "sample_dates": high_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    high_consumption_events.mean()
-                    if not high_consumption_events.empty
-                    else None
+                    high_consumption_events.mean() if not high_consumption_events.empty else None
                 ),
             },
             "low_consumption_events": {
                 "count": len(low_consumption_events),
                 "sample_dates": low_consumption_events.index[:10].tolist(),
                 "avg_consumption": (
-                    low_consumption_events.mean()
-                    if not low_consumption_events.empty
-                    else None
+                    low_consumption_events.mean() if not low_consumption_events.empty else None
                 ),
             },
             "consecutive_high_consumption": {
