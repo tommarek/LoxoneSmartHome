@@ -34,7 +34,7 @@ class UDPListener(BaseModule):
         self.measurement_counts: Dict[str, int] = defaultdict(int)
         self.room_counts: Dict[str, int] = defaultdict(int)
         self.last_stats_log = datetime.now()
-        self.stats_interval = 60  # Log stats every 60 seconds
+        self.stats_interval = 3600  # Log stats every hour
         self._stats_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:

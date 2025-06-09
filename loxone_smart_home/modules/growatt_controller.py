@@ -124,7 +124,9 @@ class GrowattController(BaseModule):
             self.logger.info("No scheduled periods found yet, skipping startup state sync")
             return
 
-        # Check battery-first periods
+        # Track if we're in any export period
+        in_export_period = False
+        # Check all scheduled periods
         for period_type, start, end in self._scheduled_periods:
             start_time = datetime.strptime(start, "%H:%M").time()
             end_time = datetime.strptime(end, "%H:%M").time()
@@ -148,6 +150,12 @@ class GrowattController(BaseModule):
                     await self._enable_ac_charge()
                 elif period_type == "export":
                     await self._enable_export()
+                    in_export_period = True
+
+        # If not in any export period, disable export
+        if not in_export_period:
+            self.logger.info("Not in any export period, disabling export...")
+            await self._disable_export()
 
         self.logger.info("Startup state synchronization complete")
 
@@ -411,6 +419,7 @@ class GrowattController(BaseModule):
 
         payload = {"value": True}
         assert self.mqtt_client is not None
+        # Use the enable topic for enabling export
         await self.mqtt_client.publish(self.config.export_enable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -424,8 +433,9 @@ class GrowattController(BaseModule):
             self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
             return
 
-        payload = {"value": False}
+        payload = {"value": True}  # Changed to True for disable topic
         assert self.mqtt_client is not None
+        # Use the disable topic for disabling export
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -651,6 +661,11 @@ class GrowattController(BaseModule):
             if price >= threshold_eur_mwh
         ]
 
+        # Always disable export at midnight to ensure clean state
+        task = asyncio.create_task(self._schedule_at_time("00:00", self._disable_export))
+        self._scheduled_tasks.append(task)
+        self.logger.info("Scheduled export disable at 00:00 for clean daily start")
+
         if not export_hours:
             self.logger.info(
                 f"No hours above export price threshold "
@@ -670,10 +685,27 @@ class GrowattController(BaseModule):
             f"{threshold_eur_mwh:.2f} EUR/MWh threshold"
         )
 
+        # Sort groups by start time to handle them in order
+        export_groups.sort(key=lambda x: datetime.strptime(x[0], "%H:%M"))
+
+        # Track previous end time to schedule disable between periods
+        previous_end: Optional[str] = None
+
         for group_start, group_end in export_groups:
             # Handle 24:00 edge case
             if group_end == "24:00":
                 group_end = "23:59"
+
+            # If there's a gap between previous export period and this one, disable export
+            if previous_end is not None and previous_end < group_start:
+                self.logger.info(
+                    f"Scheduling export disable between periods at {previous_end} "
+                    f"(gap until {group_start})"
+                )
+                task = asyncio.create_task(
+                    self._schedule_at_time(previous_end, self._disable_export)
+                )
+                self._scheduled_tasks.append(task)
 
             # Calculate price statistics for this time range
             group_prices = [
@@ -714,6 +746,9 @@ class GrowattController(BaseModule):
             # Schedule export disable at end
             task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
             self._scheduled_tasks.append(task)
+
+            # Update previous end time
+            previous_end = group_end
 
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
