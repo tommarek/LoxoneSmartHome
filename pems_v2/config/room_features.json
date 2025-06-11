@@ -1,0 +1,89 @@
+{
+  "room_features": {
+    "chodba_dole": {
+      "has_windows": false,
+      "has_external_walls": true,
+      "room_type": "hallway"
+    },
+    "chodba_nahore": {
+      "has_windows": false,
+      "has_external_walls": true,
+      "room_type": "hallway"
+    },
+    "hosti": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "guest_room"
+    },
+    "koupelna_dole": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "bathroom"
+    },
+    "koupelna_nahore": {
+      "has_windows": false,
+      "has_external_walls": true,
+      "room_type": "bathroom"
+    },
+    "kuchyne": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "kitchen"
+    },
+    "loznice": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "bedroom"
+    },
+    "obyvak": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "living_room"
+    },
+    "pokoj_1": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "bedroom"
+    },
+    "pokoj_2": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "bedroom"
+    },
+    "pracovna": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "office"
+    },
+    "satna_dole": {
+      "has_windows": false,
+      "has_external_walls": false,
+      "room_type": "closet"
+    },
+    "satna_nahore": {
+      "has_windows": false,
+      "has_external_walls": false,
+      "room_type": "closet"
+    },
+    "spajz": {
+      "has_windows": false,
+      "has_external_walls": false,
+      "room_type": "pantry"
+    },
+    "technicka_mistnost": {
+      "has_windows": false,
+      "has_external_walls": true,
+      "room_type": "technical"
+    },
+    "zachod": {
+      "has_windows": false,
+      "has_external_walls": false,
+      "room_type": "toilet"
+    },
+    "zadveri": {
+      "has_windows": true,
+      "has_external_walls": true,
+      "room_type": "entrance"
+    }
+  }
+}

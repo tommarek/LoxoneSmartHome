@@ -9,14 +9,15 @@ import asyncio
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 from analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
 from analysis.analyzers.pattern_analysis import (PVAnalyzer,
                                                  RelayPatternAnalyzer)
 from analysis.analyzers.thermal_analysis import ThermalAnalyzer
-from analysis.core.data_extraction import DataExtractor
+from analysis.core.data_extraction import \
+    DataExtractor  # TODO: Refactor to use UnifiedDataExtractor
 from analysis.core.data_preprocessing import DataPreprocessor
 from analysis.reports.report_generator import ReportGenerator
 from config.settings import PEMSSettings as Settings
@@ -40,13 +41,54 @@ class ComprehensiveAnalyzer:
         self.logger = logging.getLogger(f"{__name__}.ComprehensiveAnalyzer")
 
         # Initialize core components
-        self.extractor = DataExtractor(settings)
+        self.extractor = DataExtractor(
+            settings
+        )  # TODO: Refactor to use UnifiedDataExtractor
         self.preprocessor = DataPreprocessor()
         self.report_generator = ReportGenerator()
 
         # Initialize analyzers
         self.pv_analyzer = PVAnalyzer()
-        self.thermal_analyzer = ThermalAnalyzer(settings)
+
+        # Create a data loader adapter for ThermalAnalyzer
+        class DataLoaderAdapter:
+            def __init__(self, comprehensive_analyzer):
+                self.analyzer = comprehensive_analyzer
+
+            def get_dataset(self, name):
+                """Get dataset from processed data."""
+                if name == "outdoor_temp":
+                    # Try to get outdoor temperature from processed data
+                    if "outdoor_temp" in self.analyzer.processed_data:
+                        return self.analyzer.processed_data["outdoor_temp"]
+                    elif "weather" in self.analyzer.processed_data:
+                        weather = self.analyzer.processed_data["weather"]
+                        if (
+                            isinstance(weather, pd.DataFrame)
+                            and "temperature_2m" in weather.columns
+                        ):
+                            return weather[["temperature_2m"]].rename(
+                                columns={"temperature_2m": "value"}
+                            )
+                elif name == "weather":
+                    return self.analyzer.processed_data.get("weather")
+                elif name.startswith("room_"):
+                    # Get room data from processed rooms
+                    rooms = self.analyzer.processed_data.get("rooms", {})
+                    room_name = name.replace("room_", "")
+                    return rooms.get(room_name)
+                return None
+
+        self.data_loader_adapter = DataLoaderAdapter(self)
+        # Convert Pydantic settings to dict for ThermalAnalyzer
+        settings_dict = (
+            settings.model_dump()
+            if hasattr(settings, "model_dump")
+            else settings.dict()
+        )
+        self.thermal_analyzer = ThermalAnalyzer(
+            self.data_loader_adapter, settings_dict, self.report_generator
+        )
         self.base_load_analyzer = BaseLoadAnalyzer()
         self.relay_analyzer = RelayPatternAnalyzer()
 
@@ -269,7 +311,7 @@ class ComprehensiveAnalyzer:
         # Process each dataset
         for data_type, data in self.raw_data.items():
             if data is None or (isinstance(data, pd.DataFrame) and data.empty):
-                self.logger.warning(f"Skipping empty {data_type} dataset")
+                self.logger.info(f"Skipping empty {data_type} dataset")
                 continue
 
             if data_type == "rooms":
@@ -360,6 +402,19 @@ class ComprehensiveAnalyzer:
                 ] = self.thermal_analyzer.analyze_room_dynamics(
                     self.processed_data["rooms"], weather_data, relay_data
                 )
+
+                # Analyze unknown events and generate recommendations
+                unknown_event_recommendations = self._analyze_unknown_events(
+                    self.analysis_results["thermal_analysis"]
+                )
+                if unknown_event_recommendations:
+                    self.analysis_results["thermal_analysis"][
+                        "unknown_event_recommendations"
+                    ] = unknown_event_recommendations
+                    self.logger.info(
+                        f"Generated {len(unknown_event_recommendations)} recommendations for unknown thermal events"
+                    )
+
                 self.logger.info(
                     f"Thermal analysis completed for {len(self.processed_data['rooms'])} rooms"
                 )
@@ -455,6 +510,56 @@ class ComprehensiveAnalyzer:
         """Analyze correlation between weather and energy consumption."""
         # This can be expanded with more sophisticated analysis
         return {"status": "placeholder - to be implemented"}
+
+    def _analyze_unknown_events(self, thermal_results: Dict[str, Any]) -> List[str]:
+        """Analyze the frequency of unknown events to generate actionable recommendations."""
+        recommendations = []
+
+        for room_name, room_data in thermal_results.items():
+            if (
+                not isinstance(room_data, dict)
+                or "adaptive_thermal_analysis" not in room_data
+            ):
+                continue
+
+            adaptive_data = room_data["adaptive_thermal_analysis"]
+            if "thermal_events" in adaptive_data:
+                events = adaptive_data["thermal_events"]
+                unknown_cooling = len(events.get("unknown_cooling_events", []))
+                unknown_heating = len(events.get("unknown_heating_events", []))
+                total_unknown = unknown_cooling + unknown_heating
+
+                # Define a threshold for what constitutes a high number of unknown events
+                # e.g., more than 10% of all detected events are unknown
+                total_events = events.get("total_events", 0)
+                if total_events > 0 and (total_unknown / total_events) > 0.1:
+                    # Analyze patterns in unknown events for specific recommendations
+                    cooling_events = events.get("unknown_cooling_events", [])
+                    heating_events = events.get("unknown_heating_events", [])
+
+                    # Check for patterns in timing
+                    night_events = sum(
+                        1
+                        for event in cooling_events + heating_events
+                        if 22 <= event.get("hour", 12) or event.get("hour", 12) <= 6
+                    )
+                    day_events = total_unknown - night_events
+
+                    recommendation = f"Room '{room_name}' has {total_unknown} unexplained temperature changes ({(total_unknown / total_events * 100):.1f}% of events)."
+
+                    # Add specific recommendations based on patterns
+                    if night_events > day_events:
+                        recommendation += " Most occur at night - check for thermal bridging, drafts, or HVAC cycling."
+                    elif unknown_cooling > unknown_heating * 2:
+                        recommendation += " Mostly cooling events - check for air leaks or uncontrolled ventilation."
+                    elif unknown_heating > unknown_cooling * 2:
+                        recommendation += " Mostly heating events - check for heat sources like appliances or direct sunlight."
+                    else:
+                        recommendation += " Consider checking for drafts, appliance heat sources, or thermostat placement."
+
+                    recommendations.append(recommendation)
+
+        return recommendations
 
     def _generate_comprehensive_reports(self):
         """Generate comprehensive reports from all analysis results."""

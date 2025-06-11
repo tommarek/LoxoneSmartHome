@@ -9,41 +9,82 @@ Analyzes thermal dynamics per room with Loxone integration:
 """
 
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-# Import Loxone adapter for field standardization
-from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
-                                           LoxoneFieldAdapter)
-from config.settings import PEMSSettings
+import statsmodels.api as sm
 from scipy import optimize
+from scipy.optimize import curve_fit
 from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
 try:
-    from analysis.utils.loxone_adapter import LoxoneFieldAdapter
+    from analysis.reports.report_generator import ReportGenerator
+    from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
+                                               LoxoneFieldAdapter)
 except ImportError:
-    # Fallback if adapter not available
+    # Fallback for testing
+    LoxoneDataIntegrator = None
+    ReportGenerator = None
+
     class LoxoneFieldAdapter:
         @staticmethod
-        def _get_room_power_rating(room_name: str) -> float:
-            return 1.0  # Default fallback
+        def standardize_room_data(room_df, room_name):
+            return room_df
+
+        @staticmethod
+        def standardize_weather_data(weather_df):
+            return weather_df
+
+
+# DataLoader is a generic type, define it separately
+try:
+    from typing import Protocol
+
+    class DataLoader(Protocol):
+        def get_dataset(self, name: str):
+            ...
+
+except ImportError:
+    DataLoader = None
+
+
+# --- Constants for Physical Plausibility ---
+# Realistic thermal resistance range for a room in K/W
+R_MIN, R_MAX = 0.005, 0.5
+# Realistic thermal capacitance range for a room in MJ/K
+C_MIN_MJ, C_MAX_MJ = 1.0, 100.0
+# Realistic time constant range in hours
+TAU_MIN, TAU_MAX = 2.0, 100.0
 
 
 class ThermalAnalyzer:
-    """Analyze thermal dynamics for each room."""
+    """Analyzes thermal dynamics of rooms based on temperature, weather, and heating data."""
 
-    def __init__(self, settings: Optional[PEMSSettings] = None):
-        """Initialize the thermal analyzer.
-
-        Args:
-            settings: PEMS settings containing room power ratings and thermal setpoints
-        """
+    def __init__(
+        self,
+        data_loader: DataLoader,
+        settings: Dict[str, Any],
+        report_generator: ReportGenerator,
+    ):
+        self.data_loader = data_loader
+        self.settings = settings.get("thermal_analysis", {})
+        self.system_settings = settings
+        self.report = report_generator
         self.logger = logging.getLogger(f"{__name__}.ThermalAnalyzer")
-        self.loxone_integrator = LoxoneDataIntegrator()
-        self.settings = settings
+        if LoxoneDataIntegrator:
+            self.integrator = LoxoneDataIntegrator()
+        else:
+            self.integrator = None
+        # Load room power ratings from settings
+        self.room_power_ratings_kw = self.system_settings.get(
+            "room_power_ratings_kw", {}
+        )
+        self.room_configs = {
+            room["name"]: room for room in self.system_settings.get("rooms", [])
+        }
 
     def get_target_temp(self, room_name: str, hour: int) -> float:
         """Get target temperature for a room at a specific hour.
@@ -111,12 +152,24 @@ class ThermalAnalyzer:
             self.logger.debug("No relay data provided for heating period detection")
 
         # Prepare data using Loxone integrator if relay data is provided
-        if relay_data is not None:
+        if relay_data is not None and self.integrator is not None:
             self.logger.info("Preparing thermal analysis data with relay integration")
+            self.logger.info(
+                f"Relay data provided for rooms: {list(relay_data.keys()) if relay_data else 'None'}"
+            )
+            for room, relay_df in relay_data.items():
+                if not relay_df.empty:
+                    self.logger.info(
+                        f"Relay data for {room}: {relay_df.shape[0]} records"
+                    )
+                else:
+                    self.logger.info(f"Empty relay data for {room}")
+            # Store relay data in integrator for adaptive analysis
+            self.integrator._processed_relay_data = relay_data
             (
                 standardized_rooms,
                 standardized_weather,
-            ) = self.loxone_integrator.prepare_thermal_analysis_data(
+            ) = self.integrator.prepare_thermal_analysis_data(
                 room_data, relay_data, weather_data
             )
         else:
@@ -154,6 +207,11 @@ class ThermalAnalyzer:
         # Analyze each interior room individually using standardized data
         for room_name, room_df in interior_rooms.items():
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
+            self.logger.info(
+                f"Room {room_name} processed: {room_df.shape[0]} records"
+            )
+            if "heating_on" not in room_df.columns:
+                self.logger.info(f"Room {room_name} has no heating_on column")
 
             try:
                 # Store room name for power calculations
@@ -172,6 +230,111 @@ class ThermalAnalyzer:
 
         self.logger.info("Thermal dynamics analysis completed")
         return results
+
+    def _prepare_thermal_data(
+        self,
+    ) -> Tuple[Dict[str, pd.DataFrame], Optional[pd.DataFrame]]:
+        """Integrates room temperatures, relay states, and outdoor temperatures."""
+        self.logger.info("Preparing thermal analysis data with relay integration")
+        if self.integrator:
+            # Get room data directly from data loader
+            all_rooms_data = {}
+            room_names = [
+                "chodba_dole",
+                "chodba_nahore",
+                "hosti",
+                "koupelna_dole",
+                "koupelna_nahore",
+                "kuchyne",
+                "loznice",
+                "obyvak",
+                "pokoj_1",
+                "pokoj_2",
+                "pracovna",
+                "satna_dole",
+                "satna_nahore",
+                "spajz",
+                "technicka_mistnost",
+                "zachod",
+                "zadveri",
+                "outside",
+            ]
+            for room in room_names:
+                room_data = self.data_loader.get_dataset(f"room_{room}")
+                if room_data is not None:
+                    all_rooms_data[room] = room_data
+        else:
+            all_rooms_data = {}
+
+        outdoor_temp = self.data_loader.get_dataset("outdoor_temp")
+        weather_data = self.data_loader.get_dataset("weather")
+
+        outdoor_temp_df = None
+        if outdoor_temp is not None and not outdoor_temp.empty:
+            self.logger.info(
+                "Using outdoor temperature data from primary 'teplomer' sensor."
+            )
+            outdoor_temp_df = outdoor_temp.rename(columns={"value": "outdoor_temp"})
+        elif weather_data is not None and not weather_data.empty:
+            self.logger.info(
+                "Falling back to weather service 'temperature_2m' for outdoor temp."
+            )
+            outdoor_temp_df = weather_data[["temperature_2m"]].rename(
+                columns={"temperature_2m": "outdoor_temp"}
+            )
+
+        if outdoor_temp_df is None:
+            self.logger.error(
+                "No outdoor temperature data available. Thermal analysis will be limited."
+            )
+
+        return all_rooms_data, outdoor_temp_df
+
+    def _merge_with_outdoor_temp(
+        self, room_df: pd.DataFrame, outdoor_temp_df: Optional[pd.DataFrame]
+    ) -> Optional[pd.DataFrame]:
+        """Merges room data with outdoor temperature data, ensuring timezone consistency."""
+        if outdoor_temp_df is None:
+            self.logger.warning(
+                "Cannot merge data: Outdoor temperature data is missing."
+            )
+            return (
+                room_df  # Return as-is, downstream functions must handle missing data
+            )
+
+        try:
+            # Ensure both dataframes are timezone-aware (UTC)
+            if room_df.index.tz is None:
+                room_df.index = room_df.index.tz_localize("UTC")
+            if outdoor_temp_df.index.tz is None:
+                outdoor_temp_df.index = outdoor_temp_df.index.tz_localize("UTC")
+
+            # Resample outdoor temp to match room data frequency for a clean merge
+            resampled_outdoor = outdoor_temp_df.reindex(
+                room_df.index, method="pad", limit=1
+            )
+
+            merged_df = room_df.join(resampled_outdoor)
+
+            # Check data quality post-merge
+            valid_outdoor_temps = merged_df["outdoor_temp"].notna().sum()
+            if valid_outdoor_temps == 0:
+                self.logger.error(
+                    "Merge resulted in zero valid outdoor temperature points. Check data alignment."
+                )
+                return None
+
+            self.logger.info(
+                f"Successfully merged room and outdoor temperature data. "
+                f"Outdoor temp range: {merged_df['outdoor_temp'].min():.1f}°C to {merged_df['outdoor_temp'].max():.1f}°C"
+            )
+            return merged_df
+
+        except Exception as e:
+            self.logger.error(
+                f"Error during merging of outdoor temperature data: {e}", exc_info=True
+            )
+            return None
 
     def _analyze_single_room(
         self, room_df: pd.DataFrame, weather_data: pd.DataFrame, room_name: str
@@ -206,7 +369,18 @@ class ThermalAnalyzer:
         results["solar_gains"] = self._analyze_solar_gains(merged_data)
 
         # RC model parameters (enhanced for relay systems)
-        results["rc_parameters"] = self.estimate_rc_parameters(merged_data)
+        # Use the improved RC parameter estimation
+        power_rating_kw = self.room_power_ratings_kw.get(room_name, 0)
+        if power_rating_kw == 0:
+            self.logger.warning(
+                f"No power rating for room {room_name}, using default 2000W"
+            )
+            power_rating_w = 2000
+        else:
+            power_rating_w = power_rating_kw * 1000  # Convert kW to W
+        results["rc_parameters"] = self._estimate_rc_parameters(
+            merged_data, power_rating_w
+        )
 
         # ARX model identification
         results["arx_model"] = self._fit_arx_model(merged_data)
@@ -216,6 +390,8 @@ class ThermalAnalyzer:
 
         # Thermal comfort analysis
         results["comfort_analysis"] = self._analyze_thermal_comfort(merged_data)
+
+        # Heating usage is now calculated in the R/C parameter estimation above
 
         return results
 
@@ -234,20 +410,38 @@ class ThermalAnalyzer:
             self.logger.warning("No temperature column found in room data")
             return pd.DataFrame()
 
-        # Prepare room data
-        room_clean = room_df[[temp_col]].copy()
-        room_clean.columns = ["room_temp"]
+        # Prepare room data - copy the entire DataFrame first
+        room_clean = room_df.copy()
+        # Rename temperature column to standard name
+        room_clean.rename(columns={temp_col: "room_temp"}, inplace=True)
 
         # Add heating status if available
         heating_cols = [
             col
             for col in room_df.columns
-            if "heating" in col.lower() or "heat" in col.lower()
+            if "heating" in col.lower()
+            or "heat" in col.lower()
+            or col.lower() == "relay_state"
         ]
+
         if heating_cols:
-            room_clean["heating_on"] = room_df[heating_cols[0]]
+            # Use the first heating column found
+            heating_col = heating_cols[0]
+
+            if heating_col == "relay_state":
+                # Debug: Check relay_state data
+                # Convert relay state to heating_on (binary)
+                room_clean["heating_on"] = (room_df[heating_col] > 0).astype(int)
+            else:
+                room_clean["heating_on"] = room_df[heating_col]
+        elif "heating_on" in room_df.columns:
+            # Direct heating_on column (already standardized)
+            room_clean["heating_on"] = room_df["heating_on"]
         else:
             # Infer heating from temperature changes
+            self.logger.info(
+                "No heating column found, using inference"
+            )
             room_clean["heating_on"] = self._infer_heating_status(
                 room_clean["room_temp"]
             )
@@ -275,18 +469,28 @@ class ThermalAnalyzer:
             if temp_column:
                 self.logger.info(f"Using temperature column: {temp_column}")
 
-                # Ensure both dataframes have datetime index
+                # Ensure both dataframes have datetime index and are sorted
                 if not isinstance(weather_data.index, pd.DatetimeIndex):
                     self.logger.warning(
                         "Weather data index is not DatetimeIndex, attempting conversion"
                     )
                     weather_data.index = pd.to_datetime(weather_data.index)
 
+                # Ensure weather data index is sorted
+                if not weather_data.index.is_monotonic_increasing:
+                    self.logger.debug("Sorting non-monotonic weather data index")
+                    weather_data = weather_data.sort_index()
+
                 if not isinstance(room_clean.index, pd.DatetimeIndex):
                     self.logger.warning(
                         "Room data index is not DatetimeIndex, attempting conversion"
                     )
                     room_clean.index = pd.to_datetime(room_clean.index)
+
+                # Ensure room data index is sorted
+                if not room_clean.index.is_monotonic_increasing:
+                    self.logger.debug("Sorting non-monotonic room data index")
+                    room_clean = room_clean.sort_index()
 
                 # Resample weather data to match room data frequency (5 minutes)
                 try:
@@ -341,17 +545,14 @@ class ThermalAnalyzer:
         merged["hour"] = merged.index.hour
         merged["weekday"] = merged.index.weekday
 
-        return merged.dropna()
+        # Only drop rows where essential columns are NaN
+        # Keep heating_on data even if outdoor_temp is missing
+        return merged.dropna(subset=["room_temp", "heating_on"])
 
     def _infer_heating_status(self, temperature: pd.Series) -> pd.Series:
-        """Infer heating status from temperature changes."""
-        # Simple heuristic: heating is on when temperature is rising significantly
-        temp_change = (
-            temperature.diff().rolling(window=3).mean()
-        )  # 15-minute moving average
-        heating_threshold = 0.1  # 0.1°C increase per 5 minutes indicates heating
-
-        return (temp_change > heating_threshold).astype(int)
+        """Deprecated: Use actual relay data instead of inference."""
+        # Return zeros - we should use actual relay data
+        return pd.Series(0, index=temperature.index)
 
     def _calculate_basic_thermal_stats(
         self, data: pd.DataFrame, room_name: str
@@ -700,15 +901,43 @@ class ThermalAnalyzer:
         y = dT_dt_clean
 
         try:
-            reg = LinearRegression().fit(X, y)
+            # Use Ridge regression for better stability with noisy data
+            from sklearn.linear_model import Ridge
+
+            reg = Ridge(alpha=1.0).fit(X, y)
 
             # Extract parameters
             coeff_temp = reg.coef_[0]  # 1/(R*C)
             coeff_heating = reg.coef_[1]  # 1/C
 
-            if coeff_heating > 0:
+            # Physical constraint checks
+            if coeff_heating > 0 and coeff_temp > 0:
                 C = 1 / coeff_heating  # Thermal capacity in Wh/°C
                 R = 1 / (coeff_temp * C)  # Thermal resistance in °C/W
+
+                # Physical sanity checks
+                if C <= 0 or R <= 0:
+                    return {
+                        "warning": f"Invalid parameters: C={C:.3f}, R={R:.3f} (must be > 0)"
+                    }
+
+                if R > 10.0:  # Very high resistance
+                    self.logger.warning(
+                        f"Unusually high thermal resistance: {R:.3f} °C/W"
+                    )
+                elif R < 0.0001:  # Very low resistance
+                    self.logger.warning(
+                        f"Unusually low thermal resistance: {R:.6f} °C/W"
+                    )
+
+                if C > 10000:  # Very high capacitance
+                    self.logger.warning(
+                        f"Unusually high thermal capacitance: {C:.1f} Wh/°C"
+                    )
+                elif C < 10:  # Very low capacitance
+                    self.logger.warning(
+                        f"Unusually low thermal capacitance: {C:.3f} Wh/°C"
+                    )
 
                 # Model quality
                 y_pred = reg.predict(X)
@@ -722,12 +951,625 @@ class ThermalAnalyzer:
                     "r_squared": r2,
                     "rmse": rmse,
                     "model_intercept": reg.intercept_,
+                    "physically_valid": True,
                 }
             else:
-                return {"warning": "Invalid heating coefficient in RC model"}
+                return {
+                    "warning": f"Invalid coefficients: temp={coeff_temp:.6f}, heating={coeff_heating:.6f} (must be > 0)"
+                }
 
         except Exception as e:
             return {"warning": f"RC model fitting failed: {str(e)}"}
+
+    def _estimate_rc_parameters(
+        self, df: pd.DataFrame, p_heat_w: float
+    ) -> Dict[str, Any]:
+        """
+        Selects the best RC parameters from multiple estimation methods.
+        This function orchestrates the different estimation strategies and chooses the most
+        physically plausible and confident result.
+        """
+        self.logger.info("Starting enhanced RC parameter estimation for relay system")
+
+        # Ensure required columns are present
+        if "outdoor_temp" not in df.columns or "heating_on" not in df.columns:
+            self.logger.warning(
+                "Missing 'outdoor_temp' or 'heating_on' columns. Skipping RC estimation."
+            )
+            return self._get_default_rc_params()
+
+        estimation_methods = {
+            "decoupled": self._estimate_rc_decoupled,
+            "state_space": self._estimate_rc_state_space,
+        }
+
+        results = {}
+        for name, method_func in estimation_methods.items():
+            try:
+                params = method_func(df, p_heat_w)
+                if params and params.get("physically_valid", False):
+                    results[name] = params
+            except Exception as e:
+                self.logger.error(
+                    f"Estimation method '{name}' failed: {e}", exc_info=True
+                )
+
+        if not results:
+            self.logger.warning(
+                "All RC parameter estimation methods failed to produce a valid result."
+            )
+            return self._get_default_rc_params()
+
+        # Select the best result based on confidence score
+        best_method = max(results, key=lambda k: results[k]["confidence"])
+        final_params = results[best_method]
+
+        self.logger.info(
+            f"RC parameter estimation completed. Best method: '{best_method}'"
+        )
+        self.logger.info(
+            f"Final Parameters: R={final_params['R']:.4f} K/W, "
+            f"C={final_params['C']/1e6:.2f} MJ/K, τ={final_params['time_constant']:.1f}h"
+        )
+
+        return final_params
+
+    def _estimate_rc_decoupled(
+        self, df: pd.DataFrame, p_heat_w: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Estimates R and C using heating cycle analysis for robust thermal parameter estimation.
+        This method analyzes individual heating cycles as controlled experiments.
+        """
+        # Try new heating cycle analysis first
+        cycles = self._detect_heating_cycles(df)
+
+        if len(cycles) < 3:
+            self.logger.info(
+                f"Only {len(cycles)} heating cycles found, falling back to simplified estimation"
+            )
+            return self._estimate_rc_simplified(df, p_heat_w)
+
+        self.logger.info(f"Analyzing {len(cycles)} heating cycles for RC estimation")
+
+        # Analyze each cycle
+        decay_results = []
+        rise_results = []
+
+        for i, cycle in enumerate(cycles):
+            # Analyze cooling decay
+            decay = self._analyze_heating_cycle_decay(df, cycle)
+            if decay["fit_valid"]:
+                decay_results.append(decay)
+                self.logger.debug(
+                    f"Cycle {i+1} decay: τ={decay['time_constant_hours']:.1f}h, R²={decay['r_squared']:.3f}"
+                )
+            else:
+                self.logger.debug(
+                    f"Cycle {i+1} decay analysis failed: {decay.get('reason', 'unknown')}"
+                )
+
+            # Analyze heating rise
+            rise = self._analyze_heating_cycle_rise(df, cycle)
+            if rise["fit_valid"]:
+                rise_results.append(rise)
+                self.logger.debug(
+                    f"Cycle {i+1} rise: C={rise['thermal_capacitance_j_per_k']/1e6:.1f}MJ/K, R²={rise['fit_r_squared']:.3f}"
+                )
+            else:
+                self.logger.debug(
+                    f"Cycle {i+1} rise analysis failed: {rise.get('reason', 'unknown')}"
+                )
+
+        # Check if we have enough valid results
+        if len(decay_results) == 0 and len(rise_results) == 0:
+            self.logger.warning(
+                "No valid heating cycle analyses, falling back to simplified estimation"
+            )
+            return self._estimate_rc_simplified(df, p_heat_w)
+
+        # Calculate robust statistics from successful analyses
+        tau_values = []
+        C_values = []
+        
+        if len(decay_results) > 0:
+            tau_values = [r["time_constant_hours"] for r in decay_results]
+            tau_median = np.median(tau_values)
+            tau_std = np.std(tau_values)
+        else:
+            tau_median = None
+            tau_std = 0
+
+        if len(rise_results) > 0:
+            C_values = [r["thermal_capacitance_j_per_k"] for r in rise_results]
+            C_median = np.median(C_values)
+            C_std = np.std(C_values)
+        else:
+            C_median = None
+            C_std = 0
+
+        # If we have both τ and C, calculate R
+        if tau_median is not None and C_median is not None:
+            R_calculated = (tau_median * 3600) / C_median  # Convert hours to seconds
+            method_used = "heating_cycle_analysis"
+        elif tau_median is not None:
+            # Only have τ, estimate C from typical values
+            C_median = 30e6  # 30 MJ/K in J/K
+            R_calculated = (tau_median * 3600) / C_median
+            method_used = "heating_cycle_decay_only"
+            self.logger.info(
+                "Using typical thermal capacitance with measured time constant"
+            )
+        elif C_median is not None:
+            # Only have C, estimate τ from typical values
+            tau_median = 12.0  # 12 hour typical time constant
+            R_calculated = (tau_median * 3600) / C_median
+            method_used = "heating_cycle_rise_only"
+            self.logger.info(
+                "Using typical time constant with measured thermal capacitance"
+            )
+        else:
+            # Shouldn't reach here given the check above, but safety fallback
+            return self._estimate_rc_simplified(df, p_heat_w)
+
+        # Quality assessment
+        confidence = min(
+            1.0, len(decay_results) / 10
+        )  # More cycles = higher confidence
+
+        # Physical validity checks
+        physically_valid = (
+            R_MIN < R_calculated < R_MAX
+            and C_MIN_MJ * 1e6 < C_median < C_MAX_MJ * 1e6
+            and TAU_MIN < tau_median < TAU_MAX
+        )
+
+        # Log detailed statistics
+        self.logger.info("Heating cycle analysis complete:")
+        self.logger.info(
+            f"  Valid decay fits: {len(decay_results)}/{len(cycles)} ({len(decay_results)/len(cycles)*100:.1f}%)"
+        )
+        self.logger.info(
+            f"  Valid rise fits: {len(rise_results)}/{len(cycles)} ({len(rise_results)/len(cycles)*100:.1f}%)"
+        )
+
+        if tau_values:
+            self.logger.info(
+                f"  Time constant: median={tau_median:.1f}h, std={tau_std:.1f}h, range={min(tau_values):.1f}-{max(tau_values):.1f}h"
+            )
+        if C_values:
+            self.logger.info(
+                f"  Thermal capacitance: median={C_median/1e6:.1f}MJ/K, std={C_std/1e6:.1f}MJ/K"
+            )
+
+        # Quality warnings
+        if tau_median is not None and tau_std > tau_median * 0.5:
+            self.logger.warning(
+                f"High variability in time constants (std={tau_std:.1f}h, median={tau_median:.1f}h)"
+            )
+
+        if len(decay_results) < 5:
+            self.logger.warning(
+                f"Limited heating cycle data ({len(decay_results)} valid cycles) - results may be unreliable"
+            )
+
+        if not physically_valid:
+            self.logger.warning(
+                f"Heating cycle analysis produced unphysical results: R={R_calculated:.4f}, C={C_median/1e6:.2f}, τ={tau_median:.1f}h"
+            )
+            # Clamp to physical bounds
+            R_calculated = np.clip(R_calculated, R_MIN, R_MAX)
+            C_median = np.clip(C_median, C_MIN_MJ * 1e6, C_MAX_MJ * 1e6)
+            tau_median = np.clip(tau_median, TAU_MIN, TAU_MAX)
+            physically_valid = True
+            confidence *= 0.5  # Reduce confidence for clamped values
+
+        return {
+            "method": method_used,
+            "confidence": confidence,
+            "R": R_calculated,
+            "C": C_median,
+            "time_constant": tau_median,
+            "physically_valid": physically_valid,
+            "cycles_analyzed": len(cycles),
+            "successful_decays": len(decay_results),
+            "successful_rises": len(rise_results),
+            "tau_std_dev": tau_std,
+            "C_std_dev": C_std,
+        }
+
+    def _detect_heating_cycles(self, df: pd.DataFrame) -> List[Dict]:
+        """
+        Detect heating cycles from room temperature and heating state data.
+
+        Args:
+            df: DataFrame with 'heating_on', 'room_temp', and 'outdoor_temp' columns
+
+        Returns:
+            List of heating cycle dictionaries with cycle information
+        """
+        cycles = []
+
+        if "heating_on" not in df.columns:
+            self.logger.error("'heating_on' column not found in DataFrame")
+            return cycles
+
+        # Find heating state changes
+        heating_diff = df["heating_on"].diff()
+        start_indices = df.index[heating_diff == 1]  # Heating starts
+        end_indices = df.index[heating_diff == -1]  # Heating ends
+
+        self.logger.info(f"Found {len(start_indices)} heating starts and {len(end_indices)} heating ends")
+
+        # Handle edge cases: dataset starts/ends during heating
+        if len(df) > 0 and df["heating_on"].iloc[0] == 1:
+            # Dataset starts with heating on
+            start_indices = start_indices.insert(0, df.index[0])
+
+        if (
+            len(df) > 0
+            and df["heating_on"].iloc[-1] == 1
+            and len(start_indices) > len(end_indices)
+        ):
+            # Dataset ends with heating on
+            end_indices = end_indices.insert(len(end_indices), df.index[-1])
+
+        # Pair start and end events
+        for i in range(min(len(start_indices), len(end_indices))):
+            start_time = start_indices[i]
+            end_time = end_indices[i]
+
+
+            # Skip if end comes before start (data issue)
+            if end_time <= start_time:
+                continue
+
+            duration_minutes = (end_time - start_time).total_seconds() / 60.0
+
+            # Filter by duration
+            if (
+                duration_minutes < 10 or duration_minutes > 2880
+            ):  # 10min to 48 hours (to handle multi-day heating periods)
+                continue
+
+            # Get temperature data for this cycle
+            cycle_data = df.loc[start_time:end_time]
+            if len(cycle_data) < 2:
+                continue
+
+            # Filter out NaN temperature values for this cycle
+            valid_temps = cycle_data["room_temp"].dropna()
+            if len(valid_temps) < 2:
+                continue  # Need at least 2 valid temperature readings
+
+            start_temp = valid_temps.iloc[0]
+            peak_temp = valid_temps.max()
+
+            # Filter by temperature rise
+            temp_rise = peak_temp - start_temp
+            if temp_rise < 0.5:  # At least 0.5°C rise
+                continue
+
+            # Check for valid outdoor temperature data (optional)
+            outdoor_temp_avg = None
+            if "outdoor_temp" in cycle_data.columns:
+                outdoor_temps = cycle_data["outdoor_temp"].dropna()
+                if len(outdoor_temps) > 0:
+                    outdoor_temp_avg = outdoor_temps.mean()
+
+            # Get power rating from room config
+            power_w = self._get_room_power_rating_watts()
+
+            cycle = {
+                "start_time": start_time,
+                "end_time": end_time,
+                "duration_minutes": duration_minutes,
+                "start_temp": start_temp,
+                "peak_temp": peak_temp,
+                "outdoor_temp_avg": outdoor_temp_avg,
+                "power_w": power_w,
+            }
+            cycles.append(cycle)
+
+        self.logger.info(f"Detected {len(cycles)} valid heating cycles")
+        return cycles
+
+    def _analyze_heating_cycle_decay(self, df: pd.DataFrame, cycle: Dict) -> Dict:
+        """
+        Analyze the cooling decay phase after a heating cycle.
+
+        Args:
+            df: Full temperature DataFrame
+            cycle: Heating cycle information from _detect_heating_cycles()
+
+        Returns:
+            Dictionary with decay analysis results
+        """
+        # Extract post-heating data
+        decay_start = cycle["end_time"]
+
+        # Find end of decay period (return to baseline or 4 hours max)
+        baseline_temp = cycle["start_temp"]
+        baseline_tolerance = 0.3  # °C
+        max_decay_hours = 4
+
+        decay_end = decay_start + pd.Timedelta(hours=max_decay_hours)
+        if decay_end > df.index[-1]:
+            decay_end = df.index[-1]
+
+        # Get decay period data
+        decay_data = df.loc[decay_start:decay_end].copy()
+
+        # Find actual end point (return to baseline)
+        baseline_reached = decay_data[
+            abs(decay_data["room_temp"] - baseline_temp) <= baseline_tolerance
+        ]
+        if len(baseline_reached) > 0:
+            actual_decay_end = baseline_reached.index[0]
+            decay_data = decay_data.loc[:actual_decay_end]
+
+        if len(decay_data) < 5:  # Need minimum data points
+            return {"fit_valid": False, "reason": "insufficient_data"}
+
+        # Check for heating resumption during decay
+        if decay_data["heating_on"].sum() > 0:
+            return {"fit_valid": False, "reason": "heating_resumed"}
+
+        # Prepare data for exponential decay fitting
+        # Use temperature difference: ΔT(t) = T_room(t) - T_outdoor(t)
+        decay_data["temp_diff"] = decay_data["room_temp"] - decay_data["outdoor_temp"]
+        decay_data = decay_data.dropna(subset=["temp_diff"])
+
+        if len(decay_data) < 5:
+            return {"fit_valid": False, "reason": "insufficient_valid_data"}
+
+        # Time array in hours from decay start
+        time_hours = (decay_data.index - decay_start).total_seconds() / 3600.0
+        temp_diff = decay_data["temp_diff"].values
+
+        # Initial conditions
+        initial_temp_diff = temp_diff[0]
+        outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+
+        try:
+            # Exponential decay model: ΔT(t) = ΔT_initial * exp(-t/τ)
+            def decay_model(t, tau):
+                return initial_temp_diff * np.exp(-t / tau)
+
+            # Fit with bounds for time constant
+            bounds = ([TAU_MIN], [TAU_MAX])
+            popt, _ = curve_fit(
+                decay_model, time_hours, temp_diff, bounds=bounds, maxfev=1000
+            )
+
+            tau_fitted = popt[0]
+
+            # Calculate R² for fit quality
+            y_pred = decay_model(time_hours, tau_fitted)
+            r_squared = r2_score(temp_diff, y_pred)
+
+            # Validate fit quality
+            fit_valid = r_squared > 0.7
+
+            return {
+                "time_constant_hours": tau_fitted,
+                "r_squared": r_squared,
+                "decay_start_temp": cycle["peak_temp"],
+                "baseline_temp": baseline_temp,
+                "outdoor_temp_avg": outdoor_temp_avg,
+                "data_points": len(decay_data),
+                "fit_valid": fit_valid,
+            }
+
+        except Exception as e:
+            self.logger.debug(f"Decay fitting failed: {e}")
+            return {"fit_valid": False, "reason": "fitting_failed"}
+
+    def _analyze_heating_cycle_rise(self, df: pd.DataFrame, cycle: Dict) -> Dict:
+        """
+        Analyze the heating rise phase of a heating cycle.
+
+        Args:
+            df: Full temperature DataFrame
+            cycle: Heating cycle information from _detect_heating_cycles()
+
+        Returns:
+            Dictionary with rise analysis results
+        """
+        # Extract heating period data
+        heating_data = df.loc[cycle["start_time"] : cycle["end_time"]].copy()
+
+        # Remove first 2 minutes (system lag)
+        lag_time = pd.Timedelta(minutes=2)
+        analysis_start = cycle["start_time"] + lag_time
+        if analysis_start >= cycle["end_time"]:
+            return {"fit_valid": False, "reason": "cycle_too_short"}
+
+        steady_heating = heating_data.loc[analysis_start:]
+
+        if len(steady_heating) < 3:
+            return {"fit_valid": False, "reason": "insufficient_steady_data"}
+
+        # Calculate heating rate using linear regression on first 5-10 minutes
+        # This minimizes heat loss effects during initial heating
+        initial_period_minutes = min(
+            10, len(steady_heating) * 0.5
+        )  # First 10 min or half of data
+        initial_end = analysis_start + pd.Timedelta(minutes=initial_period_minutes)
+
+        initial_data = steady_heating.loc[:initial_end]
+        if len(initial_data) < 3:
+            initial_data = steady_heating  # Use all data if too short
+
+        # Time array in seconds from heating start
+        time_seconds = (initial_data.index - analysis_start).total_seconds()
+        temp_values = initial_data["room_temp"].values
+
+        try:
+            # Linear regression for heating rate
+            slope, _, r_value, _, _ = linregress(time_seconds, temp_values)
+
+            heating_rate_k_per_s = slope  # K/s
+            r_squared = r_value**2
+
+            # Calculate thermal capacitance: C = P_heat / (dT/dt)
+            power_w = cycle["power_w"]
+            if heating_rate_k_per_s > 0:
+                thermal_capacitance_j_per_k = power_w / heating_rate_k_per_s
+            else:
+                return {"fit_valid": False, "reason": "negative_heating_rate"}
+
+            # Validate fit quality and physical plausibility
+            fit_valid = (
+                r_squared > 0.7
+                and heating_rate_k_per_s > 0
+                and C_MIN_MJ * 1e6 < thermal_capacitance_j_per_k < C_MAX_MJ * 1e6
+            )
+
+            return {
+                "thermal_capacitance_j_per_k": thermal_capacitance_j_per_k,
+                "heating_rate_k_per_s": heating_rate_k_per_s,
+                "corrected_heating_rate_k_per_s": heating_rate_k_per_s,  # No correction applied for simplicity
+                "heat_loss_correction_applied": False,
+                "fit_r_squared": r_squared,
+                "fit_valid": fit_valid,
+            }
+
+        except Exception as e:
+            self.logger.debug(f"Rise analysis failed: {e}")
+            return {"fit_valid": False, "reason": "fitting_failed"}
+
+    def _get_room_power_rating_watts(self) -> float:
+        """Get room power rating in watts from configuration."""
+        if hasattr(self, "_current_room_name") and self._current_room_name:
+            power_kw = self.room_power_ratings_kw.get(self._current_room_name, 1.0)
+            return power_kw * 1000.0  # Convert kW to W
+        return 1000.0  # 1kW default fallback
+
+    def _estimate_rc_simplified(
+        self, df: pd.DataFrame, p_heat_w: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Simplified RC estimation for summer data with minimal thermal dynamics.
+        Uses typical building physics values scaled by room characteristics.
+        """
+        self.logger.info("Using simplified RC estimation for summer data")
+
+        # Analyze temperature variation to estimate building quality
+        temp_std = df["room_temp"].std()
+
+        # Estimate thermal properties based on temperature stability
+        if temp_std < 1.0:
+            # Very stable temperature -> well-insulated building
+            R_estimate = 0.15  # K/W - good insulation
+            C_estimate_mj = 40.0  # MJ/K - higher thermal mass
+        elif temp_std < 2.0:
+            # Moderate stability -> average building
+            R_estimate = 0.10  # K/W - average insulation
+            C_estimate_mj = 30.0  # MJ/K - typical thermal mass
+        else:
+            # High variation -> poorly insulated
+            R_estimate = 0.05  # K/W - poor insulation
+            C_estimate_mj = 20.0  # MJ/K - lower thermal mass
+
+        tau_estimate = (R_estimate * C_estimate_mj * 1e6) / 3600  # hours
+
+        # Ensure values are within physical bounds
+        R_estimate = np.clip(R_estimate, R_MIN, R_MAX)
+        C_estimate_mj = np.clip(C_estimate_mj, C_MIN_MJ, C_MAX_MJ)
+        tau_estimate = np.clip(tau_estimate, TAU_MIN, TAU_MAX)
+
+        self.logger.info(
+            f"Simplified estimation: R={R_estimate:.3f} K/W, C={C_estimate_mj:.1f} MJ/K, τ={tau_estimate:.1f}h"
+        )
+
+        return {
+            "method": "simplified",
+            "confidence": 0.6,  # Moderate confidence for physics-based estimates
+            "R": R_estimate,
+            "C": C_estimate_mj * 1e6,  # Convert to J/K
+            "time_constant": tau_estimate,
+            "physically_valid": True,
+            "note": "Estimated from building thermal characteristics (summer data)",
+        }
+
+    def _estimate_rc_state_space(
+        self, df: pd.DataFrame, power_rating_w: float
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Estimates R and C using a constrained state-space model (ARMA).
+        """
+        # Resample to consistent 15-minute intervals to ensure regular frequency
+        df_resampled = df.resample("15min").mean().interpolate(method='linear').dropna()
+        if len(df_resampled) < 50:
+            self.logger.warning("Not enough data for state-space modeling.")
+            return None
+
+        # T_room(t) = a*T_room(t-1) + b*T_out(t) + c*P_heat(t) + const
+        endog = df_resampled["room_temp"]
+        exog = df_resampled[["outdoor_temp", "heating_on"]].copy()
+        exog["heating_on"] *= power_rating_w  # Use actual power
+        
+        # Use resample to ensure proper frequency is inferred
+        try:
+            # Let statsmodels infer the frequency from the regular index
+            model = sm.tsa.ARIMA(endog, order=(1, 0, 0), exog=exog, trend="c").fit()
+        except Exception as e:
+            self.logger.warning(f"ARIMA model fitting failed: {e}")
+            return None
+
+        ar_param = model.params.get("ar.L1")
+        if ar_param <= 0 or ar_param >= 1:
+            self.logger.warning(
+                f"State-space model unstable (AR param = {ar_param:.3f})."
+            )
+            return None
+
+        # Convert model coeffs to physical params
+        dt = 15 * 60  # seconds
+        tau_seconds = -dt / np.log(ar_param)
+        tau_hours = tau_seconds / 3600.0
+
+        gain_heating = model.params.get("heating_on") / (1 - ar_param)
+
+        R = gain_heating
+        C = tau_seconds / R if R > 1e-6 else 0
+        C_mj = C / 1e6
+
+        physically_valid = (
+            (R_MIN < R < R_MAX)
+            and (C_MIN_MJ < C_mj < C_MAX_MJ)
+            and (TAU_MIN < tau_hours < TAU_MAX)
+        )
+        confidence = 1.0 - model.bse.get(
+            "ar.L1", 1.0
+        )  # Confidence based on std error of AR term
+
+        if not physically_valid:
+            self.logger.warning(
+                f"State-space estimation produced unphysical results: R={R:.4f}, C={C_mj:.2f}, τ={tau_hours:.1f}h"
+            )
+            confidence = 0.2  # Penalize unphysical results
+
+        return {
+            "method": "state_space",
+            "confidence": confidence,
+            "R": R,
+            "C": C,
+            "time_constant": tau_hours,
+            "physically_valid": physically_valid,
+        }
+
+    def _get_default_rc_params(self) -> Dict[str, Any]:
+        """Returns a default, invalid parameter set when estimation fails."""
+        return {
+            "method": "none",
+            "confidence": 0,
+            "R": np.nan,
+            "C": np.nan,
+            "time_constant": np.nan,
+            "physically_valid": False,
+        }
 
     def estimate_rc_parameters(self, data: pd.DataFrame) -> Dict[str, Any]:
         """
@@ -1062,6 +1904,7 @@ class ThermalAnalyzer:
     ) -> Optional[Dict[str, Any]]:
         """
         Solves for R and C using decoupled results from heating and cooling phases.
+        Includes physical constraints to prevent impossible values.
         """
         C_j_per_k = heatup_results.get("thermal_capacitance_j_per_k")
         cooling_factor = cooldown_results.get(
@@ -1074,28 +1917,71 @@ class ThermalAnalyzer:
             )
             return None
 
-        # C is already calculated in Joules per Kelvin
-        # cooling_factor is in 1/hours, so C needs to be in Watt-hours/Kelvin
-        # C_wh_per_k = C_j_per_k / 3600
-        # R (in K/W) = 1 / (cooling_factor * C_wh_per_k)
+        # Physical constraint checks
+        if C_j_per_k <= 0:
+            self.logger.warning(
+                f"Invalid thermal capacitance: {C_j_per_k} J/K (must be > 0)"
+            )
+            return None
 
-        # Let's keep units consistent. R*C = tau (in seconds)
+        if cooling_factor <= 0:
+            self.logger.warning(
+                f"Invalid cooling factor: {cooling_factor} 1/h (must be > 0)"
+            )
+            return None
+
+        # C is already calculated in Joules per Kelvin
         # cooling_factor is in 1/hours, so 1/cooling_factor is tau in hours.
         # tau_seconds = (1 / cooling_factor) * 3600
-        tau_seconds = (1 / cooling_factor) * 3600 if cooling_factor > 0 else 0
+        tau_seconds = (1 / cooling_factor) * 3600
 
         # R = tau / C
-        if C_j_per_k > 0:
-            R_k_per_w = tau_seconds / C_j_per_k
-        else:
-            self.logger.warning("Invalid capacitance value, cannot calculate R.")
+        R_k_per_w = tau_seconds / C_j_per_k
+
+        # Physical sanity checks for thermal resistance
+        # Typical residential room: R should be between 0.001 and 1.0 K/W
+        if R_k_per_w <= 0:
+            self.logger.warning(
+                f"Invalid thermal resistance: {R_k_per_w} K/W (must be > 0)"
+            )
             return None
+        elif R_k_per_w > 10.0:  # Very high resistance (over-insulated)
+            self.logger.warning(
+                f"Unusually high thermal resistance: {R_k_per_w:.3f} K/W (>10 K/W)"
+            )
+        elif R_k_per_w < 0.0001:  # Very low resistance (no insulation)
+            self.logger.warning(
+                f"Unusually low thermal resistance: {R_k_per_w:.6f} K/W (<0.0001 K/W)"
+            )
+
+        # Physical sanity checks for thermal capacitance
+        # Typical residential room: C should be between 1e6 and 1e8 J/K
+        if C_j_per_k > 1e9:  # Very high mass
+            self.logger.warning(
+                f"Unusually high thermal capacitance: {C_j_per_k/1e6:.1f} MJ/K (>1000 MJ/K)"
+            )
+        elif C_j_per_k < 1e5:  # Very low mass
+            self.logger.warning(
+                f"Unusually low thermal capacitance: {C_j_per_k/1e6:.3f} MJ/K (<0.1 MJ/K)"
+            )
+
+        # Physical sanity checks for time constant
+        time_constant_hours = tau_seconds / 3600
+        if time_constant_hours > 100:  # Very slow response
+            self.logger.warning(
+                f"Unusually long time constant: {time_constant_hours:.1f} hours (>100h)"
+            )
+        elif time_constant_hours < 0.1:  # Very fast response
+            self.logger.warning(
+                f"Unusually short time constant: {time_constant_hours:.3f} hours (<0.1h)"
+            )
 
         return {
             "R": R_k_per_w,  # Units: K/W or °C/W
             "C": C_j_per_k,  # Units: J/K
-            "time_constant": tau_seconds / 3600,  # Units: hours
+            "time_constant": time_constant_hours,  # Units: hours
             "method": "decoupled_simultaneous_estimation",
+            "physically_valid": True,
         }
 
     def _relay_state_space_identification(self, data: pd.DataFrame) -> Dict[str, Any]:

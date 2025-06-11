@@ -21,14 +21,14 @@
     }
   },
   "thermal_settings": {
-    "comfort_band_celsius": 0.5,
+    "comfort_band_celsius": 1.0,
     "room_setpoints": {
-      "obyvak":    { "day": 21.5, "night": 20.0 },
-      "kuchyne":   { "day": 21.0, "night": 19.5 },
+      "obyvak":    { "day": 22.5, "night": 20.0 },
+      "kuchyne":   { "day": 22.0, "night": 19.5 },
       "loznice":   { "day": 20.5, "night": 19.0 },
       "pracovna":  { "day": 22.0, "night": 19.0 },
-      "hosti":     { "day": 20.0, "night": 18.0 },
-      "chodba_dole": { "day": 20.0, "night": 18.5 },
+      "hosti":     { "day": 19.0, "night": 18.0 },
+      "chodba_dole": { "day": 21.5, "night": 18.5 },
       "chodba_nahore": { "day": 20.0, "night": 18.5 },
       "koupelna_dole": { "day": 22.0, "night": 20.0 },
       "koupelna_nahore": { "day": 22.0, "night": 20.0 },

@@ -352,6 +352,10 @@ class LoxoneFieldAdapter:
         for col in columns:
             col_lower = col.lower()
 
+            # Standard relay column names (most common)
+            if col_lower in ["relay_state", "state", "heating_state", "relay"]:
+                return col
+
             # Direct room name match
             if col_lower == room_lower:
                 return col
@@ -528,6 +532,11 @@ class LoxoneDataIntegrator:
             # Standardize the room data
             std_room_df = LoxoneFieldAdapter.standardize_room_data(room_df, room_name)
 
+            # Ensure the room DataFrame index is sorted before any reindexing operations
+            if not std_room_df.index.is_monotonic_increasing:
+                self.logger.debug(f"Sorting non-monotonic index for room {room_name}")
+                std_room_df = std_room_df.sort_index()
+
             # Add relay state if available
             standard_room_name = LoxoneFieldAdapter.standardize_room_name(room_name)
             if standard_room_name in relay_data or room_name in relay_data:
@@ -539,15 +548,27 @@ class LoxoneDataIntegrator:
                 relay_df = relay_data[relay_key]
 
                 if not relay_df.empty:
+                    # Ensure the relay DataFrame index is also sorted before reindexing
+                    if not relay_df.index.is_monotonic_increasing:
+                        self.logger.debug(
+                            f"Sorting non-monotonic index for relay {relay_key}"
+                        )
+                        relay_df = relay_df.sort_index()
+
                     # Align relay data with room data
                     relay_field = self.adapter._find_relay_field(
                         relay_df.columns, room_name
                     )
                     if relay_field:
                         # Resample relay data to match room data frequency
+                        # Use last() to get final state in each window (not max() which artificially extends heating periods)
+                        relay_resampled = (
+                            relay_df[[relay_field]].resample("5min").last()
+                        )
                         relay_series = (
-                            relay_df[relay_field]
-                            .reindex(std_room_df.index, method="nearest")
+                            relay_resampled[relay_field]
+                            .reindex(std_room_df.index)
+                            .ffill()  # Forward fill is appropriate for relay states
                             .fillna(0)
                         )
                         std_room_df["heating_on"] = (relay_series > 0).astype(int)

@@ -264,6 +264,34 @@ class DataExtractor:
             # Use print instead of logger in case logger was not initialized
             print(f"Warning: Error during DataExtractor cleanup: {e}")
 
+    def _build_timezone_aware_range(
+        self, start_date: datetime, end_date: datetime
+    ) -> str:
+        """
+        Build timezone-aware range query for InfluxDB Flux queries.
+
+        Converts naive datetimes (assumed to be Prague timezone) to UTC for InfluxDB.
+        This fixes the timezone bug where naive datetimes were incorrectly treated as UTC.
+
+        Args:
+            start_date: Start datetime (naive assumed as Prague, or timezone-aware)
+            end_date: End datetime (naive assumed as Prague, or timezone-aware)
+
+        Returns:
+            Flux range query string with proper UTC timestamps
+        """
+        # Convert naive datetimes to Prague timezone
+        if start_date.tzinfo is None:
+            start_date = self.local_tz.localize(start_date)
+        if end_date.tzinfo is None:
+            end_date = self.local_tz.localize(end_date)
+
+        # Convert to UTC for InfluxDB
+        start_utc = start_date.astimezone(self.utc_tz)
+        end_utc = end_date.astimezone(self.utc_tz)
+
+        return f"|> range(start: {start_utc.isoformat()}, stop: {end_utc.isoformat()})"
+
     async def extract_pv_data(
         self, start_date: datetime, end_date: datetime
     ) -> pd.DataFrame:
@@ -364,7 +392,7 @@ class DataExtractor:
         # Query for comprehensive solar fields from your system
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "solar")
           |> filter(fn: (r) => r["_field"] == "InputPower" or
                               r["_field"] == "PV1InputPower" or
@@ -479,7 +507,7 @@ class DataExtractor:
         # Query for temperature and humidity data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_loxone}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "temperature" or
                       r["_measurement"] == "humidity" or
                       r["_measurement"] == "target_temp")
@@ -604,7 +632,7 @@ class DataExtractor:
         # Query for comprehensive weather forecast data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_weather}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "weather_forecast")
           |> filter(fn: (r) => r["_field"] == "temperature_2m" or
                               r["_field"] == "relativehumidity_2m" or
@@ -684,7 +712,7 @@ class DataExtractor:
 
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "teplomer")
           |> filter(fn: (r) => r["topic"] == "teplomer/TC")
           |> aggregateWindow(every: 5m, fn: mean, createEmpty: false)
@@ -736,7 +764,7 @@ class DataExtractor:
         # Query for energy price data from the correct bucket
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_prices}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
           |> filter(fn: (r) => r["_field"] == "price_czk_kwh")
           |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
@@ -856,7 +884,7 @@ class DataExtractor:
         # Query for total consumption data from solar inverter (ACPowerToUser)
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "solar")
           |> filter(fn: (r) => r["_field"] == "ACPowerToUser")
           |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)
@@ -942,7 +970,7 @@ class DataExtractor:
         # Query for battery data from solar bucket
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_solar}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "solar")
           |> filter(fn: (r) => r["_field"] == "ChargePower" or
                               r["_field"] == "DischargePower" or
@@ -1926,7 +1954,7 @@ class DataExtractor:
         # Query for relay data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_loxone}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "heating")
           |> aggregateWindow(every: 5m, fn: last, createEmpty: false)
           |> keep(columns: ["_time", "_value", "room"])
@@ -2109,7 +2137,7 @@ class DataExtractor:
         # Query for current weather data from Loxone
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_loxone}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "current_weather" or
                               r["_measurement"] == "brightness" or
                               r["_measurement"] == "rain" or
@@ -2288,7 +2316,7 @@ class DataExtractor:
         # Query for shading relay data
         query = f"""
         from(bucket: "{self.settings.influxdb.bucket_loxone}")
-          |> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)
+          {self._build_timezone_aware_range(start_date, end_date)}
           |> filter(fn: (r) => r["_measurement"] == "relay" and r["tag1"] == "shading")
           |> aggregateWindow(every: 15m, fn: last, createEmpty: false)
           |> keep(columns: ["_time", "_value", "_field"])

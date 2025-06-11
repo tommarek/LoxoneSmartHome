@@ -141,14 +141,26 @@ class ReportGenerator:
         return lines
 
     def _generate_thermal_summary(self, thermal_results: Dict[str, Any]) -> list:
-        """Generate thermal analysis summary section."""
+        """Generate thermal analysis summary section with clear explanations."""
         lines = [
             "THERMAL DYNAMICS ANALYSIS",
             "-" * 30,
+            "",
+            "HEATING USAGE = % of time heating system was actively running",
+            "• 0-25%: Very efficient (minimal heating needed)",
+            "• 25-50%: Normal usage for most rooms",
+            "• 50%+: High usage (consider insulation improvements)",
+            "",
+            "DATA SOURCES:",
+            "• (Actual): Real relay switching data from Loxone - most accurate",
+            "• (Inferred): Estimated from temperature changes - less reliable",
+            "",
         ]
 
         room_count = 0
         total_heating_usage = 0
+        actual_data_count = 0
+        inferred_data_count = 0
 
         for room_name, room_data in thermal_results.items():
             if room_name == "room_coupling" or "error" in str(room_data):
@@ -158,16 +170,38 @@ class ReportGenerator:
                 room_count += 1
                 stats = room_data["basic_stats"]
                 heating_pct = stats.get("heating_percentage", 0)
+                heating_data_source = stats.get("heating_data_source", "inference")
                 total_heating_usage += heating_pct
+
+                # Count data sources
+                if heating_data_source == "actual_relay":
+                    actual_data_count += 1
+                    data_source_display = "Actual"
+                else:
+                    inferred_data_count += 1
+                    data_source_display = "Inferred"
+
+                # Check for adaptive thermal analysis data
+                adaptive_data = room_data.get("adaptive_thermal_analysis", {})
 
                 lines.extend(
                     [
                         f"Room: {room_name}",
                         f"  • Mean Temperature: {stats.get('mean_temperature', 0):.1f}°C",
                         f"  • Temperature Range: {stats.get('temperature_range', 0):.1f}°C",
-                        f"  • Heating Usage: {heating_pct:.1f}%",
+                        f"  • Heating Usage: {heating_pct:.1f}% ({data_source_display})",
                     ]
                 )
+
+                # Add adaptive analysis insights if available
+                if "thermal_events" in adaptive_data:
+                    events = adaptive_data["thermal_events"]
+                    window_events = len(events.get("window_opening_events", []))
+                    solar_events = len(events.get("solar_heating_events", []))
+                    if window_events > 0 or solar_events > 0:
+                        lines.append(
+                            f"  • Window Events: {window_events}, Solar Events: {solar_events}"
+                        )
 
                 if "time_constant" in room_data and isinstance(
                     room_data["time_constant"], dict
@@ -178,15 +212,38 @@ class ReportGenerator:
                             f"  • Time Constant: {tc['time_constant_hours']:.1f} hours"
                         )
 
+                lines.append("")  # Add space between rooms
+
         if room_count > 0:
             avg_heating = total_heating_usage / room_count
             lines.extend(
                 [
+                    "SUMMARY:",
+                    f"• {room_count} rooms analyzed",
+                    f"• {actual_data_count} rooms with actual relay data (most accurate)",
+                    f"• {inferred_data_count} rooms with inferred data (estimates)",
+                    f"• Average heating usage: {avg_heating:.1f}%",
                     "",
-                    f"Summary: {room_count} rooms analyzed",
-                    f"Average heating usage: {avg_heating:.1f}%",
+                    "HIGH USAGE ROOMS (>50%) - Consider improvements:",
                 ]
             )
+
+            # List high usage rooms
+            high_usage_rooms = []
+            for room_name, room_data in thermal_results.items():
+                if isinstance(room_data, dict) and "basic_stats" in room_data:
+                    stats = room_data["basic_stats"]
+                    heating_pct = stats.get("heating_percentage", 0)
+                    heating_source = stats.get("heating_data_source", "inference")
+                    if heating_pct > 50:
+                        high_usage_rooms.append(
+                            f"  • {room_name}: {heating_pct:.1f}% ({heating_source})"
+                        )
+
+            if high_usage_rooms:
+                lines.extend(high_usage_rooms)
+            else:
+                lines.append("  • None - all rooms operating efficiently!")
 
         lines.append("")
         return lines
@@ -228,40 +285,50 @@ class ReportGenerator:
             "-" * 30,
         ]
 
-        total_rooms = 0
-        total_cycles = 0
-
-        for room_name, room_data in relay_results.items():
-            if "error" in str(room_data):
-                continue
-
-            if isinstance(room_data, dict):
-                total_rooms += 1
-                cycles = room_data.get("daily_cycles", {}).get("mean_cycles_per_day", 0)
-                total_cycles += cycles
-
+        # Handle peak demand analysis
+        if "peak_demand" in relay_results:
+            peak = relay_results["peak_demand"]
+            if isinstance(peak, dict) and "max_peak_kw" in peak:
                 lines.extend(
                     [
-                        f"Room: {room_name}",
-                        f"  • Daily Cycles: {cycles:.1f}",
+                        f"Peak Demand: {peak.get('max_peak_kw', 0):.1f} kW",
+                        f"Peak Events: {peak.get('peak_events_count', 0)}",
+                        f"Peak Hour: {peak.get('most_common_peak_hour', 'N/A')}",
+                        "",
                     ]
                 )
 
-                if "efficiency" in room_data:
-                    eff = room_data["efficiency"]
-                    lines.append(
-                        f"  • Heating Efficiency: {eff.get('heating_efficiency', 0):.1f}%"
+        # Handle switching patterns
+        if "switching_patterns" in relay_results:
+            switching = relay_results["switching_patterns"]
+            if isinstance(switching, dict):
+                total_rooms = len(switching)
+                total_switches = sum(
+                    room.get("switches_per_day", 0)
+                    for room in switching.values()
+                    if isinstance(room, dict)
+                )
+
+                if total_rooms > 0:
+                    avg_switches = total_switches / total_rooms
+                    lines.extend(
+                        [
+                            f"Rooms Analyzed: {total_rooms}",
+                            f"Average Switches/Day: {avg_switches:.1f}",
+                            "",
+                        ]
                     )
 
-        if total_rooms > 0:
-            avg_cycles = total_cycles / total_rooms
-            lines.extend(
-                [
-                    "",
-                    f"Summary: {total_rooms} rooms analyzed",
-                    f"Average daily cycles: {avg_cycles:.1f}",
-                ]
-            )
+        # Handle load distribution
+        if "load_distribution" in relay_results:
+            load_dist = relay_results["load_distribution"]
+            if isinstance(load_dist, dict) and "total_energy_kwh" in load_dist:
+                lines.extend(
+                    [
+                        f"Total Heating Energy: {load_dist.get('total_energy_kwh', 0):.1f} kWh",
+                        "",
+                    ]
+                )
 
         lines.append("")
         return lines
@@ -1054,22 +1121,48 @@ class ReportGenerator:
             if isinstance(room_data, dict) and "basic_stats" in room_data:
                 stats = room_data["basic_stats"]
                 heating_pct = stats.get("heating_percentage", 0)
+                heating_data_source = stats.get("heating_data_source", "inference")
+                adaptive_data = room_data.get("adaptive_thermal_analysis", {})
 
-                # Determine status based on heating percentage
-                if heating_pct > 60:
-                    status_class = "status-warning"
-                    status_text = "High Usage"
-                elif heating_pct > 30:
-                    status_class = "status-good"
-                    status_text = "Normal"
+                # Determine status based on heating percentage and data source
+                if heating_data_source == "actual_relay":
+                    # More accurate assessment with actual relay data
+                    if heating_pct > 50:
+                        status_class = "status-warning"
+                        status_text = "High Usage (Actual)"
+                    elif heating_pct > 20:
+                        status_class = "status-good"
+                        status_text = "Normal (Actual)"
+                    else:
+                        status_class = "status-good"
+                        status_text = "Low Usage (Actual)"
                 else:
-                    status_class = "status-good"
-                    status_text = "Low Usage"
+                    # Less reliable temperature-based inference
+                    if heating_pct > 60:
+                        status_class = "status-warning"
+                        status_text = "High Usage (Inferred)"
+                    elif heating_pct > 30:
+                        status_class = "status-good"
+                        status_text = "Normal (Inferred)"
+                    else:
+                        status_class = "status-good"
+                        status_text = "Low Usage (Inferred)"
+
+                # Add thermal events info if available
+                events_info = ""
+                if "thermal_events" in adaptive_data:
+                    events = adaptive_data["thermal_events"]
+                    window_events = len(events.get("window_opening_events", []))
+                    solar_events = len(events.get("solar_heating_events", []))
+                    if window_events > 0 or solar_events > 0:
+                        events_info = (
+                            f"<br><small>W:{window_events} S:{solar_events}</small>"
+                        )
 
                 table_rows.append(
                     f"""
                     <tr>
-                        <td>{room_name}</td>
+                        <td>{room_name}{events_info}</td>
                         <td>{stats.get('mean_temperature', 0):.1f}°C</td>
                         <td>{stats.get('temperature_range', 0):.1f}°C</td>
                         <td>{heating_pct:.1f}%</td>
@@ -1138,31 +1231,35 @@ class ReportGenerator:
         """Generate relay analysis HTML section."""
         table_rows = []
 
-        for room_name, room_data in relay_analysis.items():
-            if isinstance(room_data, dict):
-                switching_patterns = room_data.get("switching_patterns", {})
-                switches_per_day = switching_patterns.get("switches_per_day", 0)
+        # Extract the switching patterns section which contains room data
+        switching_patterns = relay_analysis.get("switching_patterns", {})
 
-                # Determine efficiency status
-                if switches_per_day > 20:
-                    status_class = "status-warning"
-                    status_text = "High Switching"
-                elif switches_per_day > 10:
-                    status_class = "status-good"
-                    status_text = "Normal"
-                else:
-                    status_class = "status-good"
-                    status_text = "Low Switching"
+        # If switching_patterns is a dict with room data, iterate over it
+        if isinstance(switching_patterns, dict):
+            for room_name, room_data in switching_patterns.items():
+                if isinstance(room_data, dict):
+                    switches_per_day = room_data.get("switches_per_day", 0)
 
-                table_rows.append(
-                    f"""
-                    <tr>
-                        <td>{room_name}</td>
-                        <td>{switches_per_day:.1f}</td>
-                        <td><span class="status-badge {status_class}">{status_text}</span></td>
-                    </tr>
-                """
-                )
+                    # Determine efficiency status
+                    if switches_per_day > 20:
+                        status_class = "status-warning"
+                        status_text = "High Switching"
+                    elif switches_per_day > 10:
+                        status_class = "status-good"
+                        status_text = "Normal"
+                    else:
+                        status_class = "status-good"
+                        status_text = "Low Switching"
+
+                    table_rows.append(
+                        f"""
+                        <tr>
+                            <td>{room_name}</td>
+                            <td>{switches_per_day:.1f}</td>
+                            <td><span class="status-badge {status_class}">{status_text}</span></td>
+                        </tr>
+                    """
+                    )
 
         return f"""
         <section id="relay-analysis" class="analysis-section">

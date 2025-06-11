@@ -6,7 +6,7 @@ from typing import Optional
 
 
 def setup_logging(
-    level: str = "INFO",
+    level: str = "WARNING",  # Changed from INFO to WARNING for production
     format_string: Optional[str] = None,
     log_file: Optional[str] = None,
 ) -> None:

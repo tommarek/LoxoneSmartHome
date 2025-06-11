@@ -27,8 +27,40 @@ from influxdb_client import InfluxDBClient
 from influxdb_client.client.query_api import QueryApi
 from scipy import stats
 
-from ...config.energy_settings import DATA_QUALITY_THRESHOLDS, get_room_power
 from ...config.settings import PEMSSettings
+
+# Data quality thresholds for ML readiness assessment
+DATA_QUALITY_THRESHOLDS = {
+    "completeness_min": 0.8,
+    "consistency_min": 0.7,
+    "temporal_consistency_min": 0.8,
+    "reasonableness_min": 0.9,
+}
+
+
+def get_room_power(room_name: str) -> float:
+    """Get power rating for a specific room in kW - legacy compatibility."""
+    # Default room power ratings (this should ideally come from settings)
+    room_power_ratings = {
+        "obyvak": 2.4,
+        "kuchyne": 2.4,
+        "loznice": 1.2,
+        "pokoj_1": 1.2,
+        "pokoj_2": 1.2,
+        "pracovna": 1.2,
+        "hosti": 1.2,
+        "koupelna_nahore": 0.8,
+        "koupelna_dole": 0.8,
+        "chodba_nahore": 0.4,
+        "chodba_dole": 0.4,
+        "satna_nahore": 0.4,
+        "satna_dole": 0.4,
+        "technicka_mistnost": 0.4,
+        "spajz": 0.2,
+        "zachod": 0.2,
+        "zadveri": 0.4,
+    }
+    return room_power_ratings.get(room_name, 0.0)
 
 
 @dataclass
@@ -391,10 +423,21 @@ class UnifiedDataExtractor:
         self, config: QueryDefinition, start_date: datetime, end_date: datetime
     ) -> str:
         """Build Flux query string from configuration."""
+        # Handle timezone conversion properly
+        # If input dates are naive, assume they are in Prague timezone
+        if start_date.tzinfo is None:
+            start_date = self.local_tz.localize(start_date)
+        if end_date.tzinfo is None:
+            end_date = self.local_tz.localize(end_date)
+
+        # Convert to UTC for InfluxDB
+        start_utc = start_date.astimezone(self.utc_tz)
+        end_utc = end_date.astimezone(self.utc_tz)
+
         # Base query
         query_parts = [
             f'from(bucket: "{config.bucket}")',
-            f"|> range(start: {start_date.isoformat()}Z, stop: {end_date.isoformat()}Z)",
+            f"|> range(start: {start_utc.isoformat()}, stop: {end_utc.isoformat()})",
             f'|> filter(fn: (r) => r["_measurement"] == "{config.measurement}")',
         ]
 

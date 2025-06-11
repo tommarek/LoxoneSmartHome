@@ -28,7 +28,7 @@ PEMS v2 is a **production-ready** energy management platform that revolutionizes
 
 #### **🤖 Advanced AI Components**:
 - ✅ **PV Predictor**: Physics+ML hybrid with weather integration (R² > 0.85)
-- ✅ **Thermal Predictor**: RC circuit modeling for 17-room system
+- ✅ **Thermal Predictor**: RC circuit modeling for 17-room system with heating cycle analysis
 - ✅ **Load Predictor**: Ensemble forecasting with uncertainty quantification
 - ✅ **Feature Engineering**: 100+ ML features with temporal and weather correlations
 
@@ -55,7 +55,7 @@ PEMS v2 is a **production-ready** energy management platform that revolutionizes
 - **Multi-objective Optimization**: Minimize costs while maximizing self-consumption
 - **Model Predictive Control**: Rolling horizon optimization with real-time adaptation
 - **Stochastic Optimization**: Handle uncertainty in predictions and prices
-- **Thermal Modeling**: Physics-based models for accurate room temperature predictions
+- **Thermal Modeling**: Physics-based RC circuit models with heating cycle analysis for accurate room temperature predictions
 - **Relay Coordination**: Optimize 16 binary-controlled heating relays (18.12 kW total)
 - **Export Policy Aware**: Handles conditional PV export based on price thresholds
 
