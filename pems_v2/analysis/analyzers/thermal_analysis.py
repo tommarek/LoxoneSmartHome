@@ -670,6 +670,10 @@ class ThermalAnalyzer:
         # Replace outliers with NaN first, then apply smart interpolation
         df_clean.loc[outlier_mask, "room_temp"] = np.nan
 
+        # Detect stuck sensor periods (constant values for >30 minutes)
+        stuck_sensor_mask = self._detect_stuck_sensor(df_clean["room_temp"])
+        df_clean.loc[stuck_sensor_mask, "room_temp"] = np.nan
+
         # Apply smart interpolation: only fill gaps of up to 3 consecutive NaNs (15 minutes)
         # This prevents creating artificial data over long periods
         df_clean["room_temp"] = df_clean["room_temp"].interpolate(
@@ -753,7 +757,7 @@ class ThermalAnalyzer:
                 temp_values = df_smooth["room_temp"].copy()
 
                 # Handle NaN values by forward/backward filling for filtering
-                temp_filled = temp_values.fillna(method="ffill").fillna(method="bfill")
+                temp_filled = temp_values.ffill().bfill()
 
                 if len(temp_filled.dropna()) >= window_length:
                     # Apply Savitzky-Golay filter
@@ -783,7 +787,7 @@ class ThermalAnalyzer:
 
             if valid_count >= window_length:
                 temp_values = df_smooth["outdoor_temp"].copy()
-                temp_filled = temp_values.fillna(method="ffill").fillna(method="bfill")
+                temp_filled = temp_values.ffill().bfill()
 
                 if len(temp_filled.dropna()) >= window_length:
                     temp_smooth = savgol_filter(temp_filled, window_length, polyorder)
@@ -800,6 +804,82 @@ class ThermalAnalyzer:
                 )
 
         return df_smooth
+
+    def _detect_stuck_sensor(self, temp_series: pd.Series) -> pd.Series:
+        """
+        Detect periods where sensor is stuck (constant values for >30 minutes).
+
+        A stuck sensor reports the same value for extended periods, which is
+        physically unrealistic for thermal systems and corrupts analysis.
+        """
+        # Calculate rolling standard deviation to find periods with no variation
+        window_size = 6  # 30 minutes for 5-minute data
+        rolling_std = temp_series.rolling(
+            window=window_size, center=True, min_periods=1
+        ).std()
+
+        # Periods with zero standard deviation indicate stuck sensor
+        stuck_mask = (rolling_std == 0) & temp_series.notna()
+
+        # Count stuck periods
+        stuck_count = stuck_mask.sum()
+        if stuck_count > 0:
+            stuck_pct = (stuck_count / len(temp_series)) * 100
+            self.logger.info(
+                f"Detected {stuck_count} stuck sensor readings "
+                f"({stuck_pct:.1f}% of data) - marking as invalid"
+            )
+
+            # Additional check: look for abnormally long constant periods
+            # Group consecutive stuck periods and log the longest ones
+            stuck_groups = (stuck_mask != stuck_mask.shift()).cumsum()
+            for group_id in stuck_groups[stuck_mask].unique():
+                group_size = (stuck_groups == group_id).sum()
+                if group_size >= window_size:  # Only log significant stuck periods
+                    duration_minutes = group_size * 5  # 5-minute intervals
+                    self.logger.debug(
+                        f"Found stuck sensor period: {duration_minutes} minutes "
+                        f"({group_size} consecutive readings)"
+                    )
+
+        return stuck_mask
+
+    def _is_nighttime_cycle(
+        self, start_time: pd.Timestamp, end_time: pd.Timestamp
+    ) -> bool:
+        """
+        Check if a decay cycle occurs primarily during nighttime (10 PM - 6 AM).
+
+        Nighttime cycles are prioritized because they're free of solar gains,
+        providing cleaner data for thermal resistance estimation.
+        """
+        # Calculate what percentage of the cycle occurs during nighttime hours
+        total_duration = (end_time - start_time).total_seconds()
+        nighttime_duration = 0
+
+        # Check each hour within the cycle
+        current_time = start_time
+        while current_time < end_time:
+            hour = current_time.hour
+
+            # Nighttime is defined as 22:00 (10 PM) to 06:00 (6 AM)
+            is_night_hour = hour >= 22 or hour < 6
+
+            # Calculate duration of this hour segment within the cycle
+            next_hour = current_time.replace(
+                minute=0, second=0, microsecond=0
+            ) + pd.Timedelta(hours=1)
+            segment_end = min(next_hour, end_time)
+            segment_duration = (segment_end - current_time).total_seconds()
+
+            if is_night_hour:
+                nighttime_duration += segment_duration
+
+            current_time = segment_end
+
+        # Consider it a nighttime cycle if >70% occurs during night hours
+        nighttime_percentage = nighttime_duration / total_duration
+        return nighttime_percentage > 0.7
 
     def _calculate_basic_thermal_stats(
         self, data: pd.DataFrame, room_name: str
@@ -1408,14 +1488,43 @@ class ThermalAnalyzer:
         # Added R² quality bonus for better fits
         cycle_confidence = min(1.0, len(decay_results) / 6)
 
-        # Calculate average R² from decay results for quality bonus
+        # Enhanced quality assessment based on data filtering improvements
         if decay_results:
+            # Base R² quality from successful fits
             avg_r_squared = np.mean([d.get("fit_r_squared", 0) for d in decay_results])
             r_squared_bonus = min(0.2, avg_r_squared * 0.3)  # Up to 20% bonus
-        else:
-            r_squared_bonus = 0
 
-        confidence = min(1.0, cycle_confidence + r_squared_bonus)
+            # Nighttime cycle bonus - prioritize cycles free of solar contamination
+            nighttime_cycles = sum(
+                1 for d in decay_results if d.get("is_nighttime", False)
+            )
+            nighttime_ratio = nighttime_cycles / len(decay_results)
+            nighttime_bonus = min(0.15, nighttime_ratio * 0.15)  # Up to 15% bonus
+
+            # Data quality bonus - reward cycles that passed advanced filtering
+            # Count cycles that would have passed strict filtering (no stuck sensors, stable outdoor temp, monotonic)
+            high_quality_cycles = 0
+            for d in decay_results:
+                # These cycles already passed all filters, so they're high quality
+                if d.get("fit_valid", False):
+                    high_quality_cycles += 1
+
+            quality_ratio = high_quality_cycles / len(decay_results)
+            quality_bonus = min(
+                0.1, quality_ratio * 0.1
+            )  # Up to 10% bonus for clean data
+
+            self.logger.debug(
+                f"Confidence factors: base={cycle_confidence:.2f}, R²={r_squared_bonus:.2f}, "
+                f"nighttime={nighttime_bonus:.2f} ({nighttime_cycles}/{len(decay_results)} cycles), "
+                f"quality={quality_bonus:.2f} ({high_quality_cycles}/{len(decay_results)} clean)"
+            )
+        else:
+            r_squared_bonus = nighttime_bonus = quality_bonus = 0
+
+        confidence = min(
+            1.0, cycle_confidence + r_squared_bonus + nighttime_bonus + quality_bonus
+        )
 
         # Physical validity checks
         physically_valid = (
@@ -1730,6 +1839,21 @@ class ThermalAnalyzer:
                 "heating_intervals": heating_during_decay,
             }
 
+        # Check outdoor temperature stability during decay period
+        # Unstable outdoor temperature invalidates the simple exponential decay model
+        if "outdoor_temp" in decay_data.columns:
+            outdoor_temp_std = decay_data["outdoor_temp"].std()
+            outdoor_stability_threshold = 0.5  # °C maximum standard deviation
+
+            if outdoor_temp_std > outdoor_stability_threshold:
+                return {
+                    "fit_valid": False,
+                    "reason": "unstable_outdoor_temp",
+                    "outdoor_temp_std": outdoor_temp_std,
+                    "threshold": outdoor_stability_threshold,
+                    "decay_duration_hours": decay_duration_hours,
+                }
+
         # Prepare data for exponential decay fitting
         # Use temperature difference: ΔT(t) = T_room(t) - T_outdoor(t)
         decay_data["temp_diff"] = decay_data[temp_col] - decay_data["outdoor_temp"]
@@ -1780,6 +1904,26 @@ class ThermalAnalyzer:
                 "cycle_duration_hours": cycle_duration_hours,
             }
 
+        # Check monotonicity of decay curve
+        # A clean decay should be mostly monotonically decreasing
+        temp_diff_changes = np.diff(temp_diff)
+        increasing_points = (temp_diff_changes > 0).sum()
+        total_changes = len(temp_diff_changes)
+
+        if total_changes > 0:
+            increasing_percentage = increasing_points / total_changes
+            monotonicity_threshold = 0.15  # Allow up to 15% of points to increase
+
+            if increasing_percentage > monotonicity_threshold:
+                return {
+                    "fit_valid": False,
+                    "reason": "non_monotonic_decay",
+                    "increasing_percentage": increasing_percentage * 100,
+                    "threshold_percentage": monotonicity_threshold * 100,
+                    "increasing_points": increasing_points,
+                    "total_points": total_changes,
+                }
+
         try:
             # Exponential decay model: ΔT(t) = ΔT_initial * exp(-t/τ)
             def decay_model(t, tau):
@@ -1820,9 +1964,20 @@ class ThermalAnalyzer:
 
             decay_duration_hours = (decay_end - decay_start).total_seconds() / 3600.0
 
+            # Check if this is a nighttime decay cycle (10 PM to 6 AM)
+            # Nighttime cycles are prioritized as they're free of solar contamination
+            is_nighttime = self._is_nighttime_cycle(decay_start, decay_end)
+
+            # Apply nighttime quality bonus to R² for prioritization
+            quality_score = r_squared
+            if is_nighttime:
+                quality_score += 0.1  # 10% bonus for nighttime cycles
+                quality_score = min(1.0, quality_score)  # Cap at 1.0
+
             return {
                 "time_constant_hours": tau_fitted,
                 "r_squared": r_squared,
+                "fit_r_squared": quality_score,  # Enhanced score for cycle prioritization
                 "decay_start_temp": cycle["peak_temp"],
                 "baseline_temp": baseline_temp,
                 "outdoor_temp_avg": outdoor_temp_avg,
@@ -1831,6 +1986,7 @@ class ThermalAnalyzer:
                 "decay_end_reason": decay_end_reason,
                 "decay_magnitude": decay_magnitude,
                 "fit_valid": fit_valid,
+                "is_nighttime": is_nighttime,
             }
 
         except Exception as e:
