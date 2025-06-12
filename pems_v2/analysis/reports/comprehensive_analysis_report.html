@@ -182,6 +182,92 @@
             color: white;
         }
         
+        .status-excellent {
+            background: #16a085;
+            color: white;
+        }
+        
+        .status-poor {
+            background: #e67e22;
+            color: white;
+        }
+        
+        .status-unknown {
+            background: #95a5a6;
+            color: white;
+        }
+        
+        .rc-model-analysis {
+            margin: 30px 0;
+            padding: 25px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid var(--secondary-color);
+        }
+        
+        .room-coupling-analysis {
+            margin: 30px 0;
+            padding: 25px;
+            background: #f0f8ff;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        
+        .thermal-network {
+            margin: 30px 0;
+            padding: 25px;
+            background: #fefefe;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .model-explanation,
+        .coupling-explanation,
+        .network-explanation {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: rgba(255,255,255,0.7);
+            border-radius: 4px;
+            color: #444;
+        }
+        
+        .model-explanation ul,
+        .coupling-explanation ul {
+            margin-left: 20px;
+            margin-top: 10px;
+        }
+        
+        .network-diagram {
+            text-align: center;
+            margin: 20px 0;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .network-legend {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            font-size: 0.9rem;
+        }
+        
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 8px;
+            border: 1px solid #ddd;
+        }
+        
         .recommendations-section {
             background: #d4edda;
             border: 1px solid #c3e6cb;
@@ -233,6 +319,11 @@
             .metrics-grid {
                 grid-template-columns: 1fr;
             }
+            
+            .network-legend {
+                flex-direction: column;
+                align-items: center;
+            }
         }
         
             </style>
@@ -242,7 +333,7 @@
                 <header class="report-header">
                     <h1>PEMS v2 Comprehensive Analysis Report</h1>
                     <div class="report-meta">
-                        <span class="timestamp">Generated: 2025-06-11 15:03:37</span>
+                        <span class="timestamp">Generated: 2025-06-12 08:58:07</span>
                         <span class="version">Framework Version: Phase 1C</span>
                     </div>
                 </header>
@@ -266,12 +357,6 @@
             <div class="metrics-grid">
                 
                 <div class="metric-card">
-                    <h4>☀️ PV Production</h4>
-                    <div class="metric-value">182.3</div>
-                    <div>kWh Total</div>
-                </div>
-            
-                <div class="metric-card">
                     <h4>🏠 Rooms Analyzed</h4>
                     <div class="metric-value">17</div>
                     <div>Thermal Zones</div>
@@ -279,7 +364,7 @@
             
                 <div class="metric-card">
                     <h4>⚡ Base Load</h4>
-                    <div class="metric-value">288</div>
+                    <div class="metric-value">363</div>
                     <div>W Average</div>
                 </div>
             
@@ -287,184 +372,553 @@
         </section>
         
                 
-        <section id="pv-analysis" class="analysis-section">
-            <h2>☀️ PV Production Analysis</h2>
-            <div class="metrics-grid">
-                <div class="metric-card">
-                    <h4>Total Energy</h4>
-                    <div class="metric-value">182.3</div>
-                    <div>kWh</div>
-                </div>
-                <div class="metric-card">
-                    <h4>Peak Power</h4>
-                    <div class="metric-value">9,131</div>
-                    <div>W</div>
-                </div>
-                <div class="metric-card">
-                    <h4>Capacity Factor</h4>
-                    <div class="metric-value">0.5</div>
-                    <div>%</div>
-                </div>
-                <div class="metric-card">
-                    <h4>Daylight Factor</h4>
-                    <div class="metric-value">0.9</div>
-                    <div>%</div>
-                </div>
-            </div>
-        </section>
-        
         <section id="thermal-analysis" class="analysis-section">
             <h2>🏠 Thermal Dynamics Analysis</h2>
-            <table class="data-table">
-                <thead>
-                    <tr>
-                        <th>Room</th>
-                        <th>Mean Temperature</th>
-                        <th>Temperature Range</th>
-                        <th>Heating Usage</th>
-                        <th>Status</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    
+            
+            <div class="thermal-overview">
+                <h3>Room Temperature Overview</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Room</th>
+                            <th>Mean Temperature</th>
+                            <th>Temperature Range</th>
+                            <th>Heating Usage</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        
                     <tr>
                         <td>chodba_dole</td>
-                        <td>22.3°C</td>
-                        <td>5.4°C</td>
-                        <td>48.4%</td>
+                        <td>21.7°C</td>
+                        <td>3.3°C</td>
+                        <td>41.4%</td>
                         <td><span class="status-badge status-good">Normal (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>chodba_nahore</td>
-                        <td>21.4°C</td>
-                        <td>4.9°C</td>
-                        <td>15.5%</td>
-                        <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
+                        <td>20.3°C</td>
+                        <td>2.7°C</td>
+                        <td>43.4%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>hosti</td>
-                        <td>20.2°C</td>
-                        <td>7.2°C</td>
-                        <td>34.0%</td>
+                        <td>19.0°C</td>
+                        <td>5.2°C</td>
+                        <td>53.6%</td>
                         <td><span class="status-badge status-good">Normal (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>koupelna_dole</td>
-                        <td>21.6°C</td>
-                        <td>6.1°C</td>
-                        <td>7.3%</td>
+                        <td>20.6°C</td>
+                        <td>4.4°C</td>
+                        <td>7.5%</td>
                         <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>koupelna_nahore</td>
-                        <td>21.0°C</td>
-                        <td>5.0°C</td>
-                        <td>42.7%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>kuchyne</td>
-                        <td>23.0°C</td>
-                        <td>4.8°C</td>
-                        <td>44.9%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>loznice</td>
-                        <td>20.9°C</td>
-                        <td>5.4°C</td>
-                        <td>50.6%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>obyvak</td>
-                        <td>22.8°C</td>
-                        <td>4.7°C</td>
-                        <td>53.2%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>pokoj_1</td>
-                        <td>21.2°C</td>
-                        <td>5.1°C</td>
-                        <td>36.3%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>pokoj_2</td>
-                        <td>20.5°C</td>
-                        <td>6.1°C</td>
-                        <td>7.8%</td>
+                        <td>20.0°C</td>
+                        <td>2.3°C</td>
+                        <td>6.9%</td>
                         <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
                     </tr>
                 
                     <tr>
-                        <td>pracovna</td>
-                        <td>21.0°C</td>
-                        <td>6.6°C</td>
-                        <td>38.9%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>satna_dole</td>
-                        <td>20.2°C</td>
-                        <td>7.3°C</td>
-                        <td>34.5%</td>
-                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
-                    </tr>
-                
-                    <tr>
-                        <td>satna_nahore</td>
-                        <td>20.3°C</td>
-                        <td>6.9°C</td>
+                        <td>kuchyne</td>
+                        <td>22.5°C</td>
+                        <td>3.1°C</td>
                         <td>35.6%</td>
                         <td><span class="status-badge status-good">Normal (Inferred)</span></td>
                     </tr>
                 
                     <tr>
+                        <td>loznice</td>
+                        <td>20.1°C</td>
+                        <td>2.2°C</td>
+                        <td>57.2%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>obyvak</td>
+                        <td>22.4°C</td>
+                        <td>2.9°C</td>
+                        <td>35.9%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>pokoj_1</td>
+                        <td>20.6°C</td>
+                        <td>1.7°C</td>
+                        <td>34.8%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>pokoj_2</td>
+                        <td>18.9°C</td>
+                        <td>2.4°C</td>
+                        <td>29.7%</td>
+                        <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>pracovna</td>
+                        <td>19.9°C</td>
+                        <td>4.4°C</td>
+                        <td>42.0%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>satna_dole</td>
+                        <td>18.3°C</td>
+                        <td>4.3°C</td>
+                        <td>15.9%</td>
+                        <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
+                        <td>satna_nahore</td>
+                        <td>19.0°C</td>
+                        <td>2.5°C</td>
+                        <td>24.6%</td>
+                        <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
+                    </tr>
+                
+                    <tr>
                         <td>spajz</td>
-                        <td>22.2°C</td>
-                        <td>3.3°C</td>
+                        <td>21.7°C</td>
+                        <td>1.7°C</td>
                         <td>0.0%</td>
                         <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>technicka_mistnost</td>
-                        <td>21.8°C</td>
-                        <td>5.9°C</td>
-                        <td>3.6%</td>
+                        <td>20.6°C</td>
+                        <td>3.9°C</td>
+                        <td>9.5%</td>
                         <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>zachod</td>
-                        <td>21.4°C</td>
-                        <td>4.7°C</td>
-                        <td>6.5%</td>
+                        <td>20.3°C</td>
+                        <td>2.7°C</td>
+                        <td>6.9%</td>
                         <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
                     </tr>
                 
                     <tr>
                         <td>zadveri</td>
-                        <td>19.4°C</td>
-                        <td>10.4°C</td>
-                        <td>14.3%</td>
-                        <td><span class="status-badge status-good">Low Usage (Inferred)</span></td>
+                        <td>16.6°C</td>
+                        <td>6.7°C</td>
+                        <td>48.0%</td>
+                        <td><span class="status-badge status-good">Normal (Inferred)</span></td>
                     </tr>
                 
+                    </tbody>
+                </table>
+            </div>
+
+            
+        <div class="rc-model-analysis">
+            <h3>🔬 RC Model Parameters</h3>
+            <div class="model-explanation">
+                <p><strong>Thermal Model Theory:</strong> Each room is modeled as an RC circuit where:</p>
+                <ul>
+                    <li><strong>R (Thermal Resistance)</strong>: How well the room resists heat loss (lower = more heat loss)</li>
+                    <li><strong>C (Thermal Capacitance)</strong>: How much heat the room can store (higher = more stable temperature)</li>
+                    <li><strong>τ (Time Constant)</strong>: Time for temperature difference to decay to 37% (τ = R × C)</li>
+                </ul>
+            </div>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Room</th>
+                        <th>Resistance (R)</th>
+                        <th>Capacitance (C)</th>
+                        <th>Time Constant (τ)</th>
+                        <th>Thermal Performance</th>
+                        <th>Model Confidence</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    
+                <tr>
+                    <td><strong>chodba_dole</strong></td>
+                    <td>0.006 K/W</td>
+                    <td>32.40 MJ/K</td>
+                    <td>57.6 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-warning">37%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>chodba_nahore</strong></td>
+                    <td>0.106 K/W</td>
+                    <td>6.80 MJ/K</td>
+                    <td>200.0 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-warning">25%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>hosti</strong></td>
+                    <td>0.007 K/W</td>
+                    <td>87.80 MJ/K</td>
+                    <td>172.6 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">0%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>koupelna_dole</strong></td>
+                    <td>0.039 K/W</td>
+                    <td>9.67 MJ/K</td>
+                    <td>103.6 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">18%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>koupelna_nahore</strong></td>
+                    <td>0.039 K/W</td>
+                    <td>10.13 MJ/K</td>
+                    <td>110.0 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">15%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>kuchyne</strong></td>
+                    <td>0.016 K/W</td>
+                    <td>29.16 MJ/K</td>
+                    <td>132.4 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">9%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>loznice</strong></td>
+                    <td>0.021 K/W</td>
+                    <td>11.86 MJ/K</td>
+                    <td>70.3 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-warning">33%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>obyvak</strong></td>
+                    <td>0.005 K/W</td>
+                    <td>67.93 MJ/K</td>
+                    <td>42.6 hours</td>
+                    <td><span class="status-badge status-good">Good</span></td>
+                    <td><span class="status-badge status-warning">33%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>pokoj_1</strong></td>
+                    <td>0.033 K/W</td>
+                    <td>10.31 MJ/K</td>
+                    <td>93.8 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-good">50%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>pokoj_2</strong></td>
+                    <td>0.043 K/W</td>
+                    <td>16.76 MJ/K</td>
+                    <td>200.0 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">19%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>pracovna</strong></td>
+                    <td>0.019 K/W</td>
+                    <td>14.28 MJ/K</td>
+                    <td>74.3 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-warning">22%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>satna_dole</strong></td>
+                    <td>0.093 K/W</td>
+                    <td>2.46 MJ/K</td>
+                    <td>63.4 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">19%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>satna_nahore</strong></td>
+                    <td>0.044 K/W</td>
+                    <td>7.50 MJ/K</td>
+                    <td>92.6 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-warning">25%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>spajz</strong></td>
+                    <td>0.150 K/W</td>
+                    <td>40.00 MJ/K</td>
+                    <td>200.0 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">0%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>technicka_mistnost</strong></td>
+                    <td>0.007 K/W</td>
+                    <td>9.28 MJ/K</td>
+                    <td>18.0 hours</td>
+                    <td><span class="status-badge status-warning">Moderate</span></td>
+                    <td><span class="status-badge status-warning">27%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>zachod</strong></td>
+                    <td>0.079 K/W</td>
+                    <td>3.75 MJ/K</td>
+                    <td>82.4 hours</td>
+                    <td><span class="status-badge status-excellent">Excellent</span></td>
+                    <td><span class="status-badge status-poor">8%</span></td>
+                </tr>
+            
+                <tr>
+                    <td><strong>zadveri</strong></td>
+                    <td>0.028 K/W</td>
+                    <td>3.51 MJ/K</td>
+                    <td>27.7 hours</td>
+                    <td><span class="status-badge status-good">Good</span></td>
+                    <td><span class="status-badge status-warning">31%</span></td>
+                </tr>
+            
                 </tbody>
             </table>
+        </div>
+        
+            
+        <div class="room-coupling-analysis">
+            <h3>🔗 Room Thermal Coupling</h3>
+            <div class="coupling-explanation">
+                <p><strong>Thermal Coupling:</strong> Rooms exchange heat through shared walls, open doors, and air circulation.</p>
+                <p>Coupling strength is determined by temperature correlation and physical proximity.</p>
+            </div>
+            <div class="coupling-matrix">
+                <p><em>Coupling analysis requires synchronized temperature data from multiple rooms.</em></p>
+                <p>Detected rooms: chodba_dole, chodba_nahore, hosti, koupelna_dole, koupelna_nahore, kuchyne, loznice, obyvak, pokoj_1, pokoj_2, pracovna, satna_dole, satna_nahore, spajz, technicka_mistnost, zachod, zadveri</p>
+            </div>
+        </div>
+        
+            
+        <div class="thermal-network">
+            <h3>🏗️ Thermal Network Model</h3>
+            <div class="network-explanation">
+                <p><strong>Network Topology:</strong> Each room is connected to the outdoor environment through its thermal resistance.</p>
+                <p>Circle size represents thermal capacitance, connection thickness represents thermal coupling strength.</p>
+            </div>
+            <div class="network-diagram">
+                
+        <svg width="800" height="600" viewBox="0 0 800 600">
+            
+            <circle cx="400" cy="300" r="40" 
+                    fill="#95a5a6" stroke="#2c3e50" stroke-width="3"/>
+            <text x="400" y="300" text-anchor="middle" 
+                  dominant-baseline="central" font-size="12" fill="white">Outdoor</text>
+        
+                <line x1="400" y1="300" x2="600.0" y2="300.0" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="600.0" cy="300.0" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="600.0" y="295.0" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">chodba_dole</text>
+                <text x="600.0" y="308.0" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=57.6h</text>
+            
+                <line x1="400" y1="300" x2="586.4944458808711" y2="372.2483332374306" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="586.4944458808711" cy="372.2483332374306" r="28.60629921259845" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="586.4944458808711" y="367.2483332374306" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">chodba_nahore</text>
+                <text x="586.4944458808711" y="380.2483332374306" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=200.0h</text>
+            
+                <line x1="400" y1="300" x2="547.8017834441318" y2="434.73912872931146" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="547.8017834441318" cy="434.73912872931146" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="547.8017834441318" y="429.73912872931146" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">hosti</text>
+                <text x="547.8017834441318" y="442.73912872931146" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=172.6h</text>
+            
+                <line x1="400" y1="300" x2="489.14767115530765" y2="479.03265827101245" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="489.14767115530765" cy="479.03265827101245" r="34.33458773784351" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="489.14767115530765" y="474.03265827101245" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">koupelna_dole</text>
+                <text x="489.14767115530765" y="487.03265827101245" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=103.6h</text>
+            
+                <line x1="400" y1="300" x2="418.4536718926604" y2="499.14683525900693" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="418.4536718926604" cy="499.14683525900693" r="35.260125941085654" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="418.4536718926604" y="494.14683525900693" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">koupelna_nahore</text>
+                <text x="418.4536718926604" y="507.14683525900693" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=110.0h</text>
+            
+                <line x1="400" y1="300" x2="345.26740198558343" y2="492.3651286345638" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="345.26740198558343" cy="492.3651286345638" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="345.26740198558343" y="487.3651286345638" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">kuchyne</text>
+                <text x="345.26740198558343" y="500.3651286345638" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=132.4h</text>
+            
+                <line x1="400" y1="300" x2="279.4730727241487" y2="459.6034454560479" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="279.4730727241487" cy="459.6034454560479" r="38.72168067226893" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="279.4730727241487" y="454.6034454560479" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">loznice</text>
+                <text x="279.4730727241487" y="467.6034454560479" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=70.3h</text>
+            
+                <line x1="400" y1="300" x2="229.9565728540772" y2="405.2864325754712" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="229.9565728540772" cy="405.2864325754712" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="229.9565728540772" y="400.2864325754712" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">obyvak</text>
+                <text x="229.9565728540772" y="413.2864325754712" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=42.6h</text>
+            
+                <line x1="400" y1="300" x2="203.40538006321964" y2="336.7499035633141" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="203.40538006321964" cy="336.7499035633141" r="35.61805655867928" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="203.40538006321964" y="331.7499035633141" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">pokoj_1</text>
+                <text x="203.40538006321964" y="344.7499035633141" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=93.8h</text>
+            
+                <line x1="400" y1="300" x2="203.40538006321964" y2="263.25009643668596" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="203.40538006321964" cy="263.25009643668596" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="203.40538006321964" y="258.25009643668596" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">pokoj_2</text>
+                <text x="203.40538006321964" y="271.25009643668596" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=200.0h</text>
+            
+                <line x1="400" y1="300" x2="229.95657285407717" y2="194.71356742452883" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="229.95657285407717" cy="194.71356742452883" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="229.95657285407717" y="189.71356742452883" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">pracovna</text>
+                <text x="229.95657285407717" y="202.71356742452883" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=74.3h</text>
+            
+                <line x1="400" y1="300" x2="279.47307272414855" y2="140.39655454395222" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="279.47307272414855" cy="140.39655454395222" r="19.91999999999993" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="279.47307272414855" y="135.39655454395222" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">satna_dole</text>
+                <text x="279.47307272414855" y="148.39655454395222" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=63.4h</text>
+            
+                <line x1="400" y1="300" x2="345.2674019855834" y2="107.6348713654362" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="345.2674019855834" cy="107.6348713654362" r="30.009635036496135" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="345.2674019855834" y="102.6348713654362" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">satna_nahore</text>
+                <text x="345.2674019855834" y="115.6348713654362" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=92.6h</text>
+            
+                <line x1="400" y1="300" x2="418.4536718926605" y2="100.8531647409931" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="418.4536718926605" cy="100.8531647409931" r="40" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="418.4536718926605" y="95.8531647409931" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">spajz</text>
+                <text x="418.4536718926605" y="108.8531647409931" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=200.0h</text>
+            
+                <line x1="400" y1="300" x2="489.14767115530753" y2="120.96734172898749" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="489.14767115530753" cy="120.96734172898749" r="33.554951653943995" 
+                        fill="#f39c12" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="489.14767115530753" y="115.96734172898749" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">technicka_mistnost</text>
+                <text x="489.14767115530753" y="128.9673417289875" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=18.0h</text>
+            
+                <line x1="400" y1="300" x2="547.8017834441317" y2="165.26087127068845" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="547.8017834441317" cy="165.26087127068845" r="22.496296296296276" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="547.8017834441317" y="160.26087127068845" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">zachod</text>
+                <text x="547.8017834441317" y="173.26087127068845" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=82.4h</text>
+            
+                <line x1="400" y1="300" x2="586.4944458808711" y2="227.7516667625694" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            
+                <circle cx="586.4944458808711" cy="227.7516667625694" r="22.0285714285714" 
+                        fill="#3498db" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="586.4944458808711" y="222.7516667625694" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">zadveri</text>
+                <text x="586.4944458808711" y="235.7516667625694" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ=27.7h</text>
+            
+        </svg>
+        
+            </div>
+            <div class="network-legend">
+                <div class="legend-item"><span class="legend-color" style="background: #3498db;"></span> Good Thermal Performance (τ > 20h)</div>
+                <div class="legend-item"><span class="legend-color" style="background: #f39c12;"></span> Moderate Performance (10h < τ < 20h)</div>
+                <div class="legend-item"><span class="legend-color" style="background: #e74c3c;"></span> Poor Performance (τ < 10h)</div>
+            </div>
+        </div>
+        
         </section>
         
         <section id="base-load-analysis" class="analysis-section">
@@ -472,22 +926,22 @@
             <div class="metrics-grid">
                 <div class="metric-card">
                     <h4>Mean Base Load</h4>
-                    <div class="metric-value">288</div>
+                    <div class="metric-value">363</div>
                     <div>W</div>
                 </div>
                 <div class="metric-card">
                     <h4>Total Energy</h4>
-                    <div class="metric-value">1238.8</div>
+                    <div class="metric-value">540.3</div>
                     <div>kWh</div>
                 </div>
                 <div class="metric-card">
                     <h4>Load Factor</h4>
-                    <div class="metric-value">0.294</div>
+                    <div class="metric-value">0.371</div>
                     <div>Efficiency</div>
                 </div>
                 <div class="metric-card">
                     <h4>Base Load %</h4>
-                    <div class="metric-value">11.2</div>
+                    <div class="metric-value">11.0</div>
                     <div>% of Total</div>
                 </div>
             </div>
@@ -507,19 +961,19 @@
                     
                         <tr>
                             <td>chodba_dole</td>
-                            <td>7.9</td>
+                            <td>9.8</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>chodba_nahore</td>
-                            <td>0.4</td>
+                            <td>0.2</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>hosti</td>
-                            <td>0.4</td>
+                            <td>0.2</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
@@ -531,55 +985,55 @@
                     
                         <tr>
                             <td>koupelna_nahore</td>
-                            <td>3.6</td>
+                            <td>3.7</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>kuchyne</td>
-                            <td>5.2</td>
+                            <td>7.7</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>loznice</td>
-                            <td>1.5</td>
+                            <td>3.6</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>obyvak</td>
-                            <td>5.6</td>
+                            <td>8.1</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>pokoj_1</td>
-                            <td>2.5</td>
+                            <td>5.3</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>pokoj_2</td>
-                            <td>0.8</td>
+                            <td>1.5</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>pracovna</td>
-                            <td>3.5</td>
+                            <td>4.8</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>satna_dole</td>
-                            <td>2.0</td>
+                            <td>5.1</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>satna_nahore</td>
-                            <td>2.8</td>
+                            <td>4.7</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
@@ -591,20 +1045,20 @@
                     
                         <tr>
                             <td>technicka_mistnost</td>
-                            <td>0.3</td>
+                            <td>1.0</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>zachod</td>
-                            <td>1.2</td>
+                            <td>1.9</td>
                             <td><span class="status-badge status-good">Low Switching</span></td>
                         </tr>
                     
                         <tr>
                             <td>zadveri</td>
-                            <td>9.5</td>
-                            <td><span class="status-badge status-good">Low Switching</span></td>
+                            <td>15.8</td>
+                            <td><span class="status-badge status-good">Normal</span></td>
                         </tr>
                     
                 </tbody>
@@ -616,7 +1070,7 @@
         <section id="recommendations" class="recommendations-section">
             <h2>💡 Recommendations</h2>
             <ul class="recommendations-list">
-                <li>Monitor PV system performance during identified low-efficiency periods</li><li>Optimize heating schedules based on thermal time constants</li><li>Investigate high base load consumption periods for energy savings</li><li>Consider demand response strategies during peak consumption hours</li><li>PV capacity factor is low - check for shading or maintenance issues</li><li>High heating usage detected in: loznice, obyvak - consider insulation improvements</li>
+                <li>Monitor PV system performance during identified low-efficiency periods</li><li>Optimize heating schedules based on thermal time constants</li><li>Investigate high base load consumption periods for energy savings</li><li>Consider demand response strategies during peak consumption hours</li><li>High heating usage detected in: hosti, loznice - consider insulation improvements</li>
             </ul>
         </section>
         

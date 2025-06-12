@@ -926,6 +926,92 @@ class ReportGenerator:
             color: white;
         }
         
+        .status-excellent {
+            background: #16a085;
+            color: white;
+        }
+        
+        .status-poor {
+            background: #e67e22;
+            color: white;
+        }
+        
+        .status-unknown {
+            background: #95a5a6;
+            color: white;
+        }
+        
+        .rc-model-analysis {
+            margin: 30px 0;
+            padding: 25px;
+            background: #f8f9fa;
+            border-radius: 8px;
+            border-left: 4px solid var(--secondary-color);
+        }
+        
+        .room-coupling-analysis {
+            margin: 30px 0;
+            padding: 25px;
+            background: #f0f8ff;
+            border-radius: 8px;
+            border-left: 4px solid #3498db;
+        }
+        
+        .thermal-network {
+            margin: 30px 0;
+            padding: 25px;
+            background: #fefefe;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .model-explanation,
+        .coupling-explanation,
+        .network-explanation {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: rgba(255,255,255,0.7);
+            border-radius: 4px;
+            color: #444;
+        }
+        
+        .model-explanation ul,
+        .coupling-explanation ul {
+            margin-left: 20px;
+            margin-top: 10px;
+        }
+        
+        .network-diagram {
+            text-align: center;
+            margin: 20px 0;
+            padding: 20px;
+            background: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .network-legend {
+            display: flex;
+            justify-content: center;
+            flex-wrap: wrap;
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .legend-item {
+            display: flex;
+            align-items: center;
+            font-size: 0.9rem;
+        }
+        
+        .legend-color {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            margin-right: 8px;
+            border: 1px solid #ddd;
+        }
+        
         .recommendations-section {
             background: #d4edda;
             border: 1px solid #c3e6cb;
@@ -976,6 +1062,11 @@ class ReportGenerator:
             
             .metrics-grid {
                 grid-template-columns: 1fr;
+            }
+            
+            .network-legend {
+                flex-direction: column;
+                align-items: center;
             }
         }
         """
@@ -1114,8 +1205,12 @@ class ReportGenerator:
     def _generate_thermal_analysis_section_html(
         self, thermal_analysis: Dict[str, Any]
     ) -> str:
-        """Generate thermal analysis HTML section."""
+        """Generate enhanced thermal analysis HTML section with detailed RC model information."""
+        
+        # Generate room overview table
         table_rows = []
+        rc_model_details = []
+        room_coupling_data = []
 
         for room_name, room_data in thermal_analysis.items():
             if isinstance(room_data, dict) and "basic_stats" in room_data:
@@ -1171,24 +1266,278 @@ class ReportGenerator:
                 """
                 )
 
+                # Extract RC model parameters if available
+                rc_params = room_data.get("rc_parameters", {})
+                if rc_params:
+                    thermal_resistance = rc_params.get("R", None)
+                    thermal_capacitance = rc_params.get("C", None)
+                    time_constant = rc_params.get("time_constant", None)
+                    
+                    # Extract success metrics from RC parameters
+                    cycles_analyzed = rc_params.get("cycles_analyzed", 0)
+                    successful_decays = rc_params.get("successful_decays", 0)
+                    successful_rises = rc_params.get("successful_rises", 0)
+                    confidence = rc_params.get("confidence", 0)
+                    
+                    # Calculate success rate from cycles and decays
+                    success_rate = (successful_decays / cycles_analyzed * 100) if cycles_analyzed > 0 else 0
+                    
+                    rc_model_details.append({
+                        'room': room_name,
+                        'R': thermal_resistance,
+                        'C': thermal_capacitance,
+                        'tau': time_constant,
+                        'valid_decays': successful_decays,
+                        'total_cycles': cycles_analyzed,
+                        'success_rate': success_rate,
+                        'confidence': confidence
+                    })
+
+        # Generate RC model table
+        rc_table_html = self._generate_rc_model_table_html(rc_model_details)
+        
+        # Generate room coupling analysis
+        coupling_html = self._generate_room_coupling_html(thermal_analysis)
+        
+        # Generate thermal network visualization
+        network_html = self._generate_thermal_network_html(rc_model_details)
+
         return f"""
         <section id="thermal-analysis" class="analysis-section">
             <h2>🏠 Thermal Dynamics Analysis</h2>
+            
+            <div class="thermal-overview">
+                <h3>Room Temperature Overview</h3>
+                <table class="data-table">
+                    <thead>
+                        <tr>
+                            <th>Room</th>
+                            <th>Mean Temperature</th>
+                            <th>Temperature Range</th>
+                            <th>Heating Usage</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {''.join(table_rows)}
+                    </tbody>
+                </table>
+            </div>
+
+            {rc_table_html}
+            {coupling_html}
+            {network_html}
+        </section>
+        """
+
+    def _generate_rc_model_table_html(self, rc_model_details):
+        """Generate detailed RC model parameters table."""
+        if not rc_model_details:
+            return "<div class='info-box'>No RC model parameters available.</div>"
+        
+        rc_rows = []
+        for room_data in rc_model_details:
+            room = room_data['room']
+            R = room_data['R']
+            C = room_data['C']
+            tau = room_data['tau']
+            success_rate = room_data['success_rate']
+            
+            # Format values (convert C from J/K to MJ/K)
+            R_str = f"{R:.3f} K/W" if R is not None else "N/A"
+            C_str = f"{C/1e6:.2f} MJ/K" if C is not None else "N/A"
+            tau_str = f"{tau:.1f} hours" if tau is not None else "N/A"
+            
+            # Classify thermal performance
+            if tau is not None:
+                if tau > 50:
+                    thermal_class = "status-excellent"
+                    thermal_desc = "Excellent"
+                elif tau > 20:
+                    thermal_class = "status-good"
+                    thermal_desc = "Good"
+                elif tau > 10:
+                    thermal_class = "status-warning"
+                    thermal_desc = "Moderate"
+                else:
+                    thermal_class = "status-poor"
+                    thermal_desc = "Poor"
+            else:
+                thermal_class = "status-unknown"
+                thermal_desc = "Unknown"
+            
+            # Success rate indicator
+            if success_rate >= 50:
+                success_class = "status-good"
+            elif success_rate >= 20:
+                success_class = "status-warning"
+            else:
+                success_class = "status-poor"
+            
+            rc_rows.append(f"""
+                <tr>
+                    <td><strong>{room}</strong></td>
+                    <td>{R_str}</td>
+                    <td>{C_str}</td>
+                    <td>{tau_str}</td>
+                    <td><span class="status-badge {thermal_class}">{thermal_desc}</span></td>
+                    <td><span class="status-badge {success_class}">{success_rate:.0f}%</span></td>
+                </tr>
+            """)
+        
+        return f"""
+        <div class="rc-model-analysis">
+            <h3>🔬 RC Model Parameters</h3>
+            <div class="model-explanation">
+                <p><strong>Thermal Model Theory:</strong> Each room is modeled as an RC circuit where:</p>
+                <ul>
+                    <li><strong>R (Thermal Resistance)</strong>: How well the room resists heat loss (lower = more heat loss)</li>
+                    <li><strong>C (Thermal Capacitance)</strong>: How much heat the room can store (higher = more stable temperature)</li>
+                    <li><strong>τ (Time Constant)</strong>: Time for temperature difference to decay to 37% (τ = R × C)</li>
+                </ul>
+            </div>
             <table class="data-table">
                 <thead>
                     <tr>
                         <th>Room</th>
-                        <th>Mean Temperature</th>
-                        <th>Temperature Range</th>
-                        <th>Heating Usage</th>
-                        <th>Status</th>
+                        <th>Resistance (R)</th>
+                        <th>Capacitance (C)</th>
+                        <th>Time Constant (τ)</th>
+                        <th>Thermal Performance</th>
+                        <th>Model Confidence</th>
                     </tr>
                 </thead>
                 <tbody>
-                    {''.join(table_rows)}
+                    {''.join(rc_rows)}
                 </tbody>
             </table>
-        </section>
+        </div>
+        """
+
+    def _generate_room_coupling_html(self, thermal_analysis):
+        """Generate room coupling analysis."""
+        # Calculate temperature correlations between rooms
+        correlations = []
+        room_names = []
+        
+        for room_name, room_data in thermal_analysis.items():
+            if isinstance(room_data, dict) and "basic_stats" in room_data:
+                room_names.append(room_name)
+        
+        # This would ideally use actual correlation analysis
+        # For now, generate placeholder coupling information
+        coupling_html = f"""
+        <div class="room-coupling-analysis">
+            <h3>🔗 Room Thermal Coupling</h3>
+            <div class="coupling-explanation">
+                <p><strong>Thermal Coupling:</strong> Rooms exchange heat through shared walls, open doors, and air circulation.</p>
+                <p>Coupling strength is determined by temperature correlation and physical proximity.</p>
+            </div>
+            <div class="coupling-matrix">
+                <p><em>Coupling analysis requires synchronized temperature data from multiple rooms.</em></p>
+                <p>Detected rooms: {', '.join(room_names)}</p>
+            </div>
+        </div>
+        """
+        
+        return coupling_html
+
+    def _generate_thermal_network_html(self, rc_model_details):
+        """Generate thermal network visualization."""
+        if not rc_model_details:
+            return ""
+        
+        # Generate SVG thermal network diagram
+        network_svg = self._create_thermal_network_svg(rc_model_details)
+        
+        return f"""
+        <div class="thermal-network">
+            <h3>🏗️ Thermal Network Model</h3>
+            <div class="network-explanation">
+                <p><strong>Network Topology:</strong> Each room is connected to the outdoor environment through its thermal resistance.</p>
+                <p>Circle size represents thermal capacitance, connection thickness represents thermal coupling strength.</p>
+            </div>
+            <div class="network-diagram">
+                {network_svg}
+            </div>
+            <div class="network-legend">
+                <div class="legend-item"><span class="legend-color" style="background: #3498db;"></span> Good Thermal Performance (τ > 20h)</div>
+                <div class="legend-item"><span class="legend-color" style="background: #f39c12;"></span> Moderate Performance (10h < τ < 20h)</div>
+                <div class="legend-item"><span class="legend-color" style="background: #e74c3c;"></span> Poor Performance (τ < 10h)</div>
+            </div>
+        </div>
+        """
+
+    def _create_thermal_network_svg(self, rc_model_details):
+        """Create SVG diagram of thermal network."""
+        width = 800
+        height = 600
+        center_x = width // 2
+        center_y = height // 2
+        
+        # Calculate positions for rooms in a circle
+        import math
+        num_rooms = len(rc_model_details)
+        if num_rooms == 0:
+            return "<p>No thermal model data available for visualization.</p>"
+        
+        svg_elements = []
+        
+        # Add outdoor environment in center
+        svg_elements.append(f"""
+            <circle cx="{center_x}" cy="{center_y}" r="40" 
+                    fill="#95a5a6" stroke="#2c3e50" stroke-width="3"/>
+            <text x="{center_x}" y="{center_y}" text-anchor="middle" 
+                  dominant-baseline="central" font-size="12" fill="white">Outdoor</text>
+        """)
+        
+        # Add rooms around the circle
+        radius = 200
+        for i, room_data in enumerate(rc_model_details):
+            angle = 2 * math.pi * i / num_rooms
+            x = center_x + radius * math.cos(angle)
+            y = center_y + radius * math.sin(angle)
+            
+            # Determine room color based on thermal performance
+            tau = room_data.get('tau', 0)
+            if tau is None or tau == 0:
+                color = "#95a5a6"  # Gray for unknown
+            elif tau > 20:
+                color = "#3498db"  # Blue for good
+            elif tau > 10:
+                color = "#f39c12"  # Orange for moderate
+            else:
+                color = "#e74c3c"  # Red for poor
+            
+            # Room circle size based on capacitance (convert from J/K to reasonable radius)
+            C = room_data.get('C', 1)
+            # Scale capacitance to a reasonable circle radius (5-40 pixel range)
+            if C:
+                C_MJ = C / 1e6  # Convert J/K to MJ/K
+                circle_radius = max(15, min(40, 15 + C_MJ * 2))
+            else:
+                circle_radius = 20
+            
+            # Add connection line to outdoor
+            svg_elements.append(f"""
+                <line x1="{center_x}" y1="{center_y}" x2="{x}" y2="{y}" 
+                      stroke="#bdc3c7" stroke-width="2" opacity="0.6"/>
+            """)
+            
+            # Add room circle
+            svg_elements.append(f"""
+                <circle cx="{x}" cy="{y}" r="{circle_radius}" 
+                        fill="{color}" stroke="#2c3e50" stroke-width="2" opacity="0.8"/>
+                <text x="{x}" y="{y-5}" text-anchor="middle" 
+                      dominant-baseline="central" font-size="10" fill="white">{room_data['room']}</text>
+                <text x="{x}" y="{y+8}" text-anchor="middle" 
+                      dominant-baseline="central" font-size="8" fill="white">τ={tau:.1f}h</text>
+            """)
+        
+        return f"""
+        <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+            {''.join(svg_elements)}
+        </svg>
         """
 
     def _generate_base_load_section_html(
