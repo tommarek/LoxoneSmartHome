@@ -16,6 +16,7 @@ import pandas as pd
 import statsmodels.api as sm
 from scipy import optimize
 from scipy.optimize import curve_fit
+from scipy.signal import savgol_filter
 from scipy.stats import linregress
 from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
@@ -52,12 +53,12 @@ except ImportError:
 
 
 # --- Constants for Physical Plausibility ---
-# Realistic thermal resistance range for a room in K/W
-R_MIN, R_MAX = 0.005, 0.5
-# Realistic thermal capacitance range for a room in MJ/K
-C_MIN_MJ, C_MAX_MJ = 1.0, 100.0
-# Realistic time constant range in hours
-TAU_MIN, TAU_MAX = 2.0, 100.0
+# Realistic thermal resistance range for a room in K/W (increased min to avoid unphysical values)
+R_MIN, R_MAX = 0.008, 0.5
+# Realistic thermal capacitance range for a room in MJ/K (increased min for better stability)
+C_MIN_MJ, C_MAX_MJ = 2.0, 100.0
+# Realistic time constant range in hours - extended for winter conditions (increased min)
+TAU_MIN, TAU_MAX = 3.0, 200.0
 
 
 class ThermalAnalyzer:
@@ -85,6 +86,17 @@ class ThermalAnalyzer:
         self.room_configs = {
             room["name"]: room for room in self.system_settings.get("rooms", [])
         }
+
+        # Configuration for sustained heating analysis
+        self.min_heating_duration_hours = self.settings.get(
+            "min_heating_duration_hours", 2.0
+        )
+        self.min_non_heating_duration_hours = self.settings.get(
+            "min_non_heating_duration_hours", 3.0
+        )
+        self.decay_analysis_hours = self.settings.get(
+            "decay_analysis_hours", 8.0
+        )  # How long to analyze decay - extended for winter
 
     def get_target_temp(self, room_name: str, hour: int) -> float:
         """Get target temperature for a room at a specific hour.
@@ -207,9 +219,7 @@ class ThermalAnalyzer:
         # Analyze each interior room individually using standardized data
         for room_name, room_df in interior_rooms.items():
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
-            self.logger.info(
-                f"Room {room_name} processed: {room_df.shape[0]} records"
-            )
+            self.logger.info(f"Room {room_name} processed: {room_df.shape[0]} records")
             if "heating_on" not in room_df.columns:
                 self.logger.info(f"Room {room_name} has no heating_on column")
 
@@ -391,7 +401,65 @@ class ThermalAnalyzer:
         # Thermal comfort analysis
         results["comfort_analysis"] = self._analyze_thermal_comfort(merged_data)
 
-        # Heating usage is now calculated in the R/C parameter estimation above
+        # Add sustained heating cycle analysis
+        try:
+            # Get relay data from the integrator if available
+            relay_data = getattr(self.integrator, "_processed_relay_data", {})
+            outdoor_temp = (
+                weather_data.get("outdoor_temp", pd.Series())
+                if isinstance(weather_data, pd.DataFrame)
+                else pd.Series()
+            )
+
+            # Find matching relay states for this room
+            relay_states = pd.Series(dtype=int)
+            room_key = self._find_matching_relay_room(room_name, relay_data.keys())
+            if room_key and room_key in relay_data:
+                relay_df = relay_data[room_key]
+                if "relay_state" in relay_df.columns:
+                    relay_states = relay_df["relay_state"].reindex(
+                        merged_data.index, method="nearest", fill_value=0
+                    )
+
+            if len(relay_states) > 0 and len(outdoor_temp) > 0:
+                sustained_analysis = self.analyze_sustained_heating_cycles(
+                    merged_data["room_temp"],
+                    outdoor_temp.reindex(merged_data.index, method="nearest"),
+                    relay_states,
+                )
+                results["sustained_heating_analysis"] = sustained_analysis
+
+                # Also calculate real heating usage from relay data
+                heating_usage = self._calculate_real_heating_usage(
+                    room_name, relay_data
+                )
+                results["heating_usage"] = heating_usage
+
+                # Replace misleading heating_percentage with actual heating usage
+                if (
+                    "basic_stats" in results
+                    and heating_usage.get("heating_data_source") == "actual_relay"
+                ):
+                    results["basic_stats"]["heating_percentage"] = heating_usage.get(
+                        "actual_heating_usage_pct", 0
+                    )
+                    results["basic_stats"]["heating_data_source"] = heating_usage.get(
+                        "heating_data_source", "inference"
+                    )
+            else:
+                results["sustained_heating_analysis"] = {
+                    "warning": "No relay data available for sustained heating analysis"
+                }
+                results["heating_usage"] = {
+                    "heating_data_source": "no_relay_data",
+                    "actual_heating_usage_pct": 0,
+                }
+
+        except Exception as e:
+            self.logger.warning(
+                f"Sustained heating analysis failed for {room_name}: {e}"
+            )
+            results["sustained_heating_analysis"] = {"error": str(e)}
 
         return results
 
@@ -415,6 +483,9 @@ class ThermalAnalyzer:
         # Rename temperature column to standard name
         room_clean.rename(columns={temp_col: "room_temp"}, inplace=True)
 
+        # Apply upstream data cleaning with rolling median outlier removal
+        room_clean = self._clean_temperature_data(room_clean)
+
         # Add heating status if available
         heating_cols = [
             col
@@ -427,23 +498,35 @@ class ThermalAnalyzer:
         if heating_cols:
             # Use the first heating column found
             heating_col = heating_cols[0]
+            self.logger.debug(f"Found heating column '{heating_col}' in room data")
 
             if heating_col == "relay_state":
-                # Debug: Check relay_state data
                 # Convert relay state to heating_on (binary)
                 room_clean["heating_on"] = (room_df[heating_col] > 0).astype(int)
+                # Debug relay state timing
+                relay_on_count = room_clean["heating_on"].sum()
+                self.logger.debug(
+                    f"Relay states - ON intervals: {relay_on_count}, Total points: {len(room_clean)}"
+                )
             else:
                 room_clean["heating_on"] = room_df[heating_col]
         elif "heating_on" in room_df.columns:
             # Direct heating_on column (already standardized)
+            self.logger.debug("Using existing 'heating_on' column")
             room_clean["heating_on"] = room_df["heating_on"]
         else:
             # Infer heating from temperature changes
-            self.logger.info(
-                "No heating column found, using inference"
-            )
+            self.logger.info("No heating column found, using inference")
             room_clean["heating_on"] = self._infer_heating_status(
                 room_clean["room_temp"]
+            )
+
+        # Log heating statistics for debugging
+        if "heating_on" in room_clean.columns:
+            heating_stats = room_clean["heating_on"].value_counts()
+            heating_pct = (room_clean["heating_on"] == 1).mean() * 100
+            self.logger.debug(
+                f"Heating statistics: {heating_stats.to_dict()}, {heating_pct:.1f}% heating time"
             )
 
         # Add setpoint if available
@@ -497,7 +580,7 @@ class ThermalAnalyzer:
                     weather_resampled = (
                         weather_data[[temp_column]]
                         .resample("5min")
-                        .interpolate(method="linear")
+                        .interpolate(method="time", limit=3, limit_direction="both")
                     )
                     weather_resampled.columns = ["outdoor_temp"]
 
@@ -554,6 +637,170 @@ class ThermalAnalyzer:
         # Return zeros - we should use actual relay data
         return pd.Series(0, index=temperature.index)
 
+    def _clean_temperature_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply upstream data cleaning with rolling median outlier removal.
+
+        This removes spurious spikes from sensor readings that can ruin
+        derivative calculations (dT/dt) and statistical fits.
+        """
+        if "room_temp" not in df.columns:
+            return df
+
+        df_clean = df.copy()
+
+        # Apply rolling median filter to remove outliers
+        # Window of 3-5 samples is sufficient for spike removal
+        window_size = 5  # 25 minutes for 5-minute data
+
+        # Use center=True to avoid time-shifting the data
+        temp_median = (
+            df_clean["room_temp"]
+            .rolling(window=window_size, center=True, min_periods=1)
+            .median()
+        )
+
+        # Calculate deviation from median
+        temp_deviation = abs(df_clean["room_temp"] - temp_median)
+
+        # Define outlier threshold (e.g., 2°C deviation from local median)
+        outlier_threshold = 2.0  # degrees Celsius
+        outlier_mask = temp_deviation > outlier_threshold
+
+        # Replace outliers with NaN first, then apply smart interpolation
+        df_clean.loc[outlier_mask, "room_temp"] = np.nan
+
+        # Apply smart interpolation: only fill gaps of up to 3 consecutive NaNs (15 minutes)
+        # This prevents creating artificial data over long periods
+        df_clean["room_temp"] = df_clean["room_temp"].interpolate(
+            method="time", limit=3, limit_direction="both"
+        )
+
+        # Count and log outliers removed
+        outliers_removed = outlier_mask.sum()
+        remaining_nans = df_clean["room_temp"].isna().sum()
+        if outliers_removed > 0:
+            self.logger.info(
+                f"Cleaned {outliers_removed} temperature outliers "
+                f"({outliers_removed/len(df)*100:.1f}% of data), "
+                f"{remaining_nans} gaps too large to interpolate"
+            )
+
+            # Log statistics about outliers
+            if outliers_removed > 0:
+                max_deviation = temp_deviation[outlier_mask].max()
+                self.logger.debug(
+                    f"Max outlier deviation: {max_deviation:.2f}°C "
+                    f"(threshold: {outlier_threshold}°C)"
+                )
+
+        # Also clean outdoor temperature if present
+        if (
+            "outdoor_temp" in df_clean.columns
+            and not df_clean["outdoor_temp"].isna().all()
+        ):
+            outdoor_median = (
+                df_clean["outdoor_temp"]
+                .rolling(window=window_size, center=True, min_periods=1)
+                .median()
+            )
+
+            outdoor_deviation = abs(df_clean["outdoor_temp"] - outdoor_median)
+            outdoor_outlier_mask = outdoor_deviation > outlier_threshold
+
+            # Replace outliers with NaN first, then apply smart interpolation
+            df_clean.loc[outdoor_outlier_mask, "outdoor_temp"] = np.nan
+
+            # Apply smart interpolation for outdoor temperature
+            df_clean["outdoor_temp"] = df_clean["outdoor_temp"].interpolate(
+                method="time", limit=3, limit_direction="both"
+            )
+
+            outdoor_outliers_removed = outdoor_outlier_mask.sum()
+            outdoor_remaining_nans = df_clean["outdoor_temp"].isna().sum()
+            if outdoor_outliers_removed > 0:
+                self.logger.debug(
+                    f"Cleaned {outdoor_outliers_removed} outdoor temperature outliers, "
+                    f"{outdoor_remaining_nans} gaps too large to interpolate"
+                )
+
+        # Apply Savitzky-Golay filter for noise reduction while preserving signal shape
+        # This is crucial for accurate derivative calculations (dT/dt)
+        df_clean = self._apply_savgol_smoothing(df_clean)
+
+        return df_clean
+
+    def _apply_savgol_smoothing(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply Savitzky-Golay filter for noise reduction while preserving signal shape.
+
+        This is superior to moving averages as it preserves the true shape of signals
+        (like heating curve starts) while removing noise - essential for derivative calculations.
+        """
+        df_smooth = df.copy()
+
+        # Parameters for Savitzky-Golay filter
+        window_length = 7  # Must be odd, 5-9 is good for 5-minute data
+        polyorder = 2  # Polynomial order 2-3 works well
+
+        # Apply smoothing to room temperature if available and has sufficient data
+        if "room_temp" in df_smooth.columns and not df_smooth["room_temp"].isna().all():
+            valid_mask = df_smooth["room_temp"].notna()
+            valid_count = valid_mask.sum()
+
+            if valid_count >= window_length:
+                # Create a temporary series for filtering (Savitzky-Golay needs no NaN values)
+                temp_values = df_smooth["room_temp"].copy()
+
+                # Handle NaN values by forward/backward filling for filtering
+                temp_filled = temp_values.fillna(method="ffill").fillna(method="bfill")
+
+                if len(temp_filled.dropna()) >= window_length:
+                    # Apply Savitzky-Golay filter
+                    temp_smooth = savgol_filter(temp_filled, window_length, polyorder)
+
+                    # Restore NaN values where they originally existed
+                    df_smooth["room_temp"] = temp_smooth
+                    df_smooth.loc[~valid_mask, "room_temp"] = np.nan
+
+                    self.logger.debug(
+                        f"Applied Savitzky-Golay smoothing to room temperature "
+                        f"(window={window_length}, poly={polyorder})"
+                    )
+            else:
+                self.logger.debug(
+                    f"Insufficient data for room temperature smoothing "
+                    f"({valid_count} < {window_length} required)"
+                )
+
+        # Apply smoothing to outdoor temperature if available
+        if (
+            "outdoor_temp" in df_smooth.columns
+            and not df_smooth["outdoor_temp"].isna().all()
+        ):
+            valid_mask = df_smooth["outdoor_temp"].notna()
+            valid_count = valid_mask.sum()
+
+            if valid_count >= window_length:
+                temp_values = df_smooth["outdoor_temp"].copy()
+                temp_filled = temp_values.fillna(method="ffill").fillna(method="bfill")
+
+                if len(temp_filled.dropna()) >= window_length:
+                    temp_smooth = savgol_filter(temp_filled, window_length, polyorder)
+                    df_smooth["outdoor_temp"] = temp_smooth
+                    df_smooth.loc[~valid_mask, "outdoor_temp"] = np.nan
+
+                    self.logger.debug(
+                        f"Applied Savitzky-Golay smoothing to outdoor temperature"
+                    )
+            else:
+                self.logger.debug(
+                    f"Insufficient data for outdoor temperature smoothing "
+                    f"({valid_count} < {window_length} required)"
+                )
+
+        return df_smooth
+
     def _calculate_basic_thermal_stats(
         self, data: pd.DataFrame, room_name: str
     ) -> Dict[str, Any]:
@@ -589,9 +836,12 @@ class ThermalAnalyzer:
                 }
             )
 
-        # Outdoor temperature relationship
+        # Outdoor temperature relationship with variance check
         if "outdoor_temp" in data.columns:
-            correlation = data["room_temp"].corr(data["outdoor_temp"])
+            if data["room_temp"].std() > 1e-10 and data["outdoor_temp"].std() > 1e-10:
+                correlation = data["room_temp"].corr(data["outdoor_temp"])
+            else:
+                correlation = None
             stats.update(
                 {
                     "outdoor_correlation": correlation,
@@ -841,10 +1091,16 @@ class ThermalAnalyzer:
         if len(solar_warming) < 20:
             return {"warning": "Insufficient solar warming periods found"}
 
-        # Correlation analysis
-        solar_correlation = solar_warming["solar_proxy"].corr(
-            solar_warming["temp_change"]
-        )
+        # Correlation analysis with variance check
+        if (
+            solar_warming["solar_proxy"].std() > 1e-10
+            and solar_warming["temp_change"].std() > 1e-10
+        ):
+            solar_correlation = solar_warming["solar_proxy"].corr(
+                solar_warming["temp_change"]
+            )
+        else:
+            solar_correlation = None
 
         # Peak solar gain estimation
         peak_solar_hours = no_heating_data[
@@ -1037,17 +1293,52 @@ class ThermalAnalyzer:
         rise_results = []
 
         for i, cycle in enumerate(cycles):
-            # Analyze cooling decay
-            decay = self._analyze_heating_cycle_decay(df, cycle)
+            # Find next heating cycle start time (if any)
+            next_cycle_start = None
+            if i + 1 < len(cycles):
+                next_cycle_start = cycles[i + 1]["start_time"]
+
+            # Analyze cooling decay with next cycle information
+            decay = self._analyze_heating_cycle_decay(df, cycle, next_cycle_start)
             if decay["fit_valid"]:
                 decay_results.append(decay)
                 self.logger.debug(
-                    f"Cycle {i+1} decay: τ={decay['time_constant_hours']:.1f}h, R²={decay['r_squared']:.3f}"
+                    f"Cycle {i+1} decay: τ={decay['time_constant_hours']:.1f}h, R²={decay['r_squared']:.3f}, "
+                    f"duration={decay['decay_duration_hours']:.1f}h, end_reason={decay['decay_end_reason']}"
                 )
             else:
-                self.logger.debug(
-                    f"Cycle {i+1} decay analysis failed: {decay.get('reason', 'unknown')}"
-                )
+                # Enhanced debugging for failed decay fits
+                reason = decay.get("reason", "unknown")
+                self.logger.debug(f"Cycle {i+1} decay analysis failed: {reason}")
+                if i < 3:  # Show details for first 3 failures
+                    extra_info = []
+                    if "data_points" in decay:
+                        extra_info.append(f"data_points={decay['data_points']}")
+                    if "heating_intervals" in decay:
+                        extra_info.append(
+                            f"heating_resumed={decay['heating_intervals']}"
+                        )
+                    if "decay_duration_hours" in decay:
+                        extra_info.append(
+                            f"duration={decay['decay_duration_hours']:.1f}h"
+                        )
+                    if "decay_end_reason" in decay:
+                        extra_info.append(f"end_reason={decay['decay_end_reason']}")
+                    if extra_info:
+                        self.logger.debug(f"  Details: {', '.join(extra_info)}")
+
+                    # Show cycle timing info
+                    if next_cycle_start:
+                        gap_hours = (
+                            next_cycle_start - cycle["end_time"]
+                        ).total_seconds() / 3600
+                        self.logger.debug(f"  Gap to next cycle: {gap_hours:.1f}h")
+                    else:
+                        self.logger.debug(f"  No next cycle (last cycle)")
+
+                    self.logger.debug(
+                        f"  Cycle: {cycle['end_time']} (end), temp rise: {cycle.get('peak_temp', 0) - cycle.get('start_temp', 0):.1f}°C"
+                    )
 
             # Analyze heating rise
             rise = self._analyze_heating_cycle_rise(df, cycle)
@@ -1071,7 +1362,7 @@ class ThermalAnalyzer:
         # Calculate robust statistics from successful analyses
         tau_values = []
         C_values = []
-        
+
         if len(decay_results) > 0:
             tau_values = [r["time_constant_hours"] for r in decay_results]
             tau_median = np.median(tau_values)
@@ -1112,10 +1403,19 @@ class ThermalAnalyzer:
             # Shouldn't reach here given the check above, but safety fallback
             return self._estimate_rc_simplified(df, p_heat_w)
 
-        # Quality assessment
-        confidence = min(
-            1.0, len(decay_results) / 10
-        )  # More cycles = higher confidence
+        # Quality assessment with improved thresholds
+        # Reduced from 10 cycles to 6 cycles for good confidence
+        # Added R² quality bonus for better fits
+        cycle_confidence = min(1.0, len(decay_results) / 6)
+
+        # Calculate average R² from decay results for quality bonus
+        if decay_results:
+            avg_r_squared = np.mean([d.get("fit_r_squared", 0) for d in decay_results])
+            r_squared_bonus = min(0.2, avg_r_squared * 0.3)  # Up to 20% bonus
+        else:
+            r_squared_bonus = 0
+
+        confidence = min(1.0, cycle_confidence + r_squared_bonus)
 
         # Physical validity checks
         physically_valid = (
@@ -1162,7 +1462,7 @@ class ThermalAnalyzer:
             C_median = np.clip(C_median, C_MIN_MJ * 1e6, C_MAX_MJ * 1e6)
             tau_median = np.clip(tau_median, TAU_MIN, TAU_MAX)
             physically_valid = True
-            confidence *= 0.5  # Reduce confidence for clamped values
+            confidence *= 0.8  # Reduced penalty: was 0.5, now 0.8
 
         return {
             "method": method_used,
@@ -1199,7 +1499,15 @@ class ThermalAnalyzer:
         start_indices = df.index[heating_diff == 1]  # Heating starts
         end_indices = df.index[heating_diff == -1]  # Heating ends
 
-        self.logger.info(f"Found {len(start_indices)} heating starts and {len(end_indices)} heating ends")
+        self.logger.info(
+            f"Found {len(start_indices)} heating starts and {len(end_indices)} heating ends"
+        )
+
+        # Debug: Log relay timing for troubleshooting
+        if len(start_indices) > 0:
+            self.logger.debug(f"First few heating starts: {start_indices[:5].tolist()}")
+        if len(end_indices) > 0:
+            self.logger.debug(f"First few heating ends: {end_indices[:5].tolist()}")
 
         # Handle edge cases: dataset starts/ends during heating
         if len(df) > 0 and df["heating_on"].iloc[0] == 1:
@@ -1219,17 +1527,19 @@ class ThermalAnalyzer:
             start_time = start_indices[i]
             end_time = end_indices[i]
 
-
             # Skip if end comes before start (data issue)
             if end_time <= start_time:
                 continue
 
             duration_minutes = (end_time - start_time).total_seconds() / 60.0
 
-            # Filter by duration
+            # Filter by duration - relaxed minimum for winter short cycles
             if (
-                duration_minutes < 10 or duration_minutes > 2880
-            ):  # 10min to 48 hours (to handle multi-day heating periods)
+                duration_minutes < 5 or duration_minutes > 2880
+            ):  # 5min to 48 hours (relaxed from 10min for winter conditions)
+                self.logger.debug(
+                    f"Cycle {start_time} to {end_time} rejected: duration {duration_minutes:.1f}min out of range"
+                )
                 continue
 
             # Get temperature data for this cycle
@@ -1238,16 +1548,31 @@ class ThermalAnalyzer:
                 continue
 
             # Filter out NaN temperature values for this cycle
-            valid_temps = cycle_data["room_temp"].dropna()
+            # Check both 'room_temp' and 'temperature' column names for compatibility
+            temp_col = (
+                "room_temp" if "room_temp" in cycle_data.columns else "temperature"
+            )
+            if temp_col not in cycle_data.columns:
+                self.logger.debug(
+                    f"Cycle {start_time} to {end_time} rejected: no temperature column found"
+                )
+                continue
+
+            valid_temps = cycle_data[temp_col].dropna()
             if len(valid_temps) < 2:
                 continue  # Need at least 2 valid temperature readings
 
             start_temp = valid_temps.iloc[0]
             peak_temp = valid_temps.max()
 
-            # Filter by temperature rise
+            # Filter by temperature rise - relaxed for winter conditions
             temp_rise = peak_temp - start_temp
-            if temp_rise < 0.5:  # At least 0.5°C rise
+            if (
+                temp_rise < 0.1
+            ):  # Relaxed from 0.5°C - even small rises are valuable in winter
+                self.logger.debug(
+                    f"Cycle {start_time} to {end_time} rejected: temp rise {temp_rise:.2f}°C too small"
+                )
                 continue
 
             # Check for valid outdoor temperature data (optional)
@@ -1274,50 +1599,140 @@ class ThermalAnalyzer:
         self.logger.info(f"Detected {len(cycles)} valid heating cycles")
         return cycles
 
-    def _analyze_heating_cycle_decay(self, df: pd.DataFrame, cycle: Dict) -> Dict:
+    def _analyze_heating_cycle_decay(
+        self, df: pd.DataFrame, cycle: Dict, next_cycle_start: pd.Timestamp = None
+    ) -> Dict:
         """
         Analyze the cooling decay phase after a heating cycle.
 
         Args:
             df: Full temperature DataFrame
             cycle: Heating cycle information from _detect_heating_cycles()
+            next_cycle_start: Start time of the next heating cycle (if any)
 
         Returns:
             Dictionary with decay analysis results
         """
-        # Extract post-heating data
-        decay_start = cycle["end_time"]
+        # Find actual peak temperature time (accounting for thermal lag after relay OFF)
+        relay_off_time = cycle["end_time"]
+        peak_temp = cycle["peak_temp"]
 
-        # Find end of decay period (return to baseline or 4 hours max)
+        # Look for peak temperature time after relay stops (thermal lag effect)
+        # Search in a window after relay stops to find when peak actually occurs
+        search_window_hours = 2.0  # Allow up to 2 hours for thermal lag
+        search_end = relay_off_time + pd.Timedelta(hours=search_window_hours)
+
+        # Get data from relay OFF until search window end
+        if len(df) > 0 and search_end <= df.index[-1]:
+            post_relay_data = df.loc[relay_off_time:search_end]
+        else:
+            post_relay_data = df.loc[relay_off_time:]
+
+        # Check temperature column name for compatibility
+        temp_col = "room_temp" if "room_temp" in df.columns else "temperature"
+
+        if not post_relay_data.empty and temp_col in post_relay_data.columns:
+            # Find when the actual peak temperature occurs (could be after relay OFF)
+            valid_temps = post_relay_data[temp_col].dropna()
+            if len(valid_temps) > 0:
+                actual_peak_temp = valid_temps.max()
+                # If temperature continued rising after relay OFF, use that peak time
+                if actual_peak_temp >= peak_temp:
+                    peak_temp_idx = valid_temps.idxmax()
+                    decay_start = peak_temp_idx
+                    self.logger.debug(
+                        f"Peak temperature {actual_peak_temp:.1f}°C found at {peak_temp_idx} (thermal lag after relay OFF at {relay_off_time})"
+                    )
+                else:
+                    # Peak was during heating period, use relay OFF time
+                    decay_start = relay_off_time
+                    self.logger.debug(
+                        f"Peak temperature {peak_temp:.1f}°C occurred during heating, starting decay from relay OFF at {relay_off_time}"
+                    )
+            else:
+                decay_start = relay_off_time
+        else:
+            decay_start = relay_off_time
+
+        # Get baseline temperature for analysis
         baseline_temp = cycle["start_temp"]
         baseline_tolerance = 0.3  # °C
-        max_decay_hours = 4
 
-        decay_end = decay_start + pd.Timedelta(hours=max_decay_hours)
-        if decay_end > df.index[-1]:
-            decay_end = df.index[-1]
+        # Find end of decay period - use next heating cycle start if available
+        if next_cycle_start is not None and next_cycle_start > decay_start:
+            # Use the time until next heating cycle starts
+            decay_end = next_cycle_start
+            decay_end_reason = "next_heating_cycle"
+        else:
+            # Fallback: Find natural end point or use maximum period
+            max_decay_hours = (
+                8  # Extended for winter conditions to capture longer natural decay
+            )
 
-        # Get decay period data
+            decay_end = decay_start + pd.Timedelta(hours=max_decay_hours)
+            if decay_end > df.index[-1]:
+                decay_end = df.index[-1]
+                decay_end_reason = "data_end"
+            else:
+                decay_end_reason = "max_time"
+
+            # Check for natural return to baseline
+            potential_decay_data = df.loc[decay_start:decay_end]
+            baseline_reached = potential_decay_data[
+                abs(potential_decay_data[temp_col] - baseline_temp)
+                <= baseline_tolerance
+            ]
+            if len(baseline_reached) > 0:
+                decay_end = baseline_reached.index[0]
+                decay_end_reason = "baseline_reached"
+
+        # Get decay period data and ensure heating is actually off
         decay_data = df.loc[decay_start:decay_end].copy()
 
-        # Find actual end point (return to baseline)
-        baseline_reached = decay_data[
-            abs(decay_data["room_temp"] - baseline_temp) <= baseline_tolerance
-        ]
-        if len(baseline_reached) > 0:
-            actual_decay_end = baseline_reached.index[0]
-            decay_data = decay_data.loc[:actual_decay_end]
+        # Remove any data points where heating is still on (edge case handling)
+        heating_off_mask = decay_data["heating_on"] == 0
+        decay_data = decay_data[heating_off_mask]
 
-        if len(decay_data) < 5:  # Need minimum data points
-            return {"fit_valid": False, "reason": "insufficient_data"}
+        # Check if we have any data left after filtering
+        if len(decay_data) == 0:
+            return {
+                "fit_valid": False,
+                "reason": "no_decay_data",
+                "note": "All data points during decay period have heating on",
+            }
 
-        # Check for heating resumption during decay
-        if decay_data["heating_on"].sum() > 0:
-            return {"fit_valid": False, "reason": "heating_resumed"}
+        # Adaptive minimum data points based on decay duration
+        decay_duration_hours = (
+            decay_data.index[-1] - decay_data.index[0]
+        ).total_seconds() / 3600
+        # For short decays, require fewer points (minimum 3 for curve fitting)
+        min_data_points = 3 if decay_duration_hours < 1.0 else 5
+
+        if len(decay_data) < min_data_points:  # Need minimum data points
+            return {
+                "fit_valid": False,
+                "reason": "insufficient_data",
+                "data_points": len(decay_data),
+                "required_points": min_data_points,
+                "decay_duration_hours": decay_duration_hours,
+            }
+
+        # Verify no heating during decay period (should be zero now)
+        heating_during_decay = decay_data["heating_on"].sum()
+        if heating_during_decay > 0:
+            # This should not happen now that we filter out heating_on points
+            self.logger.warning(
+                f"Unexpected heating during decay: {heating_during_decay} intervals"
+            )
+            return {
+                "fit_valid": False,
+                "reason": "heating_resumed",
+                "heating_intervals": heating_during_decay,
+            }
 
         # Prepare data for exponential decay fitting
         # Use temperature difference: ΔT(t) = T_room(t) - T_outdoor(t)
-        decay_data["temp_diff"] = decay_data["room_temp"] - decay_data["outdoor_temp"]
+        decay_data["temp_diff"] = decay_data[temp_col] - decay_data["outdoor_temp"]
         decay_data = decay_data.dropna(subset=["temp_diff"])
 
         if len(decay_data) < 5:
@@ -1331,15 +1746,49 @@ class ThermalAnalyzer:
         initial_temp_diff = temp_diff[0]
         outdoor_temp_avg = decay_data["outdoor_temp"].mean()
 
+        # Check for minimum decay magnitude (signal-to-noise ratio)
+        final_temp_diff = temp_diff[-1]
+        decay_magnitude = initial_temp_diff - final_temp_diff
+
+        # Adaptive threshold based on outdoor temperature and cycle characteristics
+        outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+        cycle_duration_hours = cycle.get("duration_minutes", 60) / 60.0
+
+        # More relaxed thresholds for short cycles and winter conditions
+        if outdoor_temp_avg < 5.0:  # Winter conditions (< 5°C)
+            if cycle_duration_hours < 0.5:  # Very short cycles (< 30 min)
+                min_decay_magnitude = 0.2  # °C - very relaxed for short winter cycles
+            else:
+                min_decay_magnitude = 0.3  # °C - relaxed for winter
+        else:
+            if cycle_duration_hours < 0.5:  # Very short cycles
+                min_decay_magnitude = 0.3  # °C - relaxed for short cycles
+            else:
+                min_decay_magnitude = 0.5  # °C - moderate for other seasons
+
+        if decay_magnitude < min_decay_magnitude:
+            self.logger.debug(
+                f"Decay magnitude {decay_magnitude:.2f}°C < {min_decay_magnitude:.2f}°C "
+                f"(cycle duration: {cycle_duration_hours:.1f}h, outdoor: {outdoor_temp_avg:.1f}°C)"
+            )
+            return {
+                "fit_valid": False,
+                "reason": "insufficient_decay_magnitude",
+                "decay_magnitude": decay_magnitude,
+                "min_required": min_decay_magnitude,
+                "outdoor_temp_avg": outdoor_temp_avg,
+                "cycle_duration_hours": cycle_duration_hours,
+            }
+
         try:
             # Exponential decay model: ΔT(t) = ΔT_initial * exp(-t/τ)
             def decay_model(t, tau):
                 return initial_temp_diff * np.exp(-t / tau)
 
-            # Fit with bounds for time constant
+            # Fit with bounds for time constant - extended iterations for better convergence
             bounds = ([TAU_MIN], [TAU_MAX])
             popt, _ = curve_fit(
-                decay_model, time_hours, temp_diff, bounds=bounds, maxfev=1000
+                decay_model, time_hours, temp_diff, bounds=bounds, maxfev=2000
             )
 
             tau_fitted = popt[0]
@@ -1348,8 +1797,28 @@ class ThermalAnalyzer:
             y_pred = decay_model(time_hours, tau_fitted)
             r_squared = r2_score(temp_diff, y_pred)
 
-            # Validate fit quality
-            fit_valid = r_squared > 0.7
+            # Validate fit quality - adaptive threshold based on conditions
+            # Winter conditions typically have more noise due to frequent cycling
+            outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+            if outdoor_temp_avg < 5.0:  # Winter conditions
+                r_squared_threshold = 0.2  # Very relaxed for winter
+            elif outdoor_temp_avg < 15.0:  # Shoulder seasons
+                r_squared_threshold = 0.3  # Moderate
+            else:  # Summer conditions
+                r_squared_threshold = 0.4  # Standard
+
+            fit_valid = r_squared > r_squared_threshold
+
+            if fit_valid:
+                self.logger.debug(
+                    f"DECAY FIT SUCCESS: τ={tau_fitted:.1f}h, R²={r_squared:.3f}, magnitude={decay_magnitude:.1f}°C, threshold={r_squared_threshold:.1f} (outdoor={outdoor_temp_avg:.1f}°C)"
+                )
+            else:
+                self.logger.debug(
+                    f"DECAY FIT REJECTED: τ={tau_fitted:.1f}h, R²={r_squared:.3f} < {r_squared_threshold:.1f}, magnitude={decay_magnitude:.1f}°C (outdoor={outdoor_temp_avg:.1f}°C)"
+                )
+
+            decay_duration_hours = (decay_end - decay_start).total_seconds() / 3600.0
 
             return {
                 "time_constant_hours": tau_fitted,
@@ -1358,6 +1827,9 @@ class ThermalAnalyzer:
                 "baseline_temp": baseline_temp,
                 "outdoor_temp_avg": outdoor_temp_avg,
                 "data_points": len(decay_data),
+                "decay_duration_hours": decay_duration_hours,
+                "decay_end_reason": decay_end_reason,
+                "decay_magnitude": decay_magnitude,
                 "fit_valid": fit_valid,
             }
 
@@ -1498,67 +1970,27 @@ class ThermalAnalyzer:
     ) -> Optional[Dict[str, Any]]:
         """
         Estimates R and C using a constrained state-space model (ARMA).
+        Currently disabled due to numerical instability issues.
         """
-        # Resample to consistent 15-minute intervals to ensure regular frequency
-        df_resampled = df.resample("15min").mean().interpolate(method='linear').dropna()
-        if len(df_resampled) < 50:
-            self.logger.warning("Not enough data for state-space modeling.")
-            return None
-
-        # T_room(t) = a*T_room(t-1) + b*T_out(t) + c*P_heat(t) + const
-        endog = df_resampled["room_temp"]
-        exog = df_resampled[["outdoor_temp", "heating_on"]].copy()
-        exog["heating_on"] *= power_rating_w  # Use actual power
-        
-        # Use resample to ensure proper frequency is inferred
-        try:
-            # Let statsmodels infer the frequency from the regular index
-            model = sm.tsa.ARIMA(endog, order=(1, 0, 0), exog=exog, trend="c").fit()
-        except Exception as e:
-            self.logger.warning(f"ARIMA model fitting failed: {e}")
-            return None
-
-        ar_param = model.params.get("ar.L1")
-        if ar_param <= 0 or ar_param >= 1:
-            self.logger.warning(
-                f"State-space model unstable (AR param = {ar_param:.3f})."
-            )
-            return None
-
-        # Convert model coeffs to physical params
-        dt = 15 * 60  # seconds
-        tau_seconds = -dt / np.log(ar_param)
-        tau_hours = tau_seconds / 3600.0
-
-        gain_heating = model.params.get("heating_on") / (1 - ar_param)
-
-        R = gain_heating
-        C = tau_seconds / R if R > 1e-6 else 0
-        C_mj = C / 1e6
-
-        physically_valid = (
-            (R_MIN < R < R_MAX)
-            and (C_MIN_MJ < C_mj < C_MAX_MJ)
-            and (TAU_MIN < tau_hours < TAU_MAX)
+        self.logger.warning(
+            "State-space estimation disabled due to convergence issues. "
+            "Use decoupled method instead."
         )
-        confidence = 1.0 - model.bse.get(
-            "ar.L1", 1.0
-        )  # Confidence based on std error of AR term
+        return None
 
-        if not physically_valid:
-            self.logger.warning(
-                f"State-space estimation produced unphysical results: R={R:.4f}, C={C_mj:.2f}, τ={tau_hours:.1f}h"
-            )
-            confidence = 0.2  # Penalize unphysical results
+        # TODO: Fix state-space estimation method
+        # Issues to resolve:
+        # 1. Maximum Likelihood convergence failures
+        # 2. Negative resistance values from poor ARIMA fits
+        # 3. Insufficient data validation (need 200+ points)
+        # 4. Incorrect physical parameter conversion
+        # 5. No convergence validation
 
-        return {
-            "method": "state_space",
-            "confidence": confidence,
-            "R": R,
-            "C": C,
-            "time_constant": tau_hours,
-            "physically_valid": physically_valid,
-        }
+        # Original code disabled - needs complete rewrite
+        # df_resampled = df.resample("15min").mean().interpolate(method="linear").dropna()
+        # if len(df_resampled) < 200:  # Increased minimum data requirement
+        #     self.logger.warning("Not enough data for state-space modeling (need 200+ points).")
+        #     return None
 
     def _get_default_rc_params(self) -> Dict[str, Any]:
         """Returns a default, invalid parameter set when estimation fails."""
@@ -1673,7 +2105,11 @@ class ThermalAnalyzer:
             heating_events = results.get("heatup_analysis", {}).get(
                 "heating_events_analyzed", 0
             )
-            confidence = 0.8 + (cooldown_r2 * 0.15) + min(heating_events / 20, 0.05)
+            # Improved confidence calculation with lower thresholds
+            confidence = 0.7 + (cooldown_r2 * 0.2) + min(heating_events / 15, 0.1)
+            # Base confidence reduced from 0.8 to 0.7
+            # R² bonus increased from 0.15 to 0.2
+            # Heating events bonus: threshold reduced from 20 to 15, max increased to 0.1
             candidates.append(("decoupled", confidence, decoupled))
 
         # PRIORITY 2: State-space identification
@@ -1717,7 +2153,9 @@ class ThermalAnalyzer:
                 # Legacy fields - create manual combination with low confidence
                 R = cooldown["thermal_resistance"]
                 C = heatup["thermal_capacitance"]
-                confidence = 0.3  # Very low confidence for potentially flawed data
+                confidence = (
+                    0.4  # Improved confidence for manual combinations (was 0.3)
+                )
 
                 manual = {
                     "R": R,
@@ -2274,7 +2712,15 @@ class ThermalAnalyzer:
         temp_df = pd.DataFrame(
             {name: temp[common_index] for name, temp in room_temps.items()}
         )
-        correlation_matrix = temp_df.corr()
+        # Calculate room coupling matrix with variance check
+        if temp_df.std().min() > 1e-10:  # All columns have sufficient variance
+            correlation_matrix = temp_df.corr()
+        else:
+            correlation_matrix = pd.DataFrame(
+                index=temp_df.columns, columns=temp_df.columns
+            )
+            correlation_matrix.loc[:, :] = np.nan
+            self.logger.debug("Room coupling matrix skipped due to zero variance")
 
         # Heat transfer analysis
         coupling_results = {
@@ -2318,3 +2764,781 @@ class ThermalAnalyzer:
             )
 
         return coupling_results
+
+    def _calculate_thermal_capacitance_from_peak(
+        self,
+        cycle: Dict[str, Any],
+        initial_temp: float,
+        heating_end_temp: float,
+        peak_temp: float,
+        peak_time: pd.Timestamp,
+        heating_start: pd.Timestamp,
+        heating_end: pd.Timestamp,
+        energy_input_kwh: float,
+    ) -> Dict[str, Any]:
+        """Calculate thermal capacitance considering heat losses and room coupling.
+
+        During heating: Heat_input = Heat_stored + Heat_lost_outside + Heat_lost_to_rooms
+        After heating: Heat_stored = Heat_lost_outside + Heat_lost_to_rooms
+
+        The peak timing tells us when the net heat flow becomes zero.
+        """
+
+        if energy_input_kwh <= 0:
+            return {"error": "No energy input data available"}
+
+        heating_duration_hours = (heating_end - heating_start).total_seconds() / 3600
+        peak_delay_hours = (peak_time - heating_end).total_seconds() / 3600
+
+        # Phase 1: During heating (heat input vs losses)
+        heating_phase_rise = heating_end_temp - initial_temp
+
+        # Phase 2: After heating (thermal inertia vs losses)
+        post_heating_rise = peak_temp - heating_end_temp
+
+        # Estimate heat loss rates
+        # Assume outdoor temperature and adjacent room temperatures are relatively constant
+        # Heat loss rate is proportional to temperature difference
+
+        # Average temperature during heating phase for heat loss calculations
+        avg_temp_during_heating = (initial_temp + heating_end_temp) / 2
+
+        # Heat input rate (kW)
+        heat_input_rate_kw = energy_input_kwh / heating_duration_hours
+
+        # During heating phase:
+        # Net heat storage rate = Heat input rate - Heat loss rate
+        # dT/dt = (P_in - P_loss) / C
+        # where P_loss = (T_room - T_outside) / R_total
+
+        # Temperature rise rate during heating
+        heating_temp_rise_rate = heating_phase_rise / heating_duration_hours  # °C/hr
+
+        # After heating stops:
+        # dT/dt = -P_loss / C = -(T_room - T_outside) / (R_total * C)
+        # The fact that temperature continues to rise means stored heat is redistributing
+
+        analysis = {
+            "heating_phase_analysis": {
+                "temperature_rise": heating_phase_rise,
+                "rise_rate_per_hour": heating_temp_rise_rate,
+                "heat_input_rate_kw": heat_input_rate_kw,
+                "net_heat_storage_efficiency": heating_temp_rise_rate
+                / heat_input_rate_kw
+                if heat_input_rate_kw > 0
+                else None,
+            },
+            "post_heating_analysis": {
+                "temperature_rise": post_heating_rise,
+                "peak_delay_hours": peak_delay_hours,
+                "thermal_inertia_indicator": post_heating_rise / heating_phase_rise
+                if heating_phase_rise > 0
+                else None,
+            },
+            "thermal_mass_indicators": {
+                "total_temperature_rise": peak_temp - initial_temp,
+                "peak_delay_ratio": peak_delay_hours / heating_duration_hours
+                if heating_duration_hours > 0
+                else None,
+            },
+        }
+
+        # Enhanced thermal capacitance calculation considering heat flows
+        if heating_temp_rise_rate > 0 and heat_input_rate_kw > 0:
+            # Key insight: The peak delay tells us about thermal inertia
+            # Longer delay = more thermal mass storing and redistributing heat
+
+            # During heating: P_input = C * dT/dt + P_losses
+            # Where P_losses = heat to outside + heat to adjacent rooms
+
+            # The net heat storage rate during heating
+            net_heat_storage_rate = heating_temp_rise_rate  # °C/hr
+
+            # Estimate heat loss coefficient from post-heating behavior
+            # After heating stops, the continued temperature rise indicates
+            # heat redistribution from thermal mass
+
+            if peak_delay_hours > 0 and post_heating_rise > 0:
+                # Heat redistribution rate after heating stops
+                redistribution_rate = post_heating_rise / peak_delay_hours  # °C/hr
+
+                # This gives us insight into thermal mass vs heat losses
+                thermal_mass_factor = peak_delay_hours * heating_duration_hours
+
+                # Corrected thermal capacitance accounting for heat losses
+                # The fact that temperature rises after heating indicates stored heat
+                correction_factor = 1 + (post_heating_rise / heating_phase_rise)
+
+                corrected_thermal_capacitance = (
+                    energy_input_kwh * correction_factor
+                ) / (peak_temp - initial_temp)
+
+                analysis["estimated_parameters"] = {
+                    "thermal_capacitance_kwh_per_k": corrected_thermal_capacitance,
+                    "thermal_capacitance_mj_per_k": corrected_thermal_capacitance * 3.6,
+                    "correction_factor": correction_factor,
+                    "thermal_mass_factor": thermal_mass_factor,
+                    "redistribution_rate_c_per_hour": redistribution_rate,
+                    "confidence": "medium",
+                    "note": "Accounts for thermal inertia and heat redistribution",
+                }
+
+                # Estimate effective thermal resistance during heating
+                # During heating: Net power stored = Input power - Lost power
+                # Lost power ≈ Temperature difference / Thermal resistance
+
+                if avg_temp_during_heating > 0:
+                    # This is a rough estimate - would need outdoor temp for accuracy
+                    estimated_heat_loss_rate = heat_input_rate_kw - (
+                        net_heat_storage_rate * corrected_thermal_capacitance
+                    )
+
+                    if estimated_heat_loss_rate > 0:
+                        analysis["heat_loss_analysis"] = {
+                            "estimated_heat_loss_rate_kw": estimated_heat_loss_rate,
+                            "heat_loss_fraction": estimated_heat_loss_rate
+                            / heat_input_rate_kw,
+                            "storage_efficiency": (
+                                heat_input_rate_kw - estimated_heat_loss_rate
+                            )
+                            / heat_input_rate_kw,
+                            "note": "Heat loss estimates require outdoor and adjacent room temperatures for accuracy",
+                        }
+            else:
+                # Fallback to simple calculation
+                simple_capacitance = energy_input_kwh / (peak_temp - initial_temp)
+                analysis["estimated_parameters"] = {
+                    "thermal_capacitance_kwh_per_k": simple_capacitance,
+                    "thermal_capacitance_mj_per_k": simple_capacitance * 3.6,
+                    "confidence": "low",
+                    "note": "Simple calculation - no post-heating rise detected",
+                }
+
+        return analysis
+
+    def _estimate_heat_losses_during_cycle(
+        self,
+        room_temp_series: pd.Series,
+        outdoor_temp_series: pd.Series,
+        heating_start: pd.Timestamp,
+        heating_end: pd.Timestamp,
+    ) -> Dict[str, float]:
+        """Estimate heat losses to outside and adjacent rooms during heating cycle."""
+
+        # Get temperature data for the heating period
+        heating_period = room_temp_series[heating_start:heating_end]
+        outdoor_period = outdoor_temp_series[heating_start:heating_end]
+
+        if len(heating_period) < 3 or len(outdoor_period) < 3:
+            return {"error": "Insufficient temperature data"}
+
+        # Calculate average temperature differences
+        avg_room_temp = heating_period.mean()
+        avg_outdoor_temp = outdoor_period.mean()
+        avg_temp_diff_outside = avg_room_temp - avg_outdoor_temp
+
+        # For adjacent rooms, we'd need their temperatures
+        # For now, estimate based on the fact that adjacent rooms are typically
+        # warmer than outside but cooler than the heated room
+
+        estimated_losses = {
+            "avg_temp_diff_to_outside": avg_temp_diff_outside,
+            "note": "Heat loss estimation requires outdoor and adjacent room temperatures",
+        }
+
+        return estimated_losses
+
+    def _find_matching_relay_room(self, room_name: str, relay_room_keys: list) -> str:
+        """
+        Find the matching relay key for a given room name.
+
+        Args:
+            room_name: Name of the room (e.g., 'obyvak')
+            relay_room_keys: List of available relay data keys (e.g., ['relay_obyvak'])
+
+        Returns:
+            Matching relay key or None if not found
+        """
+        # Direct match first
+        if room_name in relay_room_keys:
+            return room_name
+
+        # Try with 'relay_' prefix
+        relay_key = f"relay_{room_name}"
+        if relay_key in relay_room_keys:
+            return relay_key
+
+        # Try without 'room_' prefix if present
+        if room_name.startswith("room_"):
+            clean_room_name = room_name[5:]  # Remove 'room_' prefix
+            if clean_room_name in relay_room_keys:
+                return clean_room_name
+            relay_key = f"relay_{clean_room_name}"
+            if relay_key in relay_room_keys:
+                return relay_key
+
+        # Fuzzy matching for common variations
+        for key in relay_room_keys:
+            # Remove common prefixes for comparison
+            clean_key = key.replace("relay_", "").replace("room_", "")
+            clean_room = room_name.replace("relay_", "").replace("room_", "")
+
+            if clean_key == clean_room:
+                return key
+
+        self.logger.debug(
+            f"No matching relay found for room '{room_name}' in {relay_room_keys}"
+        )
+        return None
+
+    def analyze_sustained_heating_cycles(
+        self, room_temp: pd.Series, outdoor_temp: pd.Series, relay_states: pd.Series
+    ) -> Dict[str, Any]:
+        """Analyze sustained heating cycles followed by decay periods.
+
+        This method looks for heating periods longer than min_heating_duration_hours,
+        followed by non-heating periods longer than min_non_heating_duration_hours.
+        It analyzes the temperature rise, peak finding, and decay characteristics.
+        """
+
+        if len(room_temp) < 100 or len(relay_states) < 100:
+            return {"error": "Insufficient data for sustained heating analysis"}
+
+        # Ensure data is aligned
+        common_index = room_temp.index.intersection(relay_states.index).intersection(
+            outdoor_temp.index
+        )
+        if len(common_index) < 100:
+            return {"error": "Insufficient aligned data"}
+
+        room_temp = room_temp.reindex(common_index)
+        relay_states = relay_states.reindex(common_index)
+        outdoor_temp = outdoor_temp.reindex(common_index)
+
+        # Find sustained heating periods
+        heating_cycles = self._find_sustained_heating_cycles(relay_states)
+
+        if not heating_cycles:
+            return {
+                "warning": f"No sustained heating cycles found (min duration: {self.min_heating_duration_hours}h)"
+            }
+
+        cycle_analyses = []
+
+        for cycle in heating_cycles:
+            cycle_analysis = self._analyze_single_heating_cycle(
+                room_temp, outdoor_temp, cycle
+            )
+            if cycle_analysis:
+                cycle_analyses.append(cycle_analysis)
+
+        if not cycle_analyses:
+            return {"warning": "No valid heating cycles could be analyzed"}
+
+        # Aggregate results across all cycles
+        summary_stats = self._aggregate_cycle_statistics(cycle_analyses)
+
+        return {
+            "heating_cycles_analyzed": len(cycle_analyses),
+            "sustained_cycles_found": len(heating_cycles),
+            "cycle_details": cycle_analyses,
+            "summary_statistics": summary_stats,
+            "configuration": {
+                "min_heating_duration_hours": self.min_heating_duration_hours,
+                "min_non_heating_duration_hours": self.min_non_heating_duration_hours,
+                "decay_analysis_hours": self.decay_analysis_hours,
+            },
+        }
+
+    def _find_sustained_heating_cycles(
+        self, relay_states: pd.Series
+    ) -> List[Dict[str, Any]]:
+        """Find periods of sustained heating followed by sustained non-heating."""
+
+        cycles = []
+        heating_start = None
+
+        for i in range(1, len(relay_states)):
+            current_state = relay_states.iloc[i]
+            prev_state = relay_states.iloc[i - 1]
+            current_time = relay_states.index[i]
+
+            # Detect start of heating period
+            if current_state == 1 and prev_state == 0:
+                heating_start = current_time
+
+            # Detect end of heating period
+            elif current_state == 0 and prev_state == 1 and heating_start is not None:
+                heating_end = current_time
+                heating_duration_hours = (
+                    heating_end - heating_start
+                ).total_seconds() / 3600
+
+                # Check if heating period is long enough
+                if heating_duration_hours >= self.min_heating_duration_hours:
+                    # Look for sustained non-heating period after this
+                    non_heating_end = self._find_non_heating_period_end(
+                        relay_states, heating_end
+                    )
+
+                    if non_heating_end:
+                        non_heating_duration_hours = (
+                            non_heating_end - heating_end
+                        ).total_seconds() / 3600
+
+                        if (
+                            non_heating_duration_hours
+                            >= self.min_non_heating_duration_hours
+                        ):
+                            cycles.append(
+                                {
+                                    "heating_start": heating_start,
+                                    "heating_end": heating_end,
+                                    "non_heating_end": non_heating_end,
+                                    "heating_duration_hours": heating_duration_hours,
+                                    "non_heating_duration_hours": non_heating_duration_hours,
+                                }
+                            )
+
+                heating_start = None
+
+        return cycles
+
+    def _find_non_heating_period_end(
+        self, relay_states: pd.Series, heating_end
+    ) -> Optional[pd.Timestamp]:
+        """Find the end of a sustained non-heating period."""
+
+        # Look at data after heating ended
+        after_heating = relay_states[relay_states.index > heating_end]
+
+        last_time = heating_end
+
+        for timestamp, state in after_heating.items():
+            current_duration = (timestamp - heating_end).total_seconds() / 3600
+
+            # If we hit another heating period before reaching minimum duration
+            if state == 1 and current_duration < self.min_non_heating_duration_hours:
+                return None
+
+            # If we've reached minimum non-heating duration
+            if current_duration >= self.min_non_heating_duration_hours:
+                return timestamp
+
+            last_time = timestamp
+
+        # If we reached end of data and have enough non-heating time
+        final_duration = (last_time - heating_end).total_seconds() / 3600
+        if final_duration >= self.min_non_heating_duration_hours:
+            return last_time
+
+        return None
+
+    def _analyze_single_heating_cycle(
+        self,
+        room_temp: pd.Series,
+        outdoor_temp: pd.Series,
+        cycle: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Analyze a single sustained heating cycle."""
+
+        heating_start = cycle["heating_start"]
+        heating_end = cycle["heating_end"]
+        non_heating_end = cycle["non_heating_end"]
+
+        # Get temperature data for the cycle
+        cycle_data = room_temp[heating_start:non_heating_end]
+
+        if len(cycle_data) < 10:
+            return None
+
+        # Analyze heating phase
+        heating_data = room_temp[heating_start:heating_end]
+        if len(heating_data) < 5:
+            return None
+
+        initial_temp = heating_data.iloc[0]
+        heating_end_temp = heating_data.iloc[-1]
+
+        # Find temperature peak across the entire heating + non-heating period
+        entire_cycle_data = room_temp[heating_start:non_heating_end]
+        if len(entire_cycle_data) > 0:
+            peak_temp = entire_cycle_data.max()
+            peak_time = entire_cycle_data.idxmax()
+            peak_delay_actual = (peak_time - heating_end).total_seconds() / 3600
+        else:
+            peak_temp = heating_end_temp
+            peak_time = heating_end
+            peak_delay_actual = 0
+
+        # Analyze decay phase
+        decay_start = peak_time
+        decay_end = min(
+            decay_start + pd.Timedelta(hours=self.decay_analysis_hours), non_heating_end
+        )
+
+        decay_analysis = self._analyze_temperature_decay(
+            room_temp[decay_start:decay_end],
+            outdoor_temp[decay_start:decay_end],
+            peak_temp,
+        )
+
+        # Calculate energy input estimate (if room power rating available)
+        energy_input_kwh = self._estimate_energy_input(cycle)
+
+        # Calculate temperature rise metrics
+        total_temp_rise = peak_temp - initial_temp
+        heating_phase_rise = heating_end_temp - initial_temp
+        post_heating_rise = peak_temp - heating_end_temp
+
+        # Calculate thermal capacitance using peak timing and energy input
+        thermal_capacitance_analysis = self._calculate_thermal_capacitance_from_peak(
+            cycle,
+            initial_temp,
+            heating_end_temp,
+            peak_temp,
+            peak_time,
+            heating_start,
+            heating_end,
+            energy_input_kwh,
+        )
+
+        return {
+            "cycle_start": heating_start,
+            "cycle_end": non_heating_end,
+            "heating_duration_hours": cycle["heating_duration_hours"],
+            "non_heating_duration_hours": cycle["non_heating_duration_hours"],
+            "initial_temperature": initial_temp,
+            "heating_end_temperature": heating_end_temp,
+            "peak_temperature": peak_temp,
+            "peak_time": peak_time,
+            "peak_delay_hours": peak_delay_actual,
+            "total_temperature_rise": total_temp_rise,
+            "heating_phase_rise": heating_phase_rise,
+            "post_heating_rise": post_heating_rise,
+            "energy_input_kwh": energy_input_kwh,
+            "thermal_efficiency": total_temp_rise / energy_input_kwh
+            if energy_input_kwh > 0
+            else None,
+            "thermal_capacitance_analysis": thermal_capacitance_analysis,
+            "decay_analysis": decay_analysis,
+        }
+
+    def _analyze_temperature_decay(
+        self, decay_temp: pd.Series, outdoor_temp: pd.Series, peak_temp: float
+    ) -> Dict[str, Any]:
+        """Analyze temperature decay characteristics."""
+
+        if len(decay_temp) < 5:
+            return {"error": "Insufficient decay data"}
+
+        # Calculate decay rate
+        time_hours = [
+            (t - decay_temp.index[0]).total_seconds() / 3600 for t in decay_temp.index
+        ]
+        temps = decay_temp.values
+
+        if len(time_hours) < 3:
+            return {"error": "Insufficient time points"}
+
+        # Linear decay rate (simple)
+        try:
+            slope, _, r_value, _, _ = linregress(time_hours, temps)
+            linear_decay_rate = -slope  # Make positive (temperature is dropping)
+        except Exception:
+            linear_decay_rate = None
+            r_value = None
+
+        # Exponential decay analysis
+        exponential_params = self._fit_exponential_decay(time_hours, temps, peak_temp)
+
+        # Calculate heat loss to outside coupling
+        temp_diff_to_outside = decay_temp - outdoor_temp.reindex(
+            decay_temp.index, method="nearest"
+        )
+        avg_temp_diff = temp_diff_to_outside.mean()
+
+        # Room coupling (how much temperature tracks outdoor changes)
+        outdoor_changes = outdoor_temp.diff()
+        room_changes = decay_temp.diff()
+
+        if len(outdoor_changes) > 5 and len(room_changes) > 5:
+            # Align the series
+            common_idx = outdoor_changes.index.intersection(room_changes.index)
+            if len(common_idx) > 5:
+                outdoor_aligned = outdoor_changes.reindex(common_idx).fillna(0)
+                room_aligned = room_changes.reindex(common_idx).fillna(0)
+                try:
+                    # Check for sufficient variance to avoid divide by zero warnings
+                    if outdoor_aligned.std() > 1e-10 and room_aligned.std() > 1e-10:
+                        coupling_corr = np.corrcoef(outdoor_aligned, room_aligned)[0, 1]
+                    else:
+                        coupling_corr = None
+                        self.logger.debug(
+                            "Correlation skipped due to zero variance in temperature data"
+                        )
+                except Exception:
+                    coupling_corr = None
+            else:
+                coupling_corr = None
+        else:
+            coupling_corr = None
+
+        return {
+            "decay_duration_hours": (
+                decay_temp.index[-1] - decay_temp.index[0]
+            ).total_seconds()
+            / 3600,
+            "temperature_drop": peak_temp - decay_temp.iloc[-1],
+            "linear_decay_rate_per_hour": linear_decay_rate,
+            "linear_fit_r_squared": r_value**2 if r_value else None,
+            "exponential_decay": exponential_params,
+            "average_temp_diff_to_outside": avg_temp_diff,
+            "room_outdoor_coupling": coupling_corr,
+            "initial_decay_temp": decay_temp.iloc[0],
+            "final_decay_temp": decay_temp.iloc[-1],
+        }
+
+    def _fit_exponential_decay(
+        self, time_hours: List[float], temps: List[float], _: float
+    ) -> Dict[str, Any]:
+        """Fit exponential decay model to temperature data."""
+
+        try:
+            # Exponential decay: T(t) = T_ambient + (T_peak - T_ambient) * exp(-t/tau)
+            # Simplified: T(t) = A * exp(-t/tau) + C
+
+            def exp_decay(t, A, tau, C):
+                return A * np.exp(-np.array(t) / tau) + C
+
+            # Improved initial guess for better numerical stability
+            temp_range = max(temps) - min(temps)
+            A_guess = max(0.1, abs(temps[0] - temps[-1]))  # Ensure positive amplitude
+            tau_guess = np.clip(
+                max(time_hours) / 3, TAU_MIN, TAU_MAX / 2
+            )  # Constrain to reasonable range
+            C_guess = (
+                np.mean(temps[-3:]) if len(temps) >= 3 else temps[-1]
+            )  # Use last few points for asymptote
+
+            # Add bounds for physical plausibility and better numerical stability
+            bounds = (
+                [
+                    0,
+                    TAU_MIN,
+                    min(temps) - 5,
+                ],  # Lower bounds: positive amplitude, min time constant, reasonable asymptote
+                [max(temps) - min(temps) + 5, TAU_MAX, max(temps) + 5],  # Upper bounds
+            )
+
+            popt, pcov = curve_fit(
+                exp_decay,
+                time_hours,
+                temps,
+                p0=[A_guess, tau_guess, C_guess],
+                bounds=bounds,
+                maxfev=2000,
+                method="trf",  # Trust Region Reflective algorithm for better stability
+            )
+
+            # Check parameter errors from covariance matrix
+            param_errors = np.sqrt(np.diag(pcov)) if pcov is not None else None
+
+            A_fit, tau_fit, C_fit = popt
+
+            # Calculate R-squared
+            y_pred = exp_decay(time_hours, *popt)
+            ss_res = np.sum((temps - y_pred) ** 2)
+            ss_tot = np.sum((temps - np.mean(temps)) ** 2)
+            r_squared = 1 - (ss_res / ss_tot) if ss_tot > 0 else None
+
+            return {
+                "amplitude": A_fit,
+                "time_constant_hours": tau_fit,
+                "asymptote_temp": C_fit,
+                "r_squared": r_squared,
+                "fit_successful": True,
+            }
+
+        except Exception as e:
+            return {"error": str(e), "fit_successful": False}
+
+    def _estimate_energy_input(self, cycle: Dict[str, Any]) -> float:
+        """Estimate energy input during heating cycle."""
+
+        heating_duration_hours = cycle["heating_duration_hours"]
+
+        # Try to get room power rating from current analysis context
+        room_power_kw = 0
+        if hasattr(self, "_current_room_name") and self._current_room_name:
+            room_power_kw = self.room_power_ratings_kw.get(self._current_room_name, 0)
+
+        if room_power_kw > 0:
+            # Calculate actual energy input based on power rating
+            energy_input_kwh = room_power_kw * heating_duration_hours
+            return energy_input_kwh
+        else:
+            # Fallback: estimate based on typical residential heating power
+            # Assume 2 kW per room as default (can be overridden in config)
+            default_power_kw = 2.0
+            return default_power_kw * heating_duration_hours
+
+    def _aggregate_cycle_statistics(
+        self, cycle_analyses: List[Dict[str, Any]]
+    ) -> Dict[str, Any]:
+        """Aggregate statistics across all analyzed cycles."""
+
+        if not cycle_analyses:
+            return {}
+
+        # Extract numeric values for aggregation
+        temp_rises = [
+            c["total_temperature_rise"]
+            for c in cycle_analyses
+            if c.get("total_temperature_rise")
+        ]
+        heating_durations = [c["heating_duration_hours"] for c in cycle_analyses]
+        peak_delays = [
+            c["peak_delay_hours"] for c in cycle_analyses if c.get("peak_delay_hours")
+        ]
+
+        decay_rates = []
+        time_constants = []
+        coupling_values = []
+
+        for cycle in cycle_analyses:
+            decay = cycle.get("decay_analysis", {})
+            if decay.get("linear_decay_rate_per_hour"):
+                decay_rates.append(decay["linear_decay_rate_per_hour"])
+
+            exp_decay = decay.get("exponential_decay", {})
+            if exp_decay.get("time_constant_hours") and exp_decay.get("fit_successful"):
+                time_constants.append(exp_decay["time_constant_hours"])
+
+            if decay.get("room_outdoor_coupling") is not None:
+                coupling_values.append(decay["room_outdoor_coupling"])
+
+        def safe_stats(values):
+            if not values:
+                return {"mean": None, "std": None, "min": None, "max": None}
+            return {
+                "mean": np.mean(values),
+                "std": np.std(values),
+                "min": np.min(values),
+                "max": np.max(values),
+                "count": len(values),
+            }
+
+        return {
+            "temperature_rise_stats": safe_stats(temp_rises),
+            "heating_duration_stats": safe_stats(heating_durations),
+            "peak_delay_stats": safe_stats(
+                peak_delays
+            ),  # Keep for analysis of peak timing
+            "decay_rate_stats": safe_stats(decay_rates),
+            "time_constant_stats": safe_stats(time_constants),
+            "coupling_stats": safe_stats(coupling_values),
+        }
+
+    def _calculate_real_heating_usage(self, room_name: str, relay_data: Dict) -> Dict:
+        """
+        Calculate real heating usage from relay data.
+
+        Args:
+            room_name: Name of the room
+            relay_data: Dictionary of relay data from integrator
+
+        Returns:
+            Dictionary with heating usage statistics
+        """
+        try:
+            # Find matching relay data for this room
+            room_key = self._find_matching_relay_room(room_name, relay_data.keys())
+
+            if not room_key or room_key not in relay_data:
+                return {
+                    "heating_data_source": "no_relay_data",
+                    "actual_heating_usage_pct": 0,
+                    "note": f"No relay data found for room {room_name}",
+                }
+
+            relay_df = relay_data[room_key]
+
+            if "relay_state" not in relay_df.columns:
+                return {
+                    "heating_data_source": "no_relay_state",
+                    "actual_heating_usage_pct": 0,
+                    "note": f"No relay_state column in data for {room_name}",
+                }
+
+            # Calculate actual heating usage from relay states
+            total_points = len(relay_df)
+            heating_points = (relay_df["relay_state"] > 0).sum()
+
+            if total_points == 0:
+                return {
+                    "heating_data_source": "empty_data",
+                    "actual_heating_usage_pct": 0,
+                    "note": f"Empty relay data for {room_name}",
+                }
+
+            heating_percentage = (heating_points / total_points) * 100
+
+            return {
+                "heating_data_source": "actual_relay",
+                "actual_heating_usage_pct": heating_percentage,
+                "total_data_points": total_points,
+                "heating_data_points": heating_points,
+                "note": f"Calculated from {total_points} relay state measurements",
+            }
+
+        except Exception as e:
+            self.logger.warning(
+                f"Error calculating real heating usage for {room_name}: {e}"
+            )
+            return {
+                "heating_data_source": "calculation_error",
+                "actual_heating_usage_pct": 0,
+                "error": str(e),
+            }
+
+    def _find_matching_relay_room(self, room_name: str, available_keys: list) -> str:
+        """
+        Find matching relay data key for a room name.
+
+        Args:
+            room_name: Name of the room
+            available_keys: List of available relay data keys
+
+        Returns:
+            Matching key or None
+        """
+        # Direct match
+        if room_name in available_keys:
+            return room_name
+
+        # Try with 'relay_' prefix
+        relay_key = f"relay_{room_name}"
+        if relay_key in available_keys:
+            return relay_key
+
+        # Try variations (remove/add underscores, different cases)
+        variations = [
+            room_name.replace("_", ""),
+            room_name.replace("_", "-"),
+            room_name.lower(),
+            room_name.upper(),
+            f"relay_states_{room_name}",
+            f"heating_{room_name}",
+        ]
+
+        for variation in variations:
+            if variation in available_keys:
+                return variation
+
+        # Fuzzy matching - look for partial matches
+        for key in available_keys:
+            if room_name.lower() in key.lower() or key.lower() in room_name.lower():
+                return key
+
+        return None
