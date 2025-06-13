@@ -23,21 +23,11 @@ from sklearn.metrics import mean_squared_error, r2_score
 
 try:
     from analysis.reports.report_generator import ReportGenerator
-    from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
-                                               LoxoneFieldAdapter)
+    from analysis.preprocessing.thermal_data_preprocessor import ThermalDataPreprocessor
 except ImportError:
     # Fallback for testing
-    LoxoneDataIntegrator = None
     ReportGenerator = None
-
-    class LoxoneFieldAdapter:
-        @staticmethod
-        def standardize_room_data(room_df, room_name):
-            return room_df
-
-        @staticmethod
-        def standardize_weather_data(weather_df):
-            return weather_df
+    ThermalDataPreprocessor = None
 
 
 # DataLoader is a generic type, define it separately
@@ -66,19 +56,23 @@ class ThermalAnalyzer:
 
     def __init__(
         self,
-        data_loader: DataLoader,
         settings: Dict[str, Any],
         report_generator: ReportGenerator,
+        preprocessor: Optional[ThermalDataPreprocessor] = None,
     ):
-        self.data_loader = data_loader
         self.settings = settings.get("thermal_analysis", {})
         self.system_settings = settings
         self.report = report_generator
         self.logger = logging.getLogger(f"{__name__}.ThermalAnalyzer")
-        if LoxoneDataIntegrator:
-            self.integrator = LoxoneDataIntegrator()
+        
+        # Initialize preprocessor
+        if preprocessor:
+            self.preprocessor = preprocessor
+        elif ThermalDataPreprocessor:
+            self.preprocessor = ThermalDataPreprocessor(settings)
         else:
-            self.integrator = None
+            self.preprocessor = None
+            
         # Load room power ratings from settings
         self.room_power_ratings_kw = self.system_settings.get(
             "room_power_ratings_kw", {}
@@ -124,110 +118,54 @@ class ThermalAnalyzer:
         relay_data: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> Dict[str, Any]:
         """
-        Analyze thermal dynamics for all rooms with Loxone integration.
+        Analyze thermal dynamics for all rooms using preprocessed data.
 
         Args:
-            room_data: Dictionary of room DataFrames with Loxone temperature data
+            room_data: Dictionary of room DataFrames with temperature data
             weather_data: Weather data with outdoor temperature
             relay_data: Optional relay state data for heating period detection
 
         Returns:
             Dictionary with thermal analysis results for each room
         """
-        self.logger.info(
-            "Starting thermal dynamics analysis with Loxone integration..."
-        )
+        self.logger.info("Starting thermal dynamics analysis...")
 
-        # --- Input Validation Logging ---
+        # Input validation
         if not room_data:
             self.logger.error("Room data is empty. Aborting thermal analysis.")
             return {"error": "Empty room data"}
-        if weather_data.empty:
-            self.logger.warning(
-                "Weather data is empty. Outdoor temperature correlation will be limited."
-            )
 
-        self.logger.debug(f"Room data rooms: {list(room_data.keys())}")
-        for room, df in room_data.items():
-            if isinstance(df, pd.DataFrame):
-                self.logger.debug(
-                    f"Room {room} data shape: {df.shape}, columns: {df.columns.tolist()}"
-                )
-
-        if not weather_data.empty:
-            self.logger.debug(
-                f"Weather data shape: {weather_data.shape}, columns: {weather_data.columns.tolist()}"
+        # Preprocess data using the dedicated preprocessor
+        if self.preprocessor:
+            self.logger.info("Using thermal data preprocessor for data preparation")
+            processed_rooms, processed_weather = self.preprocessor.prepare_thermal_analysis_data(
+                room_data, weather_data, relay_data
             )
-        if relay_data:
-            self.logger.debug(f"Relay data rooms: {list(relay_data.keys())}")
+            self.logger.info(f"Preprocessor returned {len(processed_rooms)} processed rooms")
+            # Log sample column info for debugging
+            for room_name, room_df in list(processed_rooms.items())[:2]:
+                self.logger.debug(f"Room {room_name} columns after preprocessing: {list(room_df.columns)}")
         else:
-            self.logger.debug("No relay data provided for heating period detection")
+            self.logger.warning("No preprocessor available, using raw data")
+            processed_rooms = room_data
+            processed_weather = weather_data
 
-        # Prepare data using Loxone integrator if relay data is provided
-        if relay_data is not None and self.integrator is not None:
-            self.logger.info("Preparing thermal analysis data with relay integration")
-            self.logger.info(
-                f"Relay data provided for rooms: {list(relay_data.keys()) if relay_data else 'None'}"
-            )
-            for room, relay_df in relay_data.items():
-                if not relay_df.empty:
-                    self.logger.info(
-                        f"Relay data for {room}: {relay_df.shape[0]} records"
-                    )
-                else:
-                    self.logger.info(f"Empty relay data for {room}")
-            # Store relay data in integrator for adaptive analysis
-            self.integrator._processed_relay_data = relay_data
-            (
-                standardized_rooms,
-                standardized_weather,
-            ) = self.integrator.prepare_thermal_analysis_data(
-                room_data, relay_data, weather_data
-            )
-        else:
-            # Standardize room data without relay integration
-            self.logger.info("Standardizing room data without relay integration")
-            standardized_rooms = {}
-            for room_name, room_df in room_data.items():
-                standardized_rooms[
-                    room_name
-                ] = LoxoneFieldAdapter.standardize_room_data(room_df, room_name)
-            standardized_weather = LoxoneFieldAdapter.standardize_weather_data(
-                weather_data
-            )
+        if not processed_rooms:
+            self.logger.error("Data preprocessing failed or resulted in empty data")
+            return {"error": "Preprocessing failed"}
 
         results = {}
 
-        # Filter out external environment data (not actual rooms)
-        external_environments = [
-            "outside",
-            "outdoor",
-            "external",
-            "environment",
-            "weather",
-        ]
-        interior_rooms = {
-            room_name: room_df
-            for room_name, room_df in standardized_rooms.items()
-            if not any(env in room_name.lower() for env in external_environments)
-        }
-
-        self.logger.info(
-            f"Filtered to {len(interior_rooms)} interior rooms (excluded external environment data)"
-        )
-
-        # Analyze each interior room individually using standardized data
-        for room_name, room_df in interior_rooms.items():
+        # Analyze each room individually using preprocessed data
+        for room_name, room_df in processed_rooms.items():
             self.logger.info(f"Analyzing thermal dynamics for room: {room_name}")
             self.logger.info(f"Room {room_name} processed: {room_df.shape[0]} records")
-            if "heating_on" not in room_df.columns:
-                self.logger.info(f"Room {room_name} has no heating_on column")
 
             try:
                 # Store room name for power calculations
                 self._current_room_name = room_name
                 room_results = self._analyze_single_room(
-                    room_df, standardized_weather, room_name
+                    room_df, processed_weather, room_name
                 )
                 results[room_name] = room_results
             except Exception as e:
@@ -236,7 +174,7 @@ class ThermalAnalyzer:
 
         # Analyze room coupling (heat transfer between rooms)
         if len(results) > 1:
-            results["room_coupling"] = self._analyze_room_coupling(standardized_rooms)
+            results["room_coupling"] = self._analyze_room_coupling(processed_rooms)
 
         self.logger.info("Thermal dynamics analysis completed")
         return results
@@ -349,15 +287,33 @@ class ThermalAnalyzer:
     def _analyze_single_room(
         self, room_df: pd.DataFrame, weather_data: pd.DataFrame, room_name: str
     ) -> Dict[str, Any]:
-        """Analyze thermal dynamics for a single room."""
+        """Analyze thermal dynamics for a single room using preprocessed data."""
         if room_df.empty:
             return {"error": "No room data available"}
 
-        # Merge room and weather data
-        merged_data = self._merge_room_weather_data(room_df, weather_data)
-
-        if merged_data.empty:
-            return {"error": "No merged room-weather data available"}
+        # Data should already be preprocessed and merged
+        merged_data = room_df
+        
+        # Validate that we have the required columns
+        required_cols = ["room_temp"]
+        missing_cols = [col for col in required_cols if col not in merged_data.columns]
+        if missing_cols:
+            return {"error": f"Missing required columns: {missing_cols}"}
+            
+        # Ensure temp_diff column exists (should be created by preprocessor)
+        if "temp_diff" not in merged_data.columns:
+            self.logger.warning("temp_diff column missing, creating with NaN values")
+            merged_data["temp_diff"] = pd.Series(index=merged_data.index, dtype=float)
+            
+        # Ensure other expected columns exist
+        if "outdoor_temp" not in merged_data.columns:
+            merged_data["outdoor_temp"] = pd.Series(index=merged_data.index, dtype=float)
+        if "heating_on" not in merged_data.columns:
+            merged_data["heating_on"] = pd.Series(0, index=merged_data.index)
+        if "hour" not in merged_data.columns:
+            merged_data["hour"] = merged_data.index.hour
+        if "weekday" not in merged_data.columns:
+            merged_data["weekday"] = merged_data.index.weekday
 
         results = {}
 
@@ -401,63 +357,39 @@ class ThermalAnalyzer:
         # Thermal comfort analysis
         results["comfort_analysis"] = self._analyze_thermal_comfort(merged_data)
 
-        # Add sustained heating cycle analysis
+        # Add sustained heating cycle analysis if heating data is available
         try:
-            # Get relay data from the integrator if available
-            relay_data = getattr(self.integrator, "_processed_relay_data", {})
-            outdoor_temp = (
-                weather_data.get("outdoor_temp", pd.Series())
-                if isinstance(weather_data, pd.DataFrame)
-                else pd.Series()
-            )
-
-            # Find matching relay states for this room
-            relay_states = pd.Series(dtype=int)
-            room_key = self._find_matching_relay_room(room_name, relay_data.keys())
-            if room_key and room_key in relay_data:
-                relay_df = relay_data[room_key]
-                if "relay_state" in relay_df.columns:
-                    relay_states = relay_df["relay_state"].reindex(
-                        merged_data.index, method="nearest", fill_value=0
-                    )
-
-            if len(relay_states) > 0 and len(outdoor_temp) > 0:
+            if "heating_on" in merged_data.columns and "outdoor_temp" in merged_data.columns:
                 sustained_analysis = self.analyze_sustained_heating_cycles(
                     merged_data["room_temp"],
-                    outdoor_temp.reindex(merged_data.index, method="nearest"),
-                    relay_states,
+                    merged_data["outdoor_temp"],
+                    merged_data["heating_on"],
                 )
                 results["sustained_heating_analysis"] = sustained_analysis
-
-                # Also calculate real heating usage from relay data
-                heating_usage = self._calculate_real_heating_usage(
-                    room_name, relay_data
-                )
-                results["heating_usage"] = heating_usage
-
-                # Replace misleading heating_percentage with actual heating usage
-                if (
-                    "basic_stats" in results
-                    and heating_usage.get("heating_data_source") == "actual_relay"
-                ):
-                    results["basic_stats"]["heating_percentage"] = heating_usage.get(
-                        "actual_heating_usage_pct", 0
-                    )
-                    results["basic_stats"]["heating_data_source"] = heating_usage.get(
-                        "heating_data_source", "inference"
-                    )
+                
+                # Calculate heating usage from available data
+                heating_pct = (merged_data["heating_on"] == 1).mean() * 100
+                results["heating_usage"] = {
+                    "actual_heating_usage_pct": heating_pct,
+                    "heating_data_source": "preprocessed"
+                }
+                
+                # Update basic stats with actual heating usage
+                if "basic_stats" in results:
+                    results["basic_stats"]["heating_percentage"] = heating_pct
+                    results["basic_stats"]["heating_data_source"] = "preprocessed"
             else:
                 results["sustained_heating_analysis"] = {
-                    "warning": "No relay data available for sustained heating analysis"
+                    "warning": "No heating or outdoor temperature data available"
                 }
                 results["heating_usage"] = {
-                    "heating_data_source": "no_relay_data",
+                    "heating_data_source": "no_data",
                     "actual_heating_usage_pct": 0,
                 }
 
         except Exception as e:
             self.logger.warning(
-                f"Sustained heating analysis failed for {room_name}: {e}"
+                f"Sustained heating analysis failed for {room_name}: {e}", exc_info=True
             )
             results["sustained_heating_analysis"] = {"error": str(e)}
 
@@ -614,14 +546,17 @@ class ThermalAnalyzer:
             self.logger.warning("Weather data is empty")
 
         # Calculate temperature difference if outdoor temperature is available
-        if "outdoor_temp" in merged.columns:
+        if "outdoor_temp" in merged.columns and not merged["outdoor_temp"].isna().all():
             merged["temp_diff"] = merged["room_temp"] - merged["outdoor_temp"]
             self.logger.info(
                 f"Successfully merged room and outdoor temperature data. Outdoor temp range: {merged['outdoor_temp'].min():.1f}°C to {merged['outdoor_temp'].max():.1f}°C"
             )
         else:
+            # Create temp_diff with NaN values when outdoor temp is not available
+            merged["temp_diff"] = pd.Series(index=merged.index, dtype=float)
+            merged["outdoor_temp"] = pd.Series(index=merged.index, dtype=float)
             self.logger.warning(
-                "No outdoor temperature data available for thermal analysis"
+                "No outdoor temperature data available for thermal analysis - using NaN placeholders"
             )
 
         # Add time features
@@ -2599,14 +2534,12 @@ class ThermalAnalyzer:
             # Use actual room power rating from configuration
             room_name = getattr(self, "_current_room_name", "unknown")
             # Get room power from settings or fallback
-            if self.settings:
-                heating_power_w = (
-                    self.settings.get_room_power(room_name) * 1000
-                )  # Convert kW to W
+            if room_name in self.room_power_ratings_kw:
+                heating_power_w = self.room_power_ratings_kw[room_name] * 1000  # Convert kW to W
             else:
-                heating_power_w = (
-                    LoxoneFieldAdapter._get_room_power_rating(room_name) * 1000
-                )
+                # Default fallback power rating (2kW for most room heaters)
+                heating_power_w = 2000  # watts
+                self.logger.warning(f"No power rating configured for room {room_name}, using default 2000W")
 
             # The rate of temperature change (dT/dt) is approximately P_heating / C
             # So, C = P_heating / (dT/dt)

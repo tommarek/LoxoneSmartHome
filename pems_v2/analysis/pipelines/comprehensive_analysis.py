@@ -16,6 +16,7 @@ from analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
 from analysis.analyzers.pattern_analysis import (PVAnalyzer,
                                                  RelayPatternAnalyzer)
 from analysis.analyzers.thermal_analysis import ThermalAnalyzer
+from analysis.preprocessing.thermal_data_preprocessor import ThermalDataPreprocessor
 from analysis.core.data_extraction import \
     DataExtractor  # TODO: Refactor to use UnifiedDataExtractor
 from analysis.core.data_preprocessing import DataPreprocessor
@@ -50,44 +51,17 @@ class ComprehensiveAnalyzer:
         # Initialize analyzers
         self.pv_analyzer = PVAnalyzer()
 
-        # Create a data loader adapter for ThermalAnalyzer
-        class DataLoaderAdapter:
-            def __init__(self, comprehensive_analyzer):
-                self.analyzer = comprehensive_analyzer
-
-            def get_dataset(self, name):
-                """Get dataset from processed data."""
-                if name == "outdoor_temp":
-                    # Try to get outdoor temperature from processed data
-                    if "outdoor_temp" in self.analyzer.processed_data:
-                        return self.analyzer.processed_data["outdoor_temp"]
-                    elif "weather" in self.analyzer.processed_data:
-                        weather = self.analyzer.processed_data["weather"]
-                        if (
-                            isinstance(weather, pd.DataFrame)
-                            and "temperature_2m" in weather.columns
-                        ):
-                            return weather[["temperature_2m"]].rename(
-                                columns={"temperature_2m": "value"}
-                            )
-                elif name == "weather":
-                    return self.analyzer.processed_data.get("weather")
-                elif name.startswith("room_"):
-                    # Get room data from processed rooms
-                    rooms = self.analyzer.processed_data.get("rooms", {})
-                    room_name = name.replace("room_", "")
-                    return rooms.get(room_name)
-                return None
-
-        self.data_loader_adapter = DataLoaderAdapter(self)
-        # Convert Pydantic settings to dict for ThermalAnalyzer
+        # Convert Pydantic settings to dict for analyzers
         settings_dict = (
             settings.model_dump()
             if hasattr(settings, "model_dump")
             else settings.dict()
         )
+        
+        # Initialize thermal data preprocessor and analyzer
+        self.thermal_preprocessor = ThermalDataPreprocessor(settings_dict)
         self.thermal_analyzer = ThermalAnalyzer(
-            self.data_loader_adapter, settings_dict, self.report_generator
+            settings_dict, self.report_generator, self.thermal_preprocessor
         )
         self.base_load_analyzer = BaseLoadAnalyzer()
         self.relay_analyzer = RelayPatternAnalyzer()
