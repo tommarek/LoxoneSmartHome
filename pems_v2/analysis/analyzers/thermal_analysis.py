@@ -807,13 +807,13 @@ class ThermalAnalyzer:
 
     def _detect_stuck_sensor(self, temp_series: pd.Series) -> pd.Series:
         """
-        Detect periods where sensor is stuck (constant values for >30 minutes).
+        Detect periods where sensor is stuck (constant values for >240 minutes).
 
         A stuck sensor reports the same value for extended periods, which is
         physically unrealistic for thermal systems and corrupts analysis.
         """
         # Calculate rolling standard deviation to find periods with no variation
-        window_size = 6  # 30 minutes for 5-minute data
+        window_size = 48  # 240 minutes for 5-minute data
         rolling_std = temp_series.rolling(
             window=window_size, center=True, min_periods=1
         ).std()
@@ -1708,11 +1708,135 @@ class ThermalAnalyzer:
         self.logger.info(f"Detected {len(cycles)} valid heating cycles")
         return cycles
 
+    def _find_thermal_peak_after_heating(
+        self,
+        df: pd.DataFrame,
+        relay_off_time: pd.Timestamp,
+        temp_col: str = "room_temp",
+    ) -> Tuple[Optional[pd.Timestamp], Optional[float]]:
+        """
+        Finds the actual temperature peak after heating stops, accounting for thermal inertia.
+
+        This improved method uses a smoothed temperature derivative to identify the true
+        start of the cooling decay phase, making it more robust to noise and minor
+        fluctuations than a simple max() search.
+
+        Args:
+            df: The dataframe containing temperature data.
+            relay_off_time: The timestamp when the heating relay turned off.
+            temp_col: The name of the temperature column.
+
+        Returns:
+            A tuple containing (peak_timestamp, peak_temperature).
+            Returns (None, None) if a valid peak cannot be found.
+        """
+        # 1. Define a search window for the peak (thermal lag)
+        # A generous window of 2 hours should be sufficient for most residential buildings.
+        search_window_hours = 2.0
+        search_start_time = relay_off_time
+        search_end_time = relay_off_time + pd.Timedelta(hours=search_window_hours)
+
+        # Constrain search window to available data
+        search_end_time = min(search_end_time, df.index[-1])
+        search_data = df.loc[search_start_time:search_end_time]
+
+        if len(search_data) < 5:  # Need at least ~20 mins of data
+            self.logger.debug("Insufficient data in post-heating window to find peak.")
+            return None, None
+
+        temps = search_data[temp_col].dropna()
+        if len(temps) < 5:
+            self.logger.debug(
+                "Not enough valid temperature points in post-heating window."
+            )
+            return None, None
+
+        # 2. Calculate smoothed temperature derivative (dT/dt)
+        # Using Savitzky-Golay is excellent for this as it fits a polynomial and
+        # can calculate the derivative in one step.
+        # We need a window that's large enough to smooth noise but small enough
+        # to capture the peak's curvature. 5-7 points for 5-min data is good.
+        window_length = min(len(temps), 7)
+        if window_length < 3 or window_length % 2 == 0:
+            # Fallback to a smaller odd window size if we don't have enough data
+            window_length = max(3, window_length - 1) if window_length > 3 else 3
+
+        if len(temps) < window_length:
+            # Fallback to simple max() if not enough data for filtering
+            peak_temp = temps.max()
+            peak_time = temps.idxmax()
+            self.logger.debug(
+                f"Falling back to simple max() for peak detection due to insufficient data ({len(temps)} points)."
+            )
+            return peak_time, peak_temp
+
+        try:
+            # Calculate 1st derivative of temperature
+            dt_dt = savgol_filter(
+                temps,
+                window_length=window_length,
+                polyorder=2,
+                deriv=1,
+                delta=5.0 / 60.0,
+            )  # delta in hours
+            dt_dt_series = pd.Series(dt_dt, index=temps.index)
+
+            # 3. Identify the peak: where dT/dt crosses from positive to negative
+            # Find the first index where the derivative becomes negative.
+            peak_candidates = dt_dt_series[dt_dt_series < 0]
+
+            if not peak_candidates.empty:
+                # The peak is the timestamp of the first negative derivative point.
+                # We take the point *before* the first negative derivative as the peak.
+                first_negative_idx = dt_dt_series.index.get_loc(
+                    peak_candidates.index[0]
+                )
+                if first_negative_idx > 0:
+                    peak_time = dt_dt_series.index[first_negative_idx - 1]
+                    peak_temp = temps.loc[peak_time]
+
+                    # 4. Validation
+                    temp_at_relay_off = temps.iloc[0]
+                    if peak_temp < temp_at_relay_off:
+                        self.logger.debug(
+                            f"Derivative-based peak ({peak_temp:.2f}°C) is lower than temp at relay off ({temp_at_relay_off:.2f}°C). "
+                            f"Reverting to max() in window."
+                        )
+                        # This can happen if the temperature immediately starts dropping.
+                        # In this case, the peak is the first point.
+                        # Or a simple max() might be more robust.
+                        peak_temp = temps.max()
+                        peak_time = temps.idxmax()
+
+                    self.logger.debug(
+                        f"Derivative-based peak found at {peak_time} with temp {peak_temp:.2f}°C."
+                    )
+                    return peak_time, peak_temp
+                else:
+                    # First point is already a peak, so it is the peak.
+                    return temps.index[0], temps.iloc[0]
+
+        except Exception as e:
+            self.logger.warning(
+                f"Peak detection with derivative failed: {e}. Falling back to max()."
+            )
+
+        # Fallback to the simple max() method if the derivative method fails
+        peak_temp = temps.max()
+        peak_time = temps.idxmax()
+        self.logger.debug("Using simple max() for peak detection as a fallback.")
+        return peak_time, peak_temp
+
     def _analyze_heating_cycle_decay(
         self, df: pd.DataFrame, cycle: Dict, next_cycle_start: pd.Timestamp = None
     ) -> Dict:
         """
         Analyze the cooling decay phase after a heating cycle.
+
+        This method properly handles:
+        1. Thermal inertia - finds actual peak temperature after heating stops
+        2. Natural decay endpoint - continues until next heating cycle starts
+        3. External heat gain detection - identifies disruptions to natural decay
 
         Args:
             df: Full temperature DataFrame
@@ -1722,128 +1846,111 @@ class ThermalAnalyzer:
         Returns:
             Dictionary with decay analysis results
         """
-        # Find actual peak temperature time (accounting for thermal lag after relay OFF)
-        relay_off_time = cycle["end_time"]
-        peak_temp = cycle["peak_temp"]
-
-        # Look for peak temperature time after relay stops (thermal lag effect)
-        # Search in a window after relay stops to find when peak actually occurs
-        search_window_hours = 2.0  # Allow up to 2 hours for thermal lag
-        search_end = relay_off_time + pd.Timedelta(hours=search_window_hours)
-
-        # Get data from relay OFF until search window end
-        if len(df) > 0 and search_end <= df.index[-1]:
-            post_relay_data = df.loc[relay_off_time:search_end]
-        else:
-            post_relay_data = df.loc[relay_off_time:]
-
         # Check temperature column name for compatibility
         temp_col = "room_temp" if "room_temp" in df.columns else "temperature"
 
-        if not post_relay_data.empty and temp_col in post_relay_data.columns:
-            # Find when the actual peak temperature occurs (could be after relay OFF)
-            valid_temps = post_relay_data[temp_col].dropna()
-            if len(valid_temps) > 0:
-                actual_peak_temp = valid_temps.max()
-                # If temperature continued rising after relay OFF, use that peak time
-                if actual_peak_temp >= peak_temp:
-                    peak_temp_idx = valid_temps.idxmax()
-                    decay_start = peak_temp_idx
-                    self.logger.debug(
-                        f"Peak temperature {actual_peak_temp:.1f}°C found at {peak_temp_idx} (thermal lag after relay OFF at {relay_off_time})"
-                    )
-                else:
-                    # Peak was during heating period, use relay OFF time
-                    decay_start = relay_off_time
-                    self.logger.debug(
-                        f"Peak temperature {peak_temp:.1f}°C occurred during heating, starting decay from relay OFF at {relay_off_time}"
-                    )
-            else:
-                decay_start = relay_off_time
-        else:
-            decay_start = relay_off_time
+        relay_off_time = cycle["end_time"]
 
-        # Get baseline temperature for analysis
-        baseline_temp = cycle["start_temp"]
-        baseline_tolerance = 0.3  # °C
+        # STEP 1: Find actual peak temperature using improved derivative-based method
+        peak_temp_time, actual_peak_temp = self._find_thermal_peak_after_heating(
+            df, relay_off_time, temp_col
+        )
 
-        # Find end of decay period - use next heating cycle start if available
+        if peak_temp_time is None:
+            return {
+                "fit_valid": False,
+                "reason": "peak_not_found",
+                "note": "Could not identify a valid temperature peak after heating stopped.",
+            }
+
+        # Validate that we found a meaningful peak
+        heating_end_temp = cycle.get("peak_temp", actual_peak_temp)
+        thermal_gain = actual_peak_temp - heating_end_temp
+
+        self.logger.debug(
+            f"Thermal inertia analysis: heating stopped at {relay_off_time}, "
+            f"peak {actual_peak_temp:.1f}°C reached at {peak_temp_time} "
+            f"(+{thermal_gain:.2f}°C thermal gain, lag: {(peak_temp_time - relay_off_time).total_seconds()/60:.0f}min)"
+        )
+
+        # STEP 2: Determine decay end point - prioritize next heating cycle
+        decay_start = peak_temp_time
+
         if next_cycle_start is not None and next_cycle_start > decay_start:
-            # Use the time until next heating cycle starts
+            # Use next heating cycle as natural endpoint
             decay_end = next_cycle_start
             decay_end_reason = "next_heating_cycle"
-        else:
-            # Fallback: Find natural end point or use maximum period
-            max_decay_hours = (
-                8  # Extended for winter conditions to capture longer natural decay
+            self.logger.debug(
+                f"Decay period: {decay_start} to {decay_end} "
+                f"({(decay_end - decay_start).total_seconds()/3600:.1f}h until next cycle)"
             )
-
+        else:
+            # No next cycle - use maximum reasonable decay period
+            max_decay_hours = 12  # Extended to capture full natural decay
             decay_end = decay_start + pd.Timedelta(hours=max_decay_hours)
+
             if decay_end > df.index[-1]:
                 decay_end = df.index[-1]
                 decay_end_reason = "data_end"
             else:
-                decay_end_reason = "max_time"
+                decay_end_reason = "max_decay_period"
 
-            # Check for natural return to baseline
-            potential_decay_data = df.loc[decay_start:decay_end]
-            baseline_reached = potential_decay_data[
-                abs(potential_decay_data[temp_col] - baseline_temp)
-                <= baseline_tolerance
-            ]
-            if len(baseline_reached) > 0:
-                decay_end = baseline_reached.index[0]
-                decay_end_reason = "baseline_reached"
+            self.logger.debug(
+                f"Decay period: {decay_start} to {decay_end} "
+                f"({(decay_end - decay_start).total_seconds()/3600:.1f}h, reason: {decay_end_reason})"
+            )
 
-        # Get decay period data and ensure heating is actually off
+        # STEP 3: Extract decay period data and validate
         decay_data = df.loc[decay_start:decay_end].copy()
 
-        # Remove any data points where heating is still on (edge case handling)
-        heating_off_mask = decay_data["heating_on"] == 0
-        decay_data = decay_data[heating_off_mask]
+        # Ensure heating remains off during entire decay period
+        if "heating_on" in decay_data.columns:
+            heating_on_during_decay = decay_data["heating_on"].sum()
+            if heating_on_during_decay > 0:
+                # Heating resumed - truncate decay period to when heating starts again
+                heating_resume_times = decay_data[decay_data["heating_on"] > 0].index
+                if len(heating_resume_times) > 0:
+                    first_heating_resume = heating_resume_times[0]
+                    decay_data = df.loc[decay_start:first_heating_resume].copy()
+                    decay_end = first_heating_resume
+                    decay_end_reason = "heating_resumed_early"
+                    self.logger.debug(
+                        f"Heating resumed at {first_heating_resume}, truncated decay period to "
+                        f"{(decay_end - decay_start).total_seconds()/3600:.1f}h"
+                    )
 
-        # Check if we have any data left after filtering
-        if len(decay_data) == 0:
+        # Validate minimum decay period duration and data points
+        decay_duration_hours = (decay_end - decay_start).total_seconds() / 3600
+
+        if decay_duration_hours < 0.5:  # Less than 30 minutes
             return {
                 "fit_valid": False,
-                "reason": "no_decay_data",
-                "note": "All data points during decay period have heating on",
+                "reason": "decay_too_short",
+                "decay_duration_hours": decay_duration_hours,
+                "note": "Decay period too short for reliable exponential fitting",
             }
 
         # Adaptive minimum data points based on decay duration
-        decay_duration_hours = (
-            decay_data.index[-1] - decay_data.index[0]
-        ).total_seconds() / 3600
-        # For short decays, require fewer points (minimum 3 for curve fitting)
-        min_data_points = 3 if decay_duration_hours < 1.0 else 5
+        min_data_points = max(
+            3, int(decay_duration_hours * 2)
+        )  # At least 2 points per hour
 
-        if len(decay_data) < min_data_points:  # Need minimum data points
+        if len(decay_data) < min_data_points:
             return {
                 "fit_valid": False,
-                "reason": "insufficient_data",
+                "reason": "insufficient_data_points",
                 "data_points": len(decay_data),
                 "required_points": min_data_points,
                 "decay_duration_hours": decay_duration_hours,
             }
 
-        # Verify no heating during decay period (should be zero now)
-        heating_during_decay = decay_data["heating_on"].sum()
-        if heating_during_decay > 0:
-            # This should not happen now that we filter out heating_on points
-            self.logger.warning(
-                f"Unexpected heating during decay: {heating_during_decay} intervals"
-            )
-            return {
-                "fit_valid": False,
-                "reason": "heating_resumed",
-                "heating_intervals": heating_during_decay,
-            }
+        # STEP 4: Check for external heat gains during decay
+        # External heat gains disrupt natural exponential decay and should be detected
 
-        # Check outdoor temperature stability during decay period
-        # Unstable outdoor temperature invalidates the simple exponential decay model
+        # Check outdoor temperature stability
         if "outdoor_temp" in decay_data.columns:
             outdoor_temp_std = decay_data["outdoor_temp"].std()
-            outdoor_stability_threshold = 0.5  # °C maximum standard deviation
+            outdoor_stability_threshold = 0.75  # °C - allow for realistic slow drift
 
             if outdoor_temp_std > outdoor_stability_threshold:
                 return {
@@ -1852,43 +1959,113 @@ class ThermalAnalyzer:
                     "outdoor_temp_std": outdoor_temp_std,
                     "threshold": outdoor_stability_threshold,
                     "decay_duration_hours": decay_duration_hours,
+                    "note": "Outdoor temperature too variable for stable decay analysis",
                 }
 
-        # Prepare data for exponential decay fitting
-        # Use temperature difference: ΔT(t) = T_room(t) - T_outdoor(t)
-        decay_data["temp_diff"] = decay_data[temp_col] - decay_data["outdoor_temp"]
+        # Prepare temperature difference data for exponential fitting
+        if "outdoor_temp" in decay_data.columns:
+            decay_data.loc[:, "temp_diff"] = decay_data[temp_col] - decay_data["outdoor_temp"]
+        else:
+            # If no outdoor temperature, use absolute room temperature
+            decay_data.loc[:, "temp_diff"] = decay_data[temp_col]
+            self.logger.warning(
+                "No outdoor temperature available, using absolute room temperature for decay analysis"
+            )
+
+        # Remove any NaN values
         decay_data = decay_data.dropna(subset=["temp_diff"])
 
-        if len(decay_data) < 5:
-            return {"fit_valid": False, "reason": "insufficient_valid_data"}
+        if len(decay_data) < min_data_points:
+            return {
+                "fit_valid": False,
+                "reason": "insufficient_valid_data",
+                "data_points": len(decay_data),
+                "required_points": min_data_points,
+                "note": "Too many NaN values after temperature difference calculation",
+            }
 
-        # Time array in hours from decay start
-        time_hours = (decay_data.index - decay_start).total_seconds() / 3600.0
-        temp_diff = decay_data["temp_diff"].values
+        # STEP 5: Detect external heat gains that disrupt natural decay
+        # Natural exponential decay should be monotonically decreasing
+        # Detect significant upward temperature movements that indicate external heat sources
 
-        # Initial conditions
-        initial_temp_diff = temp_diff[0]
-        outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+        temp_diff_values = decay_data["temp_diff"].values
+        time_hours = np.array(
+            [(t - decay_start).total_seconds() / 3600 for t in decay_data.index]
+        )
 
+        # Calculate temperature change rates (derivative)
+        if len(temp_diff_values) > 2:
+            temp_rate = np.gradient(temp_diff_values, time_hours)
+
+            # Detect significant positive temperature rates (heating during decay)
+            heating_rate_threshold = 0.3  # °C/hour - significant heating during decay
+            external_heating_mask = temp_rate > heating_rate_threshold
+            external_heating_periods = external_heating_mask.sum()
+
+            # If more than 20% of decay period shows external heating, reject the cycle
+            external_heating_ratio = external_heating_periods / len(temp_rate)
+
+            if external_heating_ratio > 0.20:
+                return {
+                    "fit_valid": False,
+                    "reason": "external_heat_gain_detected",
+                    "external_heating_ratio": external_heating_ratio,
+                    "external_heating_periods": external_heating_periods,
+                    "decay_duration_hours": decay_duration_hours,
+                    "note": f"External heat gain detected in {external_heating_ratio*100:.1f}% of decay period",
+                }
+
+        # Check monotonicity - natural decay should be generally decreasing
+        # Allow some tolerance for measurement noise and short-term fluctuations
+        temp_changes = np.diff(temp_diff_values)
+        increasing_changes = (temp_changes > 0).sum()
+        monotonicity_ratio = (
+            increasing_changes / len(temp_changes) if len(temp_changes) > 0 else 0
+        )
+
+        # Relaxed monotonicity threshold to 20% to account for real-world noise
+        monotonicity_threshold = 0.20
+
+        if monotonicity_ratio > monotonicity_threshold:
+            return {
+                "fit_valid": False,
+                "reason": "non_monotonic_decay",
+                "monotonicity_ratio": monotonicity_ratio,
+                "threshold": monotonicity_threshold,
+                "decay_duration_hours": decay_duration_hours,
+                "note": f"Decay not sufficiently monotonic ({monotonicity_ratio*100:.1f}% increasing points)",
+            }
+
+        # STEP 6: Validate decay magnitude and prepare for exponential fitting
         # Check for minimum decay magnitude (signal-to-noise ratio)
-        final_temp_diff = temp_diff[-1]
+        temp_diff_values = decay_data["temp_diff"].values
+        time_hours = np.array(
+            [(t - decay_start).total_seconds() / 3600 for t in decay_data.index]
+        )
+
+        initial_temp_diff = temp_diff_values[0]
+        final_temp_diff = temp_diff_values[-1]
         decay_magnitude = initial_temp_diff - final_temp_diff
 
         # Adaptive threshold based on outdoor temperature and cycle characteristics
-        outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+        if "outdoor_temp" in decay_data.columns:
+            outdoor_temp_avg = decay_data["outdoor_temp"].mean()
+        else:
+            outdoor_temp_avg = 15.0  # Assume moderate conditions if no outdoor temp
+
         cycle_duration_hours = cycle.get("duration_minutes", 60) / 60.0
 
-        # More relaxed thresholds for short cycles and winter conditions
+        # Further relaxed thresholds for small signal analysis
         if outdoor_temp_avg < 5.0:  # Winter conditions (< 5°C)
             if cycle_duration_hours < 0.5:  # Very short cycles (< 30 min)
-                min_decay_magnitude = 0.2  # °C - very relaxed for short winter cycles
+                min_decay_magnitude = 0.15  # °C - very relaxed for short winter cycles
             else:
-                min_decay_magnitude = 0.3  # °C - relaxed for winter
+                min_decay_magnitude = 0.2  # °C - relaxed for winter (was 0.3)
         else:
             if cycle_duration_hours < 0.5:  # Very short cycles
-                min_decay_magnitude = 0.3  # °C - relaxed for short cycles
+                min_decay_magnitude = 0.2  # °C - relaxed for short cycles (was 0.3)
             else:
-                min_decay_magnitude = 0.5  # °C - moderate for other seasons
+                min_decay_magnitude = 0.3  # °C - moderate for other seasons (was 0.5)
 
         if decay_magnitude < min_decay_magnitude:
             self.logger.debug(
@@ -1904,46 +2081,26 @@ class ThermalAnalyzer:
                 "cycle_duration_hours": cycle_duration_hours,
             }
 
-        # Check monotonicity of decay curve
-        # A clean decay should be mostly monotonically decreasing
-        temp_diff_changes = np.diff(temp_diff)
-        increasing_points = (temp_diff_changes > 0).sum()
-        total_changes = len(temp_diff_changes)
-
-        if total_changes > 0:
-            increasing_percentage = increasing_points / total_changes
-            monotonicity_threshold = 0.15  # Allow up to 15% of points to increase
-
-            if increasing_percentage > monotonicity_threshold:
-                return {
-                    "fit_valid": False,
-                    "reason": "non_monotonic_decay",
-                    "increasing_percentage": increasing_percentage * 100,
-                    "threshold_percentage": monotonicity_threshold * 100,
-                    "increasing_points": increasing_points,
-                    "total_points": total_changes,
-                }
-
         try:
             # Exponential decay model: ΔT(t) = ΔT_initial * exp(-t/τ)
             def decay_model(t, tau):
                 return initial_temp_diff * np.exp(-t / tau)
 
+            # STEP 7: Exponential decay fitting
             # Fit with bounds for time constant - extended iterations for better convergence
             bounds = ([TAU_MIN], [TAU_MAX])
             popt, _ = curve_fit(
-                decay_model, time_hours, temp_diff, bounds=bounds, maxfev=2000
+                decay_model, time_hours, temp_diff_values, bounds=bounds, maxfev=2000
             )
 
             tau_fitted = popt[0]
 
             # Calculate R² for fit quality
             y_pred = decay_model(time_hours, tau_fitted)
-            r_squared = r2_score(temp_diff, y_pred)
+            r_squared = r2_score(temp_diff_values, y_pred)
 
             # Validate fit quality - adaptive threshold based on conditions
             # Winter conditions typically have more noise due to frequent cycling
-            outdoor_temp_avg = decay_data["outdoor_temp"].mean()
             if outdoor_temp_avg < 5.0:  # Winter conditions
                 r_squared_threshold = 0.2  # Very relaxed for winter
             elif outdoor_temp_avg < 15.0:  # Shoulder seasons
@@ -1955,14 +2112,15 @@ class ThermalAnalyzer:
 
             if fit_valid:
                 self.logger.debug(
-                    f"DECAY FIT SUCCESS: τ={tau_fitted:.1f}h, R²={r_squared:.3f}, magnitude={decay_magnitude:.1f}°C, threshold={r_squared_threshold:.1f} (outdoor={outdoor_temp_avg:.1f}°C)"
+                    f"DECAY FIT SUCCESS: τ={tau_fitted:.1f}h, R²={r_squared:.3f}, magnitude={decay_magnitude:.1f}°C, "
+                    f"peak_time_lag={(peak_temp_time - relay_off_time).total_seconds()/60:.0f}min, "
+                    f"duration={decay_duration_hours:.1f}h, end_reason={decay_end_reason}"
                 )
             else:
                 self.logger.debug(
-                    f"DECAY FIT REJECTED: τ={tau_fitted:.1f}h, R²={r_squared:.3f} < {r_squared_threshold:.1f}, magnitude={decay_magnitude:.1f}°C (outdoor={outdoor_temp_avg:.1f}°C)"
+                    f"DECAY FIT REJECTED: τ={tau_fitted:.1f}h, R²={r_squared:.3f} < {r_squared_threshold:.1f}, "
+                    f"magnitude={decay_magnitude:.1f}°C, outdoor={outdoor_temp_avg:.1f}°C"
                 )
-
-            decay_duration_hours = (decay_end - decay_start).total_seconds() / 3600.0
 
             # Check if this is a nighttime decay cycle (10 PM to 6 AM)
             # Nighttime cycles are prioritized as they're free of solar contamination
@@ -1978,8 +2136,8 @@ class ThermalAnalyzer:
                 "time_constant_hours": tau_fitted,
                 "r_squared": r_squared,
                 "fit_r_squared": quality_score,  # Enhanced score for cycle prioritization
-                "decay_start_temp": cycle["peak_temp"],
-                "baseline_temp": baseline_temp,
+                "decay_start_temp": actual_peak_temp,
+                "baseline_temp": cycle.get("start_temp", outdoor_temp_avg),
                 "outdoor_temp_avg": outdoor_temp_avg,
                 "data_points": len(decay_data),
                 "decay_duration_hours": decay_duration_hours,
@@ -1987,6 +2145,11 @@ class ThermalAnalyzer:
                 "decay_magnitude": decay_magnitude,
                 "fit_valid": fit_valid,
                 "is_nighttime": is_nighttime,
+                "thermal_lag_minutes": (peak_temp_time - relay_off_time).total_seconds()
+                / 60,
+                "peak_temp_time": peak_temp_time.isoformat(),
+                "decay_start_time": decay_start.isoformat(),
+                "decay_end_time": decay_end.isoformat(),
             }
 
         except Exception as e:

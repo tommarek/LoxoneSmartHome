@@ -366,7 +366,14 @@ class PVAnalyzer:
             if seasonal_period < 7:  # If less than a week, try weekly pattern
                 seasonal_period = 7
 
-            stl = STL(daily_data, seasonal=seasonal_period)
+            # Ensure no NaN values in the data
+            daily_data_clean = daily_data.dropna()
+            if len(daily_data_clean) < seasonal_period * 2:
+                return {
+                    "warning": f"Insufficient clean data for STL decomposition (have {len(daily_data_clean)}, need at least {seasonal_period * 2})"
+                }
+
+            stl = STL(daily_data_clean, seasonal=seasonal_period, period=seasonal_period)
             result = stl.fit()
 
             seasonal_patterns = {
@@ -1363,8 +1370,10 @@ class RelayPatternAnalyzer:
         total_heating = pd.Series(0, index=weather_data.index)
         for room_name, relay_df in relay_data.items():
             if not relay_df.empty and "power_kw" in relay_df.columns:
+                # Sort relay data by index to ensure monotonic order for reindex
+                relay_df_sorted = relay_df.sort_index()
                 room_power = (
-                    relay_df["power_kw"]
+                    relay_df_sorted["power_kw"]
                     .reindex(weather_data.index, method="nearest")
                     .fillna(0)
                 )

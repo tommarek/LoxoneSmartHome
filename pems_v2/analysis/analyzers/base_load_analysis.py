@@ -737,7 +737,14 @@ class BaseLoadAnalyzer:
             if seasonal_period < 7:  # If less than a week, try weekly pattern
                 seasonal_period = 7
 
-            stl = STL(daily_load, seasonal=seasonal_period)
+            # Ensure no NaN values in the data
+            daily_load_clean = daily_load.dropna()
+            if len(daily_load_clean) < seasonal_period * 2:
+                return {
+                    "warning": f"Insufficient clean data for STL decomposition (have {len(daily_load_clean)}, need at least {seasonal_period * 2})"
+                }
+
+            stl = STL(daily_load_clean, seasonal=seasonal_period, period=seasonal_period)
             result = stl.fit()
 
             seasonal_analysis = {
