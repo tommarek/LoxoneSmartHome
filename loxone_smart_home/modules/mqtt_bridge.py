@@ -64,7 +64,11 @@ class MQTTBridge(BaseModule):
             )
             self.logger.debug(f"Sent to Loxone: {message}")
 
-        except json.JSONDecodeError:
-            self.logger.error(f"Invalid JSON payload: {payload}")
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON payload on topic {topic}: {e}")
+            self.logger.debug(f"Payload length: {len(payload)}, first 100 chars: {payload[:100]}")
+            # Check if payload might be truncated
+            if len(payload) > 1000:
+                self.logger.warning(f"Large payload ({len(payload)} chars) may be truncated")
         except Exception as e:
             self.logger.error(f"Error processing MQTT message: {e}", exc_info=True)

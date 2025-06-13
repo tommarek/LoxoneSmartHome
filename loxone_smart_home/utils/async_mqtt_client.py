@@ -235,11 +235,27 @@ class AsyncMQTTClient:
     async def _handle_message(self, message: Any) -> None:
         """Handle incoming MQTT message."""
         topic = str(message.topic)
-        payload = (
-            message.payload.decode("utf-8")
-            if isinstance(message.payload, (bytes, bytearray))
-            else str(message.payload)
-        )
+
+        # Handle payload decoding with error handling
+        if isinstance(message.payload, (bytes, bytearray)):
+            try:
+                payload = message.payload.decode("utf-8")
+            except UnicodeDecodeError as e:
+                self.logger.warning(
+                    f"Failed to decode message payload as UTF-8 for topic {topic}: {e}"
+                )
+                # Try with error handling - replace invalid characters
+                try:
+                    payload = message.payload.decode("utf-8", errors="replace")
+                    self.logger.debug(
+                        f"Successfully decoded with replacement characters for topic {topic}"
+                    )
+                except Exception:
+                    # Last resort - use latin-1 which accepts all byte values
+                    payload = message.payload.decode("latin-1")
+                    self.logger.debug(f"Decoded using latin-1 fallback for topic {topic}")
+        else:
+            payload = str(message.payload)
 
         # Get callbacks with lock
         async with self.subscribers_lock:
