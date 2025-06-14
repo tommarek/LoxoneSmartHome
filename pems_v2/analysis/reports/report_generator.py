@@ -245,7 +245,94 @@ class ReportGenerator:
             else:
                 lines.append("  • None - all rooms operating efficiently!")
 
+        # Add room coupling analysis if available
+        if "room_coupling" in thermal_results:
+            coupling_data = thermal_results["room_coupling"]
+            if isinstance(coupling_data, dict) and "correlation_matrix" in coupling_data:
+                lines.extend(self._generate_room_coupling_summary(coupling_data))
+        
         lines.append("")
+        return lines
+
+    def _generate_room_coupling_summary(self, coupling_data: Dict[str, Any]) -> list:
+        """Generate room coupling analysis summary."""
+        lines = [
+            "",
+            "ROOM THERMAL COUPLING ANALYSIS",
+            "-" * 40,
+        ]
+        
+        # Extract correlation matrix
+        correlation_matrix = coupling_data.get("correlation_matrix", {})
+        if correlation_matrix:
+            lines.append("• Temperature correlations between rooms:")
+            
+            # Find strongest and weakest correlations
+            correlations = []
+            for room1, room_corrs in correlation_matrix.items():
+                if isinstance(room_corrs, dict):
+                    for room2, corr_value in room_corrs.items():
+                        if room1 != room2 and isinstance(corr_value, (int, float)) and not pd.isna(corr_value):
+                            # Avoid duplicate pairs
+                            pair_key = tuple(sorted([room1, room2]))
+                            correlations.append((pair_key, corr_value))
+            
+            # Remove duplicates and sort
+            unique_correlations = {}
+            for pair, corr in correlations:
+                unique_correlations[pair] = corr
+            
+            if unique_correlations:
+                sorted_correlations = sorted(unique_correlations.items(), key=lambda x: x[1], reverse=True)
+                
+                # Show top 3 strongest correlations
+                lines.append("  Strongest thermal coupling:")
+                for i, ((room1, room2), corr) in enumerate(sorted_correlations[:3]):
+                    lines.append(f"    {room1} ↔ {room2}: {corr:.3f}")
+                
+                # Show weakest correlations (indicating thermal isolation)
+                if len(sorted_correlations) > 3:
+                    lines.append("  Most thermally isolated:")
+                    for i, ((room1, room2), corr) in enumerate(sorted_correlations[-2:]):
+                        lines.append(f"    {room1} ↔ {room2}: {corr:.3f}")
+        
+        # Add room pair analysis if available
+        room_pairs = coupling_data.get("room_pairs", {})
+        if room_pairs:
+            lines.append("")
+            lines.append("• Room pair heat transfer analysis:")
+            
+            # Find pairs with significant temperature differences
+            significant_pairs = []
+            for pair_name, pair_data in room_pairs.items():
+                if isinstance(pair_data, dict):
+                    max_temp_diff = pair_data.get("max_temp_diff", 0)
+                    mean_temp_diff = pair_data.get("mean_temp_diff", 0)
+                    if max_temp_diff > 2.0:  # Significant temperature difference
+                        significant_pairs.append((pair_name, max_temp_diff, mean_temp_diff))
+            
+            if significant_pairs:
+                # Sort by maximum temperature difference
+                significant_pairs.sort(key=lambda x: x[1], reverse=True)
+                lines.append("  High heat transfer potential:")
+                for pair_name, max_diff, mean_diff in significant_pairs[:3]:
+                    room1, room2 = pair_name.split('_', 1)
+                    lines.append(f"    {room1} → {room2}: {max_diff:.1f}°C max, {mean_diff:.1f}°C avg")
+        
+        # Summary statistics
+        if "most_coupled_pair" in coupling_data and "highest_correlation" in coupling_data:
+            most_coupled = coupling_data["most_coupled_pair"]
+            highest_corr = coupling_data["highest_correlation"]
+            room1, room2 = most_coupled.split('_', 1)
+            lines.append("")
+            lines.append(f"• Most coupled rooms: {room1} ↔ {room2} (correlation: {highest_corr:.3f})")
+        
+        if "least_coupled_pair" in coupling_data and "lowest_correlation" in coupling_data:
+            least_coupled = coupling_data["least_coupled_pair"]
+            lowest_corr = coupling_data["lowest_correlation"]
+            room1, room2 = least_coupled.split('_', 1)
+            lines.append(f"• Most isolated rooms: {room1} ↔ {room2} (correlation: {lowest_corr:.3f})")
+
         return lines
 
     def _generate_base_load_summary(self, base_load_results: Dict[str, Any]) -> list:
@@ -474,6 +561,61 @@ class ReportGenerator:
                     <p>For technical support, contact: system administrator</p>
                 </footer>
             </div>
+            
+            <script>
+                function showTab(tabName) {{
+                    // Hide all tab contents
+                    const tabContents = document.querySelectorAll('.tab-content');
+                    tabContents.forEach(content => {{
+                        content.classList.remove('active');
+                    }});
+                    
+                    // Remove active class from all buttons
+                    const tabButtons = document.querySelectorAll('.tab-button');
+                    tabButtons.forEach(button => {{
+                        button.classList.remove('active');
+                    }});
+                    
+                    // Show selected tab content
+                    const selectedTab = document.getElementById(tabName + '-tab');
+                    if (selectedTab) {{
+                        selectedTab.classList.add('active');
+                    }}
+                    
+                    // Add active class to clicked button
+                    const clickedButton = event ? event.target : document.querySelector('.tab-button');
+                    if (clickedButton) {{
+                        clickedButton.classList.add('active');
+                    }}
+                }}
+                
+                function toggleCorrelationLabels() {{
+                    const checkbox = document.getElementById('show-correlation-labels');
+                    const labels = document.querySelectorAll('.correlation-label');
+                    
+                    labels.forEach(label => {{
+                        if (checkbox.checked) {{
+                            label.classList.remove('hidden');
+                        }} else {{
+                            label.classList.add('hidden');
+                        }}
+                    }});
+                }}
+                
+                // Initialize default tab
+                document.addEventListener('DOMContentLoaded', function() {{
+                    // Set first tab as active by default
+                    const firstTab = document.querySelector('.tab-button');
+                    if (firstTab) {{
+                        firstTab.classList.add('active');
+                    }}
+                    
+                    const firstContent = document.querySelector('.tab-content');
+                    if (firstContent) {{
+                        firstContent.classList.add('active');
+                    }}
+                }});
+            </script>
         </body>
         </html>
         """
@@ -1046,6 +1188,196 @@ class ReportGenerator:
             font-size: 0.9rem;
         }
         
+        /* Room Coupling Visualization Styles */
+        .coupling-visualizations {
+            margin-top: 20px;
+        }
+        
+        .visualization-tabs {
+            display: flex;
+            border-bottom: 2px solid var(--border-color);
+            margin-bottom: 20px;
+        }
+        
+        .tab-button {
+            padding: 10px 20px;
+            border: none;
+            background: var(--background-color);
+            color: var(--text-color);
+            cursor: pointer;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s ease;
+        }
+        
+        .tab-button:hover {
+            background: var(--border-color);
+        }
+        
+        .tab-button.active {
+            background: var(--secondary-color);
+            color: white;
+            border-bottom-color: var(--accent-color);
+        }
+        
+        .tab-content {
+            display: none;
+        }
+        
+        .tab-content.active {
+            display: block;
+        }
+        
+        /* Correlation Heatmap Styles */
+        .correlation-heatmap {
+            margin: 20px 0;
+        }
+        
+        .heatmap-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        
+        .heatmap-grid {
+            display: grid;
+            gap: 2px;
+            margin: 20px 0;
+            background: var(--border-color);
+            padding: 10px;
+            border-radius: 8px;
+        }
+        
+        .heatmap-cell {
+            background: var(--card-background);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.8rem;
+            font-weight: bold;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: transform 0.2s ease;
+        }
+        
+        .heatmap-cell:hover {
+            transform: scale(1.1);
+            z-index: 10;
+        }
+        
+        .heatmap-label {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.75rem;
+            font-weight: bold;
+            color: var(--text-color);
+        }
+        
+        .row-label {
+            justify-content: flex-end;
+            padding-right: 10px;
+        }
+        
+        .col-label {
+            writing-mode: vertical-lr;
+            text-orientation: mixed;
+        }
+        
+        .correlation-strong { background: #e74c3c; color: white; }
+        .correlation-moderate { background: #f39c12; color: white; }
+        .correlation-weak { background: #3498db; color: white; }
+        .correlation-weak-negative { background: #95a5a6; color: white; }
+        .correlation-strong-negative { background: #8e44ad; color: white; }
+        
+        .heatmap-legend {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 15px;
+            justify-content: center;
+            margin-top: 15px;
+        }
+        
+        .legend-color {
+            width: 20px;
+            height: 16px;
+            border-radius: 3px;
+            margin-right: 8px;
+        }
+        
+        /* Network Graph Styles */
+        .network-graph {
+            margin: 20px 0;
+        }
+        
+        .network-container {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        
+        .network-legend .legend-line {
+            width: 30px;
+            height: 3px;
+            margin-right: 8px;
+            display: inline-block;
+        }
+        
+        .legend-line.strong { background: #e74c3c; height: 6px; }
+        .legend-line.moderate { background: #f39c12; height: 4px; }
+        .legend-line.weak { background: #95a5a6; height: 2px; }
+        
+        /* Network Controls */
+        .network-controls {
+            margin: 10px 0;
+            text-align: center;
+        }
+        
+        .toggle-container {
+            display: inline-flex;
+            align-items: center;
+            cursor: pointer;
+            font-size: 0.9rem;
+        }
+        
+        .toggle-container input[type="checkbox"] {
+            margin-right: 8px;
+        }
+        
+        .correlation-label {
+            transition: opacity 0.3s ease;
+        }
+        
+        .correlation-label.hidden {
+            opacity: 0;
+        }
+        
+        /* Coupling Statistics Styles */
+        .coupling-statistics {
+            margin: 20px 0;
+        }
+        
+        .coupling-badge {
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+        
+        .coupling-strong {
+            background: #e74c3c;
+            color: white;
+        }
+        
+        .coupling-moderate {
+            background: #f39c12;
+            color: white;
+        }
+        
+        .coupling-weak {
+            background: #95a5a6;
+            color: white;
+        }
+        
         @media (max-width: 768px) {
             .container {
                 padding: 15px;
@@ -1065,6 +1397,19 @@ class ReportGenerator:
             }
             
             .network-legend {
+                flex-direction: column;
+                align-items: center;
+            }
+            
+            .visualization-tabs {
+                flex-direction: column;
+            }
+            
+            .heatmap-grid {
+                font-size: 0.7rem;
+            }
+            
+            .heatmap-legend {
                 flex-direction: column;
                 align-items: center;
             }
@@ -1423,32 +1768,326 @@ class ReportGenerator:
         """
 
     def _generate_room_coupling_html(self, thermal_analysis):
-        """Generate room coupling analysis."""
-        # Calculate temperature correlations between rooms
-        correlations = []
+        """Generate room coupling analysis with interactive visualization."""
+        # Extract room coupling data if available
+        coupling_data = thermal_analysis.get("room_coupling", {})
         room_names = []
 
         for room_name, room_data in thermal_analysis.items():
             if isinstance(room_data, dict) and "basic_stats" in room_data:
                 room_names.append(room_name)
 
-        # This would ideally use actual correlation analysis
-        # For now, generate placeholder coupling information
-        coupling_html = f"""
-        <div class="room-coupling-analysis">
-            <h3>🔗 Room Thermal Coupling</h3>
-            <div class="coupling-explanation">
-                <p><strong>Thermal Coupling:</strong> Rooms exchange heat through shared walls, open doors, and air circulation.</p>
-                <p>Coupling strength is determined by temperature correlation and physical proximity.</p>
+        # Check if we have actual coupling data
+        if "correlation_matrix" in coupling_data and "room_pairs" in coupling_data:
+            correlation_matrix = coupling_data["correlation_matrix"]
+            room_pairs = coupling_data["room_pairs"]
+            
+            # Generate correlation heatmap
+            heatmap_html = self._generate_correlation_heatmap_html(correlation_matrix)
+            
+            # Generate network graph
+            network_graph_html = self._generate_coupling_network_graph_html(correlation_matrix, room_pairs)
+            
+            # Generate coupling statistics table
+            coupling_table_html = self._generate_coupling_statistics_table_html(room_pairs)
+            
+            coupling_html = f"""
+            <div class="room-coupling-analysis">
+                <h3>🔗 Room Thermal Coupling Analysis</h3>
+                <div class="coupling-explanation">
+                    <p><strong>Thermal Coupling:</strong> Rooms exchange heat through shared walls, open doors, and air circulation.</p>
+                    <p>Coupling strength is determined by temperature correlation and physical proximity.</p>
+                    <ul>
+                        <li><strong>Strong coupling (>0.7):</strong> Rooms behave as single thermal zone</li>
+                        <li><strong>Moderate coupling (0.3-0.7):</strong> Significant heat transfer between rooms</li>
+                        <li><strong>Weak coupling (<0.3):</strong> Thermally isolated rooms</li>
+                    </ul>
+                </div>
+                
+                <div class="coupling-visualizations">
+                    <div class="visualization-tabs">
+                        <button class="tab-button active" onclick="showTab('heatmap')">Correlation Heatmap</button>
+                        <button class="tab-button" onclick="showTab('network')">Network Graph</button>
+                        <button class="tab-button" onclick="showTab('statistics')">Statistics</button>
+                    </div>
+                    
+                    <div id="heatmap-tab" class="tab-content active">
+                        {heatmap_html}
+                    </div>
+                    
+                    <div id="network-tab" class="tab-content">
+                        {network_graph_html}
+                    </div>
+                    
+                    <div id="statistics-tab" class="tab-content">
+                        {coupling_table_html}
+                    </div>
+                </div>
             </div>
-            <div class="coupling-matrix">
-                <p><em>Coupling analysis requires synchronized temperature data from multiple rooms.</em></p>
-                <p>Detected rooms: {', '.join(room_names)}</p>
+            """
+        else:
+            # Fallback for when no coupling data is available
+            coupling_html = f"""
+            <div class="room-coupling-analysis">
+                <h3>🔗 Room Thermal Coupling</h3>
+                <div class="coupling-explanation">
+                    <p><strong>Thermal Coupling:</strong> Rooms exchange heat through shared walls, open doors, and air circulation.</p>
+                    <p>Coupling strength is determined by temperature correlation and physical proximity.</p>
+                </div>
+                <div class="coupling-matrix">
+                    <p><em>Coupling analysis requires synchronized temperature data from multiple rooms.</em></p>
+                    <p>Detected rooms: {', '.join(room_names)}</p>
+                    <p><strong>Note:</strong> Run thermal analysis with multiple rooms to see coupling visualization.</p>
+                </div>
+            </div>
+            """
+
+        return coupling_html
+
+    def _generate_correlation_heatmap_html(self, correlation_matrix):
+        """Generate correlation heatmap visualization."""
+        if not correlation_matrix:
+            return "<p>No correlation data available.</p>"
+        
+        # Convert correlation matrix to list of rooms and values
+        rooms = list(correlation_matrix.keys())
+        if not rooms:
+            return "<p>No room data available for heatmap.</p>"
+        
+        # Generate heatmap grid
+        heatmap_cells = []
+        for i, room1 in enumerate(rooms):
+            for j, room2 in enumerate(rooms):
+                if room1 in correlation_matrix and room2 in correlation_matrix[room1]:
+                    correlation = correlation_matrix[room1][room2]
+                    if correlation is not None and not pd.isna(correlation):
+                        # Color based on correlation strength
+                        if correlation > 0.7:
+                            color_class = "correlation-strong"
+                        elif correlation > 0.3:
+                            color_class = "correlation-moderate"
+                        elif correlation > 0:
+                            color_class = "correlation-weak"
+                        elif correlation > -0.3:
+                            color_class = "correlation-weak-negative"
+                        else:
+                            color_class = "correlation-strong-negative"
+                        
+                        heatmap_cells.append(f"""
+                        <div class="heatmap-cell {color_class}" 
+                             style="grid-column: {j + 2}; grid-row: {i + 2};"
+                             title="{room1} ↔ {room2}: {correlation:.3f}">
+                            {correlation:.2f}
+                        </div>
+                        """)
+        
+        # Generate room labels
+        row_labels = []
+        col_labels = []
+        for i, room in enumerate(rooms):
+            row_labels.append(f'<div class="heatmap-label row-label" style="grid-column: 1; grid-row: {i + 2};">{room}</div>')
+            col_labels.append(f'<div class="heatmap-label col-label" style="grid-column: {i + 2}; grid-row: 1;">{room}</div>')
+        
+        return f"""
+        <div class="correlation-heatmap">
+            <h4>Temperature Correlation Matrix</h4>
+            <div class="heatmap-container">
+                <div class="heatmap-grid" style="grid-template-columns: 120px repeat({len(rooms)}, 80px); grid-template-rows: 30px repeat({len(rooms)}, 60px);">
+                    {''.join(row_labels)}
+                    {''.join(col_labels)}
+                    {''.join(heatmap_cells)}
+                </div>
+                <div class="heatmap-legend">
+                    <div class="legend-item"><span class="legend-color correlation-strong"></span> Strong (>0.7)</div>
+                    <div class="legend-item"><span class="legend-color correlation-moderate"></span> Moderate (0.3-0.7)</div>
+                    <div class="legend-item"><span class="legend-color correlation-weak"></span> Weak (0-0.3)</div>
+                    <div class="legend-item"><span class="legend-color correlation-weak-negative"></span> Weak Negative (-0.3-0)</div>
+                    <div class="legend-item"><span class="legend-color correlation-strong-negative"></span> Strong Negative (<-0.3)</div>
+                </div>
             </div>
         </div>
         """
 
-        return coupling_html
+    def _generate_coupling_network_graph_html(self, correlation_matrix, room_pairs):
+        """Generate network graph visualization using SVG."""
+        if not correlation_matrix:
+            return "<p>No correlation data available for network graph.</p>"
+        
+        rooms = list(correlation_matrix.keys())
+        if len(rooms) < 2:
+            return "<p>Need at least 2 rooms for network visualization.</p>"
+        
+        # Calculate positions for rooms in a circle
+        import math
+        width = 600
+        height = 500
+        center_x = width // 2
+        center_y = height // 2
+        radius = 180
+        
+        svg_elements = []
+        
+        # Generate room positions and connections
+        for i, room1 in enumerate(rooms):
+            angle1 = 2 * math.pi * i / len(rooms)
+            x1 = center_x + radius * math.cos(angle1)
+            y1 = center_y + radius * math.sin(angle1)
+            
+            # Draw connections to other rooms
+            for j, room2 in enumerate(rooms):
+                if i < j:  # Avoid duplicate connections
+                    angle2 = 2 * math.pi * j / len(rooms)
+                    x2 = center_x + radius * math.cos(angle2)
+                    y2 = center_y + radius * math.sin(angle2)
+                    
+                    # Get correlation
+                    correlation = 0
+                    if room1 in correlation_matrix and room2 in correlation_matrix[room1]:
+                        correlation = correlation_matrix[room1][room2] or 0
+                    
+                    # Only draw significant connections
+                    if abs(correlation) > 0.2:
+                        # Line thickness based on correlation strength
+                        thickness = max(1, int(abs(correlation) * 6))
+                        
+                        # Color based on correlation
+                        if correlation > 0.7:
+                            color = "#e74c3c"  # Strong - red
+                        elif correlation > 0.3:
+                            color = "#f39c12"  # Moderate - orange
+                        else:
+                            color = "#95a5a6"  # Weak - gray
+                        
+                        svg_elements.append(f"""
+                        <line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" 
+                              stroke="{color}" stroke-width="{thickness}" opacity="0.7">
+                            <title>{room1} ↔ {room2}: {correlation:.3f}</title>
+                        </line>
+                        """)
+                        
+                        # Add correlation value label on the connection line
+                        mid_x = (x1 + x2) / 2
+                        mid_y = (y1 + y2) / 2
+                        
+                        # Only show labels for significant correlations to avoid clutter
+                        if abs(correlation) > 0.5:
+                            # Calculate text rotation based on line angle
+                            import math
+                            angle = math.atan2(y2 - y1, x2 - x1) * 180 / math.pi
+                            
+                            # Background rectangle for better readability
+                            svg_elements.append(f"""
+                            <rect x="{mid_x - 15}" y="{mid_y - 8}" width="30" height="16" 
+                                  fill="white" stroke="{color}" stroke-width="1" 
+                                  rx="8" opacity="0.9" class="correlation-label">
+                                <title>{room1} ↔ {room2}: {correlation:.3f}</title>
+                            </rect>
+                            """)
+                            
+                            # Correlation value text
+                            svg_elements.append(f"""
+                            <text x="{mid_x}" y="{mid_y + 4}" text-anchor="middle" 
+                                  font-size="9" font-weight="bold" fill="{color}" class="correlation-label">
+                                {correlation:.2f}
+                                <title>{room1} ↔ {room2}: {correlation:.3f}</title>
+                            </text>
+                            """)
+            
+            # Draw room circles
+            svg_elements.append(f"""
+            <circle cx="{x1}" cy="{y1}" r="25" fill="#3498db" stroke="#2c3e50" stroke-width="2">
+                <title>{room1}</title>
+            </circle>
+            <text x="{x1}" y="{y1 + 5}" text-anchor="middle" font-size="10" fill="white">{room1[:8]}</text>
+            """)
+        
+        return f"""
+        <div class="network-graph">
+            <h4>Room Coupling Network</h4>
+            <div class="network-controls">
+                <label class="toggle-container">
+                    <input type="checkbox" id="show-correlation-labels" checked onchange="toggleCorrelationLabels()">
+                    <span class="checkmark"></span>
+                    Show correlation values on connections
+                </label>
+            </div>
+            <div class="network-container">
+                <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" id="coupling-network-svg">
+                    {''.join(svg_elements)}
+                </svg>
+                <div class="network-legend">
+                    <div class="legend-item"><span class="legend-line strong"></span> Strong Coupling (>0.7)</div>
+                    <div class="legend-item"><span class="legend-line moderate"></span> Moderate Coupling (0.3-0.7)</div>
+                    <div class="legend-item"><span class="legend-line weak"></span> Weak Coupling (0.2-0.3)</div>
+                    <div class="legend-item"><em>Correlation values shown for connections >0.5</em></div>
+                </div>
+            </div>
+        </div>
+        """
+
+    def _generate_coupling_statistics_table_html(self, room_pairs):
+        """Generate coupling statistics table."""
+        if not room_pairs:
+            return "<p>No room pair statistics available.</p>"
+        
+        # Sort pairs by correlation strength
+        sorted_pairs = []
+        for pair_name, pair_data in room_pairs.items():
+            if isinstance(pair_data, dict) and "correlation" in pair_data:
+                correlation = pair_data["correlation"]
+                if correlation is not None and not pd.isna(correlation):
+                    sorted_pairs.append((pair_name, pair_data))
+        
+        sorted_pairs.sort(key=lambda x: abs(x[1]["correlation"]), reverse=True)
+        
+        # Generate table rows
+        table_rows = []
+        for pair_name, pair_data in sorted_pairs[:10]:  # Show top 10
+            room1, room2 = pair_name.split('_', 1)
+            correlation = pair_data["correlation"]
+            mean_diff = pair_data.get("mean_temp_diff", 0)
+            max_diff = pair_data.get("max_temp_diff", 0)
+            
+            # Classification
+            if abs(correlation) > 0.7:
+                coupling_class = "coupling-strong"
+                coupling_text = "Strong"
+            elif abs(correlation) > 0.3:
+                coupling_class = "coupling-moderate" 
+                coupling_text = "Moderate"
+            else:
+                coupling_class = "coupling-weak"
+                coupling_text = "Weak"
+            
+            table_rows.append(f"""
+            <tr>
+                <td>{room1} ↔ {room2}</td>
+                <td>{correlation:.3f}</td>
+                <td><span class="coupling-badge {coupling_class}">{coupling_text}</span></td>
+                <td>{mean_diff:.1f}°C</td>
+                <td>{max_diff:.1f}°C</td>
+            </tr>
+            """)
+        
+        return f"""
+        <div class="coupling-statistics">
+            <h4>Room Pair Statistics</h4>
+            <table class="data-table">
+                <thead>
+                    <tr>
+                        <th>Room Pair</th>
+                        <th>Correlation</th>
+                        <th>Coupling Strength</th>
+                        <th>Avg Temp Diff</th>
+                        <th>Max Temp Diff</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {''.join(table_rows)}
+                </tbody>
+            </table>
+        </div>
+        """
 
     def _generate_thermal_network_html(self, rc_model_details):
         """Generate thermal network visualization."""

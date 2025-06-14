@@ -3025,6 +3025,8 @@ class ThermalAnalyzer:
         self, room_data: Dict[str, pd.DataFrame]
     ) -> Dict[str, Any]:
         """Analyze thermal coupling between rooms."""
+        self.logger.info(f"Starting room coupling analysis with {len(room_data)} rooms")
+        
         if len(room_data) < 2:
             return {"warning": "Need at least 2 rooms for coupling analysis"}
 
@@ -3036,9 +3038,9 @@ class ThermalAnalyzer:
             if room_df.empty:
                 continue
 
-            # Find temperature column
+            # Find temperature column (check all possible names)
             temp_col = None
-            for col in ["temperature", "value", "temp"]:
+            for col in ["room_temp", "temperature", "value", "temp"]:
                 if col in room_df.columns:
                     temp_col = col
                     break
@@ -3050,6 +3052,12 @@ class ThermalAnalyzer:
                     common_index = room_df.index
                 else:
                     common_index = common_index.intersection(room_df.index)
+            else:
+                self.logger.warning(f"No temperature column found for room {room_name}. Available columns: {list(room_df.columns)}")
+        
+        self.logger.info(f"Found temperature data for {len(room_temps)} rooms")
+        if common_index is not None:
+            self.logger.info(f"Common index has {len(common_index)} timestamps")
 
         if len(room_temps) < 2 or common_index.empty:
             return {
