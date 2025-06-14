@@ -30,6 +30,9 @@ class ThermalDataPreprocessor:
             self.integrator = LoxoneDataIntegrator()
         else:
             self.integrator = None
+        
+        # Define resample interval for all data (5 minutes for underfloor heating)
+        self.resample_interval = '5min'
 
     def prepare_thermal_analysis_data(
         self,
@@ -76,18 +79,28 @@ class ThermalDataPreprocessor:
         # Filter out external environment data
         processed_rooms = self._filter_interior_rooms(standardized_rooms)
         
+        # Resample weather data to 5-minute intervals if available
+        if not standardized_weather.empty:
+            standardized_weather = self._resample_weather_data(standardized_weather)
+            self.logger.info(f"Weather data resampled to {self.resample_interval} intervals")
+        
         # Apply data cleaning and merging for each room
         for room_name, room_df in processed_rooms.items():
             self.logger.debug(f"Processing room {room_name} with {len(room_df)} records")
             self.logger.debug(f"Room {room_name} columns: {list(room_df.columns)}")
-            processed_room = self._merge_room_weather_data(room_df, standardized_weather)
+            
+            # Resample room data to 5-minute intervals
+            room_df_resampled = self._resample_room_data(room_df)
+            self.logger.debug(f"Room {room_name} resampled from {len(room_df)} to {len(room_df_resampled)} records")
+            
+            processed_room = self._merge_room_weather_data(room_df_resampled, standardized_weather)
             if not processed_room.empty:
                 processed_rooms[room_name] = processed_room
                 self.logger.debug(f"Room {room_name} processed successfully with columns: {list(processed_room.columns)}")
             else:
                 self.logger.warning(f"Room {room_name} processing resulted in empty DataFrame")
-                # Keep original data if preprocessing failed
-                processed_rooms[room_name] = room_df
+                # Keep resampled data if preprocessing failed
+                processed_rooms[room_name] = room_df_resampled
 
         self.logger.info(
             f"Preprocessing completed for {len(processed_rooms)} rooms"
@@ -139,6 +152,89 @@ class ThermalDataPreprocessor:
             f"(excluded external environment data)"
         )
         return interior_rooms
+    
+    def _resample_room_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Resample room data to 5-minute intervals.
+        
+        Args:
+            df: Room DataFrame with temperature and other data
+            
+        Returns:
+            Resampled DataFrame with 5-minute intervals
+        """
+        if df.empty:
+            return df
+            
+        # Remove duplicates by index (keep last value for each timestamp)
+        df = df[~df.index.duplicated(keep='last')]
+            
+        # Create a copy to avoid modifying original
+        resampled = pd.DataFrame()
+        
+        # Find temperature column
+        temp_col = self._find_temperature_column(df)
+        
+        # Resample temperature with mean aggregation
+        if temp_col:
+            resampled[temp_col] = df[temp_col].resample(self.resample_interval).mean()
+            # Interpolate to fill any gaps
+            resampled[temp_col] = resampled[temp_col].interpolate(method='linear', limit=3)
+        
+        # Resample relay/heating states with forward fill
+        for col in ['heating_on', 'relay_state', 'heating', 'heat']:
+            if col in df.columns:
+                resampled[col] = df[col].resample(self.resample_interval).ffill()
+                resampled[col] = resampled[col].fillna(0)  # Default to off
+        
+        # Resample setpoint if available
+        if 'setpoint' in df.columns:
+            resampled['setpoint'] = df['setpoint'].resample(self.resample_interval).ffill()
+        
+        # Copy any other numeric columns with mean aggregation
+        for col in df.columns:
+            if col not in resampled.columns and pd.api.types.is_numeric_dtype(df[col]):
+                resampled[col] = df[col].resample(self.resample_interval).mean()
+        
+        self.logger.debug(f"Resampled room data from {len(df)} to {len(resampled)} points")
+        return resampled
+    
+    def _resample_weather_data(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Resample weather data to 5-minute intervals.
+        
+        Args:
+            df: Weather DataFrame
+            
+        Returns:
+            Resampled DataFrame with 5-minute intervals
+        """
+        if df.empty:
+            return df
+            
+        # Remove duplicates by index (keep last value for each timestamp)
+        df = df[~df.index.duplicated(keep='last')]
+            
+        resampled = pd.DataFrame()
+        
+        # Common weather columns to resample
+        weather_cols = [
+            'temperature_2m', 'outdoor_temp', 'temperature',
+            'windspeed_10m', 'relativehumidity_2m', 'cloudcover',
+            'direct_radiation', 'diffuse_radiation', 'pressure_msl'
+        ]
+        
+        for col in weather_cols:
+            if col in df.columns:
+                resampled[col] = df[col].resample(self.resample_interval).mean()
+                # Interpolate to smooth transitions
+                resampled[col] = resampled[col].interpolate(method='linear')
+        
+        # Copy any other numeric columns
+        for col in df.columns:
+            if col not in resampled.columns and pd.api.types.is_numeric_dtype(df[col]):
+                resampled[col] = df[col].resample(self.resample_interval).mean()
+        
+        self.logger.debug(f"Resampled weather data from {len(df)} to {len(resampled)} points")
+        return resampled
 
     def _merge_room_weather_data(
         self, room_df: pd.DataFrame, weather_data: pd.DataFrame
@@ -336,8 +432,10 @@ class ThermalDataPreprocessor:
         Apply Savitzky-Golay filter for noise reduction while preserving signal shape.
         """
         df_smooth = df.copy()
-        window_length = 7  # Must be odd
-        polyorder = 2
+        # Parameters for Savitzky-Golay filter
+        # Adjusted for 5-minute resampled data (35 minutes window)
+        window_length = 7  # Must be odd (7 * 5min = 35 minutes)
+        polyorder = 2  # Polynomial order for smoothing
 
         # Apply smoothing to room temperature
         if "room_temp" in df_smooth.columns and not df_smooth["room_temp"].isna().all():

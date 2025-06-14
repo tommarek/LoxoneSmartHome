@@ -35,6 +35,15 @@
       "default":   { "day": 21.0, "night": 19.0 }
     }
   },
+  "thermal_analysis": {
+    "min_heating_duration_hours": 1.5,
+    "min_non_heating_duration_hours": 2.0,
+    "decay_analysis_hours": 12.0,
+    "resample_interval": "5min",
+    "underfloor_heating": true,
+    "thermal_lag_hours": 1.0,
+    "min_decay_duration_hours": 1.0
+  },
   "optimization": {
     "horizon_hours": 48,
     "control_hours": 24,

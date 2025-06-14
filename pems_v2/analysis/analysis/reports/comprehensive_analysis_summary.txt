@@ -1,0 +1,71 @@
+================================================================================
+PEMS v2 COMPREHENSIVE ANALYSIS SUMMARY REPORT
+================================================================================
+Generated: 2025-06-14 21:48:13
+
+THERMAL DYNAMICS ANALYSIS
+------------------------------
+
+HEATING USAGE = % of time heating system was actively running
+• 0-25%: Very efficient (minimal heating needed)
+• 25-50%: Normal usage for most rooms
+• 50%+: High usage (consider insulation improvements)
+
+DATA SOURCES:
+• (Actual): Real relay switching data from Loxone - most accurate
+• (Inferred): Estimated from temperature changes - less reliable
+
+Room: chodba_nahore
+  • Mean Temperature: 20.3°C
+  • Temperature Range: 2.7°C
+  • Heating Usage: 43.5% (Inferred)
+  • Time Constant: 6.2 hours
+
+Room: hosti
+  • Mean Temperature: 19.0°C
+  • Temperature Range: 5.2°C
+  • Heating Usage: 51.0% (Inferred)
+  • Time Constant: 2.7 hours
+
+Room: spajz
+  • Mean Temperature: 21.7°C
+  • Temperature Range: 1.7°C
+  • Heating Usage: 0.0% (Inferred)
+
+SUMMARY:
+• 3 rooms analyzed
+• 0 rooms with actual relay data (most accurate)
+• 3 rooms with inferred data (estimates)
+• Average heating usage: 31.5%
+
+HIGH USAGE ROOMS (>50%) - Consider improvements:
+  • hosti: 51.0% (preprocessed)
+  • loznice: 54.4% (preprocessed)
+
+RELAY PATTERN ANALYSIS
+------------------------------
+Peak Demand: 12.7 kW
+Peak Events: 153
+Peak Hour: 9
+
+Rooms Analyzed: 17
+Average Switches/Day: 4.5
+
+Total Heating Energy: 199.7 kWh
+
+
+WEATHER CORRELATION ANALYSIS
+------------------------------
+• PV-Weather Correlations: Available
+• Consumption-Weather Correlations: Available
+
+RECOMMENDATIONS
+------------------------------
+• Monitor PV system performance during identified low-efficiency periods
+• Optimize heating schedules based on thermal time constants
+• Investigate high base load consumption periods for energy savings
+• Consider demand response strategies during peak consumption hours
+• High heating usage detected in: hosti, loznice - consider insulation improvements
+
+================================================================================
+End of Report

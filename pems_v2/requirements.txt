@@ -26,6 +26,8 @@ optuna>=3.5.0                # For hyperparameter tuning
 # Additional ML/Data Dependencies
 scipy>=1.15.0                # Scientific computing
 pvlib>=0.13.0                # For PV system modeling
+matplotlib>=3.8.0            # For plotting and visualization
+seaborn>=0.13.0              # For enhanced plotting
 
 # Testing Dependencies
 pytest>=8.4.0               # Testing framework
