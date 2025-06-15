@@ -44,6 +44,7 @@ class InfluxDBSettings(BaseSettings):
     """
 
     url: str = Field(default="http://localhost:8086", description="InfluxDB server URL")
+    host: Optional[str] = Field(default=None, description="InfluxDB server host (legacy)")
     token: SecretStr = Field(
         ..., description="Authentication token for InfluxDB access"
     )
@@ -75,6 +76,14 @@ class InfluxDBSettings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env", env_prefix="INFLUXDB_", extra="ignore"
     )
+
+    @model_validator(mode="after")
+    def handle_legacy_host(self):
+        """Handle legacy INFLUXDB_HOST environment variable."""
+        if self.host and self.url == "http://localhost:8086":
+            # Use host if url is still the default
+            self.url = self.host
+        return self
 
 
 class MQTTSettings(BaseSettings):

@@ -17,11 +17,18 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Optional
 
-# Add the parent directory to the path so we can import from other modules
-sys.path.append(str(Path(__file__).parent.parent))
+# Add the parent directories to the path so we can import from other modules
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))  # Add project root
+sys.path.insert(0, str(Path(__file__).parent.parent))  # Add pems_v2 directory
 
-from analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
-from config.settings import PEMSSettings as Settings
+try:
+    # Try relative imports first (when run as module)
+    from ..config.settings import PEMSSettings as Settings
+    from .pipelines.comprehensive_analysis import ComprehensiveAnalyzer
+except ImportError:
+    # Fall back to absolute imports (when run directly)
+    from pems_v2.config.settings import PEMSSettings as Settings
+    from pems_v2.analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
 
 
 async def run_analysis(
@@ -161,8 +168,13 @@ def run_winter_thermal_analysis(year: int = None):
         year: Base year for the winter season. Defaults to the most recent complete winter.
     """
     # Query available winter months from InfluxDB
-    from ..config.settings import PEMSSettings
-    from .core.unified_data_extractor import UnifiedDataExtractor
+    import sys
+    from pathlib import Path
+    # Add parent directory to path for imports when run directly
+    sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+    
+    from pems_v2.config.settings import PEMSSettings
+    from pems_v2.analysis.core.unified_data_extractor import UnifiedDataExtractor
 
     settings = PEMSSettings()
     extractor = UnifiedDataExtractor(settings)
@@ -545,8 +557,13 @@ Examples:
         start_date = end_date - timedelta(days=730)
     elif args.winter:
         # Query available winter months from InfluxDB
-        from ..config.settings import PEMSSettings
-        from .core.unified_data_extractor import UnifiedDataExtractor
+        import sys
+        from pathlib import Path
+        # Add parent directory to path for imports when run directly
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+        
+        from pems_v2.config.settings import PEMSSettings
+        from pems_v2.analysis.core.unified_data_extractor import UnifiedDataExtractor
 
         settings = PEMSSettings()
         extractor = UnifiedDataExtractor(settings)
