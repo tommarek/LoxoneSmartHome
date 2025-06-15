@@ -248,9 +248,12 @@ class ReportGenerator:
         # Add room coupling analysis if available
         if "room_coupling" in thermal_results:
             coupling_data = thermal_results["room_coupling"]
-            if isinstance(coupling_data, dict) and "correlation_matrix" in coupling_data:
+            if (
+                isinstance(coupling_data, dict)
+                and "correlation_matrix" in coupling_data
+            ):
                 lines.extend(self._generate_room_coupling_summary(coupling_data))
-        
+
         lines.append("")
         return lines
 
@@ -261,47 +264,55 @@ class ReportGenerator:
             "ROOM THERMAL COUPLING ANALYSIS",
             "-" * 40,
         ]
-        
+
         # Extract correlation matrix
         correlation_matrix = coupling_data.get("correlation_matrix", {})
         if correlation_matrix:
             lines.append("• Temperature correlations between rooms:")
-            
+
             # Find strongest and weakest correlations
             correlations = []
             for room1, room_corrs in correlation_matrix.items():
                 if isinstance(room_corrs, dict):
                     for room2, corr_value in room_corrs.items():
-                        if room1 != room2 and isinstance(corr_value, (int, float)) and not pd.isna(corr_value):
+                        if (
+                            room1 != room2
+                            and isinstance(corr_value, (int, float))
+                            and not pd.isna(corr_value)
+                        ):
                             # Avoid duplicate pairs
                             pair_key = tuple(sorted([room1, room2]))
                             correlations.append((pair_key, corr_value))
-            
+
             # Remove duplicates and sort
             unique_correlations = {}
             for pair, corr in correlations:
                 unique_correlations[pair] = corr
-            
+
             if unique_correlations:
-                sorted_correlations = sorted(unique_correlations.items(), key=lambda x: x[1], reverse=True)
-                
+                sorted_correlations = sorted(
+                    unique_correlations.items(), key=lambda x: x[1], reverse=True
+                )
+
                 # Show top 3 strongest correlations
                 lines.append("  Strongest thermal coupling:")
                 for i, ((room1, room2), corr) in enumerate(sorted_correlations[:3]):
                     lines.append(f"    {room1} ↔ {room2}: {corr:.3f}")
-                
+
                 # Show weakest correlations (indicating thermal isolation)
                 if len(sorted_correlations) > 3:
                     lines.append("  Most thermally isolated:")
-                    for i, ((room1, room2), corr) in enumerate(sorted_correlations[-2:]):
+                    for i, ((room1, room2), corr) in enumerate(
+                        sorted_correlations[-2:]
+                    ):
                         lines.append(f"    {room1} ↔ {room2}: {corr:.3f}")
-        
+
         # Add room pair analysis if available
         room_pairs = coupling_data.get("room_pairs", {})
         if room_pairs:
             lines.append("")
             lines.append("• Room pair heat transfer analysis:")
-            
+
             # Find pairs with significant temperature differences
             significant_pairs = []
             for pair_name, pair_data in room_pairs.items():
@@ -309,29 +320,43 @@ class ReportGenerator:
                     max_temp_diff = pair_data.get("max_temp_diff", 0)
                     mean_temp_diff = pair_data.get("mean_temp_diff", 0)
                     if max_temp_diff > 2.0:  # Significant temperature difference
-                        significant_pairs.append((pair_name, max_temp_diff, mean_temp_diff))
-            
+                        significant_pairs.append(
+                            (pair_name, max_temp_diff, mean_temp_diff)
+                        )
+
             if significant_pairs:
                 # Sort by maximum temperature difference
                 significant_pairs.sort(key=lambda x: x[1], reverse=True)
                 lines.append("  High heat transfer potential:")
                 for pair_name, max_diff, mean_diff in significant_pairs[:3]:
-                    room1, room2 = pair_name.split('_', 1)
-                    lines.append(f"    {room1} → {room2}: {max_diff:.1f}°C max, {mean_diff:.1f}°C avg")
-        
+                    room1, room2 = pair_name.split("_", 1)
+                    lines.append(
+                        f"    {room1} → {room2}: {max_diff:.1f}°C max, {mean_diff:.1f}°C avg"
+                    )
+
         # Summary statistics
-        if "most_coupled_pair" in coupling_data and "highest_correlation" in coupling_data:
+        if (
+            "most_coupled_pair" in coupling_data
+            and "highest_correlation" in coupling_data
+        ):
             most_coupled = coupling_data["most_coupled_pair"]
             highest_corr = coupling_data["highest_correlation"]
-            room1, room2 = most_coupled.split('_', 1)
+            room1, room2 = most_coupled.split("_", 1)
             lines.append("")
-            lines.append(f"• Most coupled rooms: {room1} ↔ {room2} (correlation: {highest_corr:.3f})")
-        
-        if "least_coupled_pair" in coupling_data and "lowest_correlation" in coupling_data:
+            lines.append(
+                f"• Most coupled rooms: {room1} ↔ {room2} (correlation: {highest_corr:.3f})"
+            )
+
+        if (
+            "least_coupled_pair" in coupling_data
+            and "lowest_correlation" in coupling_data
+        ):
             least_coupled = coupling_data["least_coupled_pair"]
             lowest_corr = coupling_data["lowest_correlation"]
-            room1, room2 = least_coupled.split('_', 1)
-            lines.append(f"• Most isolated rooms: {room1} ↔ {room2} (correlation: {lowest_corr:.3f})")
+            room1, room2 = least_coupled.split("_", 1)
+            lines.append(
+                f"• Most isolated rooms: {room1} ↔ {room2} (correlation: {lowest_corr:.3f})"
+            )
 
         return lines
 
@@ -1781,16 +1806,20 @@ class ReportGenerator:
         if "correlation_matrix" in coupling_data and "room_pairs" in coupling_data:
             correlation_matrix = coupling_data["correlation_matrix"]
             room_pairs = coupling_data["room_pairs"]
-            
+
             # Generate correlation heatmap
             heatmap_html = self._generate_correlation_heatmap_html(correlation_matrix)
-            
+
             # Generate network graph
-            network_graph_html = self._generate_coupling_network_graph_html(correlation_matrix, room_pairs)
-            
+            network_graph_html = self._generate_coupling_network_graph_html(
+                correlation_matrix, room_pairs
+            )
+
             # Generate coupling statistics table
-            coupling_table_html = self._generate_coupling_statistics_table_html(room_pairs)
-            
+            coupling_table_html = self._generate_coupling_statistics_table_html(
+                room_pairs
+            )
+
             coupling_html = f"""
             <div class="room-coupling-analysis">
                 <h3>🔗 Room Thermal Coupling Analysis</h3>
@@ -1848,12 +1877,12 @@ class ReportGenerator:
         """Generate correlation heatmap visualization."""
         if not correlation_matrix:
             return "<p>No correlation data available.</p>"
-        
+
         # Convert correlation matrix to list of rooms and values
         rooms = list(correlation_matrix.keys())
         if not rooms:
             return "<p>No room data available for heatmap.</p>"
-        
+
         # Generate heatmap grid
         heatmap_cells = []
         for i, room1 in enumerate(rooms):
@@ -1872,22 +1901,28 @@ class ReportGenerator:
                             color_class = "correlation-weak-negative"
                         else:
                             color_class = "correlation-strong-negative"
-                        
-                        heatmap_cells.append(f"""
+
+                        heatmap_cells.append(
+                            f"""
                         <div class="heatmap-cell {color_class}" 
                              style="grid-column: {j + 2}; grid-row: {i + 2};"
                              title="{room1} ↔ {room2}: {correlation:.3f}">
                             {correlation:.2f}
                         </div>
-                        """)
-        
+                        """
+                        )
+
         # Generate room labels
         row_labels = []
         col_labels = []
         for i, room in enumerate(rooms):
-            row_labels.append(f'<div class="heatmap-label row-label" style="grid-column: 1; grid-row: {i + 2};">{room}</div>')
-            col_labels.append(f'<div class="heatmap-label col-label" style="grid-column: {i + 2}; grid-row: 1;">{room}</div>')
-        
+            row_labels.append(
+                f'<div class="heatmap-label row-label" style="grid-column: 1; grid-row: {i + 2};">{room}</div>'
+            )
+            col_labels.append(
+                f'<div class="heatmap-label col-label" style="grid-column: {i + 2}; grid-row: 1;">{room}</div>'
+            )
+
         return f"""
         <div class="correlation-heatmap">
             <h4>Temperature Correlation Matrix</h4>
@@ -1912,44 +1947,48 @@ class ReportGenerator:
         """Generate network graph visualization using SVG."""
         if not correlation_matrix:
             return "<p>No correlation data available for network graph.</p>"
-        
+
         rooms = list(correlation_matrix.keys())
         if len(rooms) < 2:
             return "<p>Need at least 2 rooms for network visualization.</p>"
-        
+
         # Calculate positions for rooms in a circle
         import math
+
         width = 600
         height = 500
         center_x = width // 2
         center_y = height // 2
         radius = 180
-        
+
         svg_elements = []
-        
+
         # Generate room positions and connections
         for i, room1 in enumerate(rooms):
             angle1 = 2 * math.pi * i / len(rooms)
             x1 = center_x + radius * math.cos(angle1)
             y1 = center_y + radius * math.sin(angle1)
-            
+
             # Draw connections to other rooms
             for j, room2 in enumerate(rooms):
                 if i < j:  # Avoid duplicate connections
                     angle2 = 2 * math.pi * j / len(rooms)
                     x2 = center_x + radius * math.cos(angle2)
                     y2 = center_y + radius * math.sin(angle2)
-                    
+
                     # Get correlation
                     correlation = 0
-                    if room1 in correlation_matrix and room2 in correlation_matrix[room1]:
+                    if (
+                        room1 in correlation_matrix
+                        and room2 in correlation_matrix[room1]
+                    ):
                         correlation = correlation_matrix[room1][room2] or 0
-                    
+
                     # Only draw significant connections
                     if abs(correlation) > 0.2:
                         # Line thickness based on correlation strength
                         thickness = max(1, int(abs(correlation) * 6))
-                        
+
                         # Color based on correlation
                         if correlation > 0.7:
                             color = "#e74c3c"  # Strong - red
@@ -1957,50 +1996,59 @@ class ReportGenerator:
                             color = "#f39c12"  # Moderate - orange
                         else:
                             color = "#95a5a6"  # Weak - gray
-                        
-                        svg_elements.append(f"""
+
+                        svg_elements.append(
+                            f"""
                         <line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" 
                               stroke="{color}" stroke-width="{thickness}" opacity="0.7">
                             <title>{room1} ↔ {room2}: {correlation:.3f}</title>
                         </line>
-                        """)
-                        
+                        """
+                        )
+
                         # Add correlation value label on the connection line
                         mid_x = (x1 + x2) / 2
                         mid_y = (y1 + y2) / 2
-                        
+
                         # Only show labels for significant correlations to avoid clutter
                         if abs(correlation) > 0.5:
                             # Calculate text rotation based on line angle
                             import math
+
                             angle = math.atan2(y2 - y1, x2 - x1) * 180 / math.pi
-                            
+
                             # Background rectangle for better readability
-                            svg_elements.append(f"""
+                            svg_elements.append(
+                                f"""
                             <rect x="{mid_x - 15}" y="{mid_y - 8}" width="30" height="16" 
                                   fill="white" stroke="{color}" stroke-width="1" 
                                   rx="8" opacity="0.9" class="correlation-label">
                                 <title>{room1} ↔ {room2}: {correlation:.3f}</title>
                             </rect>
-                            """)
-                            
+                            """
+                            )
+
                             # Correlation value text
-                            svg_elements.append(f"""
+                            svg_elements.append(
+                                f"""
                             <text x="{mid_x}" y="{mid_y + 4}" text-anchor="middle" 
                                   font-size="9" font-weight="bold" fill="{color}" class="correlation-label">
                                 {correlation:.2f}
                                 <title>{room1} ↔ {room2}: {correlation:.3f}</title>
                             </text>
-                            """)
-            
+                            """
+                            )
+
             # Draw room circles
-            svg_elements.append(f"""
+            svg_elements.append(
+                f"""
             <circle cx="{x1}" cy="{y1}" r="25" fill="#3498db" stroke="#2c3e50" stroke-width="2">
                 <title>{room1}</title>
             </circle>
             <text x="{x1}" y="{y1 + 5}" text-anchor="middle" font-size="10" fill="white">{room1[:8]}</text>
-            """)
-        
+            """
+            )
+
         return f"""
         <div class="network-graph">
             <h4>Room Coupling Network</h4>
@@ -2029,7 +2077,7 @@ class ReportGenerator:
         """Generate coupling statistics table."""
         if not room_pairs:
             return "<p>No room pair statistics available.</p>"
-        
+
         # Sort pairs by correlation strength
         sorted_pairs = []
         for pair_name, pair_data in room_pairs.items():
@@ -2037,29 +2085,30 @@ class ReportGenerator:
                 correlation = pair_data["correlation"]
                 if correlation is not None and not pd.isna(correlation):
                     sorted_pairs.append((pair_name, pair_data))
-        
+
         sorted_pairs.sort(key=lambda x: abs(x[1]["correlation"]), reverse=True)
-        
+
         # Generate table rows
         table_rows = []
         for pair_name, pair_data in sorted_pairs[:10]:  # Show top 10
-            room1, room2 = pair_name.split('_', 1)
+            room1, room2 = pair_name.split("_", 1)
             correlation = pair_data["correlation"]
             mean_diff = pair_data.get("mean_temp_diff", 0)
             max_diff = pair_data.get("max_temp_diff", 0)
-            
+
             # Classification
             if abs(correlation) > 0.7:
                 coupling_class = "coupling-strong"
                 coupling_text = "Strong"
             elif abs(correlation) > 0.3:
-                coupling_class = "coupling-moderate" 
+                coupling_class = "coupling-moderate"
                 coupling_text = "Moderate"
             else:
                 coupling_class = "coupling-weak"
                 coupling_text = "Weak"
-            
-            table_rows.append(f"""
+
+            table_rows.append(
+                f"""
             <tr>
                 <td>{room1} ↔ {room2}</td>
                 <td>{correlation:.3f}</td>
@@ -2067,8 +2116,9 @@ class ReportGenerator:
                 <td>{mean_diff:.1f}°C</td>
                 <td>{max_diff:.1f}°C</td>
             </tr>
-            """)
-        
+            """
+            )
+
         return f"""
         <div class="coupling-statistics">
             <h4>Room Pair Statistics</h4>

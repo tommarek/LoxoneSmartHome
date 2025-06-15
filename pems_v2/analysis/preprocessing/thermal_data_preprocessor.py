@@ -13,7 +13,8 @@ import pandas as pd
 from scipy.signal import savgol_filter
 
 try:
-    from analysis.utils.loxone_adapter import LoxoneDataIntegrator, LoxoneFieldAdapter
+    from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
+                                               LoxoneFieldAdapter)
 except ImportError:
     # Fallback for testing
     LoxoneDataIntegrator = None
@@ -30,9 +31,9 @@ class ThermalDataPreprocessor:
             self.integrator = LoxoneDataIntegrator()
         else:
             self.integrator = None
-        
+
         # Define resample interval for all data (5 minutes for underfloor heating)
-        self.resample_interval = '5min'
+        self.resample_interval = "5min"
 
     def prepare_thermal_analysis_data(
         self,
@@ -42,12 +43,12 @@ class ThermalDataPreprocessor:
     ) -> Tuple[Dict[str, pd.DataFrame], pd.DataFrame]:
         """
         Main preprocessing pipeline for thermal analysis.
-        
+
         Args:
             room_data: Raw room temperature data
             weather_data: Raw weather data
             relay_data: Optional relay state data
-            
+
         Returns:
             Tuple of (processed_room_data, processed_weather_data)
         """
@@ -62,13 +63,14 @@ class ThermalDataPreprocessor:
         if relay_data is not None and self.integrator is not None:
             self.logger.info("Preparing thermal analysis data with relay integration")
             self._log_relay_data_info(relay_data)
-            
+
             # Store relay data in integrator for adaptive analysis
             self.integrator._processed_relay_data = relay_data
-            standardized_rooms, standardized_weather = (
-                self.integrator.prepare_thermal_analysis_data(
-                    room_data, relay_data, weather_data
-                )
+            (
+                standardized_rooms,
+                standardized_weather,
+            ) = self.integrator.prepare_thermal_analysis_data(
+                room_data, relay_data, weather_data
             )
         else:
             # Standardize room data without relay integration
@@ -78,33 +80,43 @@ class ThermalDataPreprocessor:
 
         # Filter out external environment data
         processed_rooms = self._filter_interior_rooms(standardized_rooms)
-        
+
         # Resample weather data to 5-minute intervals if available
         if not standardized_weather.empty:
             standardized_weather = self._resample_weather_data(standardized_weather)
-            self.logger.info(f"Weather data resampled to {self.resample_interval} intervals")
-        
+            self.logger.info(
+                f"Weather data resampled to {self.resample_interval} intervals"
+            )
+
         # Apply data cleaning and merging for each room
         for room_name, room_df in processed_rooms.items():
-            self.logger.debug(f"Processing room {room_name} with {len(room_df)} records")
+            self.logger.debug(
+                f"Processing room {room_name} with {len(room_df)} records"
+            )
             self.logger.debug(f"Room {room_name} columns: {list(room_df.columns)}")
-            
+
             # Resample room data to 5-minute intervals
             room_df_resampled = self._resample_room_data(room_df)
-            self.logger.debug(f"Room {room_name} resampled from {len(room_df)} to {len(room_df_resampled)} records")
-            
-            processed_room = self._merge_room_weather_data(room_df_resampled, standardized_weather)
+            self.logger.debug(
+                f"Room {room_name} resampled from {len(room_df)} to {len(room_df_resampled)} records"
+            )
+
+            processed_room = self._merge_room_weather_data(
+                room_df_resampled, standardized_weather
+            )
             if not processed_room.empty:
                 processed_rooms[room_name] = processed_room
-                self.logger.debug(f"Room {room_name} processed successfully with columns: {list(processed_room.columns)}")
+                self.logger.debug(
+                    f"Room {room_name} processed successfully with columns: {list(processed_room.columns)}"
+                )
             else:
-                self.logger.warning(f"Room {room_name} processing resulted in empty DataFrame")
+                self.logger.warning(
+                    f"Room {room_name} processing resulted in empty DataFrame"
+                )
                 # Keep resampled data if preprocessing failed
                 processed_rooms[room_name] = room_df_resampled
 
-        self.logger.info(
-            f"Preprocessing completed for {len(processed_rooms)} rooms"
-        )
+        self.logger.info(f"Preprocessing completed for {len(processed_rooms)} rooms")
         return processed_rooms, standardized_weather
 
     def _standardize_room_data(
@@ -114,9 +126,9 @@ class ThermalDataPreprocessor:
         standardized_rooms = {}
         for room_name, room_df in room_data.items():
             if LoxoneFieldAdapter:
-                standardized_rooms[room_name] = LoxoneFieldAdapter.standardize_room_data(
-                    room_df, room_name
-                )
+                standardized_rooms[
+                    room_name
+                ] = LoxoneFieldAdapter.standardize_room_data(room_df, room_name)
             else:
                 # Simple fallback standardization
                 standardized_rooms[room_name] = room_df.copy()
@@ -136,7 +148,7 @@ class ThermalDataPreprocessor:
         """Filter out external environment data (not actual rooms)."""
         external_environments = [
             "outside",
-            "outdoor", 
+            "outdoor",
             "external",
             "environment",
             "weather",
@@ -152,88 +164,102 @@ class ThermalDataPreprocessor:
             f"(excluded external environment data)"
         )
         return interior_rooms
-    
+
     def _resample_room_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Resample room data to 5-minute intervals.
-        
+
         Args:
             df: Room DataFrame with temperature and other data
-            
+
         Returns:
             Resampled DataFrame with 5-minute intervals
         """
         if df.empty:
             return df
-            
+
         # Remove duplicates by index (keep last value for each timestamp)
-        df = df[~df.index.duplicated(keep='last')]
-            
+        df = df[~df.index.duplicated(keep="last")]
+
         # Create a copy to avoid modifying original
         resampled = pd.DataFrame()
-        
+
         # Find temperature column
         temp_col = self._find_temperature_column(df)
-        
+
         # Resample temperature with mean aggregation
         if temp_col:
             resampled[temp_col] = df[temp_col].resample(self.resample_interval).mean()
             # Interpolate to fill any gaps
-            resampled[temp_col] = resampled[temp_col].interpolate(method='linear', limit=3)
-        
+            resampled[temp_col] = resampled[temp_col].interpolate(
+                method="linear", limit=3
+            )
+
         # Resample relay/heating states with forward fill
-        for col in ['heating_on', 'relay_state', 'heating', 'heat']:
+        for col in ["heating_on", "relay_state", "heating", "heat"]:
             if col in df.columns:
                 resampled[col] = df[col].resample(self.resample_interval).ffill()
                 resampled[col] = resampled[col].fillna(0)  # Default to off
-        
+
         # Resample setpoint if available
-        if 'setpoint' in df.columns:
-            resampled['setpoint'] = df['setpoint'].resample(self.resample_interval).ffill()
-        
+        if "setpoint" in df.columns:
+            resampled["setpoint"] = (
+                df["setpoint"].resample(self.resample_interval).ffill()
+            )
+
         # Copy any other numeric columns with mean aggregation
         for col in df.columns:
             if col not in resampled.columns and pd.api.types.is_numeric_dtype(df[col]):
                 resampled[col] = df[col].resample(self.resample_interval).mean()
-        
-        self.logger.debug(f"Resampled room data from {len(df)} to {len(resampled)} points")
+
+        self.logger.debug(
+            f"Resampled room data from {len(df)} to {len(resampled)} points"
+        )
         return resampled
-    
+
     def _resample_weather_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """Resample weather data to 5-minute intervals.
-        
+
         Args:
             df: Weather DataFrame
-            
+
         Returns:
             Resampled DataFrame with 5-minute intervals
         """
         if df.empty:
             return df
-            
+
         # Remove duplicates by index (keep last value for each timestamp)
-        df = df[~df.index.duplicated(keep='last')]
-            
+        df = df[~df.index.duplicated(keep="last")]
+
         resampled = pd.DataFrame()
-        
+
         # Common weather columns to resample
         weather_cols = [
-            'temperature_2m', 'outdoor_temp', 'temperature',
-            'windspeed_10m', 'relativehumidity_2m', 'cloudcover',
-            'direct_radiation', 'diffuse_radiation', 'pressure_msl'
+            "temperature_2m",
+            "outdoor_temp",
+            "temperature",
+            "windspeed_10m",
+            "relativehumidity_2m",
+            "cloudcover",
+            "direct_radiation",
+            "diffuse_radiation",
+            "pressure_msl",
         ]
-        
+
         for col in weather_cols:
             if col in df.columns:
                 resampled[col] = df[col].resample(self.resample_interval).mean()
                 # Interpolate to smooth transitions
-                resampled[col] = resampled[col].interpolate(method='linear')
-        
+                resampled[col] = resampled[col].interpolate(method="linear")
+
         # Copy any other numeric columns
         for col in df.columns:
             if col not in resampled.columns and pd.api.types.is_numeric_dtype(df[col]):
                 resampled[col] = df[col].resample(self.resample_interval).mean()
-        
-        self.logger.debug(f"Resampled weather data from {len(df)} to {len(resampled)} points")
+
+        self.logger.debug(
+            f"Resampled weather data from {len(df)} to {len(resampled)} points"
+        )
         return resampled
 
     def _merge_room_weather_data(
@@ -243,7 +269,9 @@ class ThermalDataPreprocessor:
         # Ensure we have temperature column
         temp_col = self._find_temperature_column(room_df)
         if temp_col is None:
-            self.logger.warning("No temperature column found in room data - returning empty DataFrame")
+            self.logger.warning(
+                "No temperature column found in room data - returning empty DataFrame"
+            )
             return pd.DataFrame()
 
         # Prepare room data
@@ -268,15 +296,26 @@ class ThermalDataPreprocessor:
             self.logger.warning("No weather data available for merging")
 
         # Calculate temperature difference if outdoor temperature is available
-        if "outdoor_temp" in merged_data.columns and not merged_data["outdoor_temp"].isna().all():
-            merged_data["temp_diff"] = merged_data["room_temp"] - merged_data["outdoor_temp"]
-            self.logger.debug("Created temp_diff column from room and outdoor temperature")
+        if (
+            "outdoor_temp" in merged_data.columns
+            and not merged_data["outdoor_temp"].isna().all()
+        ):
+            merged_data["temp_diff"] = (
+                merged_data["room_temp"] - merged_data["outdoor_temp"]
+            )
+            self.logger.debug(
+                "Created temp_diff column from room and outdoor temperature"
+            )
         else:
             # Create temp_diff with NaN values when outdoor temp is not available
             merged_data["temp_diff"] = pd.Series(index=merged_data.index, dtype=float)
             if "outdoor_temp" not in merged_data.columns:
-                merged_data["outdoor_temp"] = pd.Series(index=merged_data.index, dtype=float)
-            self.logger.debug("Created temp_diff column with NaN values (no outdoor temperature)")
+                merged_data["outdoor_temp"] = pd.Series(
+                    index=merged_data.index, dtype=float
+                )
+            self.logger.debug(
+                "Created temp_diff column with NaN values (no outdoor temperature)"
+            )
 
         # Add time features for analysis
         merged_data["hour"] = merged_data.index.hour
@@ -287,26 +326,35 @@ class ThermalDataPreprocessor:
     def _find_temperature_column(self, room_df: pd.DataFrame) -> Optional[str]:
         """Find the temperature column in room data."""
         self.logger.debug(f"Available columns in room data: {list(room_df.columns)}")
-        
+
         # Common temperature column names
         temp_candidates = [
-            "temperature", "value", "temp", "room_temp", 
-            "Temperature", "Value", "Temp", "room_temperature",
-            "teplota", "teplomer"  # Czech names
+            "temperature",
+            "value",
+            "temp",
+            "room_temp",
+            "Temperature",
+            "Value",
+            "Temp",
+            "room_temperature",
+            "teplota",
+            "teplomer",  # Czech names
         ]
-        
+
         for col in temp_candidates:
             if col in room_df.columns:
                 self.logger.debug(f"Found temperature column: {col}")
                 return col
-                
+
         # If no exact match, look for columns containing temperature-related keywords
         for col in room_df.columns:
             col_lower = col.lower()
-            if any(keyword in col_lower for keyword in ["temp", "teplota", "temperature"]):
+            if any(
+                keyword in col_lower for keyword in ["temp", "teplota", "temperature"]
+            ):
                 self.logger.debug(f"Found temperature column by keyword match: {col}")
                 return col
-                
+
         self.logger.warning(f"No temperature column found in: {list(room_df.columns)}")
         return None
 
@@ -327,7 +375,9 @@ class ThermalDataPreprocessor:
             self.logger.debug(f"Found heating column '{heating_col}' in room data")
 
             if heating_col == "relay_state":
-                room_clean["heating_on"] = (original_room_df[heating_col] > 0).astype(int)
+                room_clean["heating_on"] = (original_room_df[heating_col] > 0).astype(
+                    int
+                )
                 relay_on_count = room_clean["heating_on"].sum()
                 self.logger.debug(
                     f"Relay states - ON intervals: {relay_on_count}, "
@@ -358,7 +408,7 @@ class ThermalDataPreprocessor:
     def _clean_temperature_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
         Apply comprehensive data cleaning with rolling median outlier removal.
-        
+
         Removes spurious spikes from sensor readings that can ruin
         derivative calculations (dT/dt) and statistical fits.
         """
@@ -398,8 +448,13 @@ class ThermalDataPreprocessor:
         self._log_cleaning_results(outlier_mask, df_clean["room_temp"])
 
         # Clean outdoor temperature if present
-        if "outdoor_temp" in df_clean.columns and not df_clean["outdoor_temp"].isna().all():
-            df_clean = self._clean_outdoor_temperature(df_clean, window_size, outlier_threshold)
+        if (
+            "outdoor_temp" in df_clean.columns
+            and not df_clean["outdoor_temp"].isna().all()
+        ):
+            df_clean = self._clean_outdoor_temperature(
+                df_clean, window_size, outlier_threshold
+            )
 
         # Apply Savitzky-Golay filter for noise reduction
         df_clean = self._apply_savgol_smoothing(df_clean)
@@ -444,7 +499,10 @@ class ThermalDataPreprocessor:
             )
 
         # Apply smoothing to outdoor temperature
-        if "outdoor_temp" in df_smooth.columns and not df_smooth["outdoor_temp"].isna().all():
+        if (
+            "outdoor_temp" in df_smooth.columns
+            and not df_smooth["outdoor_temp"].isna().all()
+        ):
             df_smooth = self._smooth_temperature_column(
                 df_smooth, "outdoor_temp", window_length, polyorder
             )
@@ -558,7 +616,9 @@ class ThermalDataPreprocessor:
             self.logger.error(f"Error during weather data merge: {e}", exc_info=True)
             return room_df
 
-    def _find_outdoor_temperature_column(self, weather_data: pd.DataFrame) -> Optional[str]:
+    def _find_outdoor_temperature_column(
+        self, weather_data: pd.DataFrame
+    ) -> Optional[str]:
         """Find outdoor temperature column in weather data."""
         for col in ["outdoor_temp", "temperature_2m", "temperature", "temp"]:
             if col in weather_data.columns:
@@ -597,7 +657,7 @@ class ThermalDataPreprocessor:
         """Log the results of data cleaning."""
         outliers_removed = outlier_mask.sum()
         remaining_nans = cleaned_temp.isna().sum()
-        
+
         if outliers_removed > 0:
             total_points = len(outlier_mask)
             self.logger.info(

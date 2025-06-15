@@ -16,10 +16,11 @@ from analysis.analyzers.base_load_analysis import BaseLoadAnalyzer
 from analysis.analyzers.pattern_analysis import (PVAnalyzer,
                                                  RelayPatternAnalyzer)
 from analysis.analyzers.thermal_analysis import ThermalAnalyzer
-from analysis.preprocessing.thermal_data_preprocessor import ThermalDataPreprocessor
 from analysis.core.data_extraction import \
     DataExtractor  # TODO: Refactor to use UnifiedDataExtractor
 from analysis.core.data_preprocessing import DataPreprocessor
+from analysis.preprocessing.thermal_data_preprocessor import \
+    ThermalDataPreprocessor
 from analysis.reports.report_generator import ReportGenerator
 from config.settings import PEMSSettings as Settings
 
@@ -57,7 +58,7 @@ class ComprehensiveAnalyzer:
             if hasattr(settings, "model_dump")
             else settings.dict()
         )
-        
+
         # Initialize thermal data preprocessor and analyzer
         self.thermal_preprocessor = ThermalDataPreprocessor(settings_dict)
         self.thermal_analyzer = ThermalAnalyzer(

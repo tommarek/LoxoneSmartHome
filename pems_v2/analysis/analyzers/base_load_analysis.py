@@ -744,7 +744,9 @@ class BaseLoadAnalyzer:
                     "warning": f"Insufficient clean data for STL decomposition (have {len(daily_load_clean)}, need at least {seasonal_period * 2})"
                 }
 
-            stl = STL(daily_load_clean, seasonal=seasonal_period, period=seasonal_period)
+            stl = STL(
+                daily_load_clean, seasonal=seasonal_period, period=seasonal_period
+            )
             result = stl.fit()
 
             seasonal_analysis = {

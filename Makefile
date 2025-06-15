@@ -86,13 +86,24 @@ clean-analysis:
 	rm -rf pems_v2/data/processed/*.parquet
 	rm -rf pems_v2/data/features/*.parquet
 	rm -rf pems_v2/data/test_output/
+	rm -rf pems_v2/analysis/data/raw/*.parquet
+	rm -rf pems_v2/analysis/data/processed/*.parquet
+	rm -rf pems_v2/analysis/data/features/*.parquet
 	rm -rf pems_v2/analysis/results/*.json
 	rm -rf pems_v2/analysis/reports/*.txt
 	rm -rf pems_v2/analysis/reports/*.html
+	rm -rf pems_v2/analysis/reports/*.json
+	rm -rf pems_v2/analysis/reports/preprocessing_viz/*.png
+	rm -rf pems_v2/analysis/reports/thermal_inertia/*.png
+	rm -rf pems_v2/analysis/reports/daily/
+	rm -rf pems_v2/analysis/analysis/reports/
 	rm -rf pems_v2/analysis/figures/*.png
+	rm -rf pems_v2/analysis/full_results/
 	rm -f pems_v2/analysis/*.log
+	rm -f pems_v2/analysis/analysis/*.log
 	rm -f pems_v2/analysis_*.log
 	rm -f pems_v2/test_*.log
+	rm -f pems_v2/analysis/thermal_cycle_debug.log
 	@echo "Analysis outputs cleaned!"
 
 clean-all: clean clean-analysis

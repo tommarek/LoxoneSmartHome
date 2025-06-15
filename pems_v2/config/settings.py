@@ -44,7 +44,9 @@ class InfluxDBSettings(BaseSettings):
     """
 
     url: str = Field(default="http://localhost:8086", description="InfluxDB server URL")
-    host: Optional[str] = Field(default=None, description="InfluxDB server host (legacy)")
+    host: Optional[str] = Field(
+        default=None, description="InfluxDB server host (legacy)"
+    )
     token: SecretStr = Field(
         ..., description="Authentication token for InfluxDB access"
     )
