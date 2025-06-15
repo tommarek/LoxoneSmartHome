@@ -809,6 +809,179 @@ class UnifiedDataExtractor:
                 f"Low quality data detected in: {', '.join(low_quality_components)}"
             )
 
+    async def get_available_data_ranges(self) -> Dict[str, Tuple[datetime, datetime]]:
+        """
+        Query InfluxDB to find available data ranges for each measurement.
+
+        Returns:
+            Dictionary mapping measurement names to (start_date, end_date) tuples
+        """
+        self.logger.info("Querying available data ranges from InfluxDB")
+
+        available_ranges = {}
+
+        # Query each bucket for data availability
+        buckets_to_check = [
+            (
+                self.settings.influxdb.bucket_loxone,
+                ["temperature", "humidity", "relay"],
+            ),
+            (self.settings.influxdb.bucket_solar, ["solarAPI", "growatt", "teplomer"]),
+            (self.settings.influxdb.bucket_weather, ["weather_forecast"]),
+            ("ote_prices", ["electricity_prices"]),
+        ]
+
+        with InfluxDBClient(
+            url=self.settings.influxdb.url,
+            token=self.settings.influxdb.token.get_secret_value(),
+            org=self.settings.influxdb.org,
+        ) as client:
+            query_api = client.query_api()
+
+            for bucket, measurements in buckets_to_check:
+                for measurement in measurements:
+                    # Query to find min and max time for each measurement
+                    query = f"""
+                    from(bucket: "{bucket}")
+                      |> range(start: -3y)
+                      |> filter(fn: (r) => r["_measurement"] == "{measurement}")
+                      |> group()
+                      |> reduce(
+                          fn: (r, accumulator) => ({{
+                            minTime: if r._time < accumulator.minTime then r._time else accumulator.minTime,
+                            maxTime: if r._time > accumulator.maxTime then r._time else accumulator.maxTime,
+                            count: accumulator.count + 1
+                          }}),
+                          identity: {{minTime: 3000-01-01T00:00:00Z, maxTime: 1970-01-01T00:00:00Z, count: 0}}
+                      )
+                    """
+
+                    try:
+                        result = query_api.query(
+                            org=self.settings.influxdb.org, query=query
+                        )
+
+                        if result and len(result) > 0 and len(result[0].records) > 0:
+                            record = result[0].records[0]
+                            if (
+                                record.get_value()
+                                and record.get_value().get("count", 0) > 0
+                            ):
+                                min_time = record.get_value().get("minTime")
+                                max_time = record.get_value().get("maxTime")
+
+                                # Convert to datetime objects
+                                if isinstance(min_time, str):
+                                    min_time = datetime.fromisoformat(
+                                        min_time.replace("Z", "+00:00")
+                                    )
+                                if isinstance(max_time, str):
+                                    max_time = datetime.fromisoformat(
+                                        max_time.replace("Z", "+00:00")
+                                    )
+
+                                available_ranges[f"{bucket}.{measurement}"] = (
+                                    min_time,
+                                    max_time,
+                                )
+                                self.logger.info(
+                                    f"  {bucket}.{measurement}: {min_time} to {max_time}"
+                                )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"Failed to query range for {bucket}.{measurement}: {e}"
+                        )
+
+        return available_ranges
+
+    async def get_available_winter_months(self) -> List[Tuple[int, int]]:
+        """
+        Query InfluxDB to find available winter months (Nov-Mar) with thermal data.
+
+        Returns:
+            List of (year, month) tuples for available winter months
+        """
+        self.logger.info("Querying available winter months from InfluxDB")
+
+        winter_months = []
+
+        # Query temperature data to find available months
+        query = """
+        from(bucket: "loxone")
+          |> range(start: -3y)
+          |> filter(fn: (r) => r["_measurement"] == "temperature")
+          |> aggregateWindow(every: 1mo, fn: count, createEmpty: false)
+          |> filter(fn: (r) => r._value > 0)
+          |> group()
+          |> sort(columns: ["_time"])
+        """
+
+        with InfluxDBClient(
+            url=self.settings.influxdb.url,
+            token=self.settings.influxdb.token.get_secret_value(),
+            org=self.settings.influxdb.org,
+        ) as client:
+            query_api = client.query_api()
+
+            try:
+                result = query_api.query(org=self.settings.influxdb.org, query=query)
+
+                if result:
+                    for table in result:
+                        for record in table.records:
+                            timestamp = record.get_time()
+                            if timestamp:
+                                # Check if it's a winter month (Nov-Mar)
+                                month = timestamp.month
+                                year = timestamp.year
+
+                                if month in [11, 12, 1, 2, 3]:
+                                    winter_months.append((year, month))
+
+                # Remove duplicates and sort
+                winter_months = sorted(list(set(winter_months)))
+
+                # Group consecutive winter months
+                if winter_months:
+                    self.logger.info("Available winter months:")
+                    current_winter_start = None
+                    prev_year, prev_month = winter_months[0]
+
+                    for year, month in winter_months:
+                        # Check if this is part of the same winter
+                        if current_winter_start is None:
+                            current_winter_start = (year, month)
+                        elif not (
+                            (month == prev_month + 1 and year == prev_year)
+                            or (
+                                month == 1
+                                and prev_month == 12
+                                and year == prev_year + 1
+                            )
+                        ):
+                            # End of a winter period
+                            self.logger.info(
+                                f"  Winter {current_winter_start[0]}/{current_winter_start[0]+1}: "
+                                f"{current_winter_start[1]}/{current_winter_start[0]} to "
+                                f"{prev_month}/{prev_year}"
+                            )
+                            current_winter_start = (year, month)
+
+                        prev_year, prev_month = year, month
+
+                    # Log the last winter period
+                    if current_winter_start:
+                        self.logger.info(
+                            f"  Winter {current_winter_start[0]}/{current_winter_start[0]+1}: "
+                            f"{current_winter_start[1]}/{current_winter_start[0]} to "
+                            f"{prev_month}/{prev_year}"
+                        )
+
+            except Exception as e:
+                self.logger.error(f"Failed to query winter months: {e}")
+
+        return winter_months
+
     def get_validation_report(self, dataset: EnergyDataset) -> Dict[str, Any]:
         """Generate comprehensive validation report for extracted dataset."""
         required_components = [
