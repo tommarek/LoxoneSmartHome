@@ -901,14 +901,17 @@ class UnifiedDataExtractor:
         Returns:
             List of (year, month) tuples for available winter months
         """
-        self.logger.info("Querying available winter months from InfluxDB")
+        self.logger.info(
+            "Querying available winter months from InfluxDB (since Sept 2022)"
+        )
 
         winter_months = []
 
         # Query temperature data to find available months
+        # Start from September 2022 when data collection began
         query = """
         from(bucket: "loxone")
-          |> range(start: -3y)
+          |> range(start: 2022-09-01T00:00:00Z)
           |> filter(fn: (r) => r["_measurement"] == "temperature")
           |> aggregateWindow(every: 1mo, fn: count, createEmpty: false)
           |> filter(fn: (r) => r._value > 0)

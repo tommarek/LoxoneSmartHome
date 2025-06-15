@@ -27,8 +27,9 @@ try:
     from .pipelines.comprehensive_analysis import ComprehensiveAnalyzer
 except ImportError:
     # Fall back to absolute imports (when run directly)
+    from pems_v2.analysis.pipelines.comprehensive_analysis import \
+        ComprehensiveAnalyzer
     from pems_v2.config.settings import PEMSSettings as Settings
-    from pems_v2.analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
 
 
 async def run_analysis(
@@ -160,21 +161,24 @@ def run_thermal_only_analysis(days_back: int = 180):
     return asyncio.run(run_analysis(start_date, end_date, analysis_types))
 
 
-def run_winter_thermal_analysis(year: int = None):
+def run_winter_thermal_analysis(year: int = None, analyze_all: bool = False):
     """
-    Run thermal analysis for all winter months (November-March) for comprehensive heating data.
+    Run thermal analysis for winter months (November-March) for comprehensive heating data.
 
     Args:
         year: Base year for the winter season. Defaults to the most recent complete winter.
+        analyze_all: If True, analyze ALL available winters since data collection began.
     """
     # Query available winter months from InfluxDB
     import sys
     from pathlib import Path
+
     # Add parent directory to path for imports when run directly
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-    
+
+    from pems_v2.analysis.core.unified_data_extractor import \
+        UnifiedDataExtractor
     from pems_v2.config.settings import PEMSSettings
-    from pems_v2.analysis.core.unified_data_extractor import UnifiedDataExtractor
 
     settings = PEMSSettings()
     extractor = UnifiedDataExtractor(settings)
@@ -201,46 +205,108 @@ def run_winter_thermal_analysis(year: int = None):
             winter_seasons[winter_key] = []
         winter_seasons[winter_key].append((month_year, month))
 
-    # Use specified year or find the most recent winter with sufficient data
-    if year is not None:
-        if year not in winter_seasons:
-            print(f"No data found for winter {year}/{year+1}")
-            return None
-        best_winter = year
-    else:
-        # Find the most recent winter with at least 3 months of data
-        best_winter = None
-        for winter_year in sorted(winter_seasons.keys(), reverse=True):
+    # If analyzing all winters, combine all available data
+    if analyze_all:
+        print("PEMS v2 Comprehensive All-Winters Thermal Analysis")
+        print("=" * 60)
+        print(f"Found {len(winter_seasons)} winter seasons in database")
+
+        # Find overall date range
+        all_winter_months = []
+        for winter_year in sorted(winter_seasons.keys()):
             months = winter_seasons[winter_year]
-            if len(months) >= 3:  # At least 3 months of winter data
-                best_winter = winter_year
-                break
+            print(
+                f"Winter {winter_year}/{winter_year+1}: {len(months)} months - "
+                + f"{', '.join([f'{m[1]}/{m[0]}' for m in sorted(months)])}"
+            )
+            all_winter_months.extend(months)
 
-        if best_winter is None:
-            print("No winter season with sufficient data found")
+        if not all_winter_months:
+            print("No winter data found")
             return None
 
-    # Build date ranges for the selected winter
-    all_months = sorted(winter_seasons[best_winter])
+        # Sort all months to find range
+        all_winter_months = sorted(all_winter_months)
+        first_year, first_month = all_winter_months[0]
+        last_year, last_month = all_winter_months[-1]
 
-    # Calculate start and end dates
-    first_year, first_month = all_months[0]
-    last_year, last_month = all_months[-1]
+        # Calculate the last day of the last month
+        if last_month == 2:  # February
+            last_day = (
+                29
+                if last_year % 4 == 0 and (last_year % 100 != 0 or last_year % 400 == 0)
+                else 28
+            )
+        elif last_month in [4, 6, 9, 11]:
+            last_day = 30
+        else:
+            last_day = 31
 
-    # Calculate the last day of the last month
-    if last_month == 2:  # February
-        last_day = (
-            29
-            if last_year % 4 == 0 and (last_year % 100 != 0 or last_year % 400 == 0)
-            else 28
+        start_date = datetime(first_year, first_month, 1)
+        end_date = datetime(last_year, last_month, last_day, 23, 59, 59)
+
+        print(
+            f"\nCombined Analysis Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
         )
-    elif last_month in [4, 6, 9, 11]:
-        last_day = 30
-    else:
-        last_day = 31
+        print(f"Total Winter Months: {len(all_winter_months)}")
+        print(f"Total Duration: {(end_date - start_date).days + 1} days")
+        print("Focus: Multi-year winter thermal dynamics and heating patterns")
+        print("Note: Analyzing ALL winter data since September 2022")
+        print("=" * 60)
 
-    start_date = datetime(first_year, first_month, 1)
-    end_date = datetime(last_year, last_month, last_day, 23, 59, 59)
+    else:
+        # Original single-winter logic
+        if year is not None:
+            if year not in winter_seasons:
+                print(f"No data found for winter {year}/{year+1}")
+                return None
+            best_winter = year
+        else:
+            # Find the most recent winter with at least 3 months of data
+            best_winter = None
+            for winter_year in sorted(winter_seasons.keys(), reverse=True):
+                months = winter_seasons[winter_year]
+                if len(months) >= 3:  # At least 3 months of winter data
+                    best_winter = winter_year
+                    break
+
+            if best_winter is None:
+                print("No winter season with sufficient data found")
+                return None
+
+        # Build date ranges for the selected winter
+        all_months = sorted(winter_seasons[best_winter])
+
+        # Calculate start and end dates
+        first_year, first_month = all_months[0]
+        last_year, last_month = all_months[-1]
+
+        # Calculate the last day of the last month
+        if last_month == 2:  # February
+            last_day = (
+                29
+                if last_year % 4 == 0 and (last_year % 100 != 0 or last_year % 400 == 0)
+                else 28
+            )
+        elif last_month in [4, 6, 9, 11]:
+            last_day = 30
+        else:
+            last_day = 31
+
+        start_date = datetime(first_year, first_month, 1)
+        end_date = datetime(last_year, last_month, last_day, 23, 59, 59)
+
+        print("PEMS v2 Complete Winter Thermal Analysis")
+        print("=" * 60)
+        print(f"Winter Season {best_winter}/{best_winter+1}:")
+        print(f"Available months: {', '.join([f'{m[1]}/{m[0]}' for m in all_months])}")
+        print(
+            f"Total Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+        )
+        print(f"Duration: {(end_date - start_date).days + 1} days")
+        print("Focus: Complete winter thermal dynamics and heating patterns")
+        print("Note: Analyzing all data since September 2022")
+        print("=" * 60)
 
     # Focus on thermal analysis
     analysis_types = {
@@ -250,17 +316,6 @@ def run_winter_thermal_analysis(year: int = None):
         "relay_patterns": True,  # Essential for heating pattern analysis
         "weather_correlation": True,  # Critical for thermal analysis
     }
-
-    print("PEMS v2 Complete Winter Thermal Analysis")
-    print("=" * 60)
-    print(f"Winter Season {best_winter}/{best_winter+1}:")
-    print(f"Available months: {', '.join([f'{m[1]}/{m[0]}' for m in all_months])}")
-    print(
-        f"Total Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
-    )
-    print(f"Duration: {(end_date - start_date).days + 1} days")
-    print("Focus: Complete winter thermal dynamics and heating patterns")
-    print("=" * 60)
 
     return asyncio.run(run_analysis(start_date, end_date, analysis_types))
 
@@ -443,6 +498,13 @@ Examples:
   # Custom analysis types
   python run_analysis.py --days 30 --pv-only
   python run_analysis.py --month "dec,jan" --thermal-only
+  
+  # Analyze single winter season
+  python run_analysis.py --winter
+  python run_analysis.py --winter --year 2023
+  
+  # Analyze ALL winters for comprehensive thermal data
+  python run_analysis.py --all-winters
         """,
     )
 
@@ -508,6 +570,11 @@ Examples:
         action="store_true",
         help="Complete winter thermal analysis (Nov through Mar)",
     )
+    preset_group.add_argument(
+        "--all-winters",
+        action="store_true",
+        help="Analyze ALL available winters since data collection began (Sept 2022)",
+    )
 
     args = parser.parse_args()
 
@@ -555,104 +622,23 @@ Examples:
         start_date = end_date - timedelta(days=180)
     elif args.full:
         start_date = end_date - timedelta(days=730)
-    elif args.winter:
-        # Query available winter months from InfluxDB
-        import sys
-        from pathlib import Path
-        # Add parent directory to path for imports when run directly
-        sys.path.insert(0, str(Path(__file__).parent.parent.parent))
-        
-        from pems_v2.config.settings import PEMSSettings
-        from pems_v2.analysis.core.unified_data_extractor import UnifiedDataExtractor
-
-        settings = PEMSSettings()
-        extractor = UnifiedDataExtractor(settings)
-
-        # Run async method to get available winter months
-        import asyncio
-
-        winter_months = asyncio.run(extractor.get_available_winter_months())
-
-        if not winter_months:
-            print("No winter data found in InfluxDB")
-            return None
-
-        # Find the most recent complete winter period
-        # Group months by winter season (Nov-Mar)
-        winter_seasons = {}
-        for year, month in winter_months:
-            # Determine which winter season this month belongs to
-            if month >= 11:  # Nov, Dec
-                winter_key = year
-            else:  # Jan, Feb, Mar
-                winter_key = year - 1
-
-            if winter_key not in winter_seasons:
-                winter_seasons[winter_key] = []
-            winter_seasons[winter_key].append((year, month))
-
-        # Find the most recent winter with at least 3 months of data
-        best_winter = None
-        for winter_year in sorted(winter_seasons.keys(), reverse=True):
-            months = winter_seasons[winter_year]
-            if len(months) >= 3:  # At least 3 months of winter data
-                best_winter = winter_year
-                break
-
-        if best_winter is None:
-            print("No winter season with sufficient data found")
-            return None
-
-        # Build date ranges for the selected winter
-        month_ranges = []
-        all_months = sorted(winter_seasons[best_winter])
-
-        for year, month in all_months:
-            # Calculate the last day of the month
-            if month == 2:  # February
-                last_day = (
-                    29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28
-                )
-            elif month in [4, 6, 9, 11]:
-                last_day = 30
-            else:
-                last_day = 31
-
-            month_start = datetime(year, month, 1)
-            month_end = datetime(year, month, last_day, 23, 59, 59)
-            month_ranges.append((month_start, month_end))
-
-        # Set overall date range
-        start_date = month_ranges[0][0]
-        end_date = month_ranges[-1][1]
-
-        print(f"Running winter analysis for winter {best_winter}/{best_winter+1}")
-        print(f"Available months: {', '.join([f'{m[1]}/{m[0]}' for m in all_months])}")
-        print(
-            f"Date range: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+    elif args.winter or args.all_winters:
+        # Use the dedicated winter analysis function
+        return run_winter_thermal_analysis(
+            year=args.year if args.winter else None, analyze_all=args.all_winters
         )
-
-        # Set thermal-focused analysis types for winter
-        analysis_types = {
-            "pv": False,  # Less relevant in winter
-            "thermal": True,
-            "base_load": True,  # Still useful for winter consumption patterns
-            "relay_patterns": True,  # Essential for heating pattern analysis
-            "weather_correlation": True,  # Critical for thermal analysis
-        }
     else:
         # Default: last 2 months
         start_date = end_date - timedelta(days=60)
 
-    # Determine analysis types (only set if not already set by winter preset)
-    if not args.winter:
-        analysis_types = {
-            "pv": True,
-            "thermal": True,
-            "base_load": True,
-            "relay_patterns": True,
-            "weather_correlation": True,
-        }
+    # Determine analysis types
+    analysis_types = {
+        "pv": True,
+        "thermal": True,
+        "base_load": True,
+        "relay_patterns": True,
+        "weather_correlation": True,
+    }
 
     # Handle exclusive analysis types
     if args.pv_only:

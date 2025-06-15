@@ -22,8 +22,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.metrics import mean_squared_error, r2_score
 
 try:
+    from analysis.preprocessing.thermal_data_preprocessor import \
+        ThermalDataPreprocessor
     from analysis.reports.report_generator import ReportGenerator
-    from analysis.preprocessing.thermal_data_preprocessor import ThermalDataPreprocessor
 except ImportError:
     # Fallback for testing
     ReportGenerator = None
@@ -47,8 +48,9 @@ except ImportError:
 R_MIN, R_MAX = 0.008, 0.5
 # Realistic thermal capacitance range for a room in MJ/K (increased min for better stability)
 C_MIN_MJ, C_MAX_MJ = 2.0, 100.0
-# Realistic time constant range in hours - extended for winter conditions (increased min)
-TAU_MIN, TAU_MAX = 3.0, 200.0
+# Realistic time constant range in hours - extended for well-insulated buildings
+# TAU_MAX increased from 200h to 350h to accommodate heavily insulated rooms
+TAU_MIN, TAU_MAX = 3.0, 350.0
 
 
 class ThermalAnalyzer:
@@ -64,7 +66,7 @@ class ThermalAnalyzer:
         self.system_settings = settings
         self.report = report_generator
         self.logger = logging.getLogger(f"{__name__}.ThermalAnalyzer")
-        
+
         # Initialize preprocessor
         if preprocessor:
             self.preprocessor = preprocessor
@@ -72,7 +74,7 @@ class ThermalAnalyzer:
             self.preprocessor = ThermalDataPreprocessor(settings)
         else:
             self.preprocessor = None
-            
+
         # Load room power ratings from settings
         self.room_power_ratings_kw = self.system_settings.get(
             "room_power_ratings_kw", {}
@@ -87,7 +89,8 @@ class ThermalAnalyzer:
         # Configuration for sustained heating analysis - adjusted for underfloor heating
         # Underfloor heating systems have longer thermal response times due to thermal mass
         self.min_heating_duration_hours = self.settings.get(
-            "min_heating_duration_hours", 1.5  # Reduced slightly but still captures thermal mass
+            "min_heating_duration_hours",
+            1.5,  # Reduced slightly but still captures thermal mass
         )
         self.min_non_heating_duration_hours = self.settings.get(
             "min_non_heating_duration_hours", 2.0  # Reduced for better cycle detection
@@ -96,14 +99,16 @@ class ThermalAnalyzer:
             "decay_analysis_hours", 12.0  # Extended for underfloor heating thermal mass
         )
 
-    def _track_rejection(self, room_name: str, reason: str, details: Dict[str, Any] = None):
+    def _track_rejection(
+        self, room_name: str, reason: str, details: Dict[str, Any] = None
+    ):
         """Track rejection reasons for statistical analysis."""
         if room_name not in self.rejection_stats:
             self.rejection_stats[room_name] = {}
-        
+
         if reason not in self.rejection_stats[room_name]:
             self.rejection_stats[room_name][reason] = {"count": 0, "details": []}
-        
+
         self.rejection_stats[room_name][reason]["count"] += 1
         if details:
             self.rejection_stats[room_name][reason]["details"].append(details)
@@ -111,45 +116,50 @@ class ThermalAnalyzer:
     def get_rejection_statistics(self) -> Dict[str, Any]:
         """Get comprehensive rejection statistics across all rooms."""
         total_stats = {"overall": {}, "by_room": self.rejection_stats}
-        
+
         # Calculate overall statistics
         for room_name, room_stats in self.rejection_stats.items():
             for reason, reason_data in room_stats.items():
                 if reason not in total_stats["overall"]:
                     total_stats["overall"][reason] = {"count": 0, "rooms": []}
                 total_stats["overall"][reason]["count"] += reason_data["count"]
-                total_stats["overall"][reason]["rooms"].append({
-                    "room": room_name, 
-                    "count": reason_data["count"]
-                })
-        
+                total_stats["overall"][reason]["rooms"].append(
+                    {"room": room_name, "count": reason_data["count"]}
+                )
+
         return total_stats
 
     def _log_rejection_summary(self):
         """Log a summary of rejection statistics."""
         stats = self.get_rejection_statistics()
-        
+
         if not stats["overall"]:
             self.logger.info("No thermal decay rejections recorded")
             return
-            
+
         self.logger.info("=== THERMAL DECAY REJECTION STATISTICS ===")
-        
+
         # Overall statistics
-        total_rejections = sum(reason_data["count"] for reason_data in stats["overall"].values())
+        total_rejections = sum(
+            reason_data["count"] for reason_data in stats["overall"].values()
+        )
         self.logger.info(f"Total rejections across all rooms: {total_rejections}")
-        
+
         # Top rejection reasons
-        sorted_reasons = sorted(stats["overall"].items(), key=lambda x: x[1]["count"], reverse=True)
+        sorted_reasons = sorted(
+            stats["overall"].items(), key=lambda x: x[1]["count"], reverse=True
+        )
         self.logger.info("Top rejection reasons:")
         for reason, data in sorted_reasons:
             percentage = (data["count"] / total_rejections) * 100
             self.logger.info(f"  {reason}: {data['count']} ({percentage:.1f}%)")
-        
+
         # Per-room breakdown
         self.logger.info("Per-room rejection breakdown:")
         for room_name, room_stats in stats["by_room"].items():
-            room_total = sum(reason_data["count"] for reason_data in room_stats.values())
+            room_total = sum(
+                reason_data["count"] for reason_data in room_stats.values()
+            )
             self.logger.info(f"  {room_name}: {room_total} total rejections")
             for reason, reason_data in room_stats.items():
                 self.logger.info(f"    {reason}: {reason_data['count']}")
@@ -200,13 +210,20 @@ class ThermalAnalyzer:
         # Preprocess data using the dedicated preprocessor
         if self.preprocessor:
             self.logger.info("Using thermal data preprocessor for data preparation")
-            processed_rooms, processed_weather = self.preprocessor.prepare_thermal_analysis_data(
+            (
+                processed_rooms,
+                processed_weather,
+            ) = self.preprocessor.prepare_thermal_analysis_data(
                 room_data, weather_data, relay_data
             )
-            self.logger.info(f"Preprocessor returned {len(processed_rooms)} processed rooms")
+            self.logger.info(
+                f"Preprocessor returned {len(processed_rooms)} processed rooms"
+            )
             # Log sample column info for debugging
             for room_name, room_df in list(processed_rooms.items())[:2]:
-                self.logger.debug(f"Room {room_name} columns after preprocessing: {list(room_df.columns)}")
+                self.logger.debug(
+                    f"Room {room_name} columns after preprocessing: {list(room_df.columns)}"
+                )
         else:
             self.logger.warning("No preprocessor available, using raw data")
             processed_rooms = room_data
@@ -240,7 +257,7 @@ class ThermalAnalyzer:
 
         # Add rejection statistics to results
         results["rejection_statistics"] = self.get_rejection_statistics()
-        
+
         # Log rejection statistics summary
         self._log_rejection_summary()
 
@@ -361,21 +378,23 @@ class ThermalAnalyzer:
 
         # Data should already be preprocessed and merged
         merged_data = room_df
-        
+
         # Validate that we have the required columns
         required_cols = ["room_temp"]
         missing_cols = [col for col in required_cols if col not in merged_data.columns]
         if missing_cols:
             return {"error": f"Missing required columns: {missing_cols}"}
-            
+
         # Ensure temp_diff column exists (should be created by preprocessor)
         if "temp_diff" not in merged_data.columns:
             self.logger.warning("temp_diff column missing, creating with NaN values")
             merged_data["temp_diff"] = pd.Series(index=merged_data.index, dtype=float)
-            
+
         # Ensure other expected columns exist
         if "outdoor_temp" not in merged_data.columns:
-            merged_data["outdoor_temp"] = pd.Series(index=merged_data.index, dtype=float)
+            merged_data["outdoor_temp"] = pd.Series(
+                index=merged_data.index, dtype=float
+            )
         if "heating_on" not in merged_data.columns:
             merged_data["heating_on"] = pd.Series(0, index=merged_data.index)
         if "hour" not in merged_data.columns:
@@ -427,21 +446,24 @@ class ThermalAnalyzer:
 
         # Add sustained heating cycle analysis if heating data is available
         try:
-            if "heating_on" in merged_data.columns and "outdoor_temp" in merged_data.columns:
+            if (
+                "heating_on" in merged_data.columns
+                and "outdoor_temp" in merged_data.columns
+            ):
                 sustained_analysis = self.analyze_sustained_heating_cycles(
                     merged_data["room_temp"],
                     merged_data["outdoor_temp"],
                     merged_data["heating_on"],
                 )
                 results["sustained_heating_analysis"] = sustained_analysis
-                
+
                 # Calculate heating usage from available data
                 heating_pct = (merged_data["heating_on"] == 1).mean() * 100
                 results["heating_usage"] = {
                     "actual_heating_usage_pct": heating_pct,
-                    "heating_data_source": "preprocessed"
+                    "heating_data_source": "preprocessed",
                 }
-                
+
                 # Update basic stats with actual heating usage
                 if "basic_stats" in results:
                     results["basic_stats"]["heating_percentage"] = heating_pct
@@ -1385,7 +1407,9 @@ class ThermalAnalyzer:
                 next_cycle_start = cycles[i + 1]["start_time"]
 
             # Analyze cooling decay with next cycle information
-            decay = self._analyze_heating_cycle_decay(df, cycle, next_cycle_start, room_name)
+            decay = self._analyze_heating_cycle_decay(
+                df, cycle, next_cycle_start, room_name
+            )
             if decay["fit_valid"]:
                 decay_results.append(decay)
                 self.logger.debug(
@@ -1785,7 +1809,8 @@ class ThermalAnalyzer:
                 window_length=window_length,
                 polyorder=2,
                 deriv=1,
-                delta=5.0 / 60.0,  # 5 minutes converted to hours for derivative calculation
+                delta=5.0
+                / 60.0,  # 5 minutes converted to hours for derivative calculation
             )  # delta in hours for 5-minute resampled data
             dt_dt_series = pd.Series(dt_dt, index=temps.index)
 
@@ -1836,7 +1861,11 @@ class ThermalAnalyzer:
         return peak_time, peak_temp
 
     def _analyze_heating_cycle_decay(
-        self, df: pd.DataFrame, cycle: Dict, next_cycle_start: pd.Timestamp = None, room_name: str = "unknown"
+        self,
+        df: pd.DataFrame,
+        cycle: Dict,
+        next_cycle_start: pd.Timestamp = None,
+        room_name: str = "unknown",
     ) -> Dict:
         """
         Analyze the cooling decay phase after a heating cycle.
@@ -1895,7 +1924,9 @@ class ThermalAnalyzer:
         else:
             # No next cycle - use maximum reasonable decay period
             # Extended for underfloor heating systems with high thermal mass
-            max_decay_hours = self.decay_analysis_hours  # Use configured decay analysis period
+            max_decay_hours = (
+                self.decay_analysis_hours
+            )  # Use configured decay analysis period
             decay_end = decay_start + pd.Timedelta(hours=max_decay_hours)
 
             if decay_end > df.index[-1]:
@@ -1932,11 +1963,14 @@ class ThermalAnalyzer:
         decay_duration_hours = (decay_end - decay_start).total_seconds() / 3600
 
         # Relaxed minimum decay duration for better cycle capture
-        if decay_duration_hours < 0.5:  # At least 30 minutes for any meaningful decay analysis
-            self._track_rejection(room_name, "decay_too_short", {
-                "decay_duration_hours": decay_duration_hours,
-                "min_required": 0.5
-            })
+        if (
+            decay_duration_hours < 0.5
+        ):  # At least 30 minutes for any meaningful decay analysis
+            self._track_rejection(
+                room_name,
+                "decay_too_short",
+                {"decay_duration_hours": decay_duration_hours, "min_required": 0.5},
+            )
             return {
                 "fit_valid": False,
                 "reason": "decay_too_short",
@@ -1947,15 +1981,22 @@ class ThermalAnalyzer:
         # Relaxed minimum data points for 5-minute resampled data
         # Accept shorter periods to capture more decay cycles
         min_data_points = max(
-            3, int(decay_duration_hours * 6)  # 6 points per hour minimum (30 min intervals)
+            3,
+            int(
+                decay_duration_hours * 6
+            ),  # 6 points per hour minimum (30 min intervals)
         )
 
         if len(decay_data) < min_data_points:
-            self._track_rejection(room_name, "insufficient_data_points", {
-                "data_points": len(decay_data),
-                "required_points": min_data_points,
-                "decay_duration_hours": decay_duration_hours
-            })
+            self._track_rejection(
+                room_name,
+                "insufficient_data_points",
+                {
+                    "data_points": len(decay_data),
+                    "required_points": min_data_points,
+                    "decay_duration_hours": decay_duration_hours,
+                },
+            )
             return {
                 "fit_valid": False,
                 "reason": "insufficient_data_points",
@@ -1970,7 +2011,9 @@ class ThermalAnalyzer:
 
         # Prepare temperature difference data for exponential fitting
         if "outdoor_temp" in decay_data.columns:
-            decay_data.loc[:, "temp_diff"] = decay_data[temp_col] - decay_data["outdoor_temp"]
+            decay_data.loc[:, "temp_diff"] = (
+                decay_data[temp_col] - decay_data["outdoor_temp"]
+            )
         else:
             # If no outdoor temperature, use absolute room temperature
             decay_data.loc[:, "temp_diff"] = decay_data[temp_col]
@@ -1982,10 +2025,11 @@ class ThermalAnalyzer:
         decay_data = decay_data.dropna(subset=["temp_diff"])
 
         if len(decay_data) < min_data_points:
-            self._track_rejection(room_name, "insufficient_valid_data", {
-                "data_points": len(decay_data),
-                "required_points": min_data_points
-            })
+            self._track_rejection(
+                room_name,
+                "insufficient_valid_data",
+                {"data_points": len(decay_data), "required_points": min_data_points},
+            )
             return {
                 "fit_valid": False,
                 "reason": "insufficient_valid_data",
@@ -2018,12 +2062,16 @@ class ThermalAnalyzer:
             external_heating_ratio = external_heating_periods / len(temp_rate)
 
             if external_heating_ratio > 0.40:
-                self._track_rejection(room_name, "external_heat_gain_detected", {
-                    "external_heating_ratio": external_heating_ratio,
-                    "external_heating_periods": external_heating_periods,
-                    "decay_duration_hours": decay_duration_hours,
-                    "heating_rate_threshold": heating_rate_threshold
-                })
+                self._track_rejection(
+                    room_name,
+                    "external_heat_gain_detected",
+                    {
+                        "external_heating_ratio": external_heating_ratio,
+                        "external_heating_periods": external_heating_periods,
+                        "decay_duration_hours": decay_duration_hours,
+                        "heating_rate_threshold": heating_rate_threshold,
+                    },
+                )
                 return {
                     "fit_valid": False,
                     "reason": "external_heat_gain_detected",
@@ -2058,7 +2106,9 @@ class ThermalAnalyzer:
         # Extremely relaxed thresholds for underfloor heating thermal analysis
         if outdoor_temp_avg < 5.0:  # Winter conditions (< 5°C)
             if cycle_duration_hours < 0.5:  # Very short cycles (< 30 min)
-                min_decay_magnitude = 0.05  # °C - extremely relaxed for short winter cycles
+                min_decay_magnitude = (
+                    0.05  # °C - extremely relaxed for short winter cycles
+                )
             else:
                 min_decay_magnitude = 0.1  # °C - very relaxed for winter
         else:
@@ -2072,12 +2122,16 @@ class ThermalAnalyzer:
                 f"Decay magnitude {decay_magnitude:.2f}°C < {min_decay_magnitude:.2f}°C "
                 f"(cycle duration: {cycle_duration_hours:.1f}h, outdoor: {outdoor_temp_avg:.1f}°C)"
             )
-            self._track_rejection(room_name, "insufficient_decay_magnitude", {
-                "decay_magnitude": decay_magnitude,
-                "min_required": min_decay_magnitude,
-                "outdoor_temp_avg": outdoor_temp_avg,
-                "cycle_duration_hours": cycle_duration_hours
-            })
+            self._track_rejection(
+                room_name,
+                "insufficient_decay_magnitude",
+                {
+                    "decay_magnitude": decay_magnitude,
+                    "min_required": min_decay_magnitude,
+                    "outdoor_temp_avg": outdoor_temp_avg,
+                    "cycle_duration_hours": cycle_duration_hours,
+                },
+            )
             return {
                 "fit_valid": False,
                 "reason": "insufficient_decay_magnitude",
@@ -2107,18 +2161,20 @@ class ThermalAnalyzer:
 
             # Physics-based validation for underfloor heating systems
             # Focus on physical plausibility rather than statistical fit quality
-            
+
             # 1. Check thermal time constant is realistic for underfloor heating
-            tau_valid = TAU_MIN <= tau_fitted <= TAU_MAX  # Hours - realistic range for underfloor systems (3-200h)
-            
+            tau_valid = (
+                TAU_MIN <= tau_fitted <= TAU_MAX
+            )  # Hours - realistic range for underfloor systems (3-200h)
+
             # 2. Check temperature prediction accuracy (more important than R²)
             rmse = np.sqrt(np.mean((temp_diff_values - y_pred) ** 2))
             max_temp_error = np.max(np.abs(temp_diff_values - y_pred))
-            
+
             # 3. Simple validation: just check physics and basic decay existence
             # For underfloor heating, we only care about realistic time constants
             # and that we observe some temperature decay - ignore prediction accuracy
-            
+
             # Combined validation: just physics-based
             fit_valid = tau_valid  # Only check if time constant is realistic (3-200h)
 
@@ -2131,17 +2187,23 @@ class ThermalAnalyzer:
             else:
                 # Simple rejection reason: only invalid time constant matters now
                 reason = "invalid_time_constant"
-                details = {"tau_fitted": tau_fitted, "tau_min": TAU_MIN, "tau_max": TAU_MAX}
-                
-                details.update({
+                details = {
                     "tau_fitted": tau_fitted,
-                    "rmse": rmse,
-                    "max_temp_error": max_temp_error,
-                    "r_squared": r_squared,
-                    "decay_magnitude": decay_magnitude,
-                    "outdoor_temp_avg": outdoor_temp_avg
-                })
-                
+                    "tau_min": TAU_MIN,
+                    "tau_max": TAU_MAX,
+                }
+
+                details.update(
+                    {
+                        "tau_fitted": tau_fitted,
+                        "rmse": rmse,
+                        "max_temp_error": max_temp_error,
+                        "r_squared": r_squared,
+                        "decay_magnitude": decay_magnitude,
+                        "outdoor_temp_avg": outdoor_temp_avg,
+                    }
+                )
+
                 self._track_rejection(room_name, reason, details)
                 self.logger.debug(
                     f"DECAY FIT REJECTED ({reason}): τ={tau_fitted:.1f}h, R²={r_squared:.3f}, "
@@ -2179,11 +2241,15 @@ class ThermalAnalyzer:
             }
 
         except Exception as e:
-            self._track_rejection(room_name, "fitting_failed", {
-                "error": str(e),
-                "decay_duration_hours": decay_duration_hours,
-                "decay_magnitude": decay_magnitude
-            })
+            self._track_rejection(
+                room_name,
+                "fitting_failed",
+                {
+                    "error": str(e),
+                    "decay_duration_hours": decay_duration_hours,
+                    "decay_magnitude": decay_magnitude,
+                },
+            )
             self.logger.debug(f"Decay fitting failed: {e}")
             return {"fit_valid": False, "reason": "fitting_failed"}
 
@@ -2631,11 +2697,15 @@ class ThermalAnalyzer:
             room_name = getattr(self, "_current_room_name", "unknown")
             # Get room power from settings or fallback
             if room_name in self.room_power_ratings_kw:
-                heating_power_w = self.room_power_ratings_kw[room_name] * 1000  # Convert kW to W
+                heating_power_w = (
+                    self.room_power_ratings_kw[room_name] * 1000
+                )  # Convert kW to W
             else:
                 # Default fallback power rating (2kW for most room heaters)
                 heating_power_w = 2000  # watts
-                self.logger.warning(f"No power rating configured for room {room_name}, using default 2000W")
+                self.logger.warning(
+                    f"No power rating configured for room {room_name}, using default 2000W"
+                )
 
             # The rate of temperature change (dT/dt) is approximately P_heating / C
             # So, C = P_heating / (dT/dt)
@@ -3026,7 +3096,7 @@ class ThermalAnalyzer:
     ) -> Dict[str, Any]:
         """Analyze thermal coupling between rooms."""
         self.logger.info(f"Starting room coupling analysis with {len(room_data)} rooms")
-        
+
         if len(room_data) < 2:
             return {"warning": "Need at least 2 rooms for coupling analysis"}
 
@@ -3053,8 +3123,10 @@ class ThermalAnalyzer:
                 else:
                     common_index = common_index.intersection(room_df.index)
             else:
-                self.logger.warning(f"No temperature column found for room {room_name}. Available columns: {list(room_df.columns)}")
-        
+                self.logger.warning(
+                    f"No temperature column found for room {room_name}. Available columns: {list(room_df.columns)}"
+                )
+
         self.logger.info(f"Found temperature data for {len(room_temps)} rooms")
         if common_index is not None:
             self.logger.info(f"Common index has {len(common_index)} timestamps")
