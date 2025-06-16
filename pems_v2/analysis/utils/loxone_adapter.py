@@ -386,7 +386,7 @@ class LoxoneFieldAdapter:
         Returns:
             Power rating in kW (default 1.0 kW if not found)
         """
-        from config.settings import PEMSSettings
+        from pems_v2.config.settings import PEMSSettings
 
         try:
             settings = PEMSSettings()

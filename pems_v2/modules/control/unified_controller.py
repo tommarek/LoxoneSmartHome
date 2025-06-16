@@ -41,10 +41,10 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from .heating_controller import (HeatingCommand, HeatingController,
-                                 HeatingStatus)
 from .growatt_controller import (GrowattCommand, GrowattController,
                                  GrowattStatus)
+from .heating_controller import (HeatingCommand, HeatingController,
+                                 HeatingStatus)
 
 
 class SystemMode(Enum):
@@ -220,9 +220,9 @@ class UnifiedController:
 
             # Execute Growatt commands
             if self.growatt_controller and (
-                schedule.battery_first_enabled is not None or
-                schedule.ac_charge_enabled is not None or
-                schedule.export_enabled is not None
+                schedule.battery_first_enabled is not None
+                or schedule.ac_charge_enabled is not None
+                or schedule.export_enabled is not None
             ):
                 growatt_success = await self._execute_growatt_schedule(schedule)
                 results["growatt"] = growatt_success
@@ -295,14 +295,10 @@ class UnifiedController:
                 growatt_status = await self.growatt_controller.get_status()
 
             # Calculate total power
-            total_power = self._calculate_total_power(
-                heating_status, growatt_status
-            )
+            total_power = self._calculate_total_power(heating_status, growatt_status)
 
             # Assess safety status
-            safety_status = self._assess_safety_status(
-                heating_status, growatt_status
-            )
+            safety_status = self._assess_safety_status(heating_status, growatt_status)
 
             # Create comprehensive status
             status = SystemStatus(
@@ -452,21 +448,21 @@ class UnifiedController:
         try:
             # Create mock schedules with single values for immediate execution
             import pandas as pd
-            
-            battery_first_schedule = pd.Series([schedule.battery_first_enabled or False])
+
+            battery_first_schedule = pd.Series(
+                [schedule.battery_first_enabled or False]
+            )
             ac_charge_schedule = pd.Series([schedule.ac_charge_enabled or False])
             export_schedule = pd.Series([schedule.export_enabled or False])
-            
+
             # Execute via Growatt controller
             results = await self.growatt_controller.execute_optimization_schedule(
-                battery_first_schedule,
-                ac_charge_schedule, 
-                export_schedule
+                battery_first_schedule, ac_charge_schedule, export_schedule
             )
-            
+
             # Return True if all modes executed successfully
             return all(results.values())
-            
+
         except Exception as e:
             self.logger.error(f"Failed to execute Growatt schedule: {e}")
             return False
@@ -593,9 +589,7 @@ class UnifiedController:
                 safety["growatt_safe"] = False
 
         # Check total power
-        total_power = self._calculate_total_power(
-            heating_status, growatt_status
-        )
+        total_power = self._calculate_total_power(heating_status, growatt_status)
         if total_power > self.max_total_power:
             safety["power_safe"] = False
 

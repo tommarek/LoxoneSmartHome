@@ -121,7 +121,9 @@ class LoxoneSmartHome:
                 logger.error(f"Failed to initialize PEMS v2 Controller: {e}")
                 self.pems_controller = None
         elif self.settings.pems_enabled and not PEMSController:
-            logger.warning("PEMS v2 enabled but not available - check PEMS v2 installation")
+            logger.warning(
+                "PEMS v2 enabled but not available - check PEMS v2 installation"
+            )
 
     async def start_modules(self) -> None:
         """Start all enabled modules."""
@@ -161,9 +163,9 @@ class LoxoneSmartHome:
         """Run PEMS v2 controller."""
         if not self.pems_controller:
             return
-            
+
         logger = logging.getLogger(__name__)
-        
+
         try:
             await self.pems_controller.start()
             await self.shutdown_event.wait()

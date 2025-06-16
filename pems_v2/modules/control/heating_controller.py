@@ -51,7 +51,8 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
-from config.settings import MQTTSettings, PEMSSettings, ThermalSettings
+
+from pems_v2.config.settings import MQTTSettings, PEMSSettings, ThermalSettings
 
 # Note: In production, these would import from the main project's MQTT client
 # from utils.async_mqtt_client import AsyncMQTTClient

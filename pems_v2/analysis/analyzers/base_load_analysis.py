@@ -483,7 +483,7 @@ class BaseLoadAnalyzer:
                 # Assume it's a status column, estimate power based on room
                 room_name = col.split("_")[0] if "_" in col else "unknown"
                 try:
-                    from config.settings import PEMSSettings
+                    from pems_v2.config.settings import PEMSSettings
 
                     settings = PEMSSettings()
                     room_power_kw = settings.get_room_power(room_name)
@@ -534,7 +534,7 @@ class BaseLoadAnalyzer:
 
                 # Use actual room power rating from configuration
                 try:
-                    from config.settings import PEMSSettings
+                    from pems_v2.config.settings import PEMSSettings
 
                     settings = PEMSSettings()
                     room_power_kw = settings.get_room_power(room_name)

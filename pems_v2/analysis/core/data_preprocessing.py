@@ -13,8 +13,9 @@ import pandas as pd
 # Import Loxone adapter for field standardization
 from analysis.utils.loxone_adapter import (LoxoneDataIntegrator,
                                            LoxoneFieldAdapter)
-from config.settings import PEMSSettings
 from scipy import stats
+
+from pems_v2.config.settings import PEMSSettings
 
 
 class DataValidator:

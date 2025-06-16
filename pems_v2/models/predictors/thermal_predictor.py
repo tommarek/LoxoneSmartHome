@@ -19,7 +19,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from config.settings import ThermalModelSettings
 from scipy import optimize
 from scipy.integrate import odeint
 from sklearn.ensemble import RandomForestRegressor
@@ -27,6 +26,8 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import cross_val_score
 from sklearn.preprocessing import StandardScaler
+
+from pems_v2.config.settings import ThermalModelSettings
 
 from ..base import BasePredictor, PerformanceMetrics, PredictionResult
 

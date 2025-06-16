@@ -82,8 +82,9 @@ from typing import Any, Dict, Optional
 
 import pandas as pd
 import pytz
-from config.settings import PEMSSettings as Settings
 from influxdb_client import InfluxDBClient
+
+from pems_v2.config.settings import PEMSSettings as Settings
 
 
 class DataExtractor:
@@ -153,7 +154,7 @@ class DataExtractor:
             ValueError: If settings contain invalid configuration
 
         Example:
-            from config.settings import PEMSSettings
+            from pems_v2.config.settings import PEMSSettings
             settings = PEMSSettings()
             extractor = DataExtractor(settings)
 

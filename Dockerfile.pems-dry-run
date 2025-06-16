@@ -1,0 +1,52 @@
+# PEMS v2 Dry Run Service Dockerfile
+FROM python:3.11-slim
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    g++ \
+    git \
+    curl \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create app directory
+WORKDIR /app
+
+# Copy requirements and install Python dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Install additional dependencies for PEMS v2
+RUN pip install --no-cache-dir \
+    cvxpy \
+    psutil \
+    dataclasses \
+    typing-extensions
+
+# Create data and log directories
+RUN mkdir -p /data/pems_dry_run /logs/pems_dry_run
+
+# Copy application code
+COPY pems_v2/ ./pems_v2/
+COPY loxone_smart_home/ ./loxone_smart_home/
+COPY pems_dry_run_service.py .
+
+# Create non-root user
+RUN useradd -m -u 1000 pems && \
+    chown -R pems:pems /app /data /logs
+USER pems
+
+# Environment variables
+ENV PYTHONPATH="/app/pems_v2:/app"
+ENV PYTHONUNBUFFERED=1
+
+# Health check
+HEALTHCHECK --interval=5m --timeout=30s --start-period=2m --retries=3 \
+  CMD python3 -c "import json, os; \
+      file_path='/data/pems_dry_run/service_metrics.json'; \
+      exit(0 if os.path.exists(file_path) and json.load(open(file_path))['success_rate'] > 0.5 else 1)" \
+  || exit 1
+
+# Default command
+CMD ["python3", "pems_dry_run_service.py"]

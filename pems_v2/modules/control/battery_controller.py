@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, Optional
 
-from config.settings import BatterySettings, MQTTSettings
+from pems_v2.config.settings import BatterySettings, MQTTSettings
 
 
 class ChargingMode(Enum):

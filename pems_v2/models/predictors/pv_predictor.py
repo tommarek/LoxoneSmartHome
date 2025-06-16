@@ -18,9 +18,10 @@ import numpy as np
 import pandas as pd
 import pvlib
 import xgboost as xgb
-from config.settings import PVModelSettings
 from sklearn.linear_model import QuantileRegressor
 from sklearn.multioutput import MultiOutputRegressor
+
+from pems_v2.config.settings import PVModelSettings
 
 from ..base import (BasePredictor, ModelMetadata, PerformanceMetrics,
                     PredictionResult)

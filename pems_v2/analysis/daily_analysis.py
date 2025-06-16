@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from analysis.pipelines.comprehensive_analysis import ComprehensiveAnalyzer
-from config.settings import PEMSSettings as Settings
+
+from pems_v2.config.settings import PEMSSettings as Settings
 
 
 class DailyAnalysisWorkflow:

@@ -14,8 +14,9 @@ from typing import Dict, Optional
 
 import numpy as np
 import pandas as pd
-from config.settings import PEMSSettings
 from sklearn.preprocessing import StandardScaler
+
+from pems_v2.config.settings import PEMSSettings
 
 
 class FeatureEngineer:

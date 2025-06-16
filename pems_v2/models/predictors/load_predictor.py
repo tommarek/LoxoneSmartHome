@@ -21,7 +21,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from config.settings import LoadModelSettings
 from scipy import signal, stats
 from scipy.fft import fft, fftfreq
 from sklearn.cluster import KMeans
@@ -31,6 +30,8 @@ from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score
 from sklearn.preprocessing import StandardScaler
+
+from pems_v2.config.settings import LoadModelSettings
 
 from ..base import BasePredictor, PerformanceMetrics, PredictionResult
 

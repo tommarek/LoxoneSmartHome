@@ -1,0 +1,133 @@
+version: '3.8'
+
+services:
+  pems-dry-run:
+    build:
+      context: .
+      dockerfile: Dockerfile.pems-dry-run
+    container_name: pems-dry-run-service
+    restart: unless-stopped
+    
+    environment:
+      # PEMS Configuration
+      - PEMS_CYCLE_INTERVAL_MINUTES=15    # Optimization cycle interval
+      - PEMS_HORIZON_HOURS=6              # Optimization horizon
+      - PEMS_MAX_SOLVE_TIME=30            # Maximum solver time (seconds)
+      - PEMS_DATA_RETENTION_HOURS=168     # Data retention (1 week)
+      
+      # Paths (mapped to volumes)
+      - PEMS_DATA_DIR=/data/pems_dry_run
+      - PEMS_LOG_DIR=/logs/pems_dry_run
+      
+      # Python configuration
+      - PYTHONPATH=/app/pems_v2:/app
+      - PYTHONUNBUFFERED=1
+    
+    volumes:
+      # Data persistence
+      - pems_data:/data/pems_dry_run
+      - pems_logs:/logs/pems_dry_run
+      
+      # Source code (for development - remove in production)
+      - ./pems_v2:/app/pems_v2:ro
+      - ./pems_dry_run_service.py:/app/pems_dry_run_service.py:ro
+      - ./loxone_smart_home:/app/loxone_smart_home:ro
+    
+    networks:
+      - pems-network
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import json; data=json.load(open('/data/pems_dry_run/service_metrics.json')); exit(0 if data['success_rate'] > 0.5 else 1)"]
+      interval: 5m
+      timeout: 30s
+      retries: 3
+      start_period: 2m
+    
+    labels:
+      - "traefik.enable=false"  # Not exposed via web
+      - "com.docker.compose.project=loxone-smart-home"
+      - "com.docker.compose.service=pems-dry-run"
+
+  # Optional: Data visualization service
+  pems-dashboard:
+    image: grafana/grafana:latest
+    container_name: pems-dashboard
+    restart: unless-stopped
+    
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_INSTALL_PLUGINS=grafana-simple-json-datasource
+    
+    ports:
+      - "3000:3000"
+    
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    
+    networks:
+      - pems-network
+    
+    depends_on:
+      - pems-dry-run
+    
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pems-dashboard.rule=Host(`pems-dashboard.local`)"
+      - "traefik.http.routers.pems-dashboard.entrypoints=web"
+
+  # Optional: Log aggregation
+  pems-logs:
+    image: datalust/seq:latest
+    container_name: pems-logs
+    restart: unless-stopped
+    
+    environment:
+      - ACCEPT_EULA=Y
+    
+    ports:
+      - "5341:80"
+    
+    volumes:
+      - seq_data:/data
+      - pems_logs:/logs/pems_dry_run:ro
+    
+    networks:
+      - pems-network
+
+volumes:
+  pems_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/pems_dry_run
+  
+  pems_logs:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./logs/pems_dry_run
+  
+  grafana_data:
+    driver: local
+  
+  seq_data:
+    driver: local
+
+networks:
+  pems-network:
+    driver: bridge

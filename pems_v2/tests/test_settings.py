@@ -8,9 +8,11 @@ import tempfile
 from pathlib import Path
 
 import pytest
-from config.settings import (BatterySettings, PEMSSettings, RoomSetpoint,
-                             SystemSettings, ThermalSettings)
 from pydantic import ValidationError
+
+from pems_v2.config.settings import (BatterySettings, PEMSSettings,
+                                     RoomSetpoint, SystemSettings,
+                                     ThermalSettings)
 
 
 def test_pems_settings_with_mock_config(pems_test_settings):
@@ -143,7 +145,7 @@ def test_thermal_settings_get_target_temp():
     """Test ThermalSettings.get_target_temp method."""
 
     # Create test thermal settings
-    from config.settings import RoomSetpoint, ThermalSettings
+    from pems_v2.config.settings import RoomSetpoint, ThermalSettings
 
     thermal_settings = ThermalSettings(
         comfort_band_celsius=0.5,

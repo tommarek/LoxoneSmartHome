@@ -162,7 +162,7 @@ def pems_test_settings(mock_system_config, mock_env_config, monkeypatch):
     monkeypatch.setenv("PEMS_CONFIG_PATH", str(mock_system_config))
 
     # Import here to ensure environment variables are set
-    from config.settings import PEMSSettings
+    from pems_v2.config.settings import PEMSSettings
 
     return PEMSSettings()
 
