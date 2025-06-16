@@ -57,6 +57,123 @@
 
 ---
 
+## 🔥 High Priority: Enhanced Thermal Analysis & Data Management
+
+### 🎯 New Priority Tasks (2025-06-16)
+
+#### Task 1: Model Persistence & Size Optimization
+**Goal:** Enable saving/loading of trained thermal models with size management
+**Files:** `pems_v2/models/predictors/thermal_predictor.py`, `pems_v2/models/base.py`
+
+**Requirements:**
+- Add `save_model()` and `load_model()` methods to thermal predictor
+- Implement model size checks before saving (warn if >50MB, refuse if >200MB)
+- Support incremental model updates without full retraining
+- Add model versioning and metadata tracking
+- Implement model compression for large parameter sets
+
+```python
+async def save_model(self, path: str, compress: bool = True) -> bool:
+    """Save trained model with size optimization."""
+    model_size = self._estimate_model_size()
+    if model_size > 200_000_000:  # 200MB limit
+        self.logger.error(f"Model too large: {model_size/1e6:.1f}MB > 200MB limit")
+        return False
+    elif model_size > 50_000_000:  # 50MB warning
+        self.logger.warning(f"Large model: {model_size/1e6:.1f}MB")
+    
+    # Save with optional compression
+    if compress and model_size > 10_000_000:  # Compress if >10MB
+        return self._save_compressed(path)
+    else:
+        return self._save_standard(path)
+```
+
+#### Task 2: Improve Room Thermal Coupling Analysis  
+**Goal:** Fix unrealistic inter-room correlations in thermal analysis
+**Files:** `pems_v2/analysis/analyzers/thermal_analysis.py`
+
+**Problem:** Current room coupling analysis shows high correlations between rooms that don't make physical sense (e.g., bathroom correlating with living room).
+
+**Solutions:**
+- Add physical adjacency matrix to `system_config.json`
+- Weight thermal coupling by shared walls/surfaces
+- Implement distance-based correlation decay
+- Add validation checks for unrealistic correlations
+- Separate heating system coupling from thermal coupling
+
+```python
+def _validate_room_coupling(self, correlations: Dict[str, float]) -> Dict[str, float]:
+    """Validate room thermal coupling against physical layout."""
+    adjacency = self.config.get('room_adjacency', {})
+    validated_correlations = {}
+    
+    for room_pair, correlation in correlations.items():
+        room1, room2 = room_pair.split(' + ')
+        
+        # Check if rooms are physically adjacent
+        is_adjacent = self._check_adjacency(room1, room2, adjacency)
+        max_expected = 0.7 if is_adjacent else 0.3
+        
+        if correlation > max_expected:
+            self.logger.warning(
+                f"Suspicious correlation {room_pair}: {correlation:.3f} > {max_expected:.3f}"
+            )
+            validated_correlations[room_pair] = min(correlation, max_expected)
+        else:
+            validated_correlations[room_pair] = correlation
+    
+    return validated_correlations
+```
+
+#### Task 3: Intelligent Data Caching & Conditional Extraction
+**Goal:** Avoid unnecessary InfluxDB queries by implementing smart data caching
+**Files:** `pems_v2/analysis/core/data_extraction.py`, `pems_v2/analysis/core/unified_data_extractor.py`
+
+**Requirements:**
+- Cache extracted data with timestamps and data range metadata
+- Add `--use-cache` and `--force-refresh` flags to analysis scripts
+- Implement incremental data updates (only fetch new data since last extraction)
+- Add data freshness checks and cache validation
+- Support partial cache updates for specific data types
+
+```python
+class CachedDataExtractor(DataExtractor):
+    """Data extractor with intelligent caching."""
+    
+    def __init__(self, cache_dir: str = "data/cache"):
+        super().__init__()
+        self.cache_dir = Path(cache_dir)
+        self.cache_metadata = self._load_cache_metadata()
+    
+    async def extract_with_cache(
+        self, 
+        data_type: str, 
+        start_date: datetime, 
+        end_date: datetime,
+        force_refresh: bool = False,
+        max_cache_age_hours: int = 24
+    ) -> pd.DataFrame:
+        """Extract data with intelligent caching."""
+        
+        # Check cache validity
+        if not force_refresh:
+            cached_data = self._check_cache(data_type, start_date, end_date, max_cache_age_hours)
+            if cached_data is not None:
+                self.logger.info(f"Using cached {data_type} data")
+                return cached_data
+        
+        # Extract fresh data
+        self.logger.info(f"Extracting fresh {data_type} data from InfluxDB...")
+        fresh_data = await super().extract_data(data_type, start_date, end_date)
+        
+        # Cache the result
+        self._cache_data(data_type, fresh_data, start_date, end_date)
+        return fresh_data
+```
+
+---
+
 ## 🔥 High Priority: Debug RC Estimation with Production Data
 
 **Problem:** Despite having sophisticated heating cycle analysis, some rooms still produce unrealistic RC parameters in production.
@@ -64,7 +181,7 @@
 **Root Causes to Investigate:**
 1. Data quality issues (sensor noise, stuck values, missing data)
 2. Incorrect power ratings in `system_config.json` for specific rooms
-3. Multi-zone thermal coupling not properly accounted for
+3. **Multi-zone thermal coupling not properly accounted for** ⬅️ **ADDRESSED ABOVE**
 4. Solar gains contaminating heating cycle analysis
 5. Underfloor heating systems with very long time constants
 
