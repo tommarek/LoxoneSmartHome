@@ -22,7 +22,8 @@ from analysis.core.data_preprocessing import DataPreprocessor
 from analysis.preprocessing.thermal_data_preprocessor import \
     ThermalDataPreprocessor
 from analysis.reports.report_generator import ReportGenerator
-from config.settings import PEMSSettings as Settings
+
+from pems_v2.config.settings import PEMSSettings as Settings
 
 
 class ComprehensiveAnalyzer:
@@ -455,14 +456,18 @@ class ComprehensiveAnalyzer:
                 weather_correlations = {}
 
                 if "pv" in self.processed_data:
+                    self.logger.info("🔍 Analyzing PV-weather correlations...")
                     weather_correlations[
                         "pv"
                     ] = await self._analyze_weather_pv_correlation()
+                    self.logger.info("✅ PV-weather correlation completed")
 
                 if "consumption" in self.processed_data:
+                    self.logger.info("🔍 Analyzing consumption-weather correlations...")
                     weather_correlations[
                         "consumption"
                     ] = await self._analyze_weather_consumption_correlation()
+                    self.logger.info("✅ Consumption-weather correlation completed")
 
                 self.analysis_results["weather_correlations"] = weather_correlations
                 self.logger.info("Weather correlation analysis completed")

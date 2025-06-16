@@ -22,6 +22,13 @@ from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
 
+# PEMS v2 imports with graceful degradation
+try:
+    from modules.pems_controller import PEMSController, PEMSControllerSettings
+except ImportError:
+    PEMSController = None
+    PEMSControllerSettings = None
+
 
 class LoxoneSmartHome:
     """Main application class that manages all modules."""
@@ -41,6 +48,7 @@ class LoxoneSmartHome:
         self.mqtt_bridge: Optional[MQTTBridge] = None
         self.weather_scraper: Optional[WeatherScraper] = None
         self.growatt_controller: Optional[GrowattController] = None
+        self.pems_controller: Optional[PEMSController] = None
 
         # Shutdown event
         self.shutdown_event = asyncio.Event()
@@ -99,6 +107,22 @@ class LoxoneSmartHome:
             )
             logger.info("Growatt Controller module initialized")
 
+        # PEMS v2 Controller
+        if self.settings.pems_enabled and PEMSController:
+            try:
+                # Use the existing PEMS config directly
+                pems_settings = self.settings.pems
+                self.pems_controller = PEMSController(
+                    self.mqtt_client, self.influxdb_client, pems_settings
+                )
+                await self.pems_controller.initialize()
+                logger.info("PEMS v2 Controller module initialized")
+            except Exception as e:
+                logger.error(f"Failed to initialize PEMS v2 Controller: {e}")
+                self.pems_controller = None
+        elif self.settings.pems_enabled and not PEMSController:
+            logger.warning("PEMS v2 enabled but not available - check PEMS v2 installation")
+
     async def start_modules(self) -> None:
         """Start all enabled modules."""
         logger = logging.getLogger(__name__)
@@ -126,6 +150,29 @@ class LoxoneSmartHome:
             task = asyncio.create_task(self.growatt_controller.run(self.shutdown_event))
             self.modules.append(task)
             logger.info("Growatt Controller started")
+
+        # Start PEMS v2 Controller
+        if self.pems_controller:
+            task = asyncio.create_task(self.run_pems_controller())
+            self.modules.append(task)
+            logger.info("PEMS v2 Controller started")
+
+    async def run_pems_controller(self) -> None:
+        """Run PEMS v2 controller."""
+        if not self.pems_controller:
+            return
+            
+        logger = logging.getLogger(__name__)
+        
+        try:
+            await self.pems_controller.start()
+            await self.shutdown_event.wait()
+        except asyncio.CancelledError:
+            logger.info("PEMS controller cancelled")
+        except Exception as e:
+            logger.error(f"PEMS controller error: {e}", exc_info=True)
+        finally:
+            await self.pems_controller.stop()
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""

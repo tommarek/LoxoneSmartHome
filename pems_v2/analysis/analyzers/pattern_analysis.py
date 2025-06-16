@@ -1033,47 +1033,62 @@ class RelayPatternAnalyzer:
         standardized_relay_data = self.loxone_integrator.prepare_relay_analysis_data(
             relay_data
         )
+        self.logger.info("✅ Relay data standardization completed")
 
         results = {}
 
         # Peak demand analysis
+        self.logger.info("🔍 Starting peak demand pattern analysis...")
         results["peak_demand"] = self._analyze_peak_demand_patterns(
             standardized_relay_data
         )
+        self.logger.info("✅ Peak demand analysis completed")
 
         # Relay coordination opportunities
+        self.logger.info("🔍 Starting relay coordination analysis...")
         results["coordination"] = self._analyze_relay_coordination(
             standardized_relay_data
         )
+        self.logger.info("✅ Relay coordination analysis completed")
 
         # Switching pattern analysis
+        self.logger.info("🔍 Starting switching pattern analysis...")
         results["switching_patterns"] = self._analyze_switching_patterns(
             standardized_relay_data
         )
+        self.logger.info("✅ Switching pattern analysis completed")
 
         # Weather correlation analysis
         if weather_data is not None and not weather_data.empty:
+            self.logger.info("🔍 Starting weather correlation analysis...")
             results["weather_correlation"] = self._analyze_weather_correlation(
                 standardized_relay_data, weather_data
             )
+            self.logger.info("✅ Weather correlation analysis completed")
 
         # Economic optimization opportunities
         if price_data is not None and not price_data.empty:
+            self.logger.info("🔍 Starting economic optimization analysis...")
             results["economic_optimization"] = self._analyze_economic_patterns(
                 standardized_relay_data, price_data
             )
+            self.logger.info("✅ Economic optimization analysis completed")
 
         # Load distribution analysis
+        self.logger.info("🔍 Starting load distribution analysis...")
         results["load_distribution"] = self._analyze_load_distribution(
             standardized_relay_data
         )
+        self.logger.info("✅ Load distribution analysis completed")
 
+        self.logger.info("🎉 Relay pattern analysis completed successfully!")
         return results
 
     def _analyze_peak_demand_patterns(
         self, relay_data: Dict[str, pd.DataFrame]
     ) -> Dict[str, Any]:
         """Analyze peak demand patterns and reduction opportunities."""
+        self.logger.debug("  → Calculating total system load...")
         # Calculate total system load
         total_load = self._calculate_total_system_load(relay_data)
 
@@ -1144,15 +1159,18 @@ class RelayPatternAnalyzer:
         self, relay_data: Dict[str, pd.DataFrame]
     ) -> Dict[str, Any]:
         """Analyze opportunities for relay coordination."""
+        self.logger.debug("  → Creating relay states dataframe...")
         # Create correlation matrix
         relay_states_df = self._create_relay_states_dataframe(relay_data)
 
         if relay_states_df.empty:
             return {"warning": "Insufficient data for coordination analysis"}
 
+        self.logger.debug(f"  → Computing correlation matrix for {len(relay_states_df.columns)} rooms...")
         correlation_matrix = relay_states_df.corr()
 
         # Find high correlation pairs (coordination candidates)
+        self.logger.debug("  → Finding coordination opportunities...")
         coordination_opportunities = []
         for i in range(len(correlation_matrix.columns)):
             for j in range(i + 1, len(correlation_matrix.columns)):
@@ -1330,6 +1348,7 @@ class RelayPatternAnalyzer:
             return {"warning": "No relay data for switching analysis"}
 
         switching_analysis = {}
+        self.logger.debug(f"  → Processing switching patterns for {len(relay_data)} rooms...")
 
         for room_name, relay_df in relay_data.items():
             if relay_df.empty or "relay_state" not in relay_df.columns:
@@ -1366,6 +1385,7 @@ class RelayPatternAnalyzer:
         if weather_data.empty:
             return {"warning": "No weather data for correlation analysis"}
 
+        self.logger.debug(f"  → Computing weather correlations with {len(weather_data)} weather records...")
         correlations = {}
 
         # Calculate total heating power

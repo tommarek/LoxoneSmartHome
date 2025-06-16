@@ -1,6 +1,6 @@
 """Configuration settings for Loxone Smart Home using Pydantic."""
 
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -167,6 +167,58 @@ class GrowattConfig(BaseModel):
         return v
 
 
+class PEMSConfig(BaseModel):
+    """PEMS v2 configuration."""
+    
+    enabled: bool = Field(default=False, description="Enable PEMS v2 controller")
+    
+    # Optimization intervals
+    optimization_interval_minutes: int = Field(
+        default=30, description="Interval between optimization cycles"
+    )
+    prediction_horizon_hours: int = Field(
+        default=24, description="Prediction horizon for optimization"
+    )
+    
+    # Model paths (relative to PEMS v2 directory)
+    pv_model_path: str = Field(
+        default="models/saved/pv_predictor.pkl",
+        description="Path to PV prediction model"
+    )
+    thermal_model_path: str = Field(
+        default="models/saved/thermal_predictor.pkl", 
+        description="Path to thermal prediction model"
+    )
+    load_model_path: str = Field(
+        default="models/saved/load_predictor.pkl",
+        description="Path to load prediction model" 
+    )
+    
+    # Control settings
+    simulation_mode: bool = Field(
+        default=True, description="Run in simulation mode (no actual control)"
+    )
+    safety_checks: bool = Field(
+        default=True, description="Enable safety constraint checking"
+    )
+    emergency_stop_temperature: float = Field(
+        default=15.0, description="Emergency stop if room temp below this"
+    )
+    
+    # System mode
+    system_mode: str = Field(
+        default="NORMAL", description="System operating mode"
+    )
+    
+    # Performance monitoring
+    max_solve_time_seconds: float = Field(
+        default=2.0, description="Maximum allowed optimization time"
+    )
+    enable_performance_monitoring: bool = Field(
+        default=True, description="Enable performance metrics collection"
+    )
+
+
 class Settings(BaseSettings):
     """Main settings class using Pydantic Settings."""
 
@@ -190,6 +242,7 @@ class Settings(BaseSettings):
     mqtt_bridge_enabled: bool = True
     weather_scraper_enabled: bool = True
     growatt_controller_enabled: bool = True
+    pems_enabled: bool = False
 
     # Service configurations
     mqtt_broker: str = "mqtt"
@@ -285,4 +338,11 @@ class Settings(BaseSettings):
         return GrowattConfig(
             device_serial=self.growatt_device_serial,
             simulation_mode=self.growatt_simulation_mode,
+        )
+
+    @property
+    def pems(self) -> PEMSConfig:
+        """Get PEMS v2 configuration."""
+        return PEMSConfig(
+            enabled=self.pems_enabled
         )

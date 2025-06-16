@@ -26,8 +26,16 @@ class OptimizationResult:
     success: bool
     objective_value: float
     heating_schedule: Dict[str, pd.Series]
-    battery_schedule: pd.Series
-    grid_schedule: pd.Series
+    
+    # Growatt control schedules (binary mode decisions)
+    battery_first_schedule: pd.Series
+    ac_charge_schedule: pd.Series
+    export_schedule: pd.Series
+    
+    # Power flow schedules (continuous values)
+    battery_schedule: pd.Series  # Actual battery power (W)
+    grid_schedule: pd.Series     # Net grid power (W, positive = import)
+    
     temperature_forecast: Dict[str, pd.Series]
     cost_breakdown: Dict[str, float]
     solve_time_seconds: float
@@ -130,9 +138,19 @@ class EnergyOptimizer:
                     n_steps, boolean=True, name=f"heat_{room}"
                 )
 
-            battery_power = cp.Variable(
-                n_steps, name="battery_power"
-            )  # Positive = charge
+            # Growatt inverter control variables (discrete modes)
+            battery_first_mode = cp.Variable(
+                n_steps, boolean=True, name="battery_first_mode"
+            )
+            ac_charge_mode = cp.Variable(
+                n_steps, boolean=True, name="ac_charge_mode"
+            )
+            export_enabled = cp.Variable(
+                n_steps, boolean=True, name="export_enabled"
+            )
+            
+            # Power flows (continuous variables derived from modes)
+            battery_power = cp.Variable(n_steps, name="battery_power")  # Actual battery power
             grid_import = cp.Variable(n_steps, name="grid_import")
             grid_export = cp.Variable(n_steps, name="grid_export")
 
@@ -157,7 +175,8 @@ class EnergyOptimizer:
 
             # Objective function with violation penalties
             objective = self._build_objective(
-                problem, heating_vars, battery_power, grid_import, grid_export, n_steps
+                problem, heating_vars, battery_power, grid_import, grid_export, 
+                battery_first_mode, ac_charge_mode, export_enabled, n_steps
             )
 
             # Add comfort violation penalties to objective
@@ -180,9 +199,12 @@ class EnergyOptimizer:
                 )
             )
 
-            # Battery constraints
+            # Growatt inverter constraints
             constraints.extend(
-                self._battery_constraints(problem, battery_power, n_steps)
+                self._growatt_constraints(
+                    problem, battery_first_mode, ac_charge_mode, export_enabled, 
+                    battery_power, grid_import, grid_export, n_steps
+                )
             )
 
             # Thermal constraints with soft violations
@@ -235,6 +257,9 @@ class EnergyOptimizer:
                 result = self._extract_solution(
                     problem,
                     heating_vars,
+                    battery_first_mode,
+                    ac_charge_mode,
+                    export_enabled,
                     battery_power,
                     grid_import,
                     grid_export,
@@ -265,7 +290,8 @@ class EnergyOptimizer:
             return result
 
     def _build_objective(
-        self, problem, heating_vars, battery_power, grid_import, grid_export, n_steps
+        self, problem, heating_vars, battery_power, grid_import, grid_export,
+        battery_first_mode, ac_charge_mode, export_enabled, n_steps
     ):
         """Build the multi-objective function."""
 
@@ -295,13 +321,33 @@ class EnergyOptimizer:
             for t in range(n_steps - 1):
                 comfort_penalty += cp.abs(heating_var[t + 1] - heating_var[t])
 
+        # 4. Growatt mode switching penalties
+        mode_switching_penalty = 0
+        for t in range(n_steps - 1):
+            # Penalize frequent mode switches (causes wear on relays)
+            mode_switching_penalty += cp.abs(battery_first_mode[t + 1] - battery_first_mode[t])
+            mode_switching_penalty += cp.abs(ac_charge_mode[t + 1] - ac_charge_mode[t])
+            mode_switching_penalty += cp.abs(export_enabled[t + 1] - export_enabled[t])
+
+        # 5. Price-based mode incentives
+        mode_price_incentive = 0
+        for t in range(n_steps):
+            if t < len(problem.price_forecast):
+                price = problem.price_forecast.iloc[t]
+                # Incentivize AC charging when prices are low
+                if price < 50:  # Low price threshold (EUR/MWh)
+                    mode_price_incentive -= 10 * ac_charge_mode[t]  # Reward AC charging
+                # Incentivize export when prices are high  
+                if price > 100:  # High price threshold (EUR/MWh)
+                    mode_price_incentive -= 20 * export_enabled[t]  # Reward export
+
         # Combine objectives
         objective = (
             problem.cost_weight * energy_cost
             - problem.self_consumption_weight * self_consumption * 0.1
-            + problem.comfort_weight  # Scale to similar magnitude
-            * comfort_penalty
-            * 10  # Penalty for switching
+            + problem.comfort_weight * comfort_penalty * 10  # Heating switching penalty
+            + 0.05 * mode_switching_penalty  # Growatt mode switching penalty
+            + mode_price_incentive  # Price-based mode incentives
         )
 
         return objective
@@ -335,9 +381,11 @@ class EnergyOptimizer:
             heating_load = 0
             for room, heating_var in heating_vars.items():
                 if room in self.rooms:
-                    room_power = (
-                        self.rooms[room].get("power_kw", 1.0) * 1000
-                    )  # Convert to W
+                    # Handle both dict and float room configurations
+                    if isinstance(self.rooms[room], dict):
+                        room_power = self.rooms[room].get("power_kw", 1.0) * 1000
+                    else:
+                        room_power = float(self.rooms[room]) * 1000  # Assume kW, convert to W
                     heating_load += heating_var[t] * room_power
 
             consumption = base_load + heating_load + grid_export[t]
@@ -374,6 +422,71 @@ class EnergyOptimizer:
 
         return constraints
 
+    def _growatt_constraints(
+        self, problem, battery_first_mode, ac_charge_mode, export_enabled,
+        battery_power, grid_import, grid_export, n_steps
+    ):
+        """Growatt inverter operational constraints."""
+        
+        constraints = []
+        dt_hours = problem.time_step_minutes / 60
+        
+        # Battery specifications (from Growatt system)
+        battery_capacity_kwh = problem.battery_capacity_kwh
+        max_charge_power_kw = 5.0  # Growatt AC charging limit
+        max_discharge_power_kw = 5.0  # Growatt discharge limit
+        
+        # SOC tracking with Growatt-specific behavior
+        soc = problem.initial_battery_soc
+        for t in range(n_steps):
+            # Battery power depends on operating modes
+            # AC charge mode: force battery charging from grid
+            # Battery first mode: prioritize battery usage over grid
+            # Export enabled: allow battery discharge for export
+            
+            # AC charging constraint: when AC charge is on, battery charges at max rate
+            ac_charge_power = ac_charge_mode[t] * max_charge_power_kw * 1000  # Convert to W
+            
+            # Battery first mode affects power flow but doesn't directly set battery power
+            # Export mode allows discharge when price is high
+            
+            # Actual battery power constraints
+            constraints.append(battery_power[t] >= -max_discharge_power_kw * 1000)  # Max discharge
+            constraints.append(battery_power[t] <= max_charge_power_kw * 1000)     # Max charge
+            
+            # When AC charging is enabled, force battery to charge
+            constraints.append(battery_power[t] >= ac_charge_power - (1 - ac_charge_mode[t]) * 1e6)
+            
+            # SOC evolution
+            energy_change_wh = battery_power[t] * dt_hours
+            soc_change = energy_change_wh / (battery_capacity_kwh * 1000)
+            soc = soc + soc_change
+            
+            # SOC limits (Growatt protection limits)
+            constraints.append(soc >= 0.1)  # 10% minimum
+            constraints.append(soc <= 0.9)  # 90% maximum
+        
+        # Mode interaction constraints
+        for t in range(n_steps):
+            # Can't have AC charge and export simultaneously (safety)
+            constraints.append(ac_charge_mode[t] + export_enabled[t] <= 1)
+            
+            # Battery first mode can coexist with AC charge (typical night charging)
+            # No additional constraints needed for this combination
+        
+        # Grid export constraints
+        max_export_kw = 10.0  # Growatt export limit
+        for t in range(n_steps):
+            # Export only when enabled
+            constraints.append(grid_export[t] <= export_enabled[t] * max_export_kw * 1000)
+            constraints.append(grid_export[t] >= 0)
+            
+            # Grid import constraints
+            constraints.append(grid_import[t] >= 0)
+            constraints.append(grid_import[t] <= 20000)  # 20kW grid connection limit
+        
+        return constraints
+
     def _thermal_constraints(
         self, problem, heating_vars, temp_vars, n_steps, comfort_violations=None
     ):
@@ -395,7 +508,11 @@ class EnergyOptimizer:
             C = self.thermal_params.get(room, {}).get("C", 1e7)  # J/K
             tau = R * C / 3600  # Time constant in hours
 
-            room_power = self.rooms[room].get("power_kw", 1.0) * 1000  # W
+            # Handle both dict and float room configurations
+            if isinstance(self.rooms[room], dict):
+                room_power = self.rooms[room].get("power_kw", 1.0) * 1000  # W
+            else:
+                room_power = float(self.rooms[room]) * 1000  # Assume kW, convert to W
 
             for t in range(n_steps):
                 # Outdoor temperature
@@ -457,6 +574,9 @@ class EnergyOptimizer:
         self,
         problem,
         heating_vars,
+        battery_first_mode,
+        ac_charge_mode,
+        export_enabled,
         battery_power,
         grid_import,
         grid_export,
@@ -482,12 +602,23 @@ class EnergyOptimizer:
                 ]
                 heating_schedule[room] = pd.Series(schedule, index=time_index)
 
-        # Extract battery schedule
+        # Extract Growatt control schedules
+        battery_first_schedule = pd.Series(
+            [int(round(battery_first_mode[t].value)) for t in range(n_steps)], index=time_index
+        )
+        ac_charge_schedule = pd.Series(
+            [int(round(ac_charge_mode[t].value)) for t in range(n_steps)], index=time_index
+        )
+        export_schedule = pd.Series(
+            [int(round(export_enabled[t].value)) for t in range(n_steps)], index=time_index
+        )
+
+        # Extract battery power schedule (actual power flow)
         battery_schedule = pd.Series(
             [battery_power[t].value for t in range(n_steps)], index=time_index
         )
 
-        # Extract grid schedule
+        # Extract grid schedule (net import/export)
         grid_schedule = pd.Series(
             [grid_import[t].value - grid_export[t].value for t in range(n_steps)],
             index=time_index,
@@ -515,6 +646,9 @@ class EnergyOptimizer:
             success=True,
             objective_value=objective_value,
             heating_schedule=heating_schedule,
+            battery_first_schedule=battery_first_schedule,
+            ac_charge_schedule=ac_charge_schedule,
+            export_schedule=export_schedule,
             battery_schedule=battery_schedule,
             grid_schedule=grid_schedule,
             temperature_forecast=temperature_forecast,
@@ -541,6 +675,11 @@ class EnergyOptimizer:
             heat_on = 1 if initial_temp < setpoint else 0
             heating_schedule[room] = pd.Series([heat_on] * n_steps, index=time_index)
 
+        # Safe Growatt modes - no aggressive charging/exporting
+        battery_first_schedule = pd.Series([0] * n_steps, index=time_index)  # Load-first mode
+        ac_charge_schedule = pd.Series([0] * n_steps, index=time_index)      # No AC charging
+        export_schedule = pd.Series([0] * n_steps, index=time_index)         # Export disabled
+        
         # No battery activity
         battery_schedule = pd.Series([0.0] * n_steps, index=time_index)
 
@@ -557,6 +696,9 @@ class EnergyOptimizer:
             success=False,
             objective_value=float("inf"),
             heating_schedule=heating_schedule,
+            battery_first_schedule=battery_first_schedule,
+            ac_charge_schedule=ac_charge_schedule,
+            export_schedule=export_schedule,
             battery_schedule=battery_schedule,
             grid_schedule=grid_schedule,
             temperature_forecast=temperature_forecast,

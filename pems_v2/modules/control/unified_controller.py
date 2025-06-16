@@ -41,13 +41,10 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
-from .battery_controller import (BatteryCommand, BatteryController,
-                                 BatteryStatus, ChargingMode)
 from .heating_controller import (HeatingCommand, HeatingController,
                                  HeatingStatus)
-from .inverter_controller import (ExportMode, InverterCommand,
-                                  InverterController, InverterMode,
-                                  InverterStatus)
+from .growatt_controller import (GrowattCommand, GrowattController,
+                                 GrowattStatus)
 
 
 class SystemMode(Enum):
@@ -69,8 +66,7 @@ class SystemStatus:
     Attributes:
         mode: Current system operating mode
         heating_status: Status from all heating zones
-        battery_status: Battery system status
-        inverter_status: Inverter system status
+        growatt_status: Growatt inverter/battery system status
         total_power_kw: Total system power consumption
         safety_status: System safety indicators
         last_updated: Timestamp of last status update
@@ -79,8 +75,7 @@ class SystemStatus:
 
     mode: SystemMode
     heating_status: Dict[str, HeatingStatus]
-    battery_status: Optional[BatteryStatus]
-    inverter_status: Optional[InverterStatus]
+    growatt_status: Optional[GrowattStatus]
     total_power_kw: float
     safety_status: Dict[str, bool]
     last_updated: datetime
@@ -94,21 +89,17 @@ class ControlSchedule:
 
     Attributes:
         heating_schedule: Room heating states and temperatures
-        battery_mode: Target battery charging mode
-        battery_power_kw: Target battery charging power
-        inverter_mode: Target inverter operating mode
-        export_enabled: Whether grid export should be enabled
-        export_limit_kw: Maximum export power limit
+        battery_first_enabled: Enable battery-first mode
+        ac_charge_enabled: Enable AC charging from grid
+        export_enabled: Enable grid export
         duration_minutes: Duration for this schedule
         priority: Schedule priority level
     """
 
     heating_schedule: Dict[str, Tuple[bool, Optional[float]]]  # room -> (state, temp)
-    battery_mode: Optional[ChargingMode] = None
-    battery_power_kw: Optional[float] = None
-    inverter_mode: Optional[InverterMode] = None
+    battery_first_enabled: Optional[bool] = None
+    ac_charge_enabled: Optional[bool] = None
     export_enabled: Optional[bool] = None
-    export_limit_kw: Optional[float] = None
     duration_minutes: Optional[int] = None
     priority: int = 0
 
@@ -164,8 +155,7 @@ class UnifiedController:
 
         # Initialize subsystem controllers
         self.heating_controller = None
-        self.battery_controller = None
-        self.inverter_controller = None
+        self.growatt_controller = None
 
         # Control state
         self.current_mode = SystemMode.NORMAL
@@ -188,19 +178,13 @@ class UnifiedController:
                 await self.heating_controller.initialize()
                 self.logger.info("Heating controller initialized")
 
-            # Initialize battery controller
-            battery_config = self.config.get("battery", {})
-            if battery_config:
-                self.battery_controller = BatteryController(battery_config)
-                await self.battery_controller.initialize()
-                self.logger.info("Battery controller initialized")
-
-            # Initialize inverter controller
-            inverter_config = self.config.get("inverter", {})
-            if inverter_config:
-                self.inverter_controller = InverterController(inverter_config)
-                await self.inverter_controller.initialize()
-                self.logger.info("Inverter controller initialized")
+            # Initialize Growatt controller
+            growatt_config = self.config.get("growatt", {})
+            mqtt_client = self.config.get("mqtt_client")
+            if growatt_config and mqtt_client:
+                self.growatt_controller = GrowattController(mqtt_client, growatt_config)
+                await self.growatt_controller.initialize()
+                self.logger.info("Growatt controller initialized")
 
             self.logger.info("Unified controller fully initialized")
 
@@ -234,17 +218,15 @@ class UnifiedController:
                 results["heating"] = all(heating_results.values())
                 self.logger.debug(f"Heating execution: {heating_results}")
 
-            # Execute battery commands
-            if schedule.battery_mode and self.battery_controller:
-                battery_success = await self._execute_battery_schedule(schedule)
-                results["battery"] = battery_success
-                self.logger.debug(f"Battery execution: {battery_success}")
-
-            # Execute inverter commands
-            if schedule.inverter_mode and self.inverter_controller:
-                inverter_success = await self._execute_inverter_schedule(schedule)
-                results["inverter"] = inverter_success
-                self.logger.debug(f"Inverter execution: {inverter_success}")
+            # Execute Growatt commands
+            if self.growatt_controller and (
+                schedule.battery_first_enabled is not None or
+                schedule.ac_charge_enabled is not None or
+                schedule.export_enabled is not None
+            ):
+                growatt_success = await self._execute_growatt_schedule(schedule)
+                results["growatt"] = growatt_success
+                self.logger.debug(f"Growatt execution: {growatt_success}")
 
             # Store successful schedule
             if all(results.values()):
@@ -308,30 +290,25 @@ class UnifiedController:
             if self.heating_controller:
                 heating_status = await self.heating_controller.get_all_status()
 
-            battery_status = None
-            if self.battery_controller:
-                battery_status = await self.battery_controller.get_status()
-
-            inverter_status = None
-            if self.inverter_controller:
-                inverter_status = await self.inverter_controller.get_status()
+            growatt_status = None
+            if self.growatt_controller:
+                growatt_status = await self.growatt_controller.get_status()
 
             # Calculate total power
             total_power = self._calculate_total_power(
-                heating_status, battery_status, inverter_status
+                heating_status, growatt_status
             )
 
             # Assess safety status
             safety_status = self._assess_safety_status(
-                heating_status, battery_status, inverter_status
+                heating_status, growatt_status
             )
 
             # Create comprehensive status
             status = SystemStatus(
                 mode=self.current_mode,
                 heating_status=heating_status,
-                battery_status=battery_status,
-                inverter_status=inverter_status,
+                growatt_status=growatt_status,
                 total_power_kw=total_power,
                 safety_status=safety_status,
                 last_updated=datetime.now(),
@@ -366,20 +343,12 @@ class UnifiedController:
                     f"Heating emergency stop: {'SUCCESS' if heating_result else 'FAILED'}"
                 )
 
-            # Stop battery charging
-            if self.battery_controller:
-                battery_result = await self.battery_controller.emergency_stop()
-                results.append(battery_result)
+            # Stop Growatt operations
+            if self.growatt_controller:
+                growatt_result = await self.growatt_controller.emergency_stop()
+                results.append(growatt_result)
                 self.logger.info(
-                    f"Battery emergency stop: {'SUCCESS' if battery_result else 'FAILED'}"
-                )
-
-            # Set inverter to safe mode
-            if self.inverter_controller:
-                inverter_result = await self.inverter_controller.emergency_safe_mode()
-                results.append(inverter_result)
-                self.logger.info(
-                    f"Inverter emergency mode: {'SUCCESS' if inverter_result else 'FAILED'}"
+                    f"Growatt emergency stop: {'SUCCESS' if growatt_result else 'FAILED'}"
                 )
 
             # Update system mode
@@ -446,11 +415,8 @@ class UnifiedController:
                 "room_count": len(self.heating_controller.rooms),
             }
 
-        if self.battery_controller:
-            limits["battery"] = self.battery_controller.get_charging_limits()
-
-        if self.inverter_controller:
-            limits["inverter"] = self.inverter_controller.get_system_limits()
+        if self.growatt_controller:
+            limits["growatt"] = self.growatt_controller.get_system_limits()
 
         return limits
 
@@ -481,40 +447,28 @@ class UnifiedController:
 
         return results
 
-    async def _execute_battery_schedule(self, schedule: ControlSchedule) -> bool:
-        """Execute battery portion of schedule."""
+    async def _execute_growatt_schedule(self, schedule: ControlSchedule) -> bool:
+        """Execute Growatt portion of schedule."""
         try:
-            return await self.battery_controller.set_charging_mode(
-                schedule.battery_mode,
-                schedule.battery_power_kw,
-                schedule.duration_minutes,
+            # Create mock schedules with single values for immediate execution
+            import pandas as pd
+            
+            battery_first_schedule = pd.Series([schedule.battery_first_enabled or False])
+            ac_charge_schedule = pd.Series([schedule.ac_charge_enabled or False])
+            export_schedule = pd.Series([schedule.export_enabled or False])
+            
+            # Execute via Growatt controller
+            results = await self.growatt_controller.execute_optimization_schedule(
+                battery_first_schedule,
+                ac_charge_schedule, 
+                export_schedule
             )
+            
+            # Return True if all modes executed successfully
+            return all(results.values())
+            
         except Exception as e:
-            self.logger.error(f"Failed to execute battery command: {e}")
-            return False
-
-    async def _execute_inverter_schedule(self, schedule: ControlSchedule) -> bool:
-        """Execute inverter portion of schedule."""
-        try:
-            # Set inverter mode
-            mode_success = await self.inverter_controller.set_mode(
-                schedule.inverter_mode, schedule.duration_minutes
-            )
-
-            # Set export settings if specified
-            export_success = True
-            if schedule.export_enabled is not None:
-                if schedule.export_enabled:
-                    export_success = await self.inverter_controller.enable_export(
-                        schedule.export_limit_kw
-                    )
-                else:
-                    export_success = await self.inverter_controller.disable_export()
-
-            return mode_success and export_success
-
-        except Exception as e:
-            self.logger.error(f"Failed to execute inverter command: {e}")
+            self.logger.error(f"Failed to execute Growatt schedule: {e}")
             return False
 
     def _validate_schedule(self, schedule: ControlSchedule) -> bool:
@@ -533,9 +487,9 @@ class UnifiedController:
                     room_power = self.heating_controller.rooms[room].get("power_kw", 0)
                     estimated_power += room_power
 
-            # Battery charging power
-            if schedule.battery_power_kw and schedule.battery_mode == ChargingMode.GRID:
-                estimated_power += schedule.battery_power_kw
+            # AC charging power (when enabled, assume 5kW charging)
+            if schedule.ac_charge_enabled:
+                estimated_power += 5.0  # Growatt AC charging power
 
             # Check against limits
             if estimated_power > self.max_total_power:
@@ -563,8 +517,8 @@ class UnifiedController:
 
                 return ControlSchedule(
                     heating_schedule=heating_schedule,
-                    battery_mode=ChargingMode.OFF,
-                    inverter_mode=InverterMode.LOAD_FIRST,
+                    battery_first_enabled=False,
+                    ac_charge_enabled=False,
                     export_enabled=False,
                 )
 
@@ -572,9 +526,8 @@ class UnifiedController:
                 # Economy: Minimal heating, battery priority
                 return ControlSchedule(
                     heating_schedule={},  # No heating changes
-                    battery_mode=ChargingMode.GRID,
-                    battery_power_kw=5.0,
-                    inverter_mode=InverterMode.BATTERY_FIRST,
+                    battery_first_enabled=True,
+                    ac_charge_enabled=True,
                     export_enabled=False,
                 )
 
@@ -582,8 +535,8 @@ class UnifiedController:
                 # Export: Maximum export revenue
                 return ControlSchedule(
                     heating_schedule={},  # No heating changes
-                    battery_mode=ChargingMode.PV_ONLY,
-                    inverter_mode=InverterMode.GRID_FIRST,
+                    battery_first_enabled=False,
+                    ac_charge_enabled=False,
                     export_enabled=True,
                 )
 
@@ -598,8 +551,7 @@ class UnifiedController:
     def _calculate_total_power(
         self,
         heating_status: Dict[str, HeatingStatus],
-        battery_status: Optional[BatteryStatus],
-        inverter_status: Optional[InverterStatus],
+        growatt_status: Optional[GrowattStatus],
     ) -> float:
         """Calculate total system power consumption."""
         total_power = 0.0
@@ -608,27 +560,21 @@ class UnifiedController:
         for status in heating_status.values():
             total_power += status.power_w / 1000.0  # Convert to kW
 
-        # Battery power (positive = charging from grid)
-        if battery_status and battery_status.power_kw > 0:
-            total_power += battery_status.power_kw
-
-        # Grid import (positive = import from grid)
-        if inverter_status and inverter_status.export_power_kw < 0:
-            total_power += abs(inverter_status.export_power_kw)
+        # Growatt power (from grid import)
+        if growatt_status and growatt_status.grid_power_w > 0:
+            total_power += growatt_status.grid_power_w / 1000.0  # Convert to kW
 
         return total_power
 
     def _assess_safety_status(
         self,
         heating_status: Dict[str, HeatingStatus],
-        battery_status: Optional[BatteryStatus],
-        inverter_status: Optional[InverterStatus],
+        growatt_status: Optional[GrowattStatus],
     ) -> Dict[str, bool]:
         """Assess overall system safety status."""
         safety = {
             "heating_safe": True,
-            "battery_safe": True,
-            "inverter_safe": True,
+            "growatt_safe": True,
             "power_safe": True,
             "emergency_clear": not self.emergency_active,
         }
@@ -638,23 +584,17 @@ class UnifiedController:
             if status.power_w > 10000:  # 10kW per room seems excessive
                 safety["heating_safe"] = False
 
-        # Check battery safety
-        if battery_status:
-            if not (10 <= battery_status.soc_percent <= 95):
-                safety["battery_safe"] = False
-            if not (-5 <= battery_status.temperature_c <= 45):
-                safety["battery_safe"] = False
-
-        # Check inverter safety
-        if inverter_status:
-            if not (45 <= inverter_status.grid_frequency_hz <= 55):
-                safety["inverter_safe"] = False
-            if inverter_status.temperature_c > 65:
-                safety["inverter_safe"] = False
+        # Check Growatt safety
+        if growatt_status:
+            if not (0.1 <= growatt_status.battery_soc <= 0.9):
+                safety["growatt_safe"] = False
+            # Check for unsafe mode combinations
+            if growatt_status.ac_charge_enabled and growatt_status.export_enabled:
+                safety["growatt_safe"] = False
 
         # Check total power
         total_power = self._calculate_total_power(
-            heating_status, battery_status, inverter_status
+            heating_status, growatt_status
         )
         if total_power > self.max_total_power:
             safety["power_safe"] = False
@@ -672,8 +612,8 @@ class UnifiedController:
 
 def create_unified_controller(
     heating_config: Dict[str, Any],
-    battery_config: Dict[str, Any],
-    inverter_config: Dict[str, Any],
+    growatt_config: Dict[str, Any],
+    mqtt_client,
     system_config: Dict[str, Any] = None,
 ) -> UnifiedController:
     """
@@ -681,8 +621,8 @@ def create_unified_controller(
 
     Args:
         heating_config: Heating system configuration
-        battery_config: Battery system configuration
-        inverter_config: Inverter system configuration
+        growatt_config: Growatt system configuration
+        mqtt_client: MQTT client for communication
         system_config: Overall system configuration
 
     Returns:
@@ -694,8 +634,8 @@ def create_unified_controller(
 
     config = {
         "heating": heating_config,
-        "battery": battery_config,
-        "inverter": inverter_config,
+        "growatt": growatt_config,
+        "mqtt_client": mqtt_client,
         "system": system_config,
     }
 
