@@ -21,4 +21,21 @@ dist/
 *.spec
 # Installer logs
 pip-log.txt
-pip-delete-this-directory.txt           
+pip-delete-this-directory.txt
+
+# Coverage reports
+.coverage
+htmlcov/
+
+# Runtime data and logs
+data/
+logs/
+
+# Analysis outputs (large files)
+*.parquet
+*.pkl
+*.joblib
+
+# Temporary files
+*.tmp
+*.temp           
