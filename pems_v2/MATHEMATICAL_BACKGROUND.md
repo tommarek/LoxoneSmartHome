@@ -1,24 +1,33 @@
 # Mathematical Background for PEMS v2
 
-This document provides the theoretical foundations and mathematical models used in the Predictive Energy Management System (PEMS) v2.
+This document provides the comprehensive theoretical foundations and mathematical models used in the Predictive Energy Management System (PEMS) v2.
 
 ## Table of Contents
 1. [Thermal Dynamics](#thermal-dynamics)
    - [RC Model](#rc-model)
-   - [Time Constant](#time-constant)
-   - [Heat Transfer Equations](#heat-transfer-equations)
+   - [Heating Cycle Analysis](#heating-cycle-analysis)
+   - [Multi-Zone Coupling](#multi-zone-coupling)
+   - [Parameter Estimation](#parameter-estimation)
 2. [Solar PV Modeling](#solar-pv-modeling)
    - [Irradiance Models](#irradiance-models)
    - [Temperature Effects](#temperature-effects)
+   - [Power Output Prediction](#power-output-prediction)
 3. [Load Forecasting](#load-forecasting)
    - [Time Series Analysis](#time-series-analysis)
    - [Machine Learning Models](#machine-learning-models)
+   - [Feature Engineering](#feature-engineering)
 4. [Optimization Theory](#optimization-theory)
-   - [Linear Programming](#linear-programming)
-   - [Dynamic Programming](#dynamic-programming)
+   - [Model Predictive Control](#model-predictive-control)
+   - [Mixed-Integer Programming](#mixed-integer-programming)
+   - [Multi-Objective Optimization](#multi-objective-optimization)
 5. [Battery Management](#battery-management)
    - [State of Charge](#state-of-charge)
+   - [Power Flow Constraints](#power-flow-constraints)
    - [Degradation Models](#degradation-models)
+6. [Control Theory](#control-theory)
+   - [State-Space Representation](#state-space-representation)
+   - [Feedback Control](#feedback-control)
+   - [Constraint Handling](#constraint-handling)
 
 ---
 
@@ -26,161 +35,202 @@ This document provides the theoretical foundations and mathematical models used 
 
 ### RC Model
 
-The thermal behavior of a room is modeled using an electrical RC (Resistance-Capacitance) circuit analogy:
+The thermal behavior of a room is modeled using an electrical RC (Resistance-Capacitance) circuit analogy. This first-order model captures the essential dynamics while remaining computationally tractable for real-time control.
+
+#### Fundamental Equation
+
+The heat balance equation for a single room:
 
 ```
-Q̇ = (T_outdoor - T_room) / R + P_heating
-C × dT_room/dt = Q̇
+C × dT_room/dt = (T_outdoor - T_room)/R + P_heating + Q_solar + Q_internal
 ```
 
 Where:
-- **Q̇**: Heat flow rate (W)
-- **R**: Thermal resistance (K/W)
-- **C**: Thermal capacitance (J/K)
+- **C**: Thermal capacitance (J/K) - ability to store thermal energy
+- **R**: Thermal resistance (K/W) - resistance to heat flow
 - **T_room**: Room temperature (°C)
 - **T_outdoor**: Outdoor temperature (°C)
 - **P_heating**: Heating power input (W)
+- **Q_solar**: Solar heat gains (W)
+- **Q_internal**: Internal heat gains from occupants and equipment (W)
 
-### Time Constant
+#### Time Constant
 
-The time constant (τ) is a fundamental parameter describing how quickly a room loses heat:
+The time constant τ = R × C characterizes the thermal response:
 
-#### Definition
 ```
 τ = R × C
 ```
 
-The time constant represents the time it takes for the temperature difference to decay to **1/e (≈37%)** of its initial value.
+Physical interpretation:
+- **τ < 10 hours**: Poor insulation, rapid temperature changes
+- **τ = 20-40 hours**: Average residential building
+- **τ > 50 hours**: Excellent insulation, slow thermal response
 
-#### Temperature Decay Equation
-After heating stops, the room temperature follows an exponential decay:
+#### Solution Forms
+
+**Heating Phase** (constant power input):
+```
+T(t) = T_outdoor + R × P_heating × (1 - e^(-t/τ)) + (T_initial - T_outdoor) × e^(-t/τ)
+```
+
+**Cooling Phase** (no heating):
+```
+T(t) = T_outdoor + (T_initial - T_outdoor) × e^(-t/τ)
+```
+
+### Heating Cycle Analysis
+
+PEMS v2 uses individual heating cycles as controlled experiments to estimate RC parameters accurately.
+
+#### Cycle Detection
+
+A heating cycle consists of:
+1. **Heating Phase**: Relay turns ON, temperature rises
+2. **Cooling Phase**: Relay turns OFF, temperature decays
+
+Detection algorithm:
+```python
+heating_changes = df['heating_on'].diff()
+heating_starts = df[heating_changes == 1].index
+heating_ends = df[heating_changes == -1].index
+```
+
+Filtering criteria:
+- Minimum duration: 10 minutes (avoid transients)
+- Maximum duration: 4 hours (avoid multi-cycle events)
+- Minimum temperature rise: 0.5°C (ensure measurable response)
+
+#### Decay Analysis
+
+Post-heating temperature decay follows exponential behavior:
 
 ```
-ΔT(t) = ΔT₀ × e^(-t/τ)
+T(t) = T_outdoor + (T_peak - T_outdoor) × e^(-t/τ)
+```
+
+Linearized form for regression:
+```
+ln[(T(t) - T_outdoor)/(T_peak - T_outdoor)] = -t/τ
+```
+
+Robust fitting procedure:
+1. Extract decay period (heating OFF until return to baseline)
+2. Remove outliers using Median Absolute Deviation
+3. Apply weighted least squares (recent points weighted higher)
+4. Validate with R² > 0.7 threshold
+
+#### Rise Analysis
+
+During heating, temperature rise rate reveals thermal capacitance:
+
+```
+dT/dt = P_heating/C - (T_room - T_outdoor)/(R × C)
+```
+
+At heating start (T_room ≈ T_outdoor):
+```
+(dT/dt)_initial ≈ P_heating/C
+```
+
+Therefore:
+```
+C = P_heating / (dT/dt)_initial
+```
+
+Implementation:
+1. Extract first 10 minutes of heating (after 2-minute lag)
+2. Linear regression on temperature vs. time
+3. Slope gives dT/dt for capacitance calculation
+
+### Multi-Zone Coupling
+
+Real buildings exhibit thermal coupling between adjacent rooms, requiring a multi-zone model.
+
+#### Coupled RC Network
+
+For n rooms, the system becomes:
+
+```
+C_i × dT_i/dt = Σ_j[(T_j - T_i)/R_ij] + (T_out - T_i)/R_i,out + P_i + Q_i
+```
+
+Matrix form:
+```
+C × dT/dt = -G × T + B × u + d
 ```
 
 Where:
-- **ΔT(t)**: Temperature difference at time t (°C)
-- **ΔT₀**: Initial temperature difference (°C)
-- **τ**: Time constant (hours)
-- **e**: Euler's number (≈2.718)
+- **C**: Diagonal capacitance matrix (n×n)
+- **G**: Conductance matrix, G_ij = 1/R_ij
+- **T**: Temperature vector (n×1)
+- **B**: Input matrix for heating powers
+- **u**: Control input vector (heating powers)
+- **d**: Disturbance vector (outdoor temp influence + solar gains)
 
-#### Physical Interpretation
-- **Small τ (5-10 hours)**: Poor insulation, rapid heat loss
-- **Medium τ (20-40 hours)**: Average insulation
-- **Large τ (50-100 hours)**: Excellent insulation, slow heat loss
-
-#### Practical Example
-For a room with τ = 20 hours:
-- After 20 hours: 37% of initial temperature difference remains
-- After 40 hours: 14% remains (e^-2)
-- After 60 hours: 5% remains (e^-3)
-
-### Heat Transfer Equations
-
-#### Conduction
-Heat flow through walls, windows, and other building elements:
+#### Conductance Matrix Structure
 
 ```
-Q̇_cond = U × A × (T_out - T_in)
+G = [
+  g_11  -g_12  -g_13  ...
+  -g_21  g_22  -g_23  ...
+  -g_31  -g_32  g_33  ...
+  ...
+]
 ```
 
 Where:
-- **U**: Overall heat transfer coefficient (W/m²K)
-- **A**: Surface area (m²)
+- Diagonal: g_ii = Σ_j(1/R_ij) + 1/R_i,out (total conductance)
+- Off-diagonal: g_ij = -1/R_ij (coupling conductance)
 
-#### Convection
-Heat transfer due to air movement:
+#### Eigenvalue Analysis
 
-```
-Q̇_conv = h × A × (T_surface - T_air)
-```
-
-Where:
-- **h**: Convection coefficient (W/m²K)
-
-#### Radiation
-Solar gains through windows:
+System eigenvalues determine thermal modes:
 
 ```
-Q̇_solar = A_window × SHGC × I_solar × cos(θ)
+det(G - λC) = 0
 ```
 
-Where:
-- **SHGC**: Solar Heat Gain Coefficient
-- **I_solar**: Solar irradiance (W/m²)
-- **θ**: Angle of incidence
-
-### Room Coupling
-
-Real buildings have thermal coupling between adjacent rooms. The multi-zone RC model accounts for these interactions:
-
-#### Multi-Zone RC Model
-
-For a building with n rooms, the thermal network becomes:
-
+Time constants of thermal modes:
 ```
-C_i × dT_i/dt = Σ(T_j - T_i)/R_ij + (T_out - T_i)/R_i + P_heating_i + Q̇_solar_i
+τ_k = 1/λ_k
 ```
 
-Where:
-- **i, j**: Room indices
-- **R_ij**: Thermal resistance between rooms i and j (K/W)
-- **R_i**: Thermal resistance from room i to outside (K/W)
+Typical mode interpretation:
+- **Fast modes** (τ < 5h): Individual room responses
+- **Medium modes** (τ = 10-30h): Floor-level dynamics
+- **Slow mode** (τ > 50h): Whole-building response
 
-#### Coupling Matrix
+### Parameter Estimation
 
-The system can be written in matrix form:
+#### Physics-Based Constraints
+
+RC parameters must satisfy physical bounds:
+
+```python
+R_MIN = 0.008  # K/W (very poor insulation)
+R_MAX = 0.5    # K/W (excellent insulation)
+C_MIN = 2e6    # J/K (light construction)
+C_MAX = 100e6  # J/K (heavy construction)
+TAU_MIN = 3    # hours (minimum time constant)
+TAU_MAX = 350  # hours (maximum time constant)
+```
+
+#### Confidence Scoring
+
+Parameter confidence based on:
 
 ```
-C × dT/dt = -G × T + P + Q_external
+confidence = w_1 × (n_cycles/n_target) + w_2 × avg_R² + w_3 × night_ratio + w_4 × quality_score
 ```
 
 Where:
-- **C**: Diagonal capacitance matrix
-- **G**: Conductance matrix (G_ij = 1/R_ij)
-- **T**: Temperature vector
-- **P**: Heating power vector
-- **Q_external**: External heat gains
+- **n_cycles**: Number of valid heating cycles analyzed
+- **avg_R²**: Average goodness of fit
+- **night_ratio**: Fraction of nighttime cycles (no solar interference)
+- **quality_score**: Data quality metrics (no stuck sensors, stable outdoor temp)
 
-#### Steady-State Solution
-
-At equilibrium (dT/dt = 0):
-
-```
-T_steady = G^(-1) × (P + Q_external)
-```
-
-#### Thermal Coupling Coefficient
-
-The strength of coupling between rooms i and j:
-
-```
-k_ij = 1/(R_ij × √(C_i × C_j))
-```
-
-Values:
-- **k > 0.1**: Strong coupling (open doors, thin walls)
-- **0.01 < k < 0.1**: Moderate coupling (normal walls)
-- **k < 0.01**: Weak coupling (insulated walls, different floors)
-
-#### Dynamic Response
-
-The coupled system has multiple time constants (eigenvalues of G×C^(-1)):
-
-```
-τ_mode = -1/λ_mode
-```
-
-- **Fast modes**: Individual room responses
-- **Slow modes**: Whole-building thermal response
-
-#### Identification Strategy
-
-1. **Individual Analysis**: Estimate single-room RC parameters
-2. **Cross-Correlation**: Identify coupled rooms from temperature correlations
-3. **Multi-Zone Fitting**: Simultaneously fit coupled RC network
-4. **Validation**: Compare predicted vs. actual inter-room heat flows
+Weights: w_1=0.4, w_2=0.3, w_3=0.15, w_4=0.15
 
 ---
 
@@ -188,50 +238,122 @@ The coupled system has multiple time constants (eigenvalues of G×C^(-1)):
 
 ### Irradiance Models
 
-#### Clear Sky Model
-The theoretical maximum solar irradiance:
+#### Solar Position
+
+Solar angles calculation:
 
 ```
-I_clear = I_0 × (1 + 0.033 × cos(360×n/365)) × cos(θ_z)
+δ = 23.45° × sin(360° × (284 + n)/365)  # Declination
+h = 15° × (TST - 12)                     # Hour angle
+α = arcsin(sin(δ)sin(φ) + cos(δ)cos(φ)cos(h))  # Elevation
 ```
 
 Where:
-- **I_0**: Solar constant (1367 W/m²)
+- **δ**: Solar declination angle
 - **n**: Day of year
-- **θ_z**: Solar zenith angle
+- **h**: Hour angle
+- **TST**: True Solar Time
+- **φ**: Latitude
+- **α**: Solar elevation angle
 
-#### Diffuse Irradiance
-For cloudy conditions:
+#### Clear Sky Irradiance
+
+Direct normal irradiance:
 
 ```
-I_diffuse = I_global × (1 - k_t)^1.5
+I_DN = I_0 × τ_atm^(1/sin(α))
 ```
 
 Where:
-- **k_t**: Clearness index (0-1)
+- **I_0**: Extraterrestrial radiation (1367 W/m²)
+- **τ_atm**: Atmospheric transmittance (0.75 typical)
+
+Global horizontal irradiance:
+
+```
+I_GHI = I_DN × sin(α) + I_diffuse
+```
+
+#### Cloud Cover Effects
+
+Clearness index model:
+
+```
+k_t = I_measured / I_clear_sky
+```
+
+Diffuse fraction correlation (Erbs et al.):
+```
+k_d = {
+  1.0 - 0.09×k_t                    for k_t ≤ 0.22
+  0.951 - 0.1604×k_t + 4.388×k_t²   for 0.22 < k_t ≤ 0.8
+  0.165                              for k_t > 0.8
+}
+```
 
 ### Temperature Effects
 
-PV panel efficiency decreases with temperature:
+#### Cell Temperature Model
+
+Energy balance on PV module:
 
 ```
-P_actual = P_STC × [1 + α(T_cell - T_STC)]
-```
-
-Where:
-- **P_STC**: Power at Standard Test Conditions
-- **α**: Temperature coefficient (typically -0.4%/°C)
-- **T_cell**: Cell temperature (°C)
-- **T_STC**: Standard temperature (25°C)
-
-Cell temperature estimation:
-
-```
-T_cell = T_ambient + (NOCT - 20)/800 × I_solar
+T_cell = T_ambient + (NOCT - 20°C) × (I_POA/800) × (1 - η_ref/τα)
 ```
 
 Where:
-- **NOCT**: Nominal Operating Cell Temperature (typically 45°C)
+- **NOCT**: Nominal Operating Cell Temperature (45°C typical)
+- **I_POA**: Plane of Array irradiance (W/m²)
+- **η_ref**: Reference efficiency
+- **τα**: Transmittance-absorptance product (0.9 typical)
+
+#### Power Temperature Correction
+
+```
+P = P_STC × (I_POA/1000) × [1 + γ(T_cell - 25°C)]
+```
+
+Where:
+- **P_STC**: Rated power at Standard Test Conditions
+- **γ**: Power temperature coefficient (-0.4%/°C typical)
+
+### Power Output Prediction
+
+#### Physical Model
+
+DC power output:
+
+```
+P_DC = η_module × A × I_POA × [1 + γ(T_cell - 25°C)]
+```
+
+AC power output (including inverter):
+
+```
+P_AC = P_DC × η_inverter(P_DC/P_rated)
+```
+
+Inverter efficiency curve:
+
+```
+η_inverter = (P_DC/P_rated) / (k_0 + k_1×(P_DC/P_rated) + k_2×(P_DC/P_rated)²)
+```
+
+#### Machine Learning Enhancement
+
+Hybrid approach combining physics and ML:
+
+```
+P_predicted = w_physics × P_physical + w_ML × P_ML
+```
+
+Where typically w_physics = 0.6, w_ML = 0.4
+
+ML features include:
+- Weather forecast variables
+- Historical patterns
+- Seasonal indicators
+- Cloud motion vectors
 
 ---
 
@@ -239,81 +361,190 @@ Where:
 
 ### Time Series Analysis
 
-#### ARIMA Model
-AutoRegressive Integrated Moving Average:
+#### Components Decomposition
+
+Load time series decomposition:
 
 ```
-y_t = c + φ₁y_{t-1} + φ₂y_{t-2} + ... + θ₁ε_{t-1} + θ₂ε_{t-2} + ... + ε_t
-```
-
-Where:
-- **y_t**: Load at time t
-- **φᵢ**: Autoregressive parameters
-- **θᵢ**: Moving average parameters
-- **ε_t**: Error term
-
-#### Fourier Series
-For capturing daily and weekly patterns:
-
-```
-L(t) = a₀ + Σ[aₙcos(2πnt/T) + bₙsin(2πnt/T)]
+L(t) = T(t) + S(t) + R(t)
 ```
 
 Where:
-- **T**: Period (24 hours or 168 hours)
-- **aₙ, bₙ**: Fourier coefficients
+- **T(t)**: Trend component
+- **S(t)**: Seasonal component (daily, weekly patterns)
+- **R(t)**: Residual (random) component
+
+#### Fourier Analysis
+
+Seasonal patterns captured via Fourier series:
+
+```
+S(t) = Σ_k[a_k × cos(2πkt/T) + b_k × sin(2πkt/T)]
+```
+
+Key periods:
+- T = 24 hours (daily cycle)
+- T = 168 hours (weekly cycle)
+- T = 8760 hours (annual cycle)
 
 ### Machine Learning Models
 
-#### LSTM Networks
-Long Short-Term Memory networks capture long-term dependencies:
+#### Random Forest Regression
+
+Ensemble prediction:
 
 ```
-f_t = σ(W_f × [h_{t-1}, x_t] + b_f)  # Forget gate
-i_t = σ(W_i × [h_{t-1}, x_t] + b_i)  # Input gate
-C̃_t = tanh(W_C × [h_{t-1}, x_t] + b_C)  # Candidate values
-C_t = f_t × C_{t-1} + i_t × C̃_t  # Cell state
-o_t = σ(W_o × [h_{t-1}, x_t] + b_o)  # Output gate
-h_t = o_t × tanh(C_t)  # Hidden state
+L_pred = (1/N) × Σ_i Tree_i(features)
 ```
+
+Feature importance calculated via:
+```
+Importance_j = Σ_nodes (w × Δimpurity × I[feature_j used])
+```
+
+#### LSTM Architecture
+
+State equations for load prediction:
+
+```
+f_t = σ(W_f × [h_{t-1}, x_t] + b_f)        # Forget gate
+i_t = σ(W_i × [h_{t-1}, x_t] + b_i)        # Input gate
+C̃_t = tanh(W_C × [h_{t-1}, x_t] + b_C)    # Candidate values
+C_t = f_t × C_{t-1} + i_t × C̃_t           # Cell state
+o_t = σ(W_o × [h_{t-1}, x_t] + b_o)        # Output gate
+h_t = o_t × tanh(C_t)                      # Hidden state
+L_t = W_y × h_t + b_y                      # Output (load prediction)
+```
+
+### Feature Engineering
+
+#### Temporal Features
+- Hour of day (sine/cosine encoding)
+- Day of week (one-hot encoding)
+- Month of year
+- Holiday indicators
+- Business day flag
+
+#### Weather Features
+- Temperature (current and lagged)
+- Temperature squared (for heating/cooling)
+- Humidity
+- Wind speed
+- Solar radiation
+
+#### Historical Features
+- Lagged load values (t-1h, t-24h, t-168h)
+- Rolling averages (6h, 24h)
+- Same hour previous week
+- Load differences (capturing trends)
 
 ---
 
 ## Optimization Theory
 
-### Linear Programming
+### Model Predictive Control
 
-The energy optimization problem:
+PEMS v2 implements receding horizon control with the following formulation:
+
+#### Objective Function
+
+Minimize total cost over prediction horizon H:
 
 ```
-Minimize: Σ(c_t × P_grid_t × Δt)
+J = Σ_{t=0}^{H-1} [c_t × P_grid_t × Δt + ρ × V_comfort_t²]
+```
 
+Where:
+- **c_t**: Time-of-use electricity price (CZK/kWh)
+- **P_grid_t**: Grid power import (kW)
+- **ρ**: Comfort violation penalty (1000 CZK/°C²)
+- **V_comfort_t**: Temperature deviation from comfort bounds
+
+#### System Dynamics
+
+Discrete-time thermal dynamics:
+
+```
+T_{t+1} = A × T_t + B_u × u_t + B_d × d_t
+```
+
+Where:
+- **A**: State transition matrix (discretized from continuous RC model)
+- **B_u**: Control input matrix
+- **B_d**: Disturbance input matrix
+- **u_t**: Heating control vector (binary for each room)
+- **d_t**: Disturbances (outdoor temp, solar gains)
+
+Discretization using zero-order hold:
+
+```
+A = e^(-G×C^(-1)×Δt)
+B_u = C^(-1) × G^(-1) × (I - A) × P_heat
+```
+
+### Mixed-Integer Programming
+
+#### Binary Heating Controls
+
+Room heating as binary variables:
+
+```
+u_i,t ∈ {0, 1}  ∀i ∈ rooms, ∀t ∈ horizon
+```
+
+Minimum on/off time constraints:
+
+```
+u_i,t - u_i,t-1 ≤ u_i,τ  ∀τ ∈ [t+1, t+t_min_on]    # Minimum on time
+u_i,t-1 - u_i,t ≤ 1-u_i,τ  ∀τ ∈ [t+1, t+t_min_off] # Minimum off time
+```
+
+#### Linearization Techniques
+
+Comfort violation (absolute value) linearization:
+
+```
+V_comfort_t ≥ T_t - T_max
+V_comfort_t ≥ T_min - T_t
+V_comfort_t ≥ 0
+```
+
+Battery power (bidirectional) decomposition:
+
+```
+P_battery_t = P_charge_t - P_discharge_t
+P_charge_t ≥ 0
+P_discharge_t ≥ 0
+P_charge_t ≤ M × δ_charge_t        # M = large number
+P_discharge_t ≤ M × (1-δ_charge_t)  # δ binary variable
+```
+
+### Multi-Objective Optimization
+
+#### Weighted Sum Method
+
+Combined objectives:
+
+```
+J_total = w_cost × J_cost + w_comfort × J_comfort + w_self × J_self_consumption
+```
+
+Where:
+- **J_cost**: Energy cost objective
+- **J_comfort**: Thermal comfort objective
+- **J_self**: PV self-consumption objective
+
+#### Pareto Optimization
+
+ε-constraint method for Pareto front:
+
+```
+Minimize: J_cost
 Subject to:
-- P_load_t = P_grid_t + P_battery_t + P_pv_t
-- P_battery_min ≤ P_battery_t ≤ P_battery_max
-- SOC_min ≤ SOC_t ≤ SOC_max
-- SOC_{t+1} = SOC_t + η × P_battery_t × Δt / E_capacity
+  J_comfort ≤ ε_comfort
+  J_self ≥ ε_self
+  All other constraints...
 ```
-
-Where:
-- **c_t**: Electricity price at time t
-- **P_grid_t**: Grid power
-- **P_battery_t**: Battery power (positive = discharge)
-- **η**: Battery efficiency
-
-### Dynamic Programming
-
-Bellman equation for optimal control:
-
-```
-V*(s_t) = min_a [c(s_t, a_t) + γ × V*(s_{t+1})]
-```
-
-Where:
-- **V*(s_t)**: Optimal value function
-- **s_t**: System state at time t
-- **a_t**: Action (control decision)
-- **γ**: Discount factor
 
 ---
 
@@ -321,107 +552,338 @@ Where:
 
 ### State of Charge
 
-#### Coulomb Counting
-Basic SOC estimation:
+#### Dynamic Model
+
+SOC evolution with efficiency:
 
 ```
-SOC(t) = SOC(0) + (1/C_nominal) × ∫I(τ)dτ
+SOC_{t+1} = SOC_t + (η_charge × P_charge_t - P_discharge_t/η_discharge) × Δt / E_capacity
 ```
 
 Where:
-- **C_nominal**: Nominal capacity (Ah)
-- **I(τ)**: Current (positive for charging)
+- **η_charge**: Charging efficiency (0.95 typical)
+- **η_discharge**: Discharging efficiency (0.95 typical)
+- **E_capacity**: Battery capacity (kWh)
 
-#### Voltage-Based SOC
-Using Open Circuit Voltage (OCV):
+#### Constraints
+
+Operational limits:
 
 ```
-SOC = f(V_oc)  # Lookup table or polynomial fit
+SOC_min ≤ SOC_t ≤ SOC_max           # Typically 0.1 ≤ SOC ≤ 0.9
+P_charge_t ≤ P_charge_max            # Maximum charge rate
+P_discharge_t ≤ P_discharge_max      # Maximum discharge rate
+P_charge_t × P_discharge_t = 0       # Cannot charge and discharge simultaneously
+```
+
+### Power Flow Constraints
+
+#### Energy Balance
+
+System power balance at each timestep:
+
+```
+P_load_t = P_grid_t + P_pv_t + P_discharge_t - P_charge_t
+```
+
+#### Grid Constraints
+
+Export limitations:
+
+```
+P_grid_t ≥ -P_export_max  # Negative = export
+```
+
+Power factor requirements:
+
+```
+|Q_t| ≤ P_t × tan(acos(PF_min))
 ```
 
 ### Degradation Models
 
-#### Cycle Life
-Battery capacity fade with cycling:
+#### Cycle Aging
+
+Rainflow counting for equivalent cycles:
 
 ```
-C_fade = k_1 × N^0.5 + k_2 × N
+L_cycle = Σ_i (N_i × DOD_i^k)
 ```
 
 Where:
-- **N**: Number of equivalent full cycles
-- **k_1, k_2**: Degradation coefficients
+- **N_i**: Number of cycles at depth i
+- **DOD_i**: Depth of discharge
+- **k**: Stress factor (2.0 typical)
+
+Capacity fade:
+
+```
+C_fade_cycle = α × L_cycle^β
+```
 
 #### Calendar Aging
-Capacity loss over time:
+
+Time-based degradation:
 
 ```
-C_loss = A × exp(-E_a / (R × T)) × t^z
+C_fade_calendar = γ × (t/t_ref)^0.5 × exp((T-T_ref)/T_scale)
 ```
 
-Where:
-- **E_a**: Activation energy
-- **R**: Gas constant
-- **T**: Temperature (K)
-- **z**: Power law exponent (typically 0.5)
+Total capacity:
+
+```
+C_remaining = C_nominal × (1 - C_fade_cycle - C_fade_calendar)
+```
 
 ---
 
-## Statistical Metrics
+## Control Theory
 
-### Error Metrics
+### State-Space Representation
 
-#### Mean Absolute Percentage Error (MAPE)
-```
-MAPE = (100/n) × Σ|y_actual - y_predicted|/y_actual
-```
+#### Continuous-Time System
 
-#### Root Mean Square Error (RMSE)
-```
-RMSE = √[(1/n) × Σ(y_actual - y_predicted)²]
-```
+Full state-space model:
 
-### Goodness of Fit
-
-#### R-squared (Coefficient of Determination)
 ```
-R² = 1 - (SS_res / SS_tot)
+dx/dt = A_c × x + B_c × u + E_c × w
+y = C_c × x + D_c × u
 ```
 
 Where:
-- **SS_res**: Σ(y_actual - y_predicted)²
-- **SS_tot**: Σ(y_actual - ȳ)²
+- **x**: State vector [T_room_1, ..., T_room_n, SOC]ᵀ
+- **u**: Control vector [P_heat_1, ..., P_heat_n, P_battery]ᵀ
+- **w**: Disturbance vector [T_outdoor, I_solar, P_load]ᵀ
+- **y**: Output vector (measured temperatures)
+
+#### Discrete-Time Conversion
+
+Using zero-order hold:
+
+```
+x_{k+1} = A_d × x_k + B_d × u_k + E_d × w_k
+y_k = C_d × x_k + D_d × u_k
+```
+
+Where:
+```
+A_d = e^(A_c × Ts)
+B_d = A_c^(-1) × (A_d - I) × B_c
+E_d = A_c^(-1) × (A_d - I) × E_c
+```
+
+### Feedback Control
+
+#### State Estimation
+
+Kalman filter for unmeasured states:
+
+```
+x̂_{k+1|k} = A_d × x̂_{k|k} + B_d × u_k
+P_{k+1|k} = A_d × P_{k|k} × A_d^T + Q
+
+K_k = P_{k+1|k} × C_d^T × (C_d × P_{k+1|k} × C_d^T + R)^(-1)
+x̂_{k+1|k+1} = x̂_{k+1|k} + K_k × (y_{k+1} - C_d × x̂_{k+1|k})
+P_{k+1|k+1} = (I - K_k × C_d) × P_{k+1|k}
+```
+
+Where:
+- **Q**: Process noise covariance
+- **R**: Measurement noise covariance
+- **K**: Kalman gain
+
+#### Disturbance Rejection
+
+Feedforward compensation:
+
+```
+u_ff = -B_d^(-1) × E_d × w_predicted
+```
+
+### Constraint Handling
+
+#### Soft Constraints
+
+Barrier function method:
+
+```
+J_barrier = J_original - μ × Σ_i log(g_i(x))
+```
+
+Where g_i(x) > 0 represents inequality constraints.
+
+#### Constraint Tightening
+
+Robust MPC with uncertainty:
+
+```
+T_min + δ ≤ T_t ≤ T_max - δ
+```
+
+Where δ accounts for prediction uncertainty.
 
 ---
 
-## Implementation Notes
+## Implementation Considerations
 
 ### Numerical Stability
 
-1. **Exponential Decay**: For large time constants, use log-space calculations:
-   ```python
-   log_decay = -t / tau
-   if log_decay > -20:  # Avoid underflow
-       decay = np.exp(log_decay)
-   else:
-       decay = 0
-   ```
+#### Condition Number Monitoring
 
-2. **Matrix Operations**: Use condition number checks for RC estimation:
-   ```python
-   if np.linalg.cond(A) > 1e10:
-       # Matrix is ill-conditioned, use regularization
-       A_reg = A + lambda * np.eye(n)
-   ```
+For matrix operations:
 
-### Convergence Criteria
-
-For iterative algorithms:
-```
-|x_{k+1} - x_k| / |x_k| < ε_rel  OR  |x_{k+1} - x_k| < ε_abs
+```python
+κ(A) = ||A|| × ||A^(-1)||
+if κ(A) > 10^10:
+    # Apply regularization
+    A_reg = A + λ × I
 ```
 
-Typical values:
-- **ε_rel**: 1e-3 (0.1% relative change)
-- **ε_abs**: 1e-6 (absolute tolerance)
+#### Scaling
 
+Variable normalization:
+
+```
+x_normalized = (x - x_mean) / x_std
+u_normalized = u / u_max
+```
+
+### Computational Efficiency
+
+#### Sparse Matrix Exploitation
+
+Thermal coupling matrix is typically sparse:
+
+```python
+from scipy.sparse import csr_matrix
+G_sparse = csr_matrix(G)
+# Use sparse linear algebra routines
+```
+
+#### Warm Starting
+
+For sequential optimizations:
+
+```
+x_0^(k+1) = [x_1^(k), x_2^(k), ..., x_{H-1}^(k), x_H^(k)]
+```
+
+Shift previous solution as initial guess.
+
+### Real-Time Guarantees
+
+#### Optimization Timeouts
+
+Ensure bounded execution time:
+
+```python
+solver.options['max_iter'] = 1000
+solver.options['max_cpu_time'] = 1.5  # seconds
+```
+
+#### Fallback Strategies
+
+If optimization fails:
+1. Use previous solution
+2. Apply rule-based control
+3. Maintain safety constraints
+
+---
+
+## Validation and Testing
+
+### Model Validation
+
+#### Cross-Validation
+
+Time series cross-validation:
+
+```
+Train: [0, t_1] → Test: [t_1, t_2]
+Train: [0, t_2] → Test: [t_2, t_3]
+...
+```
+
+#### Residual Analysis
+
+Check for model adequacy:
+
+```
+Residuals: e_t = y_measured_t - y_predicted_t
+```
+
+Tests:
+- Normality: Shapiro-Wilk test
+- Autocorrelation: Ljung-Box test
+- Heteroscedasticity: Breusch-Pagan test
+
+### Performance Metrics
+
+#### Prediction Accuracy
+
+Mean Absolute Percentage Error:
+
+```
+MAPE = (100/n) × Σ|y_actual - y_predicted|/|y_actual|
+```
+
+Normalized Root Mean Square Error:
+
+```
+NRMSE = RMSE / (y_max - y_min)
+```
+
+#### Control Performance
+
+Integrated Absolute Error:
+
+```
+IAE = ∫|setpoint - actual| dt
+```
+
+Total Variation:
+
+```
+TV = Σ|u_{t+1} - u_t|
+```
+
+### Robustness Testing
+
+#### Monte Carlo Simulation
+
+Parameter uncertainty:
+
+```python
+for i in range(N_simulations):
+    R_i = R_nominal × (1 + σ_R × randn())
+    C_i = C_nominal × (1 + σ_C × randn())
+    simulate_system(R_i, C_i)
+```
+
+#### Worst-Case Analysis
+
+Robust optimization formulation:
+
+```
+min_u max_w J(u, w)
+```
+
+Where w represents bounded uncertainties.
+
+---
+
+## References
+
+1. **Thermal Modeling**: Madsen, H., & Holst, J. (1995). "Estimation of continuous-time models for the heat dynamics of a building." Energy and Buildings.
+
+2. **PV Modeling**: Duffie, J. A., & Beckman, W. A. (2013). "Solar Engineering of Thermal Processes."
+
+3. **MPC Theory**: Rawlings, J. B., & Mayne, D. Q. (2009). "Model Predictive Control: Theory and Design."
+
+4. **Battery Management**: Plett, G. L. (2015). "Battery Management Systems, Volume I: Battery Modeling."
+
+5. **Load Forecasting**: Hong, T., & Fan, S. (2016). "Probabilistic electric load forecasting: A tutorial review." International Journal of Forecasting.
+
+---
+
+This mathematical background provides the theoretical foundation for all algorithms implemented in PEMS v2. The models balance physical accuracy with computational efficiency, enabling real-time optimization for residential energy management.
