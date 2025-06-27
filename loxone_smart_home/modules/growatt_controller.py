@@ -672,6 +672,9 @@ class GrowattController(BaseModule):
                 f"({threshold_eur_mwh:.2f} EUR/MWh = "
                 f"{self.config.export_price_threshold:.2f} CZK/kWh)"
             )
+            # Schedule disable at midnight with small delay to avoid conflicts
+            task = asyncio.create_task(self._schedule_at_time("00:00:05", self._disable_export))
+            self._scheduled_tasks.append(task)
             return
 
         # Group export hours into contiguous blocks (ignore price differences for export)
@@ -743,8 +746,13 @@ class GrowattController(BaseModule):
             task = asyncio.create_task(self._schedule_at_time(group_start, self._enable_export))
             self._scheduled_tasks.append(task)
 
-            # Schedule export disable at end
-            task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
+            # Always schedule export disable at end, but handle midnight transitions
+            # For periods ending at 23:59, schedule disable at 23:59:55 to ensure
+            # it happens before any potential midnight enable/disable
+            if group_end == "23:59":
+                task = asyncio.create_task(self._schedule_at_time("23:59:55", self._disable_export))
+            else:
+                task = asyncio.create_task(self._schedule_at_time(group_end, self._disable_export))
             self._scheduled_tasks.append(task)
 
             # Update previous end time
@@ -753,7 +761,11 @@ class GrowattController(BaseModule):
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
         try:
-            target_time = datetime.strptime(time_str, "%H:%M").time()
+            # Support both HH:MM and HH:MM:SS formats
+            try:
+                target_time = datetime.strptime(time_str, "%H:%M:%S").time()
+            except ValueError:
+                target_time = datetime.strptime(time_str, "%H:%M").time()
             now = self._get_local_now()
 
             # Calculate next occurrence of target time in local timezone
