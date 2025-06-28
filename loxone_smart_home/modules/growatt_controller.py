@@ -661,11 +661,6 @@ class GrowattController(BaseModule):
             if price >= threshold_eur_mwh
         ]
 
-        # Always disable export at midnight to ensure clean state
-        task = asyncio.create_task(self._schedule_at_time("00:00", self._disable_export))
-        self._scheduled_tasks.append(task)
-        self.logger.info("Scheduled export disable at 00:00 for clean daily start")
-
         if not export_hours:
             self.logger.info(
                 f"No hours above export price threshold "
@@ -757,6 +752,13 @@ class GrowattController(BaseModule):
 
             # Update previous end time
             previous_end = group_end
+
+        # Check if we need a midnight disable (only if no export period starts at 00:00)
+        has_midnight_start = any(group[0] == "00:00" for group in export_groups)
+        if not has_midnight_start:
+            task = asyncio.create_task(self._schedule_at_time("00:00", self._disable_export))
+            self._scheduled_tasks.append(task)
+            self.logger.info("Scheduled export disable at 00:00 for clean daily start")
 
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
