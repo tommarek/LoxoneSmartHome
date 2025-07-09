@@ -161,20 +161,6 @@ services:
     volumes:
       - teslamate-db:/var/lib/postgresql/data
 
-  headscale:
-    image: headscale/headscale:latest
-    container_name: headscale
-    restart: unless-stopped
-    command: headscale serve
-    ports:
-      - "8080:8080"  # HTTP API/Web UI
-      - "9090:9090"  # Metrics (optional)
-    volumes:
-      - ./headscale/config:/etc/headscale
-      - ./headscale/data:/var/lib/headscale
-    environment:
-      - TZ=Europe/Prague
-
 volumes:
   cargo-cache:
   teslamate-db:
