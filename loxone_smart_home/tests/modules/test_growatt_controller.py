@@ -68,16 +68,28 @@ async def test_controller_initialization(growatt_controller: GrowattController) 
 
 @pytest.mark.asyncio
 async def test_fetch_dam_energy_prices_success(growatt_controller: GrowattController) -> None:
-    """Test successful energy price fetching."""
+    """Test successful energy price fetching with correct EUR/MWh parsing."""
+    # Mock response matching actual OTE API structure
     mock_response = {
+        "axis": {
+            "y": {"legend": "Price (EUR/MWh)"}  # API claims EUR but line 0 is CZK
+        },
         "data": {
             "dataLine": [
-                {},
                 {
+                    "colour": "FF6600",
                     "point": [
-                        {"x": "1", "y": "1500.50"},
-                        {"x": "2", "y": "1600.25"},
-                        {"x": "3", "y": "1400.00"},
+                        {"x": "1", "y": 3912.8},  # CZK/MWh (line 0)
+                        {"x": "2", "y": 3879.3},
+                        {"x": "3", "y": 3997.7},
+                    ]
+                },
+                {
+                    "colour": "A04000",
+                    "point": [
+                        {"x": "1", "y": 98.5},    # EUR/MWh (line 1)
+                        {"x": "2", "y": 105.2},
+                        {"x": "3", "y": 92.7},
                     ]
                 },
             ]
@@ -93,9 +105,10 @@ async def test_fetch_dam_energy_prices_success(growatt_controller: GrowattContro
         prices = await growatt_controller._fetch_dam_energy_prices("2024-01-01")
 
         assert len(prices) == 3
-        assert prices[("00:00", "01:00")] == 1500.50
-        assert prices[("01:00", "02:00")] == 1600.25
-        assert prices[("02:00", "03:00")] == 1400.00
+        # Should use dataLine[1] which contains EUR/MWh prices
+        assert prices[("00:00", "01:00")] == 98.5
+        assert prices[("01:00", "02:00")] == 105.2
+        assert prices[("02:00", "03:00")] == 92.7
 
 
 @pytest.mark.asyncio
@@ -108,6 +121,64 @@ async def test_fetch_dam_energy_prices_failure(growatt_controller: GrowattContro
 
         prices = await growatt_controller._fetch_dam_energy_prices()
         assert prices == {}
+
+
+@pytest.mark.asyncio
+async def test_fetch_dam_energy_prices_single_dataline(
+    growatt_controller: GrowattController
+) -> None:
+    """Test price fetching when only one dataLine exists (fallback case)."""
+    mock_response = {
+        "data": {
+            "dataLine": [
+                {
+                    "point": [
+                        {"x": "1", "y": 100.0},
+                        {"x": "2", "y": 110.0},
+                    ]
+                },
+            ]
+        }
+    }
+    with patch("aiohttp.ClientSession") as mock_session:
+        mock_get = AsyncMock()
+        mock_get.__aenter__.return_value.status = 200
+        mock_get.__aenter__.return_value.json = AsyncMock(return_value=mock_response)
+        mock_session.return_value.__aenter__.return_value.get = MagicMock(return_value=mock_get)
+        
+        prices = await growatt_controller._fetch_dam_energy_prices("2024-01-01")
+        assert len(prices) == 2
+        # Falls back to first line when only one exists
+        assert prices[("00:00", "01:00")] == 100.0
+        assert prices[("01:00", "02:00")] == 110.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_dam_energy_prices_full_day(growatt_controller: GrowattController) -> None:
+    """Test price fetching with full 24-hour data."""
+    mock_response = {
+        "data": {
+            "dataLine": [
+                {"point": []},  # CZK prices (ignored)
+                {
+                    "point": [
+                        {"x": str(i), "y": 90.0 + i * 2} for i in range(1, 25)
+                    ]
+                },
+            ]
+        }
+    }
+    with patch("aiohttp.ClientSession") as mock_session:
+        mock_get = AsyncMock()
+        mock_get.__aenter__.return_value.status = 200
+        mock_get.__aenter__.return_value.json = AsyncMock(return_value=mock_response)
+        mock_session.return_value.__aenter__.return_value.get = MagicMock(return_value=mock_get)
+        
+        prices = await growatt_controller._fetch_dam_energy_prices("2024-01-01")
+        assert len(prices) == 24
+        # Verify first and last hours
+        assert prices[("00:00", "01:00")] == 92.0  # 90 + 1*2
+        assert prices[("23:00", "24:00")] == 138.0  # 90 + 24*2
 
 
 @pytest.mark.asyncio
