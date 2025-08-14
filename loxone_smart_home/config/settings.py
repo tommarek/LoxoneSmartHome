@@ -163,9 +163,19 @@ class GrowattConfig(BaseModel):
     export_enable_topic: str = "energy/solar/command/export/enable"
     export_disable_topic: str = "energy/solar/command/export/disable"
 
+    # Grid-first mode topics
+    grid_first_topic: str = "energy/solar/command/gridfirst/set/timeslot"
+    grid_first_stopsoc_topic: str = "energy/solar/command/gridfirst/set/stopsoc"
+    grid_first_powerrate_topic: str = "energy/solar/command/gridfirst/set/powerrate"
+
     # Scheduling
     schedule_hour: int = Field(default=23, ge=0, le=23)  # Daily calculation hour
     schedule_minute: int = Field(default=59, ge=0, le=59)  # Daily calculation minute
+
+    # Season detection parameters
+    summer_temp_threshold: float = Field(default=15.0, ge=-20, le=40)  # °C
+    summer_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh (below operator costs)
+    temperature_avg_days: int = Field(default=3, ge=1, le=7)  # Days for temperature average
 
     # Simulation mode
     simulation_mode: bool = False
