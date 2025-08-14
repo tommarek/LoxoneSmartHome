@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 import zoneinfo
 
-from loxone_smart_home.config.settings import Settings
-from loxone_smart_home.modules.growatt_controller import GrowattController
+from config.settings import Settings
+from modules.growatt_controller import GrowattController
 
 
 @pytest.fixture

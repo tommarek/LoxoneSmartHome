@@ -59,9 +59,42 @@ class GrowattController(BaseModule):
         self._season_mode: Optional[str] = None
         self._season_mode_updated: Optional[datetime] = None
 
+        # Running flag for daily loop
+        self._running: bool = False
+
+        # Track last applied mode to prevent flapping
+        self._last_mode: Optional[str] = None
+
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
         return datetime.now(self._local_tz)
+
+    def _parse_hhmm(self, s: str) -> dt_time:
+        """Parse HH:MM allowing '24:00' -> 00:00 next day semantics."""
+        if s == "24:00":
+            # treat as 00:00 (next day) for comparisons
+            return dt_time(0, 0)
+        return datetime.strptime(s, "%H:%M").time()
+
+    def _normalize_end_time(self, s: str) -> str:
+        """Return a safe end-time string for scheduling and parsing."""
+        # Prefer 23:59 to avoid '24:00' which Python can't parse
+        return "23:59" if s in ("24:00", "23:60") else s
+
+    async def _set_mode(self, mode: str, *args: Any) -> None:
+        """Set inverter mode with flapping guard."""
+        if self._last_mode == mode:
+            self.logger.debug(f"Mode {mode} already active, skipping redundant command")
+            return
+
+        if mode == "battery_first":
+            await self._set_battery_first(*args)
+        elif mode == "grid_first":
+            await self._set_grid_first(*args)
+        elif mode == "load_first":
+            await self._set_load_first()
+
+        self._last_mode = mode
 
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
@@ -127,7 +160,7 @@ class GrowattController(BaseModule):
 
     def _log_price_table(self, hourly_prices: Dict[Tuple[str, str], float], date: str) -> None:
         """Log hourly prices in a nice table format."""
-        eur_czk_rate = 25.0
+        eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
 
         self.logger.info(f"Energy prices for {date}:")
         self.logger.info("┌──────────┬────────────┬──────────────┐")
@@ -147,6 +180,7 @@ class GrowattController(BaseModule):
 
     async def start(self) -> None:
         """Start the Growatt controller."""
+        self._running = True  # Set the flag so daily loop runs
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
 
@@ -156,13 +190,25 @@ class GrowattController(BaseModule):
 
     async def stop(self) -> None:
         """Stop the Growatt controller."""
+        self._running = False  # Clear the flag to stop daily loop
+
         # Cancel all scheduled tasks
         for task in self._scheduled_tasks:
             if not task.done():
                 task.cancel()
 
-        if self._daily_schedule_task:
+        if self._daily_schedule_task and not self._daily_schedule_task.done():
             self._daily_schedule_task.cancel()
+
+        # Give tasks a chance to cancel cleanly
+        try:
+            all_tasks = [t for t in self._scheduled_tasks if t]
+            if self._daily_schedule_task:
+                all_tasks.append(self._daily_schedule_task)
+            if all_tasks:
+                await asyncio.gather(*all_tasks, return_exceptions=True)
+        except Exception:
+            pass
 
         # Disable battery first mode on shutdown
         try:
@@ -191,8 +237,8 @@ class GrowattController(BaseModule):
 
         # Check all scheduled periods
         for period_type, start, end in self._scheduled_periods:
-            start_time = datetime.strptime(start, "%H:%M").time()
-            end_time = datetime.strptime(end, "%H:%M").time()
+            start_time = self._parse_hhmm(start)
+            end_time = self._parse_hhmm(self._normalize_end_time(end))
             current_time_only = current_time.time()
 
             # Handle periods that don't cross midnight
@@ -208,17 +254,17 @@ class GrowattController(BaseModule):
                 )
 
                 if period_type == "battery_first":
-                    await self._set_battery_first(start, end)
+                    await self._set_mode("battery_first", start, end)
                     mode_applied = True
                     # Check if we're in summer mode to disable AC charging
                     season = await self._get_season_mode()
                     if season == "summer":
                         await self._disable_ac_charge()
                 elif period_type == "grid_first":
-                    await self._set_grid_first(start, end, 100)  # Always 100% stopSOC
+                    await self._set_mode("grid_first", start, end, 100)  # Always 100% stopSOC
                     mode_applied = True
                 elif period_type == "load_first":
-                    await self._set_load_first()
+                    await self._set_mode("load_first")
                     mode_applied = True
                 elif period_type == "ac_charge":
                     await self._enable_ac_charge()
@@ -229,7 +275,7 @@ class GrowattController(BaseModule):
         # If no mode was applied, default to load-first
         if not mode_applied:
             self.logger.info("Not in any scheduled period, applying load-first mode...")
-            await self._set_load_first()
+            await self._set_mode("load_first")
 
         # If not in any export period, disable export
         if not in_export_period:
@@ -252,24 +298,47 @@ class GrowattController(BaseModule):
         self.logger.info(f"Fetching DAM energy prices for {date} from: {url}")
 
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url) as response:
+            timeout = aiohttp.ClientTimeout(total=20)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    url, headers={"User-Agent": "growatt-controller/1.0"}
+                ) as response:
                     if response.status != 200:
                         self.logger.error(f"Failed to fetch DAM prices: HTTP {response.status}")
                         return {}
 
                     data = await response.json()
 
-            hourly_prices = {}
-            if data.get("data", {}).get("dataLine"):
-                price_data = data["data"]["dataLine"][1]["point"]
+            # More resilient parsing - try to find price data
+            lines = data.get("data", {}).get("dataLine", [])
+            if not lines:
+                self.logger.error("DAM response missing dataLine")
+                return {}
 
-                for point in price_data:
-                    hour = int(point["x"]) - 1
-                    price = float(point["y"])
+            # Try to locate the line that contains price points (has 'point' with x,y)
+            price_line = None
+            for line in lines:
+                if isinstance(line, dict):
+                    pts = line.get("point", [])
+                    if pts and all(isinstance(p, dict) and "x" in p and "y" in p for p in pts):
+                        price_line = pts
+                        break
+
+            if not price_line:
+                self.logger.error("DAM response has no valid price point data")
+                return {}
+
+            hourly_prices: Dict[Tuple[str, str], float] = {}
+            for p in price_line:
+                try:
+                    hour = int(p["x"]) - 1
+                    price = float(p["y"])
                     start_time = f"{hour:02d}:00"
                     stop_time = f"{hour + 1:02d}:00"
                     hourly_prices[(start_time, stop_time)] = price
+                except (KeyError, ValueError, TypeError) as e:
+                    self.logger.warning(f"Skipping invalid price point: {p}, error: {e}")
+                    continue
 
             self.logger.info(f"Successfully fetched {len(hourly_prices)} DAM price points")
             return hourly_prices
@@ -282,43 +351,41 @@ class GrowattController(BaseModule):
         self, prices: Dict[Tuple[str, str], float], x: int = 2
     ) -> List[Tuple[str, str, float]]:
         """Find X consecutive hours with lowest total price."""
-        intervals = list(prices.keys())
+        if not prices:
+            return []
+
+        # Sort by start time "HH:MM"
+        intervals = sorted(prices.keys(), key=lambda t: t[0])
         num_intervals = len(intervals)
 
         if num_intervals < 2:
             return []
 
-        # Determine interval duration
-        interval_duration = (
-            datetime.strptime(intervals[1][0], "%H:%M")
-            - datetime.strptime(intervals[0][0], "%H:%M")
-        ).seconds // 60
+        # Determine interval duration from the first two (now sorted)
+        start0 = datetime.strptime(intervals[0][0], "%H:%M")
+        start1 = datetime.strptime(intervals[1][0], "%H:%M")
+        interval_duration = int((start1 - start0).total_seconds() // 60)
 
-        if interval_duration == 15:
-            intervals_per_hour = 4
-        elif interval_duration == 60:
-            intervals_per_hour = 1
-        else:
+        if interval_duration not in (15, 60):
             self.logger.warning(f"Unknown interval duration: {interval_duration} minutes")
             return []
 
+        intervals_per_hour = 60 // interval_duration
         intervals_needed = x * intervals_per_hour
 
         if num_intervals < intervals_needed:
             return []
 
-        cheapest_window = []
+        cheapest_window: List[Tuple[str, str, float]] = []
         min_price_sum = float("inf")
 
         for i in range(num_intervals - intervals_needed + 1):
-            window_intervals = intervals[i:i + intervals_needed]
-            price_sum = sum(prices[interval] for interval in window_intervals)
+            window = intervals[i:i + intervals_needed]
+            price_sum = sum(prices[k] for k in window)
 
             if price_sum < min_price_sum:
                 min_price_sum = price_sum
-                cheapest_window = [
-                    (interval[0], interval[1], prices[interval]) for interval in window_intervals
-                ]
+                cheapest_window = [(s, e, prices[(s, e)]) for (s, e) in window]
 
         return cheapest_window
 
@@ -375,7 +442,7 @@ class GrowattController(BaseModule):
         current_group_price = sorted_hours[0][2]
 
         for hour in sorted_hours[1:]:
-            previous_end = datetime.strptime(current_group_end, "%H:%M")
+            previous_end = datetime.strptime(self._normalize_end_time(current_group_end), "%H:%M")
             current_start = datetime.strptime(hour[0], "%H:%M")
             current_price = hour[2]
 
@@ -385,12 +452,12 @@ class GrowattController(BaseModule):
             ):
                 current_group_end = hour[1]
             else:
-                groups.append((current_group_start, current_group_end))
+                groups.append((current_group_start, self._normalize_end_time(current_group_end)))
                 current_group_start = hour[0]
                 current_group_end = hour[1]
                 current_group_price = current_price
 
-        groups.append((current_group_start, current_group_end))
+        groups.append((current_group_start, self._normalize_end_time(current_group_end)))
         return groups
 
     def _group_contiguous_hours_simple(
@@ -407,18 +474,18 @@ class GrowattController(BaseModule):
         current_group_end = sorted_hours[0][1]
 
         for hour in sorted_hours[1:]:
-            previous_end = datetime.strptime(current_group_end, "%H:%M")
+            previous_end = datetime.strptime(self._normalize_end_time(current_group_end), "%H:%M")
             current_start = datetime.strptime(hour[0], "%H:%M")
 
             # Group if contiguous (ignore price differences)
             if current_start == previous_end:
                 current_group_end = hour[1]
             else:
-                groups.append((current_group_start, current_group_end))
+                groups.append((current_group_start, self._normalize_end_time(current_group_end)))
                 current_group_start = hour[0]
                 current_group_end = hour[1]
 
-        groups.append((current_group_start, current_group_end))
+        groups.append((current_group_start, self._normalize_end_time(current_group_end)))
         return groups
 
     async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
@@ -512,7 +579,9 @@ class GrowattController(BaseModule):
             self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
             return
 
-        payload = {"value": True}  # Changed to True for disable topic
+        # Use command topic pattern: both enable and disable topics get {"value": True}
+        # This is intentional for command-based topics (edge-triggered)
+        payload = {"value": True}
         assert self.mqtt_client is not None
         # Use the disable topic for disabling export
         await self.mqtt_client.publish(self.config.export_disable_topic, json.dumps(payload))
@@ -693,7 +762,7 @@ class GrowattController(BaseModule):
             consecutive_avg = 0.0
 
         # Convert prices to CZK/kWh for display
-        eur_czk_rate = 25.0
+        eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
         min_price_czk = min_price * eur_czk_rate / 1000
         max_price_czk = max_price * eur_czk_rate / 1000
         avg_price_czk = avg_price * eur_czk_rate / 1000
@@ -739,7 +808,7 @@ class GrowattController(BaseModule):
     ) -> None:
         """Schedule summer battery strategy with grid-first and low-price storage."""
         # Convert threshold from CZK/kWh to EUR/MWh for comparison
-        eur_czk_rate = 25.0
+        eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
         threshold_eur_mwh = self.config.summer_price_threshold * 1000 / eur_czk_rate
 
         # Find hours below the summer threshold (typically <1 CZK/kWh)
@@ -863,9 +932,9 @@ class GrowattController(BaseModule):
         # Schedule load-first for evening (after last low price)
         if last_low_end != "24:00" and last_low_end != "23:59":
             self.logger.info(
-                f"Scheduling load-first from {last_low_end} to 24:00 (use stored energy)"
+                f"Scheduling load-first from {last_low_end} to 23:59 (use stored energy)"
             )
-            self._scheduled_periods.append(("load_first", last_low_end, "24:00"))
+            self._scheduled_periods.append(("load_first", last_low_end, "23:59"))
 
             task = asyncio.create_task(
                 self._schedule_at_time(last_low_end, self._set_load_first)
@@ -920,7 +989,7 @@ class GrowattController(BaseModule):
                     avg_charge_price = sum(charge_prices) / len(charge_prices)
 
                     # Convert to CZK/kWh for display
-                    eur_czk_rate = 25.0
+                    eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
                     min_charge_price_czk_kwh = min_charge_price * eur_czk_rate / 1000
                     max_charge_price_czk_kwh = max_charge_price * eur_czk_rate / 1000
                     avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
@@ -946,9 +1015,10 @@ class GrowattController(BaseModule):
                 )
                 self._scheduled_tasks.append(task)
 
-                # Schedule AC charge stop
+                # Schedule AC charge stop (normalize if 24:00)
+                stop_time_norm = self._normalize_end_time(stop_time)
                 task = asyncio.create_task(
-                    self._schedule_at_time(stop_time, self._disable_ac_charge)
+                    self._schedule_at_time(stop_time_norm, self._disable_ac_charge)
                 )
                 self._scheduled_tasks.append(task)
 
@@ -959,8 +1029,8 @@ class GrowattController(BaseModule):
         """Schedule export enable/disable based on price thresholds."""
         # Convert threshold from CZK/kWh to EUR/MWh for comparison with API data
         # API prices are in EUR/MWh, threshold is in CZK/kWh
-        # 1 EUR = 25 CZK, 1 MWh = 1000 kWh
-        eur_czk_rate = 25.0
+        # Conversion: 1 MWh = 1000 kWh
+        eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
         threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
 
         export_hours = [
@@ -999,8 +1069,7 @@ class GrowattController(BaseModule):
 
         for group_start, group_end in export_groups:
             # Handle 24:00 edge case
-            if group_end == "24:00":
-                group_end = "23:59"
+            group_end = self._normalize_end_time(group_end)
 
             # If there's a gap between previous export period and this one, disable export
             if previous_end is not None and previous_end < group_start:
@@ -1017,7 +1086,7 @@ class GrowattController(BaseModule):
             group_prices = [
                 price
                 for start, stop, price in export_hours_with_price
-                if start >= group_start and stop <= (group_end if group_end != "23:59" else "24:00")
+                if start >= group_start and stop <= group_end
             ]
             if group_prices:
                 min_price = min(group_prices)
@@ -1025,6 +1094,7 @@ class GrowattController(BaseModule):
                 avg_price = sum(group_prices) / len(group_prices)
 
                 # Convert prices to CZK/kWh for display
+                eur_czk_rate = getattr(self.config, "eur_czk_rate", 25.0)
                 min_price_czk_kwh = min_price * eur_czk_rate / 1000
                 max_price_czk_kwh = max_price * eur_czk_rate / 1000
                 avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
@@ -1071,11 +1141,21 @@ class GrowattController(BaseModule):
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
         try:
+            # Normalize impossible time to end-of-day
+            if time_str in ("24:00", "24:00:00"):
+                time_str = "23:59:55"
+
             # Support both HH:MM and HH:MM:SS formats
             try:
                 target_time = datetime.strptime(time_str, "%H:%M:%S").time()
             except ValueError:
-                target_time = datetime.strptime(time_str, "%H:%M").time()
+                # Allow HH:MM and normalize 24:00 here too if it slips through
+                if time_str == "24:00":
+                    time_str = "23:59:55"
+                    target_time = datetime.strptime(time_str, "%H:%M:%S").time()
+                else:
+                    target_time = datetime.strptime(time_str, "%H:%M").time()
+
             now = self._get_local_now()
 
             # Calculate next occurrence of target time in local timezone
@@ -1089,6 +1169,9 @@ class GrowattController(BaseModule):
                 await asyncio.sleep(delay)
                 await coro_func(*args)
 
+        except asyncio.CancelledError:
+            # Expected on shutdown; keep quiet
+            raise
         except Exception as e:
             self.logger.error(f"Error in scheduled task at {time_str}: {e}", exc_info=True)
 
@@ -1114,7 +1197,7 @@ class GrowattController(BaseModule):
 
                 delay = (target_datetime - now).total_seconds()
 
-                self.logger.info(f"Next daily calculation scheduled in {delay/3600:.1f} hours")
+                self.logger.info(f"Next daily calculation scheduled in {delay / 3600:.1f} hours")
                 await asyncio.sleep(delay)
 
                 # Run calculation
