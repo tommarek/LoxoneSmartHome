@@ -68,7 +68,7 @@ class GrowattController(BaseModule):
         # EUR/CZK exchange rate cache
         self._eur_czk_rate: Optional[float] = None
         self._eur_czk_rate_updated: Optional[datetime] = None
-        
+
         # Track AC and Export states to prevent duplicate commands
         self._ac_enabled: Optional[bool] = None
         self._export_enabled: Optional[bool] = None
@@ -109,22 +109,22 @@ class GrowattController(BaseModule):
         """Get date string in local timezone for API calls."""
         local_date = self._get_local_now() + timedelta(days=days_ahead)
         return local_date.strftime("%Y-%m-%d")
-    
+
     def _log_schedule_summary(self) -> None:
         """Log a summary of the scheduled periods for the day."""
         if not self._scheduled_periods:
             self.logger.info("No periods scheduled for the day")
             return
-            
+
         self.logger.info("═══════════════════════════════════════")
         self.logger.info("Daily Schedule Summary:")
         self.logger.info("───────────────────────────────────────")
         self.logger.info("Type            Start   End")
         self.logger.info("───────────────────────────────────────")
-        
+
         for period_type, start, end in sorted(self._scheduled_periods, key=lambda x: x[1]):
             self.logger.info(f"{period_type:<15} {start}  →  {end}")
-            
+
         self.logger.info("═══════════════════════════════════════")
 
     async def _get_eur_czk_rate(self) -> float:
@@ -169,7 +169,7 @@ class GrowattController(BaseModule):
                         # Convert Czech decimal format (comma) to Python float
                         rate_str = parts[4].replace(',', '.')
                         rate = float(rate_str)
-                        
+
                         # Guard against invalid rates
                         if rate <= 0:
                             raise ValueError(f"Invalid EUR/CZK rate from CNB: {rate}")
@@ -614,7 +614,7 @@ class GrowattController(BaseModule):
         """Enable AC charging during battery-first mode."""
         if self._ac_enabled is True:
             return  # Already enabled, skip duplicate command
-            
+
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⚡ [SIMULATE] AC CHARGING ENABLED (simulated at {current_time})")
@@ -634,7 +634,7 @@ class GrowattController(BaseModule):
         """Disable AC charging."""
         if self._ac_enabled is False:
             return  # Already disabled, skip duplicate command
-            
+
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⚡ [SIMULATE] AC CHARGING DISABLED (simulated at {current_time})")
@@ -672,7 +672,7 @@ class GrowattController(BaseModule):
         """Enable electricity export to grid."""
         if self._export_enabled is True:
             return  # Already enabled, skip duplicate command
-            
+
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ [SIMULATE] EXPORT ENABLED (simulated at {current_time})")
@@ -693,7 +693,7 @@ class GrowattController(BaseModule):
         """Disable electricity export to grid."""
         if self._export_enabled is False:
             return  # Already disabled, skip duplicate command
-            
+
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ [SIMULATE] EXPORT DISABLED (simulated at {current_time})")
@@ -786,18 +786,18 @@ class GrowattController(BaseModule):
         tasks_to_cancel = [t for t in self._scheduled_tasks if t and not t.done()]
         for task in tasks_to_cancel:
             task.cancel()
-        
+
         if tasks_to_cancel:
             try:
                 await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
             except Exception:
                 pass
-        
+
         self._scheduled_tasks.clear()
 
         # Clear scheduled periods for new schedule
         self._scheduled_periods.clear()
-        
+
         # Reset mode signature and state tracking for new day
         self._last_mode_sig = None
         self._ac_enabled = None
@@ -835,7 +835,7 @@ class GrowattController(BaseModule):
 
         # Get exchange rate once for consistency
         eur_czk_rate = await self._get_eur_czk_rate()
-        
+
         # Log price table for visibility
         await self._log_price_table(hourly_prices, target_date, eur_czk_rate)
 
@@ -852,7 +852,7 @@ class GrowattController(BaseModule):
         else:
             # Winter strategy: Traditional battery-first with AC charging
             await self._schedule_winter_strategy(hourly_prices, eur_czk_rate)
-        
+
         # Log the complete schedule summary
         self._log_schedule_summary()
 
