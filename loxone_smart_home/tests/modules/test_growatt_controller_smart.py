@@ -46,11 +46,13 @@ def settings():
 
 
 @pytest.fixture
-def controller(mock_mqtt_client, mock_influxdb_client, settings):
+async def controller(mock_mqtt_client, mock_influxdb_client, settings):
     """Create a Growatt controller instance."""
     controller = GrowattController(mock_mqtt_client, mock_influxdb_client, settings)
     controller._running = True
-    return controller
+    yield controller
+    # Cleanup: stop the controller to cancel all tasks
+    await controller.stop()
 
 
 @pytest.mark.asyncio
@@ -122,7 +124,7 @@ async def test_grid_first_mode_simulation(controller, mock_mqtt_client):
 @pytest.mark.asyncio
 async def test_grid_first_mode_real(controller, mock_mqtt_client, settings):
     """Test grid-first mode sends correct MQTT messages."""
-    settings.growatt.simulation_mode = False
+    controller.config.simulation_mode = False
     
     await controller._set_grid_first("06:00", "12:00", 100)
     
@@ -145,7 +147,7 @@ async def test_grid_first_mode_real(controller, mock_mqtt_client, settings):
 @pytest.mark.asyncio
 async def test_load_first_mode(controller, mock_mqtt_client, settings):
     """Test load-first mode disables both battery-first and grid-first."""
-    settings.growatt.simulation_mode = False
+    controller.config.simulation_mode = False
     
     await controller._set_load_first()
     
@@ -342,7 +344,7 @@ async def test_export_control_summer_low_prices(controller):
         for h in range(24)
     }
     
-    await controller._schedule_summer_strategy(hourly_prices)
+    await controller._schedule_summer_strategy(hourly_prices, 25.0)
     
     # Check that export is disabled during low-price hours
     # This is indirectly verified by checking the scheduled periods
@@ -351,3 +353,38 @@ async def test_export_control_summer_low_prices(controller):
     
     # During battery-first periods in summer, export should be disabled
     # (This would be verified by the actual scheduled tasks)
+
+
+@pytest.mark.asyncio
+async def test_zero_exchange_rate_protection(controller):
+    """Test that zero or negative exchange rates are handled safely."""
+    # Test negative rate from API
+    with patch('aiohttp.ClientSession') as mock_session:
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value="EMU|euro|1|EUR|-25.0")
+        mock_session.return_value.__aenter__.return_value.get.return_value.__aenter__.return_value = mock_response
+        
+        # Clear cache to force API call
+        controller._eur_czk_rate = None
+        controller._eur_czk_rate_updated = None
+        
+        rate = await controller._get_eur_czk_rate()
+        assert rate == 25.0  # Should return safe fallback of 25.0
+
+
+@pytest.mark.asyncio
+async def test_full_neutral_shutdown(controller, mock_mqtt_client):
+    """Test that stop() disables all modes for neutral state."""
+    controller.config.simulation_mode = False
+    
+    # Don't actually stop the controller in the fixture cleanup
+    with patch.object(controller, '_disable_battery_first') as mock_battery:
+        with patch.object(controller, '_disable_grid_first') as mock_grid:
+            with patch.object(controller, '_disable_export') as mock_export:
+                await controller.stop()
+                
+                # All three disable methods should be called
+                mock_battery.assert_called_once()
+                mock_grid.assert_called_once()
+                mock_export.assert_called_once()
