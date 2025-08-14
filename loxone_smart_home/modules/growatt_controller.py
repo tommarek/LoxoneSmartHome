@@ -421,36 +421,26 @@ class GrowattController(BaseModule):
 
                     data = await response.json()
 
-            # More resilient parsing - try to find price data
-            lines = data.get("data", {}).get("dataLine", [])
-            if not lines:
-                self.logger.error("DAM response missing dataLine")
-                return {}
-
-            # Try to locate the line that contains price points (has 'point' with x,y)
-            price_line = None
-            for line in lines:
-                if isinstance(line, dict):
-                    pts = line.get("point", [])
-                    if pts and all(isinstance(p, dict) and "x" in p and "y" in p for p in pts):
-                        price_line = pts
-                        break
-
-            if not price_line:
-                self.logger.error("DAM response has no valid price point data")
-                return {}
-
+            # Parse the OTE API response
+            # dataLine[0] contains CZK/MWh prices (despite axis label saying EUR)
+            # dataLine[1] contains actual EUR/MWh prices
             hourly_prices: Dict[Tuple[str, str], float] = {}
-            for p in price_line:
-                try:
-                    hour = int(p["x"]) - 1
-                    price = float(p["y"])
+            if data.get("data", {}).get("dataLine"):
+                lines = data["data"]["dataLine"]
+                if len(lines) >= 2:
+                    # Use second line (index 1) which has EUR/MWh prices
+                    price_data = lines[1].get("point", [])
+                else:
+                    # Fallback to first line if only one exists
+                    price_data = lines[0].get("point", [])
+                    self.logger.warning("Only one dataLine found, prices might be in CZK")
+
+                for point in price_data:
+                    hour = int(point["x"]) - 1
+                    price = float(point["y"])
                     start_time = f"{hour:02d}:00"
                     stop_time = f"{hour + 1:02d}:00"
                     hourly_prices[(start_time, stop_time)] = price
-                except (KeyError, ValueError, TypeError) as e:
-                    self.logger.warning(f"Skipping invalid price point: {p}, error: {e}")
-                    continue
 
             self.logger.info(f"Successfully fetched {len(hourly_prices)} DAM price points")
             return hourly_prices
