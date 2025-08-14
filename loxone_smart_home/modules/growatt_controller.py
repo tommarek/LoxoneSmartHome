@@ -986,6 +986,8 @@ class GrowattController(BaseModule):
             self._scheduled_tasks.append(task)
 
             # Export should be enabled all day (no low prices to avoid)
+            # Add export period so startup sync knows to enable export
+            self._scheduled_periods.append(("export", "00:00", "23:59"))
             task = asyncio.create_task(
                 self._schedule_at_time("00:00:10", self._enable_export)
             )
