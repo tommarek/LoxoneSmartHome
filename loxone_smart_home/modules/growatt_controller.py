@@ -1059,7 +1059,13 @@ class GrowattController(BaseModule):
     async def _schedule_summer_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
-        """Schedule summer battery strategy with grid-first and low-price storage."""
+        """Schedule summer battery strategy with grid-first and low-price storage.
+        
+        Export Logic:
+        - DISABLED during low-price hours (< threshold, typically < 1 CZK/kWh)
+        - ENABLED during all other periods (prices > threshold)
+        - This maximizes profit by avoiding sales at low prices
+        """
         # Convert threshold from CZK/kWh to EUR/MWh for comparison
         # Minimal guard against division by zero
         eur_czk_rate = max(eur_czk_rate, 1.0)
@@ -1181,12 +1187,13 @@ class GrowattController(BaseModule):
                     f"Scheduling load-first from {previous_end} to {group_start} (price gap)"
                 )
                 self._scheduled_periods.append(("load_first", previous_end, group_start))
+                self._scheduled_periods.append(("export", previous_end, group_start))  # Track export period
                 task = asyncio.create_task(
                     self._schedule_at_time(previous_end, self._set_load_first)
                 )
                 self._scheduled_tasks.append(task)
 
-                # Re-enable export during the gap
+                # Re-enable export during the gap (prices above threshold)
                 task = asyncio.create_task(
                     self._schedule_at_time(f"{previous_end}:05", self._enable_export)
                 )
@@ -1227,13 +1234,14 @@ class GrowattController(BaseModule):
                 f"Scheduling load-first from {last_low_end} to 23:59 (use stored energy)"
             )
             self._scheduled_periods.append(("load_first", last_low_end, "23:59"))
+            self._scheduled_periods.append(("export", last_low_end, "23:59"))  # Enable export for excess
 
             task = asyncio.create_task(
                 self._schedule_at_time(last_low_end, self._set_load_first)
             )
             self._scheduled_tasks.append(task)
-
-            # Re-enable export for evening high prices
+            
+            # Enable export for evening (in case of excess energy)
             task = asyncio.create_task(
                 self._schedule_at_time(f"{last_low_end}:05", self._enable_export)
             )
