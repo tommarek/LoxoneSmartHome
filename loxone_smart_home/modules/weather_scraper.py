@@ -149,7 +149,17 @@ class WeatherScraper(BaseModule):
         }
 
         async with self._session.get(url, params=params) as resp:
+            if resp.status != 200:
+                self.logger.error(f"OpenMeteo weather API returned status {resp.status}")
+                return []
             js = await resp.json()
+
+        # Validate response structure
+        if "hourly" not in js:
+            self.logger.error(f"OpenMeteo weather response missing 'hourly' key. Keys: {list(js.keys())}")
+            if "error" in js:
+                self.logger.error(f"API error: {js['error']}")
+            return []
 
         # Air quality data
         air_fields = "pm10,pm2_5,ozone,aerosol_optical_depth,uv_index"
@@ -162,11 +172,24 @@ class WeatherScraper(BaseModule):
             "timezone": "GMT",
         }
 
-        async with self._session.get(air_url, params=air_params) as resp:
-            js_air = await resp.json()
+        try:
+            async with self._session.get(air_url, params=air_params) as resp:
+                if resp.status != 200:
+                    self.logger.warning(f"Air quality API returned status {resp.status}")
+                    js_air = {}
+                else:
+                    js_air = await resp.json()
 
-        # Merge air quality data
-        js["hourly"].update(js_air["hourly"])
+            # Merge air quality data if available
+            if "hourly" in js_air:
+                js["hourly"].update(js_air["hourly"])
+            elif js_air:  # Only log if we got a response but no hourly data
+                self.logger.warning(f"Air quality response missing 'hourly' key. Keys: {list(js_air.keys())}")
+                if "error" in js_air:
+                    self.logger.warning(f"Air quality API error: {js_air['error']}")
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch air quality data: {e}")
+            # Continue without air quality data - it's optional
 
         # Process data
         hour_now = int(

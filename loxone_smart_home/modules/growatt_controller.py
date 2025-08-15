@@ -9,6 +9,8 @@ from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+from astral import LocationInfo
+from astral.sun import sun
 
 from config.settings import Settings
 from modules.base import BaseModule
@@ -54,6 +56,15 @@ class GrowattController(BaseModule):
 
         # Local timezone (Prague/Czech Republic)
         self._local_tz = zoneinfo.ZoneInfo("Europe/Prague")
+        
+        # Location for sunrise/sunset calculations
+        self._location = LocationInfo(
+            name="Prague",
+            region="Czech Republic", 
+            latitude=settings.weather.latitude,
+            longitude=settings.weather.longitude,
+            timezone="Europe/Prague"
+        )
 
         # Season mode cache
         self._season_mode: Optional[str] = None
@@ -109,6 +120,23 @@ class GrowattController(BaseModule):
         """Get date string in local timezone for API calls."""
         local_date = self._get_local_now() + timedelta(days=days_ahead)
         return local_date.strftime("%Y-%m-%d")
+    
+    def _get_sunrise_time(self, days_ahead: int = 0) -> str:
+        """Get sunrise time for the specified date.
+        
+        Args:
+            days_ahead: Number of days ahead (0 for today, 1 for tomorrow)
+            
+        Returns:
+            Sunrise time as HH:MM string in local timezone
+        """
+        target_date = self._get_local_now().date() + timedelta(days=days_ahead)
+        s = sun(self._location.observer, date=target_date, tzinfo=self._local_tz)
+        sunrise = s['sunrise']
+        # Round to nearest 15 minutes for cleaner scheduling
+        minutes = (sunrise.minute // 15) * 15
+        sunrise = sunrise.replace(minute=minutes, second=0, microsecond=0)
+        return sunrise.strftime("%H:%M")
 
     def _log_schedule_summary(self) -> None:
         """Log a summary of the scheduled periods for the day."""
@@ -373,7 +401,7 @@ class GrowattController(BaseModule):
                     if season == "summer":
                         await self._disable_ac_charge()
                 elif period_type == "grid_first":
-                    await self._set_mode("grid_first", start, end, 100)  # Always 100% stopSOC
+                    await self._set_mode("grid_first", start, end, 20, 10)  # 20% stopSOC, 10% powerRate
                     mode_applied = True
                 elif period_type == "load_first":
                     await self._set_mode("load_first")
@@ -712,17 +740,20 @@ class GrowattController(BaseModule):
         )
         self._export_enabled = False
 
-    async def _set_grid_first(self, start_hour: str, stop_hour: str, stop_soc: int = 100) -> None:
+    async def _set_grid_first(
+        self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 10
+    ) -> None:
         """Set grid-first mode for specified time window.
 
         Grid-first mode prioritizes selling to grid over charging battery.
-        stop_soc is set to 100% to prevent battery discharge to grid.
+        stop_soc: Battery level to stop discharging at (default 20%)
+        power_rate: Discharge rate in % (default 10%)
         """
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔌 [SIMULATE] GRID-FIRST MODE SET: {start_hour}-{stop_hour} "
-                f"(stopSOC={stop_soc}%, simulated at {current_time})"
+                f"(stopSOC={stop_soc}%, powerRate={power_rate}%, simulated at {current_time})"
             )
             return
 
@@ -731,17 +762,24 @@ class GrowattController(BaseModule):
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
 
-        # Set stop SOC to prevent battery discharge
+        # Set stop SOC (battery level to stop discharging)
         stopsoc_payload = {"value": stop_soc}
         await self.mqtt_client.publish(
             self.config.grid_first_stopsoc_topic, json.dumps(stopsoc_payload)
         )
 
+        # Set power rate (discharge rate)
+        powerrate_payload = {"value": power_rate}
+        await self.mqtt_client.publish(
+            self.config.grid_first_powerrate_topic, json.dumps(powerrate_payload)
+        )
+
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
-            f"🔌 GRID-FIRST MODE SET: {start_hour}-{stop_hour} (stopSOC={stop_soc}%) "
-            f"at {current_time} → Topics: {self.config.grid_first_topic}, "
-            f"{self.config.grid_first_stopsoc_topic}"
+            f"🔌 GRID-FIRST MODE SET: {start_hour}-{stop_hour} "
+            f"(stopSOC={stop_soc}%, powerRate={power_rate}%) at {current_time} → "
+            f"Topics: {self.config.grid_first_topic}, {self.config.grid_first_stopsoc_topic}, "
+            f"{self.config.grid_first_powerrate_topic}"
         )
 
     async def _disable_grid_first(self) -> None:
@@ -965,31 +1003,47 @@ class GrowattController(BaseModule):
         ]
 
         if not low_price_hours:
-            # No low-price hours - use battery-first without AC charging all day
+            # No low-price hours - optimize based on time of day
             self.logger.info(
                 f"Summer mode: No hours below "
-                f"{self.config.summer_price_threshold:.2f} CZK/kWh. "
-                f"Using battery-first without AC charging all day."
+                f"{self.config.summer_price_threshold:.2f} CZK/kWh."
             )
 
-            # Schedule battery-first for entire day without AC charging
-            self._scheduled_periods.append(("battery_first", "00:00", "23:59"))
+            # Get sunrise time
+            now = self._get_local_now()
+            days_ahead = 1 if now.time() >= dt_time(23, 45) else 0
+            sunrise_time = self._get_sunrise_time(days_ahead)
+            self.logger.info(f"Sunrise time: {sunrise_time}")
+
+            # Schedule Load-First from midnight until sunrise
+            if sunrise_time != "00:00":
+                self.logger.info(
+                    f"Scheduling load-first from 00:00 to {sunrise_time} (overnight consumption)"
+                )
+                self._scheduled_periods.append(("load_first", "00:00", sunrise_time))
+                task = asyncio.create_task(
+                    self._schedule_at_time("00:00", self._set_load_first)
+                )
+                self._scheduled_tasks.append(task)
+
+            # Schedule Grid-First from sunrise to sunset (sell solar + battery at 10% rate)
+            self.logger.info(
+                f"Scheduling grid-first from {sunrise_time} to 23:59 "
+                f"(sell solar + battery, stopSOC=20%, powerRate=10%)"
+            )
+            self._scheduled_periods.append(("grid_first", sunrise_time, "23:59"))
+            self._scheduled_periods.append(("export", sunrise_time, "23:59"))
+            
             task = asyncio.create_task(
-                self._schedule_at_time("00:00", self._set_battery_first, "00:00", "23:59")
+                self._schedule_at_time(
+                    sunrise_time, self._set_grid_first, sunrise_time, "23:59", 20, 10
+                )
             )
             self._scheduled_tasks.append(task)
 
-            # Ensure AC charging is disabled
+            # Enable export after sunrise
             task = asyncio.create_task(
-                self._schedule_at_time("00:00:05", self._disable_ac_charge)
-            )
-            self._scheduled_tasks.append(task)
-
-            # Export should be enabled all day (no low prices to avoid)
-            # Add export period so startup sync knows to enable export
-            self._scheduled_periods.append(("export", "00:00", "23:59"))
-            task = asyncio.create_task(
-                self._schedule_at_time("00:00:10", self._enable_export)
+                self._schedule_at_time(f"{sunrise_time}:05", self._enable_export)
             )
             self._scheduled_tasks.append(task)
             return
@@ -1007,24 +1061,44 @@ class GrowattController(BaseModule):
             f"First low: {first_low_start}, Last low: {last_low_end}"
         )
 
-        # Schedule grid-first mode for morning (before first low price)
-        if first_low_start != "00:00":
-            self.logger.info(
-                f"Scheduling grid-first from 00:00 to {first_low_start} (sell morning solar)"
-            )
-            self._scheduled_periods.append(("grid_first", "00:00", first_low_start))
+        # Get sunrise time for the target day (tomorrow if scheduling after 23:45)
+        now = self._get_local_now()
+        days_ahead = 1 if now.time() >= dt_time(23, 45) else 0
+        sunrise_time = self._get_sunrise_time(days_ahead)
+        self.logger.info(f"Sunrise time: {sunrise_time}")
 
-            # Set grid-first at midnight with stopSOC=100%
+        # Schedule Load-First from midnight until sunrise
+        if sunrise_time != "00:00":
+            self.logger.info(
+                f"Scheduling load-first from 00:00 to {sunrise_time} (overnight consumption)"
+            )
+            self._scheduled_periods.append(("load_first", "00:00", sunrise_time))
+            task = asyncio.create_task(
+                self._schedule_at_time("00:00", self._set_load_first)
+            )
+            self._scheduled_tasks.append(task)
+
+        # Schedule Grid-First from sunrise until first low price (or end of day if no low prices)
+        grid_first_end = first_low_start if first_low_start > sunrise_time else "23:59"
+        if sunrise_time < grid_first_end:
+            self.logger.info(
+                f"Scheduling grid-first from {sunrise_time} to {grid_first_end} "
+                f"(sell morning solar, stopSOC=20%, powerRate=10%)"
+            )
+            self._scheduled_periods.append(("grid_first", sunrise_time, grid_first_end))
+            self._scheduled_periods.append(("export", sunrise_time, grid_first_end))
+            
+            # Set grid-first at sunrise with stopSOC=20% and powerRate=10%
             task = asyncio.create_task(
                 self._schedule_at_time(
-                    "00:00", self._set_grid_first, "00:00", first_low_start, 100
+                    sunrise_time, self._set_grid_first, sunrise_time, grid_first_end, 20, 10
                 )
             )
             self._scheduled_tasks.append(task)
 
             # Enable export during morning high prices
             task = asyncio.create_task(
-                self._schedule_at_time("00:00:05", self._enable_export)
+                self._schedule_at_time(f"{sunrise_time}:05", self._enable_export)
             )
             self._scheduled_tasks.append(task)
 
