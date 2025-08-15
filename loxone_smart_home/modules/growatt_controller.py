@@ -139,21 +139,91 @@ class GrowattController(BaseModule):
         return sunrise.strftime("%H:%M")
 
     def _log_schedule_summary(self) -> None:
-        """Log a summary of the scheduled periods for the day."""
+        """Log a detailed summary of the scheduled periods for the day."""
         if not self._scheduled_periods:
             self.logger.info("No periods scheduled for the day")
             return
 
-        self.logger.info("═══════════════════════════════════════")
-        self.logger.info("Daily Schedule Summary:")
-        self.logger.info("───────────────────────────────────────")
-        self.logger.info("Type            Start   End")
-        self.logger.info("───────────────────────────────────────")
-
+        self.logger.info("═" * 80)
+        self.logger.info("                        DAILY SCHEDULE SUMMARY")
+        self.logger.info("═" * 80)
+        
+        # Add season mode and sunrise info
+        if hasattr(self, '_season_mode') and self._season_mode:
+            self.logger.info(f"Season Mode: {self._season_mode.upper()}")
+        
+        try:
+            days_ahead = 1 if self._get_local_now().time() >= dt_time(23, 45) else 0
+            sunrise = self._get_sunrise_time(days_ahead)
+            self.logger.info(f"Sunrise Time: {sunrise}")
+        except:
+            pass
+        
+        self.logger.info("-" * 80)
+        
+        # Build comprehensive schedule view
+        schedule_entries = []
+        
+        # Group periods by time
+        time_slots = {}
         for period_type, start, end in sorted(self._scheduled_periods, key=lambda x: x[1]):
-            self.logger.info(f"{period_type:<15} {start}  →  {end}")
-
-        self.logger.info("═══════════════════════════════════════")
+            key = f"{start}-{end}"
+            if key not in time_slots:
+                time_slots[key] = {
+                    "start": start,
+                    "end": end,
+                    "modes": set(),
+                    "primary_mode": None
+                }
+            time_slots[key]["modes"].add(period_type)
+            
+            # Determine primary mode (battery_first, grid_first, or load_first)
+            if period_type in ["battery_first", "grid_first", "load_first"]:
+                time_slots[key]["primary_mode"] = period_type
+        
+        # Create detailed schedule entries
+        for time_key in sorted(time_slots.keys()):
+            slot = time_slots[time_key]
+            entry = {
+                "time": f"{slot['start']} → {slot['end']}",
+                "mode": slot["primary_mode"] or "Unknown",
+                "details": []
+            }
+            
+            # Add mode-specific details
+            if slot["primary_mode"] == "grid_first":
+                entry["mode"] = "GRID-FIRST"
+                entry["details"].append("StopSOC: 20%")
+                entry["details"].append("PowerRate: 10%")
+                entry["details"].append("Priority: Sell to grid")
+            elif slot["primary_mode"] == "battery_first":
+                entry["mode"] = "BATTERY-FIRST"
+                entry["details"].append("Priority: Charge battery")
+            elif slot["primary_mode"] == "load_first":
+                entry["mode"] = "LOAD-FIRST"
+                entry["details"].append("Priority: Supply loads")
+            
+            # Add AC charging status
+            if "ac_charge" in slot["modes"]:
+                entry["details"].append("AC Charging: ENABLED")
+            elif slot["primary_mode"] in ["battery_first", "grid_first"]:
+                entry["details"].append("AC Charging: DISABLED")
+            
+            # Add export status
+            if "export" in slot["modes"]:
+                entry["details"].append("Export: ENABLED")
+            else:
+                entry["details"].append("Export: DISABLED")
+            
+            schedule_entries.append(entry)
+        
+        # Print schedule in readable format
+        for entry in schedule_entries:
+            self.logger.info(f"[{entry['time']}] {entry['mode']}")
+            for detail in entry['details']:
+                self.logger.info(f"  • {detail}")
+        
+        self.logger.info("═" * 80)
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
