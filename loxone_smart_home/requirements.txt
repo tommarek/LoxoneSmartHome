@@ -19,6 +19,7 @@ aiohttp==3.9.1
 
 # Date/time handling
 pytz==2023.3
+astral==3.2  # For sunrise/sunset calculations
 
 # Data processing
 pandas==2.1.4
