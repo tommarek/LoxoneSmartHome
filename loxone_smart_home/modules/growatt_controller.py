@@ -98,7 +98,7 @@ class GrowattController(BaseModule):
     def _normalize_end_time(self, s: str) -> str:
         """Return a safe end-time string for scheduling and parsing."""
         # Prefer 23:59 to avoid '24:00' which Python can't parse
-        return "23:59" if s in ("24:00", "23:60") else s
+        return "23:59" if s in ("24:00", "23:60", "24:00:00") else s
 
     async def _set_mode(self, mode: str, *args: Any) -> None:
         """Set inverter mode with flapping guard."""
@@ -128,14 +128,22 @@ class GrowattController(BaseModule):
             days_ahead: Number of days ahead (0 for today, 1 for tomorrow)
             
         Returns:
-            Sunrise time as HH:MM string in local timezone
+            Sunrise time as HH:MM string in local timezone, rounded to nearest 15 minutes
         """
         target_date = self._get_local_now().date() + timedelta(days=days_ahead)
         s = sun(self._location.observer, date=target_date, tzinfo=self._local_tz)
         sunrise = s['sunrise']
-        # Round to nearest 15 minutes for cleaner scheduling
-        minutes = (sunrise.minute // 15) * 15
-        sunrise = sunrise.replace(minute=minutes, second=0, microsecond=0)
+        
+        # Round to nearest 15 minutes (not floor)
+        total_minutes = sunrise.hour * 60 + sunrise.minute
+        rounded_minutes = int((total_minutes + 7) // 15) * 15  # +7 for rounding to nearest
+        hour, minute = divmod(rounded_minutes, 60)
+        
+        # Handle 24:00 edge case (should roll to 00:00 next day for display)
+        if hour >= 24:
+            hour -= 24
+        
+        sunrise = sunrise.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return sunrise.strftime("%H:%M")
 
     def _log_schedule_summary(self) -> None:
@@ -156,7 +164,7 @@ class GrowattController(BaseModule):
             days_ahead = 1 if self._get_local_now().time() >= dt_time(23, 45) else 0
             sunrise = self._get_sunrise_time(days_ahead)
             self.logger.info(f"Sunrise Time: {sunrise}")
-        except:
+        except Exception:
             pass
         
         self.logger.info("-" * 80)
@@ -558,20 +566,23 @@ class GrowattController(BaseModule):
         intervals = sorted(prices.keys(), key=lambda t: t[0])
         num_intervals = len(intervals)
 
-        if num_intervals < 2:
+        if num_intervals == 0:
             return []
 
-        # Determine interval duration from the first two (now sorted)
-        start0 = datetime.strptime(intervals[0][0], "%H:%M")
-        start1 = datetime.strptime(intervals[1][0], "%H:%M")
-        interval_duration = int((start1 - start0).total_seconds() // 60)
+        # Determine interval duration
+        if num_intervals >= 2:
+            start0 = datetime.strptime(intervals[0][0], "%H:%M")
+            start1 = datetime.strptime(intervals[1][0], "%H:%M")
+            interval_duration = int((start1 - start0).total_seconds() // 60)
+        else:
+            interval_duration = 60  # assume hourly if only one interval present
 
         if interval_duration not in (15, 60):
             self.logger.warning(f"Unknown interval duration: {interval_duration} minutes")
             return []
 
         intervals_per_hour = 60 // interval_duration
-        intervals_needed = x * intervals_per_hour
+        intervals_needed = max(1, x * intervals_per_hour)  # Allow x=1
 
         if num_intervals < intervals_needed:
             return []
@@ -1091,14 +1102,23 @@ class GrowattController(BaseModule):
             sunrise_time = self._get_sunrise_time(days_ahead)
             self.logger.info(f"Sunrise time: {sunrise_time}")
 
-            # Schedule Load-First from midnight until sunrise
+            # Schedule Load-First from midnight until sunrise  
             if sunrise_time != "00:00":
                 self.logger.info(
                     f"Scheduling load-first from 00:00 to {sunrise_time} (overnight consumption)"
                 )
                 self._scheduled_periods.append(("load_first", "00:00", sunrise_time))
+                # Since no hours are below threshold, all prices are good - enable export
+                self._scheduled_periods.append(("export", "00:00", sunrise_time))
+                
                 task = asyncio.create_task(
                     self._schedule_at_time("00:00", self._set_load_first)
+                )
+                self._scheduled_tasks.append(task)
+                
+                # Enable export for overnight period (prices above threshold)
+                task = asyncio.create_task(
+                    self._schedule_at_time("00:00:05", self._enable_export)
                 )
                 self._scheduled_tasks.append(task)
 
@@ -1149,6 +1169,23 @@ class GrowattController(BaseModule):
                 f"Scheduling load-first from 00:00 to {sunrise_time} (overnight consumption)"
             )
             self._scheduled_periods.append(("load_first", "00:00", sunrise_time))
+            
+            # Check if overnight prices are above threshold - if so, enable export
+            sunrise_t = datetime.strptime(sunrise_time, "%H:%M").time()
+            overnight_above_threshold = any(
+                (datetime.strptime(start, "%H:%M").time() < sunrise_t) 
+                and (price >= threshold_eur_mwh)
+                for ((start, _), price) in hourly_prices.items()
+            )
+            
+            if overnight_above_threshold:
+                self.logger.info("Overnight prices above threshold, enabling export")
+                self._scheduled_periods.append(("export", "00:00", sunrise_time))
+                task = asyncio.create_task(
+                    self._schedule_at_time("00:00:05", self._enable_export)
+                )
+                self._scheduled_tasks.append(task)
+            
             task = asyncio.create_task(
                 self._schedule_at_time("00:00", self._set_load_first)
             )
@@ -1396,8 +1433,7 @@ class GrowattController(BaseModule):
                 max_price = max(group_prices)
                 avg_price = sum(group_prices) / len(group_prices)
 
-                # Convert prices to CZK/kWh for display
-                eur_czk_rate = await self._get_eur_czk_rate()
+                # Convert prices to CZK/kWh for display (use passed-in rate for consistency)
                 min_price_czk_kwh = min_price * eur_czk_rate / 1000
                 max_price_czk_kwh = max_price * eur_czk_rate / 1000
                 avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
