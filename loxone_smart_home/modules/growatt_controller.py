@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import aiohttp
 from astral import LocationInfo
@@ -24,6 +24,30 @@ PeriodType = Literal["battery_first", "grid_first", "load_first", "ac_charge", "
 # Mode precedence (highest → lowest). load_first is the fallback/default if none match.
 MODE_PRECEDENCE: Tuple[PeriodType, ...] = ("battery_first", "grid_first", "load_first")
 
+# Use a single end-of-day barrier everywhere
+EOD_HHMM = "23:59"
+EOD_HHMMSS = "23:59:55"
+EOD_DTTIME = dt_time(23, 59, 55)
+
+# Common time jitter constants for readability
+MIDNIGHT_JITTER = "00:00:05"  # 5 seconds after midnight
+MIDNIGHT_DISABLE_JITTER = "00:00:10"  # 10 seconds after midnight for disables
+
+
+def _is_24(s: str) -> bool:
+    """Check if time string represents 24:00 (end of day)."""
+    return s in ("24:00", "24:00:00")
+
+
+def _fmt_hhmm(t: Union[datetime, dt_time]) -> str:
+    """Format datetime/time as HH:MM string."""
+    return (t if isinstance(t, dt_time) else t.time()).strftime("%H:%M")
+
+
+def _fmt_hhmmss(t: Union[datetime, dt_time]) -> str:
+    """Format datetime/time as HH:MM:SS string."""
+    return (t if isinstance(t, dt_time) else t.time()).strftime("%H:%M:%S")
+
 
 @dataclass(frozen=True)
 class Period:
@@ -31,6 +55,7 @@ class Period:
     kind: PeriodType
     start: dt_time
     end: dt_time
+    params: Optional[Dict[str, Any]] = None
 
     def contains_time(self, t: dt_time) -> bool:
         """Check if a time falls within this period, handling midnight wrap."""
@@ -44,16 +69,6 @@ class Period:
         return (self.kind, self.start.strftime("%H:%M"), self.end.strftime("%H:%M"))
 
 
-class EnergyPriceData:
-    """Data class for energy price information."""
-
-    def __init__(self, prices: Dict[Tuple[str, str], float]) -> None:
-        """Initialize energy price data."""
-        self.prices = prices
-        # Use Prague timezone for energy price data
-        self.timestamp = datetime.now(zoneinfo.ZoneInfo("Europe/Prague"))
-
-
 class GrowattController(BaseModule):
     """Growatt controller that manages battery charging based on energy prices."""
 
@@ -63,6 +78,103 @@ class GrowattController(BaseModule):
             if m in modes:
                 return m
         return "load_first"  # Default mode
+
+    def _validate_config(self) -> None:
+        """Validate required config attributes and set defaults."""
+        required = [
+            "battery_first_topic",
+            "grid_first_topic",
+            "grid_first_stopsoc_topic",
+            "grid_first_powerrate_topic",
+            "ac_charge_topic",
+            "export_enable_topic",
+            "export_disable_topic",
+            "schedule_hour",
+            "schedule_minute",
+            "export_price_threshold",
+            "summer_price_threshold",
+            "battery_charge_hours",
+            "individual_cheapest_hours",
+        ]
+        missing = [k for k in required if not hasattr(self.config, k)]
+        if missing:
+            raise ValueError(f"Growatt config missing keys: {', '.join(missing)}")
+
+        # Set sensible defaults for optional flags
+        if not hasattr(self.config, "dst_merge_policy"):
+            self.config.dst_merge_policy = "avg"
+        if not hasattr(self.config, "suppress_export_during_ac_charge"):
+            self.config.suppress_export_during_ac_charge = True
+        if not hasattr(self.config, "eur_czk_rate"):
+            self.config.eur_czk_rate = 25.0
+        if not hasattr(self.config, "temperature_avg_days"):
+            self.config.temperature_avg_days = 3
+        if not hasattr(self.config, "summer_temp_threshold"):
+            self.config.summer_temp_threshold = 15.0
+        if not hasattr(self.config, "simulation_mode"):
+            self.config.simulation_mode = False
+
+        # Validate and clamp schedule time
+        if hasattr(self.config, "schedule_hour"):
+            if not 0 <= self.config.schedule_hour <= 23:
+                old_val = self.config.schedule_hour
+                self.config.schedule_hour = max(0, min(23, self.config.schedule_hour))
+                self.logger.warning(
+                    f"Invalid schedule_hour, clamping to 0-23 "
+                    f"(was {old_val} → now {self.config.schedule_hour})"
+                )
+
+        if hasattr(self.config, "schedule_minute"):
+            if not 0 <= self.config.schedule_minute <= 59:
+                old_val = self.config.schedule_minute
+                self.config.schedule_minute = max(0, min(59, self.config.schedule_minute))
+                self.logger.warning(
+                    f"Invalid schedule_minute, clamping to 0-59 "
+                    f"(was {old_val} → now {self.config.schedule_minute})"
+                )
+
+        # Validate battery_charge_hours
+        if hasattr(self.config, "battery_charge_hours"):
+            if not 0 <= self.config.battery_charge_hours <= 24:
+                old_val = self.config.battery_charge_hours
+                self.config.battery_charge_hours = max(
+                    0, min(24, self.config.battery_charge_hours)
+                )
+                self.logger.warning(
+                    f"Invalid battery_charge_hours, clamping to 0-24 "
+                    f"(was {old_val} → now {self.config.battery_charge_hours})"
+                )
+
+        # Validate individual_cheapest_hours
+        if hasattr(self.config, "individual_cheapest_hours"):
+            if not 0 <= self.config.individual_cheapest_hours <= 24:
+                old_val = self.config.individual_cheapest_hours
+                self.config.individual_cheapest_hours = max(
+                    0, min(24, self.config.individual_cheapest_hours)
+                )
+                self.logger.warning(
+                    f"Invalid individual_cheapest_hours, clamping to 0-24 "
+                    f"(was {old_val} → now {self.config.individual_cheapest_hours})"
+                )
+
+        # Validate price thresholds
+        if hasattr(self.config, "summer_price_threshold"):
+            if self.config.summer_price_threshold < 0:
+                old_val = self.config.summer_price_threshold
+                self.config.summer_price_threshold = max(0, self.config.summer_price_threshold)
+                self.logger.warning(
+                    f"Invalid summer_price_threshold, setting to 0 "
+                    f"(was {old_val} → now {self.config.summer_price_threshold})"
+                )
+
+        if hasattr(self.config, "export_price_threshold"):
+            if self.config.export_price_threshold < 0:
+                old_val = self.config.export_price_threshold
+                self.config.export_price_threshold = max(0, self.config.export_price_threshold)
+                self.logger.warning(
+                    f"Invalid export_price_threshold, setting to 0 "
+                    f"(was {old_val} → now {self.config.export_price_threshold})"
+                )
 
     def __init__(
         self,
@@ -79,6 +191,9 @@ class GrowattController(BaseModule):
             settings=settings,
         )
         self.config = settings.growatt
+
+        # Validate config and set defaults
+        self._validate_config()
 
         # Scheduled tasks
         self._scheduled_tasks: List[asyncio.Task[None]] = []
@@ -106,9 +221,6 @@ class GrowattController(BaseModule):
         # Running flag for daily loop
         self._running: bool = False
 
-        # Track last applied mode signature to prevent flapping
-        self._last_mode_sig: Optional[Tuple[str, Tuple[Any, ...]]] = None
-
         # EUR/CZK exchange rate cache
         self._eur_czk_rate: Optional[float] = None
         self._eur_czk_rate_updated: Optional[datetime] = None
@@ -120,6 +232,9 @@ class GrowattController(BaseModule):
         # Track inverter clock drift
         self._clock_drift_seconds: float = 0
 
+        # Track applied mode configurations to prevent flapping
+        self._last_applied: Dict[str, Tuple[Any, ...]] = {}
+
         # Default scheduler function (will be set properly in _calculate_and_schedule_next_day)
         self._schedule_func = self._schedule_at_time
 
@@ -127,21 +242,40 @@ class GrowattController(BaseModule):
         """Get current time in local timezone."""
         return datetime.now(self._local_tz)
 
-    def _parse_hhmm(self, s: str) -> dt_time:
-        """Parse HH:MM allowing '24:00' -> 00:00 next day semantics."""
-        if s in ("24:00", "24:00:00"):
-            # Represent exclusive end-of-day as 00:00 for comparisons
-            # Callers should track if this is next-day
+    def _parse_time_any(self, s: str) -> dt_time:
+        """Accept HH:MM, HH:MM:SS, and '24:00' => 00:00 (next-day semantics)."""
+        if _is_24(s):
             return dt_time(0, 0)
-        return datetime.strptime(s, "%H:%M").time()
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(s, fmt).time()
+            except ValueError:
+                pass
+        raise ValueError(f"Invalid time string: {s}")
+
+    def _parse_hhmm(self, s: str) -> dt_time:
+        """Parse HH:MM or HH:MM:SS string to time object."""
+        return self._parse_time_any(s)
 
     def _normalize_end_time(self, s: str) -> str:
-        """Normalize end time only for final device payloads/scheduling.
+        """Only for device/scheduler emission. Collapse '24:00' to end-of-day barrier."""
+        return EOD_HHMMSS if _is_24(s) else s
 
-        Use this ONLY when emitting to _schedule_at_time or device payloads.
-        Keep "24:00" in logic for proper grouping.
+    def _normalize_for_schedule(self, s: str) -> str:
+        """Normalize any time string for scheduling calls.
+
+        Converts 24:00 to EOD_HHMMSS and ensures HH:MM:SS format.
         """
-        return "23:59:55" if s in ("24:00", "24:00:00") else s
+        if _is_24(s):
+            return EOD_HHMMSS
+        # Normalize HH:MM to HH:MM:SS for consistency
+        for fmt in ("%H:%M:%S", "%H:%M"):
+            try:
+                return datetime.strptime(s, fmt).strftime("%H:%M:%S")
+            except ValueError:
+                pass
+        # If we can't parse it, raise an error
+        raise ValueError(f"Invalid time string for schedule: {s}")
 
     def _bump_time(self, hhmm: str, seconds: int) -> str:
         """Add seconds to a time string systematically.
@@ -160,21 +294,28 @@ class GrowattController(BaseModule):
         t = (t + timedelta(seconds=seconds)).time()
         return t.strftime("%H:%M:%S")
 
-    async def _set_mode(self, mode: str, *args: Any) -> None:
-        """Set inverter mode with flapping guard."""
-        sig = (mode, args)
-        if self._last_mode_sig == sig:
-            self.logger.debug(f"Mode {mode} with args {args} already applied, skipping")
-            return
+    def _to_device_hhmm(self, s: str) -> str:
+        """Convert time string to HH:MM format required by device timeslot endpoints.
 
+        The firmware strictly requires HH:MM format (no seconds) for
+        batteryfirst/set/timeslot and gridfirst/set/timeslot commands.
+        """
+        # Handle EOD sentinels and 24:00
+        if s in ("24:00", "24:00:00", EOD_HHMMSS):
+            return EOD_HHMM  # "23:59"
+        # Truncate to HH:MM if longer
+        return s[:5] if len(s) >= 5 else s
+
+    async def _set_mode(self, mode: str, *args: Any) -> None:
+        """Set the inverter mode (thin dispatcher to individual setters)."""
         if mode == "battery_first":
             await self._set_battery_first(*args)
         elif mode == "grid_first":
             await self._set_grid_first(*args)
         elif mode == "load_first":
             await self._set_load_first()
-
-        self._last_mode_sig = sig
+        else:
+            self.logger.error(f"Unknown mode: {mode}")
 
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
@@ -236,8 +377,9 @@ class GrowattController(BaseModule):
         time_slots: Dict[str, Dict[str, Any]] = {}
         for period in sorted(self._scheduled_periods, key=lambda x: x.start):
             start_str = period.start.strftime("%H:%M")
-            # If the slot wraps (start > end) and end is 00:00, present as 24:00
-            if period.start > period.end and period.end == dt_time(0, 0):
+            # If the slot wraps (start > end) and end is 00:00, or ends at EOD, present as 24:00
+            if ((period.start > period.end and period.end == dt_time(0, 0))
+                    or period.end == EOD_DTTIME):
                 end_str = "24:00"
             else:
                 end_str = period.end.strftime("%H:%M")
@@ -247,9 +389,11 @@ class GrowattController(BaseModule):
                     "start": start_str,
                     "end": end_str,
                     "modes": set(),
+                    "periods": [],  # Track actual period objects
                     "primary_mode": None
                 }
             time_slots[key]["modes"].add(period.kind)
+            time_slots[key]["periods"].append(period)
 
         # Determine primary mode using consistent precedence for all slots
         for key, slot in time_slots.items():
@@ -267,8 +411,16 @@ class GrowattController(BaseModule):
             # Add mode-specific details
             if slot["primary_mode"] == "grid_first":
                 entry["mode"] = "GRID-FIRST"
-                entry["details"].append("StopSOC: 20%")
-                entry["details"].append("PowerRate: 10%")
+                # Find the first grid_first period from this slot's contributing periods
+                gf = next((p for p in slot["periods"] if p.kind == "grid_first" and p.params), None)
+                if gf and gf.params:
+                    stop_soc = gf.params.get("stop_soc", 20)
+                    power_rate = gf.params.get("power_rate", 10)
+                else:
+                    stop_soc = 20
+                    power_rate = 10
+                entry["details"].append(f"StopSOC: {stop_soc}%")
+                entry["details"].append(f"PowerRate: {power_rate}%")
                 entry["details"].append("Priority: Sell to grid")
             elif slot["primary_mode"] == "battery_first":
                 entry["mode"] = "BATTERY-FIRST"
@@ -466,38 +618,67 @@ class GrowattController(BaseModule):
             return False
 
     def _ensure_future_start(
-        self, start_str: str, stop_str: str, min_future_minutes: int = 1
+        self,
+        start_str: str,
+        stop_str: str,
+        min_future_minutes: int = 1,
+        preserve_duration: bool = False,
     ) -> Tuple[str, str]:
         """Ensure start time is at least min_future_minutes in the future.
 
-        Returns adjusted (start, stop) times.
+        If preserve_duration=True, keep the original slot duration when bumping start.
+        Returns adjusted (start, stop) in HH:MM format.
         """
         now = self._get_local_now()
 
-        # Parse times
-        start_time = self._parse_hhmm(start_str)
-        stop_time = self._parse_hhmm(stop_str)
+        # Parse times (support HH:MM or HH:MM:SS)
+        def _parse_any(s: str) -> datetime:
+            if s in ("24:00", "24:00:00"):
+                s = "00:00:00"
+            for fmt in ("%H:%M:%S", "%H:%M"):
+                try:
+                    t = datetime.strptime(s, fmt).time()
+                    return datetime.combine(now.date(), t, self._local_tz)
+                except ValueError:
+                    continue
+            raise ValueError(f"Invalid time string: {s}")
 
-        # Calculate start as datetime for today
-        start_dt = datetime.combine(now.date(), start_time, self._local_tz)
-        stop_dt = datetime.combine(now.date(), stop_time, self._local_tz)
+        start_dt = _parse_any(start_str)
+        stop_dt = _parse_any(stop_str)
 
-        # If stop is before start, it's tomorrow
+        # Compute original duration (handle wrap)
         if stop_dt <= start_dt:
             stop_dt += timedelta(days=1)
+        duration = stop_dt - start_dt
 
-        # Check if start is in the past or too soon
-        min_start = now + timedelta(minutes=min_future_minutes)
-
+        # Round up to the next whole minute to avoid edge cases
+        min_start = now.replace(microsecond=0, second=0) + timedelta(minutes=min_future_minutes)
         if start_dt <= min_start:
-            # Need to adjust start time to be in the future
-            self.logger.debug(
-                f"Adjusting start time from {start_str} to {min_start.strftime('%H:%M')} "
+            adjusted_start_dt = min_start
+            if preserve_duration:
+                adjusted_stop_dt = adjusted_start_dt + duration
+            else:
+                adjusted_stop_dt = stop_dt  # keep original stop
+
+            # Normalize back into today's clock (mod 24h)
+            def _fmt(dt: datetime) -> str:
+                t = dt.time()
+                return t.strftime("%H:%M")
+
+            msg = (
+                f"Adjusting start time from {start_str} to {_fmt(adjusted_start_dt)} "
                 f"(+{min_future_minutes}min from now)"
             )
-            return min_start.strftime("%H:%M"), stop_str
+            if preserve_duration:
+                msg += f", stop adjusted from {stop_str} to {_fmt(adjusted_stop_dt)}"
+            self.logger.debug(msg)
+            return _fmt(adjusted_start_dt), _fmt(adjusted_stop_dt)
 
-        return start_str, stop_str
+        # No change
+        return (
+            start_dt.time().strftime("%H:%M"),
+            stop_dt.time().strftime("%H:%M"),
+        )
 
     async def _get_season_mode(self) -> str:
         """Determine season mode based on 3-day temperature average."""
@@ -644,8 +825,14 @@ class GrowattController(BaseModule):
 
         try:
             await self._disable_export()
+            await asyncio.sleep(0.2)  # Small delay before AC disable
         except Exception as e:
             self.logger.error(f"Error disabling export on shutdown: {e}")
+
+        try:
+            await self._disable_ac_charge()
+        except Exception as e:
+            self.logger.error(f"Error disabling AC charge on shutdown: {e}")
 
         self.logger.info("Growatt controller stopped")
 
@@ -675,7 +862,15 @@ class GrowattController(BaseModule):
         primary = self._select_primary_mode(active)
         desired_mode: Tuple[Any, ...]
         if primary == "grid_first":
-            desired_mode = ("grid_first", 20, 10)  # Default stopSOC=20%, powerRate=10%
+            # Try to get params from an active scheduled grid-first period
+            stop_soc = 20  # Default
+            power_rate = 10  # Default
+            for p in self._scheduled_periods:
+                if p.kind == "grid_first" and p.contains_time(now_t) and p.params:
+                    stop_soc = int(p.params.get("stop_soc", stop_soc))
+                    power_rate = int(p.params.get("power_rate", power_rate))
+                    break
+            desired_mode = ("grid_first", stop_soc, power_rate)
         elif primary == "battery_first":
             desired_mode = ("battery_first",)
         else:
@@ -692,18 +887,26 @@ class GrowattController(BaseModule):
         end = now + timedelta(hours=1)
         # Handle midnight crossing safely
         if end.date() != now.date():
-            next_hour = "23:59"  # Stop at end of day
+            next_hour = EOD_HHMMSS  # Stop at end of day
         else:
             next_hour = end.strftime("%H:00")
 
         if desired_mode[0] == "battery_first":
-            await self._set_mode("battery_first", current_hour, next_hour)
+            # Use _emit_device_window to handle midnight wrap properly
+            # Don't preserve duration to avoid spillover past the hour
+            await self._emit_device_window(
+                self._set_battery_first, current_hour, next_hour, preserve_when_same_day=False
+            )
         elif desired_mode[0] == "grid_first":
-            await self._set_mode(
-                "grid_first", current_hour, next_hour, desired_mode[1], desired_mode[2]
+            # Use _emit_device_window to handle midnight wrap properly
+            # Don't preserve duration to avoid spillover past the hour
+            await self._emit_device_window(
+                self._set_grid_first, current_hour, next_hour,
+                desired_mode[1], desired_mode[2],
+                preserve_when_same_day=False,
             )
         else:
-            await self._set_mode("load_first")
+            await self._set_load_first()
 
         # Small delay before AC charging control
         await asyncio.sleep(0.5)
@@ -1001,10 +1204,39 @@ class GrowattController(BaseModule):
         groups.append((group_start, group_end))
         return groups
 
-    async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
+    async def _ensure_exclusive(self, primary: PeriodType) -> None:
+        """Ensure modes are mutually exclusive at the device level."""
+        if primary == "battery_first":
+            await self._disable_grid_first()
+            await asyncio.sleep(0.5)
+        elif primary == "grid_first":
+            await self._disable_battery_first()
+            await asyncio.sleep(0.5)
+
+    async def _set_battery_first(
+        self, start_hour: str, stop_hour: str, *, preserve_duration: bool = True
+    ) -> None:
         """Set battery-first mode for specified time window."""
-        # Ensure start time is in the future for inverter to trigger
-        adjusted_start, adjusted_stop = self._ensure_future_start(start_hour, stop_hour)
+        # Preserve duration when bumping start so the window semantics stay intact
+        adjusted_start, adjusted_stop = self._ensure_future_start(
+            start_hour, stop_hour, preserve_duration=preserve_duration
+        )
+
+        # Guard against collapsed windows (start == stop)
+        if adjusted_start == adjusted_stop:
+            self.logger.debug(
+                f"Battery-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
+                "skipping."
+            )
+            return
+
+        # Per-mode idempotence keyed by APPLIED params
+        sig = ("battery_first", adjusted_start, adjusted_stop)
+        if self._last_applied.get("battery_first") == sig:
+            self.logger.debug(
+                f"Battery-first {adjusted_start}-{adjusted_stop} already applied, skipping"
+            )
+            return
 
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -1012,9 +1244,16 @@ class GrowattController(BaseModule):
                 f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
                 f"(original: {start_hour}-{stop_hour}, simulated at {current_time})"
             )
+            self._last_applied["battery_first"] = sig
             return
 
-        payload = {"start": adjusted_start, "stop": adjusted_stop, "enabled": True, "slot": 1}
+        # Ensure exclusive mode before setting
+        await self._ensure_exclusive("battery_first")
+
+        # Convert to HH:MM format required by device
+        start_dev = self._to_device_hhmm(adjusted_start)
+        stop_dev = self._to_device_hhmm(adjusted_stop)
+        payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
 
         assert self.mqtt_client is not None
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
@@ -1025,6 +1264,7 @@ class GrowattController(BaseModule):
             f"(original: {start_hour}-{stop_hour}, action at {current_time}) → "
             f"Topic: {self.config.battery_first_topic}"
         )
+        self._last_applied["battery_first"] = sig
 
     async def _set_ac_charge(self, enabled: bool) -> None:
         """Set AC charging state (unified setter)."""
@@ -1116,7 +1356,8 @@ class GrowattController(BaseModule):
         await self._set_export(False)
 
     async def _set_grid_first(
-        self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 10
+        self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 10,
+        *, preserve_duration: bool = True
     ) -> None:
         """Set grid-first mode for specified time window.
 
@@ -1125,11 +1366,30 @@ class GrowattController(BaseModule):
         power_rate: Discharge rate in % (default 10%)
         """
         # Ensure start time is in the future for inverter to trigger
-        adjusted_start, adjusted_stop = self._ensure_future_start(start_hour, stop_hour)
+        adjusted_start, adjusted_stop = self._ensure_future_start(
+            start_hour, stop_hour, preserve_duration=preserve_duration
+        )
+
+        # Guard against collapsed windows (start == stop)
+        if adjusted_start == adjusted_stop:
+            self.logger.debug(
+                f"Grid-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
+                "skipping."
+            )
+            return
 
         # Validate and clamp parameters to safe ranges
         stop_soc = max(5, min(100, stop_soc))
         power_rate = max(1, min(100, power_rate))
+
+        # Per-mode idempotence keyed by APPLIED params
+        sig = ("grid_first", adjusted_start, adjusted_stop, stop_soc, power_rate)
+        if self._last_applied.get("grid_first") == sig:
+            self.logger.debug(
+                f"Grid-first {adjusted_start}-{adjusted_stop} "
+                f"(stopSOC={stop_soc}, rate={power_rate}) already applied, skipping"
+            )
+            return
 
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -1138,9 +1398,13 @@ class GrowattController(BaseModule):
                 f"(original: {start_hour}-{stop_hour}, stopSOC={stop_soc}%, "
                 f"powerRate={power_rate}%, simulated at {current_time})"
             )
+            self._last_applied["grid_first"] = sig
             return
 
         assert self.mqtt_client is not None
+
+        # Ensure exclusive mode before setting
+        await self._ensure_exclusive("grid_first")
 
         # First set the parameters before enabling the mode
         # Set stop SOC (battery level to stop discharging)
@@ -1163,9 +1427,12 @@ class GrowattController(BaseModule):
         # Small delay before enabling the mode
         await asyncio.sleep(0.5)
 
-        # Finally set the time slot to enable the mode
+        # Finally set the time slot to enable the mode (use slot 2 for grid-first)
+        # Convert to HH:MM format required by device
+        start_dev = self._to_device_hhmm(adjusted_start)
+        stop_dev = self._to_device_hhmm(adjusted_stop)
         timeslot_payload = {
-            "start": adjusted_start, "stop": adjusted_stop, "enabled": True, "slot": 1
+            "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 2
         }
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
@@ -1178,6 +1445,7 @@ class GrowattController(BaseModule):
             f"Topics: {self.config.grid_first_topic}, {self.config.grid_first_stopsoc_topic}, "
             f"{self.config.grid_first_powerrate_topic}"
         )
+        self._last_applied["grid_first"] = sig
 
     async def _disable_grid_first(self) -> None:
         """Disable grid-first mode."""
@@ -1186,7 +1454,7 @@ class GrowattController(BaseModule):
             self.logger.info(f"🔌 [SIMULATE] GRID-FIRST MODE DISABLED (simulated at {current_time})")
             return
 
-        payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
+        payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 2}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -1234,8 +1502,8 @@ class GrowattController(BaseModule):
         # Clear scheduled periods for new schedule
         self._scheduled_periods.clear()
 
-        # Reset mode signature and state tracking for new day
-        self._last_mode_sig = None
+        # Reset state tracking for new day
+        self._last_applied.clear()
         self._ac_enabled = None
         self._export_enabled = None
 
@@ -1382,13 +1650,13 @@ class GrowattController(BaseModule):
         """Schedule fallback mode when price data is unavailable."""
         # Schedule to disable battery-first at midnight with jitter
         task = asyncio.create_task(
-            self._schedule_at_time(self._bump_time("00:00", 5), self._disable_battery_first)
+            self._schedule_at_time(MIDNIGHT_JITTER, self._disable_battery_first)
         )
         self._scheduled_tasks.append(task)
 
         # Schedule to disable export at midnight with jitter
         task = asyncio.create_task(
-            self._schedule_at_time(self._bump_time("00:00", 10), self._disable_export)
+            self._schedule_at_time(MIDNIGHT_DISABLE_JITTER, self._disable_export)
         )
         self._scheduled_tasks.append(task)
 
@@ -1453,24 +1721,25 @@ class GrowattController(BaseModule):
                 self._scheduled_tasks.append(task)
 
                 # Enable export for overnight period (prices above threshold)
-                task = self._schedule_action(self._bump_time("00:00", 5), self._enable_export)
+                task = self._schedule_action(MIDNIGHT_JITTER, self._enable_export)
                 self._scheduled_tasks.append(task)
 
-            # Schedule Grid-First from sunrise to sunset (sell solar + battery at 10% rate)
+            # Schedule Grid-First from sunrise to end of day (sell solar + battery at 10% rate)
             self.logger.info(
-                f"Scheduling grid-first from {sunrise_str} to 23:59 "
+                f"Scheduling grid-first from {sunrise_str} to {EOD_HHMM} "
                 f"(sell solar + battery, stopSOC=20%, powerRate=10%)"
             )
             self._scheduled_periods.append(
-                Period("grid_first", sunrise_time, dt_time(23, 59))
+                Period("grid_first", sunrise_time, EOD_DTTIME,
+                       params={"stop_soc": 20, "power_rate": 10})
             )
             self._scheduled_periods.append(
-                Period("export", sunrise_time, dt_time(23, 59))
+                Period("export", sunrise_time, EOD_DTTIME)
             )
 
             task = self._schedule_action(
                 sunrise_str, self._emit_device_window,
-                self._set_grid_first, sunrise_str, "23:59", 20, 10
+                self._set_grid_first, sunrise_str, EOD_HHMM, 20, 10
             )
             self._scheduled_tasks.append(task)
 
@@ -1521,7 +1790,7 @@ class GrowattController(BaseModule):
                 self._scheduled_periods.append(
                     Period("export", dt_time(0, 0), sunrise_time)
                 )
-                task = self._schedule_action(self._bump_time("00:00", 5), self._enable_export)
+                task = self._schedule_action(MIDNIGHT_JITTER, self._enable_export)
                 self._scheduled_tasks.append(task)
 
             task = self._schedule_action("00:00", self._set_load_first)
@@ -1542,7 +1811,8 @@ class GrowattController(BaseModule):
                 Period(
                     "grid_first",
                     sunrise_time,
-                    self._parse_hhmm(grid_first_end)
+                    self._parse_hhmm(grid_first_end),
+                    params={"stop_soc": 20, "power_rate": 10}
                 )
             )
             self._scheduled_periods.append(
@@ -1620,15 +1890,15 @@ class GrowattController(BaseModule):
             previous_end = group_end
 
         # Schedule load-first for evening (after last low price)
-        if last_low_end != "24:00" and last_low_end != "23:59":
+        if not _is_24(last_low_end):
             self.logger.info(
-                f"Scheduling load-first from {last_low_end} to 23:59 (use stored energy)"
+                f"Scheduling load-first from {last_low_end} to {EOD_HHMM} (use stored energy)"
             )
             self._scheduled_periods.append(
-                Period("load_first", self._parse_hhmm(last_low_end), dt_time(23, 59))
+                Period("load_first", self._parse_hhmm(last_low_end), EOD_DTTIME)
             )
             self._scheduled_periods.append(
-                Period("export", self._parse_hhmm(last_low_end), dt_time(23, 59))
+                Period("export", self._parse_hhmm(last_low_end), EOD_DTTIME)
             )  # Enable export for excess
 
             task = self._schedule_action(last_low_end, self._set_load_first)
@@ -1719,6 +1989,9 @@ class GrowattController(BaseModule):
         # Schedule export control
         await self._schedule_export_control(hourly_prices, eur_czk_rate)
 
+        # Ensure clean end-of-day state
+        self._schedule_end_of_day_cleanup()
+
     async def _schedule_export_control(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
@@ -1732,8 +2005,8 @@ class GrowattController(BaseModule):
             """Split a possibly midnight-wrapping range into 1-2 non-wrapping segments."""
             if start <= end:
                 return [(start, end)]
-            # Wraps midnight: [start, 23:59:59) U [00:00, end)
-            return [(start, dt_time(23, 59, 59)), (dt_time(0, 0), end)]
+            # Wraps midnight: [start, EOD) U [00:00, end)
+            return [(start, EOD_DTTIME), (dt_time(0, 0), end)]
 
         def _ranges_overlap(
             a_start: dt_time, a_end: dt_time, b_start: dt_time, b_end: dt_time
@@ -1808,7 +2081,7 @@ class GrowattController(BaseModule):
             )
             # Schedule disable at midnight with small delay to avoid conflicts
             task = asyncio.create_task(
-                self._schedule_at_time(self._bump_time("00:00", 5), self._disable_export)
+                self._schedule_at_time(MIDNIGHT_JITTER, self._disable_export)
             )
             self._scheduled_tasks.append(task)
             return
@@ -1827,30 +2100,15 @@ class GrowattController(BaseModule):
         # Sort groups by start time to handle them in order
         export_groups.sort(key=lambda x: self._parse_hhmm(x[0]))
 
-        # Track previous end time to schedule disable between periods
-        previous_end: Optional[str] = None
-        midnight_enable_scheduled = False  # Track if we actually scheduled a 00:00 enable
-        last_enable_started = False  # Track if we enabled the preceding window
+        # Track if we actually scheduled a 00:00 enable
+        midnight_enable_scheduled = False
 
         for group_start, group_end in export_groups:
             # DO NOT normalize here; keep HH:MM or "24:00" for logic
             # group_end_norm will be used only when calling _schedule_at_time
 
-            # If there's a gap and we previously enabled, schedule disable
-            if previous_end is not None and last_enable_started:
-                prev_end_t = self._parse_hhmm(previous_end)
-                group_start_t = self._parse_hhmm(group_start)
-                if prev_end_t < group_start_t:
-                    self.logger.info(
-                        f"Scheduling export disable between periods at {previous_end} "
-                        f"(gap until {group_start})"
-                    )
-                    # Normalize only for scheduling
-                    disable_time = self._normalize_end_time(previous_end)
-                    task = asyncio.create_task(
-                        self._schedule_at_time(disable_time, self._disable_export)
-                    )
-                    self._scheduled_tasks.append(task)
+            # Note: Gap-disable between export groups removed as redundant
+            # Each export slice already schedules its own disable at slice end
 
             # Check if export overlaps with AC charging (if suppression enabled)
             suppress_export = getattr(self.config, "suppress_export_during_ac_charge", True)
@@ -1877,18 +2135,19 @@ class GrowattController(BaseModule):
                     self.logger.info(
                         f"Export {group_start}-{group_end} fully overlaps AC charge, skipping"
                     )
-                    previous_end = group_end  # keep logic-time here
-                    last_enable_started = False
                     continue
             else:
                 # No AC overlap, use full window
                 export_slices = [(self._parse_hhmm(group_start), self._parse_hhmm(group_end))]
 
             # Schedule each export slice
-            scheduled_any_slice = False
             for slice_start_t, slice_end_t in export_slices:
                 slice_start = slice_start_t.strftime("%H:%M")
-                slice_end = self._normalize_end_time(slice_end_t.strftime("%H:%M"))
+                # Keep the exact EOD barrier if the slice ends at EOD_DTTIME
+                if slice_end_t == EOD_DTTIME:
+                    slice_end = EOD_HHMMSS
+                else:
+                    slice_end = self._normalize_end_time(slice_end_t.strftime("%H:%M"))
 
                 # Calculate price statistics for this slice
                 group_prices = [
@@ -1934,45 +2193,29 @@ class GrowattController(BaseModule):
                 task = self._schedule_action(slice_start, self._enable_export)
                 self._scheduled_tasks.append(task)
 
-                # Schedule export disable at end
-                if slice_end == "23:59":
-                    disable_at = "23:59:55"
-                else:
-                    disable_at = slice_end
+                # Schedule export disable at end (normalize to EOD sentinel if needed)
+                disable_at = self._normalize_for_schedule(slice_end)
                 task = self._schedule_action(disable_at, self._disable_export)
                 self._scheduled_tasks.append(task)
 
-                scheduled_any_slice = True
-
-            # Update tracking variables
-            last_enable_started = scheduled_any_slice
-            previous_end = group_end  # keep logic-time here
-
         # Check if we need a midnight disable (only if we didn't schedule a 00:00 enable)
         if not midnight_enable_scheduled:
-            # Add jitter to avoid collision with other midnight actions
-            disable_time = self._bump_time("00:00", 5)
-            task = asyncio.create_task(self._schedule_at_time(disable_time, self._disable_export))
+            # Use constant for better readability
+            task = asyncio.create_task(
+                self._schedule_at_time(MIDNIGHT_JITTER, self._disable_export)
+            )
             self._scheduled_tasks.append(task)
-            self.logger.info(f"Scheduled export disable at {disable_time} for clean daily start")
+            self.logger.info(f"Scheduled export disable at {MIDNIGHT_JITTER} for clean daily start")
 
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
         try:
-            # Normalize impossible time to end-of-day
-            if time_str in ("24:00", "24:00:00"):
-                time_str = "23:59:55"
+            # Normalize time using unified handler
+            time_str = self._normalize_for_schedule(time_str)
 
             # Support both HH:MM and HH:MM:SS formats
-            try:
-                target_time = datetime.strptime(time_str, "%H:%M:%S").time()
-            except ValueError:
-                # Allow HH:MM and normalize 24:00 here too if it slips through
-                if time_str == "24:00":
-                    time_str = "23:59:55"
-                    target_time = datetime.strptime(time_str, "%H:%M:%S").time()
-                else:
-                    target_time = datetime.strptime(time_str, "%H:%M").time()
+            # Parse time with unified handler
+            target_time = self._parse_time_any(time_str)
 
             now = self._get_local_now()
 
@@ -1985,6 +2228,9 @@ class GrowattController(BaseModule):
 
             if delay > 0:
                 await asyncio.sleep(delay)
+            # Check if still running before executing
+            if not self._running:
+                return
             await coro_func(*args)
 
         except asyncio.CancelledError:
@@ -1999,22 +2245,29 @@ class GrowattController(BaseModule):
         start_hhmm: str,
         stop_hhmm: str,
         *extra: Any,
+        preserve_when_same_day: bool = True,
     ) -> None:
         """Call the device setter once or split across midnight if start > stop.
 
         Some Growatt firmwares don't accept a single slot where start > stop.
         This helper splits such windows into two: [start → 23:59] and [00:00 → stop].
+        Args:
+            preserve_when_same_day: Whether to preserve duration for same-day windows.
+                                   Set to False for immediate apply to avoid spillover.
         """
         st = self._parse_hhmm(start_hhmm)
         en = self._parse_hhmm(stop_hhmm)
         if st <= en:
-            await setter(start_hhmm, stop_hhmm, *extra)
+            # If we're aiming at the EOD barrier, never preserve duration on bumps.
+            # Otherwise, allow the caller to choose.
+            preserve = False if stop_hhmm in (EOD_HHMM, EOD_HHMMSS) else preserve_when_same_day
+            await setter(start_hhmm, stop_hhmm, *extra, preserve_duration=preserve)
         else:
             # Split wrap: [start → 23:59] U [00:00 → stop]
             self.logger.debug(f"Splitting midnight-wrap window {start_hhmm}-{stop_hhmm}")
-            await setter(start_hhmm, "23:59", *extra)
+            await setter(start_hhmm, EOD_HHMM, *extra, preserve_duration=False)  # Keep hard EOD
             await asyncio.sleep(0.5)  # Delay between split commands
-            await setter("00:00", stop_hhmm, *extra)
+            await setter("00:00", stop_hhmm, *extra, preserve_duration=True)
 
     async def _schedule_today(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule only if the time is still ahead *today* (no rollover).
@@ -2023,20 +2276,16 @@ class GrowattController(BaseModule):
         Use this ONLY when re-applying today's schedule (e.g., after a midday restart).
         Do NOT use for the nightly calculation which schedules tomorrow's prices.
         """
-        # Normalize "24:00" for parsing
-        if time_str in ("24:00", "24:00:00"):
-            time_str = "23:59:55"
+        # Normalize like _schedule_at_time (HH:MM -> HH:MM:SS, 24:00 -> EOD)
+        time_str = self._normalize_for_schedule(time_str)
 
         try:
-            try:
-                target_time = datetime.strptime(time_str, "%H:%M:%S").time()
-            except ValueError:
-                target_time = datetime.strptime(time_str, "%H:%M").time()
+            target_time = self._parse_time_any(time_str)
         except Exception:
             self.logger.warning(f"Skipping invalid time string: {time_str}")
             return
 
-        now = self._get_local_now()
+        now = self._get_local_now().replace(microsecond=0)
         target_dt = datetime.combine(now.date(), target_time, self._local_tz)
 
         if target_dt <= now:
@@ -2046,13 +2295,27 @@ class GrowattController(BaseModule):
         delay = (target_dt - now).total_seconds()
 
         try:
-            await asyncio.sleep(delay)
+            if delay > 0:
+                await asyncio.sleep(delay)
+            # Check if still running before executing
+            if not self._running:
+                return
             await coro_func(*args)
         except asyncio.CancelledError:
             # Expected on shutdown
             raise
         except Exception as e:
             self.logger.error(f"Error in scheduled task at {time_str}: {e}", exc_info=True)
+
+    def _schedule_end_of_day_cleanup(self) -> None:
+        """Ensure we land in a neutral state at end of day."""
+        # Small jittered disables are safe & idempotent.
+        self._scheduled_tasks.append(
+            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._disable_export))
+        )
+        self._scheduled_tasks.append(
+            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._disable_ac_charge))
+        )
 
     async def _schedule_daily_calculation(self) -> None:
         """Run initial calculation now and then re-run daily at configured schedule hour:minute."""
@@ -2076,7 +2339,10 @@ class GrowattController(BaseModule):
 
                 delay = (target_datetime - now).total_seconds()
 
-                self.logger.info(f"Next daily calculation scheduled in {delay / 3600:.1f} hours")
+                self.logger.info(
+                    f"Next daily calculation at {target_datetime.strftime('%Y-%m-%d %H:%M:%S')} "
+                    f"({delay / 3600:.1f} hours)"
+                )
                 await asyncio.sleep(delay)
 
                 # Run calculation
