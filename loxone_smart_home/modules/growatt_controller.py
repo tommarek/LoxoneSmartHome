@@ -521,11 +521,13 @@ class GrowattController(BaseModule):
         # Land fully neutral - disable all modes to ensure predictable state
         try:
             await self._disable_battery_first()
+            await asyncio.sleep(0.5)  # Delay between shutdown commands
         except Exception as e:
             self.logger.error(f"Error disabling battery first on shutdown: {e}")
 
         try:
             await self._disable_grid_first()
+            await asyncio.sleep(0.5)  # Delay between shutdown commands
         except Exception as e:
             self.logger.error(f"Error disabling grid first on shutdown: {e}")
 
@@ -592,6 +594,9 @@ class GrowattController(BaseModule):
         else:
             await self._set_mode("load_first")
 
+        # Small delay before AC charging control
+        await asyncio.sleep(0.5)
+        
         # AC charging (honor summer mode rule)
         season = await self._get_season_mode()
         if season == "summer" and want_ac:
@@ -603,6 +608,9 @@ class GrowattController(BaseModule):
         else:
             await self._disable_ac_charge()
 
+        # Small delay before export control
+        await asyncio.sleep(0.5)
+        
         # Export control
         if want_export:
             await self._enable_export()
@@ -895,6 +903,7 @@ class GrowattController(BaseModule):
         payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
 
         assert self.mqtt_client is not None
+        self.logger.debug(f"Enabling battery-first mode for {start_hour}-{stop_hour}")
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -1012,22 +1021,33 @@ class GrowattController(BaseModule):
             )
             return
 
-        # Set the time slot
-        timeslot_payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
         assert self.mqtt_client is not None
-        await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
 
+        # First set the parameters before enabling the mode
         # Set stop SOC (battery level to stop discharging)
         stopsoc_payload = {"value": stop_soc}
+        self.logger.debug(f"Setting grid-first stopSOC to {stop_soc}%")
         await self.mqtt_client.publish(
             self.config.grid_first_stopsoc_topic, json.dumps(stopsoc_payload)
         )
 
+        # Small delay between commands
+        await asyncio.sleep(0.5)
+
         # Set power rate (discharge rate)
         powerrate_payload = {"value": power_rate}
+        self.logger.debug(f"Setting grid-first powerRate to {power_rate}%")
         await self.mqtt_client.publish(
             self.config.grid_first_powerrate_topic, json.dumps(powerrate_payload)
         )
+
+        # Small delay before enabling the mode
+        await asyncio.sleep(0.5)
+
+        # Finally set the time slot to enable the mode
+        timeslot_payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
+        self.logger.debug(f"Enabling grid-first mode for {start_hour}-{stop_hour}")
+        await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -1064,8 +1084,9 @@ class GrowattController(BaseModule):
             self.logger.info(f"⚖️ [SIMULATE] LOAD-FIRST MODE SET (simulated at {current_time})")
             return
 
-        # Disable both battery-first and grid-first
+        # Disable both battery-first and grid-first with delay between
         await self._disable_battery_first()
+        await asyncio.sleep(0.5)  # Delay between commands
         await self._disable_grid_first()
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -1870,6 +1891,7 @@ class GrowattController(BaseModule):
             # Split wrap: [start → 23:59] U [00:00 → stop]
             self.logger.debug(f"Splitting midnight-wrap window {start_hhmm}-{stop_hhmm}")
             await setter(start_hhmm, "23:59", *extra)
+            await asyncio.sleep(0.5)  # Delay between split commands
             await setter("00:00", stop_hhmm, *extra)
 
     async def _schedule_today(self, time_str: str, coro_func: Any, *args: Any) -> None:
