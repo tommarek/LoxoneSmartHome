@@ -492,6 +492,28 @@ class OTEPriceCollector(BaseModule):
             f"within check window (2-{max_hour} PM). Will try again tomorrow."
         )
 
+    async def _update_today_and_tomorrow(self) -> None:
+        """Update prices for today and tomorrow based on time of day.
+
+        This is a compatibility method for tests. Before 2 PM, fetches only today's prices.
+        After 2 PM, fetches both today's and tomorrow's prices.
+        """
+        now = datetime.now(self._local_tz)
+        today_str = now.strftime("%Y-%m-%d")
+
+        # Always fetch today's prices
+        today_prices = await self._fetch_prices_for_date(today_str)
+        if today_prices:
+            await self._store_prices(today_prices, today_str)
+
+        # After 2 PM, also fetch tomorrow's prices
+        if now.hour >= 14:
+            tomorrow = now + timedelta(days=1)
+            tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+            tomorrow_prices = await self._fetch_prices_for_date(tomorrow_str)
+            if tomorrow_prices:
+                await self._store_prices(tomorrow_prices, tomorrow_str)
+
     async def _check_and_fill_gaps(self) -> None:
         """Check for gaps in the data and fill them."""
         try:

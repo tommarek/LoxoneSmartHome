@@ -176,7 +176,7 @@ class GrowattConfig(BaseModel):
     summer_temp_threshold: float = Field(default=15.0, ge=-20, le=40)  # °C
     summer_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh (below operator costs)
     temperature_avg_days: int = Field(default=3, ge=1, le=7)  # Days for temperature average
-    
+
     # Currency conversion
     eur_czk_rate: float = Field(default=25.0, gt=0)  # EUR to CZK exchange rate
 

@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Growatt Inverter Dashboard</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+        
+        header {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+        }
+        
+        h1 {
+            color: #333;
+            font-size: 28px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            display: inline-block;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-indicator.online {
+            background: #10b981;
+        }
+        
+        .status-indicator.offline {
+            background: #ef4444;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .dashboard {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+        }
+        
+        .card {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 15px;
+            padding: 20px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.1);
+            transition: transform 0.3s ease;
+        }
+        
+        .card:hover {
+            transform: translateY(-5px);
+        }
+        
+        .card h2 {
+            color: #4c1d95;
+            font-size: 18px;
+            margin-bottom: 15px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .metric {
+            display: flex;
+            justify-content: space-between;
+            padding: 10px 0;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        
+        .metric:last-child {
+            border-bottom: none;
+        }
+        
+        .metric-label {
+            color: #6b7280;
+            font-size: 14px;
+        }
+        
+        .metric-value {
+            color: #111827;
+            font-weight: 600;
+            font-size: 16px;
+        }
+        
+        .metric-value.positive {
+            color: #10b981;
+        }
+        
+        .metric-value.negative {
+            color: #ef4444;
+        }
+        
+        .metric-value.warning {
+            color: #f59e0b;
+        }
+        
+        .mode-badge {
+            display: inline-block;
+            padding: 4px 12px;
+            border-radius: 20px;
+            font-size: 14px;
+            font-weight: 500;
+        }
+        
+        .mode-badge.battery-first {
+            background: #dbeafe;
+            color: #1e40af;
+        }
+        
+        .mode-badge.load-first {
+            background: #fef3c7;
+            color: #92400e;
+        }
+        
+        .mode-badge.grid-first {
+            background: #dcfce7;
+            color: #166534;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 20px;
+            background: #e5e7eb;
+            border-radius: 10px;
+            overflow: hidden;
+            margin-top: 5px;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #10b981, #34d399);
+            transition: width 0.5s ease;
+        }
+        
+        .last-update {
+            text-align: center;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 14px;
+            margin-top: 20px;
+        }
+        
+        .error-message {
+            background: #fee2e2;
+            color: #991b1b;
+            padding: 15px;
+            border-radius: 10px;
+            margin: 20px 0;
+            display: none;
+        }
+        
+        .loading {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+        
+        .spinner {
+            border: 3px solid #e5e7eb;
+            border-top: 3px solid #6366f1;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 20px;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        .schedule-item {
+            display: flex;
+            justify-content: space-between;
+            padding: 8px 0;
+            font-size: 14px;
+        }
+        
+        .schedule-time {
+            color: #4b5563;
+        }
+        
+        .schedule-mode {
+            font-weight: 500;
+        }
+        
+        .price-chart {
+            margin-top: 15px;
+            height: 150px;
+            position: relative;
+        }
+        
+        .chart-bar {
+            display: inline-block;
+            width: calc(100% / 24 - 2px);
+            background: #e5e7eb;
+            margin: 0 1px;
+            vertical-align: bottom;
+            position: relative;
+            transition: background 0.3s;
+        }
+        
+        .chart-bar:hover {
+            background: #9ca3af;
+        }
+        
+        .chart-bar.active {
+            background: #6366f1;
+        }
+        
+        .chart-bar.cheapest {
+            background: #10b981;
+        }
+        
+        .chart-bar.expensive {
+            background: #ef4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path d="M12 2v10l3-3M9 7l3 3M3 11h3M18 11h3M5.6 17.4l2.1-2.1M16.3 17.4l-2.1-2.1"/>
+                </svg>
+                Growatt Inverter Dashboard
+                <span class="status-indicator" id="connectionStatus"></span>
+            </h1>
+        </header>
+        
+        <div class="error-message" id="errorMessage"></div>
+        
+        <div class="dashboard" id="dashboard">
+            <div class="loading">
+                <div class="spinner"></div>
+                <p>Loading inverter data...</p>
+            </div>
+        </div>
+        
+        <div class="last-update" id="lastUpdate"></div>
+    </div>
+    
+    <script>
+        let updateInterval;
+        
+        async function fetchInverterData() {
+            try {
+                const response = await fetch('/inverter/status');
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const data = await response.json();
+                updateDashboard(data);
+                document.getElementById('errorMessage').style.display = 'none';
+            } catch (error) {
+                console.error('Error fetching inverter data:', error);
+                showError('Failed to fetch inverter data. Please check the connection.');
+            }
+        }
+        
+        function updateDashboard(data) {
+            const dashboard = document.getElementById('dashboard');
+            
+            // Update connection status
+            const statusIndicator = document.getElementById('connectionStatus');
+            statusIndicator.className = `status-indicator ${data.connected ? 'online' : 'offline'}`;
+            
+            // Build dashboard HTML
+            dashboard.innerHTML = `
+                <!-- System Status Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <circle cx="12" cy="12" r="10"/>
+                            <path d="M12 6v6l4 2"/>
+                        </svg>
+                        System Status
+                    </h2>
+                    <div class="metric">
+                        <span class="metric-label">Mode</span>
+                        <span class="metric-value">
+                            <span class="mode-badge ${getModeClass(data.current_mode)}">${data.current_mode || 'Unknown'}</span>
+                        </span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Inverter Time</span>
+                        <span class="metric-value">${formatTime(data.inverter_time)}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Time Offset</span>
+                        <span class="metric-value ${data.time_offset_minutes > 5 ? 'warning' : ''}">${data.time_offset_minutes || 0} min</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Simulation Mode</span>
+                        <span class="metric-value">${data.simulation_mode ? 'Yes' : 'No'}</span>
+                    </div>
+                </div>
+                
+                <!-- Power Flow Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/>
+                        </svg>
+                        Power Flow
+                    </h2>
+                    <div class="metric">
+                        <span class="metric-label">Solar Production</span>
+                        <span class="metric-value positive">${formatPower(data.solar_power)} W</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Battery Power</span>
+                        <span class="metric-value ${data.battery_power > 0 ? 'positive' : 'negative'}">${formatPower(data.battery_power)} W</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Grid Power</span>
+                        <span class="metric-value ${data.grid_power < 0 ? 'positive' : 'negative'}">${formatPower(data.grid_power)} W</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Load Power</span>
+                        <span class="metric-value">${formatPower(data.load_power)} W</span>
+                    </div>
+                </div>
+                
+                <!-- Battery Status Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <rect x="1" y="6" width="18" height="12" rx="2"/>
+                            <path d="M23 10v4"/>
+                        </svg>
+                        Battery Status
+                    </h2>
+                    <div class="metric">
+                        <span class="metric-label">State of Charge</span>
+                        <span class="metric-value">${data.battery_soc || 0}%</span>
+                    </div>
+                    <div class="progress-bar">
+                        <div class="progress-fill" style="width: ${data.battery_soc || 0}%"></div>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Voltage</span>
+                        <span class="metric-value">${formatVoltage(data.battery_voltage)} V</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Current</span>
+                        <span class="metric-value">${formatCurrent(data.battery_current)} A</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Temperature</span>
+                        <span class="metric-value ${data.battery_temp > 40 ? 'warning' : ''}">${data.battery_temp || '--'}°C</span>
+                    </div>
+                </div>
+                
+                <!-- Energy Prices Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>
+                        </svg>
+                        Energy Prices
+                    </h2>
+                    <div class="metric">
+                        <span class="metric-label">Current Price</span>
+                        <span class="metric-value">${formatPrice(data.current_price)} CZK/kWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Average Today</span>
+                        <span class="metric-value">${formatPrice(data.avg_price_today)} CZK/kWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Min/Max Today</span>
+                        <span class="metric-value">${formatPrice(data.min_price_today)} - ${formatPrice(data.max_price_today)}</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Export Threshold</span>
+                        <span class="metric-value">${formatPrice(data.export_threshold)} CZK/kWh</span>
+                    </div>
+                    ${renderPriceChart(data.hourly_prices)}
+                </div>
+                
+                <!-- Schedule Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M8 2v4M16 2v4M3 10h18M5 4h14a2 2 0 012 2v14a2 2 0 01-2 2H5a2 2 0 01-2-2V6a2 2 0 012-2z"/>
+                        </svg>
+                        Today's Schedule
+                    </h2>
+                    ${renderSchedule(data.schedule)}
+                </div>
+                
+                <!-- Statistics Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M3 3v18h18M8 17V9M12 17V5M16 17v-3"/>
+                        </svg>
+                        Daily Statistics
+                    </h2>
+                    <div class="metric">
+                        <span class="metric-label">Energy Produced</span>
+                        <span class="metric-value positive">${formatEnergy(data.daily_production)} kWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Energy Consumed</span>
+                        <span class="metric-value">${formatEnergy(data.daily_consumption)} kWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Grid Import</span>
+                        <span class="metric-value negative">${formatEnergy(data.daily_import)} kWh</span>
+                    </div>
+                    <div class="metric">
+                        <span class="metric-label">Grid Export</span>
+                        <span class="metric-value positive">${formatEnergy(data.daily_export)} kWh</span>
+                    </div>
+                </div>
+            `;
+            
+            // Update last update time
+            document.getElementById('lastUpdate').textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+        }
+        
+        function getModeClass(mode) {
+            if (!mode) return '';
+            if (mode.includes('Battery First')) return 'battery-first';
+            if (mode.includes('Load First')) return 'load-first';
+            if (mode.includes('Grid First')) return 'grid-first';
+            return '';
+        }
+        
+        function formatPower(value) {
+            if (value === null || value === undefined) return '--';
+            return Math.abs(value).toLocaleString();
+        }
+        
+        function formatVoltage(value) {
+            if (value === null || value === undefined) return '--';
+            return value.toFixed(1);
+        }
+        
+        function formatCurrent(value) {
+            if (value === null || value === undefined) return '--';
+            return value.toFixed(1);
+        }
+        
+        function formatPrice(value) {
+            if (value === null || value === undefined) return '--';
+            return value.toFixed(2);
+        }
+        
+        function formatEnergy(value) {
+            if (value === null || value === undefined) return '--';
+            return value.toFixed(2);
+        }
+        
+        function formatTime(timestamp) {
+            if (!timestamp) return '--';
+            return new Date(timestamp).toLocaleTimeString();
+        }
+        
+        function renderSchedule(schedule) {
+            if (!schedule || schedule.length === 0) {
+                return '<div class="metric"><span class="metric-label">No schedule configured</span></div>';
+            }
+            
+            return schedule.map(item => `
+                <div class="schedule-item">
+                    <span class="schedule-time">${item.time}</span>
+                    <span class="schedule-mode mode-badge ${getModeClass(item.mode)}">${item.mode}</span>
+                </div>
+            `).join('');
+        }
+        
+        function renderPriceChart(prices) {
+            if (!prices || prices.length === 0) {
+                return '<div class="price-chart"><p style="text-align: center; color: #9ca3af;">No price data available</p></div>';
+            }
+            
+            const maxPrice = Math.max(...prices.map(p => p.price));
+            const minPrice = Math.min(...prices.map(p => p.price));
+            const currentHour = new Date().getHours();
+            
+            const bars = prices.map((item, index) => {
+                const height = ((item.price - minPrice) / (maxPrice - minPrice)) * 100;
+                let className = 'chart-bar';
+                if (index === currentHour) className += ' active';
+                if (item.is_cheapest) className += ' cheapest';
+                if (item.is_expensive) className += ' expensive';
+                
+                return `<div class="${className}" style="height: ${height}%" title="${item.hour}:00 - ${item.price.toFixed(2)} CZK/kWh"></div>`;
+            }).join('');
+            
+            return `<div class="price-chart">${bars}</div>`;
+        }
+        
+        function showError(message) {
+            const errorDiv = document.getElementById('errorMessage');
+            errorDiv.textContent = message;
+            errorDiv.style.display = 'block';
+        }
+        
+        // Initial load
+        fetchInverterData();
+        
+        // Auto-refresh every 30 seconds
+        updateInterval = setInterval(fetchInverterData, 30000);
+        
+        // Clean up on page unload
+        window.addEventListener('beforeunload', () => {
+            if (updateInterval) {
+                clearInterval(updateInterval);
+            }
+        });
+    </script>
+</body>
+</html>

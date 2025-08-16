@@ -552,11 +552,11 @@ class GrowattController(BaseModule):
 
     async def _get_inverter_time(self) -> Optional[datetime]:
         """Query current time from the inverter via MQTT request/response.
-        
+
         Protocol details (tested and working):
         - Request topic: energy/solar/command/datetime/get
         - Response topic: energy/solar/result
-        - Response contains: {"value": "YYYY-MM-DD HH:MM:SS", "command": "datetime/get", 
+        - Response contains: {"value": "YYYY-MM-DD HH:MM:SS", "command": "datetime/get",
                              "success": true, "message": "..."}
         """
         if self._optional_config.get("simulation_mode", False):
@@ -564,20 +564,20 @@ class GrowattController(BaseModule):
 
         try:
             assert self.mqtt_client is not None
-            
+
             # Set up the request/response pattern
             request_topic = "energy/solar/command/datetime/get"
             # The inverter responds on a common result topic
             response_topic = "energy/solar/result"
-            
+
             # Create a correlation ID for tracking this specific request
             import uuid
             correlation_id = f"datetime-{uuid.uuid4().hex[:8]}"
-            
+
             # Create a future to wait for the response
             loop = asyncio.get_running_loop()
             response_future: asyncio.Future[datetime] = loop.create_future()
-            
+
             # Handler for the response
             async def response_handler(_topic: str, payload: Any) -> None:
                 try:
@@ -585,11 +585,11 @@ class GrowattController(BaseModule):
                     if isinstance(payload, bytes):
                         payload = payload.decode()
                     data = json.loads(payload)
-                    
+
                     # Check if this is our datetime response
                     if data.get("command") != "datetime/get":
                         return  # Not our response, ignore
-                    
+
                     # Check success
                     if not data.get("success", False):
                         error_msg = data.get("message", "Unknown error")
@@ -598,37 +598,37 @@ class GrowattController(BaseModule):
                                 ValueError(f"Inverter returned error: {error_msg}")
                             )
                         return
-                    
+
                     value = data.get("value")  # Format: "YYYY-MM-DD HH:MM:SS"
-                    
+
                     if value:
                         # Parse the datetime string
                         dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-                        
+
                         # Handle potential year issue: firmware may return 2-digit year
                         # If year < 100, it's likely years since 2000, so add 2000
                         if dt.year < 100:
                             dt = dt.replace(year=dt.year + 2000)
                             self.logger.debug(f"Adjusted 2-digit year to {dt.year}")
-                        
+
                         # Add timezone info
                         dt = dt.replace(tzinfo=self._local_tz)
-                        
+
                         if not response_future.done():
                             response_future.set_result(dt)
                             self.logger.debug(f"Received inverter time: {value}")
                     else:
                         if not response_future.done():
                             response_future.set_exception(ValueError("No value in response"))
-                            
+
                 except Exception as e:
                     self.logger.error(f"Error parsing inverter time response: {e}")
                     if not response_future.done():
                         response_future.set_exception(e)
-            
+
             # Subscribe to the result topic
             await self.mqtt_client.subscribe(response_topic, response_handler)
-            
+
             try:
                 # Send the request with correlation ID
                 request_payload = {"correlationId": correlation_id}
@@ -637,11 +637,11 @@ class GrowattController(BaseModule):
                     f"with correlationId: {correlation_id}"
                 )
                 await self.mqtt_client.publish(request_topic, json.dumps(request_payload))
-                
+
                 # Wait for response with timeout
                 inverter_time = await asyncio.wait_for(response_future, timeout=5.0)
                 return inverter_time
-                
+
             except asyncio.TimeoutError:
                 self.logger.warning(
                     f"Inverter time request timed out after 5 seconds. "
@@ -1305,7 +1305,7 @@ class GrowattController(BaseModule):
         *, preserve_duration: bool = True
     ) -> None:
         """Set battery-first mode for specified time window.
-        
+
         Battery-first mode prioritizes charging battery from grid/solar.
         stop_soc: Battery level to stop charging at (default 90%)
         power_rate: Charge rate in % (default 100%)
@@ -1434,14 +1434,14 @@ class GrowattController(BaseModule):
 
     async def _set_export(self, enabled: bool) -> None:
         """Set export state (unified setter handling edge-triggered topics).
-        
+
         NOTE: Export control is NOT handled by the Growatt inverter firmware.
         These topics are consumed by external systems:
         - Smart meter relay control
         - Loxone home automation
         - DSO (Distribution System Operator) limiter
         - Other energy management systems
-        
+
         The edge-triggered design means:
         - export/enable topic triggers export ON
         - export/disable topic triggers export OFF

@@ -12,6 +12,7 @@ import sys
 from typing import Any, List, Optional
 
 import colorlog
+from aiohttp import web
 from dotenv import load_dotenv
 
 from config.settings import Settings
@@ -20,6 +21,7 @@ from modules.mqtt_bridge import MQTTBridge
 from modules.ote_price_collector import OTEPriceCollector
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
+from modules.growatt.api import create_growatt_api
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
@@ -44,6 +46,11 @@ class LoxoneSmartHome:
         self.weather_scraper: Optional[WeatherScraper] = None
         self.growatt_controller: Optional[GrowattController] = None
         self.ote_collector: Optional[OTEPriceCollector] = None
+
+        # API server
+        self.api_app: Optional[web.Application] = None
+        self.api_runner: Optional[web.AppRunner] = None
+        self.api_site: Optional[web.TCPSite] = None
 
         # Shutdown event
         self.shutdown_event = asyncio.Event()
@@ -106,6 +113,39 @@ class LoxoneSmartHome:
             self.ote_collector = OTEPriceCollector(self.influxdb_client, self.settings)
             logger.info("OTE Price Collector module initialized")
 
+    async def start_api_server(self) -> None:
+        """Start the API server for Growatt controller."""
+        logger = logging.getLogger(__name__)
+
+        try:
+            # Create web application
+            self.api_app = web.Application()
+
+            # Register Growatt API routes
+            create_growatt_api(self.api_app, self.growatt_controller)
+
+            # Create and start runner
+            self.api_runner = web.AppRunner(self.api_app)
+            await self.api_runner.setup()
+
+            # Create TCP site on port 8080
+            self.api_site = web.TCPSite(self.api_runner, '0.0.0.0', 8080)
+            await self.api_site.start()
+
+            logger.info("API server listening on http://0.0.0.0:8080")
+
+        except Exception as e:
+            logger.error(f"Failed to start API server: {e}")
+
+    async def stop_api_server(self) -> None:
+        """Stop the API server."""
+        if self.api_site:
+            await self.api_site.stop()
+        if self.api_runner:
+            await self.api_runner.cleanup()
+        if self.api_app:
+            await self.api_app.cleanup()
+
     async def start_modules(self) -> None:
         """Start all enabled modules."""
         logger = logging.getLogger(__name__)
@@ -140,6 +180,11 @@ class LoxoneSmartHome:
             self.modules.append(task)
             logger.info("OTE Price Collector started")
 
+        # Start API server if Growatt controller is enabled
+        if self.growatt_controller and self.settings.growatt_controller_enabled:
+            await self.start_api_server()
+            logger.info("API server started on port 8080")
+
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""
         logger = logging.getLogger(__name__)
@@ -151,6 +196,9 @@ class LoxoneSmartHome:
         # Wait for all modules to complete
         if self.modules:
             await asyncio.gather(*self.modules, return_exceptions=True)
+
+        # Stop API server
+        await self.stop_api_server()
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()

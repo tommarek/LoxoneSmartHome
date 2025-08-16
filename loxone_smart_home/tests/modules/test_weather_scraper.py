@@ -216,12 +216,29 @@ class TestWeatherScraper:
         """Test fetching weather from OpenMeteo."""
         weather_scraper.settings.weather.weather_service = "openmeteo"
 
-        # Mock the HTTP session
-        mock_response = AsyncMock()
-        mock_response.json = AsyncMock()
-        mock_response.json.side_effect = [mock_openmeteo_response, mock_air_quality_response]
+        # Mock the HTTP session with proper status codes
+        mock_response1 = AsyncMock()
+        mock_response1.status = 200
+        mock_response1.json = AsyncMock(return_value=mock_openmeteo_response)
 
-        weather_scraper._session = create_mock_session(mock_response)
+        mock_response2 = AsyncMock()
+        mock_response2.status = 200
+        mock_response2.json = AsyncMock(return_value=mock_air_quality_response)
+
+        mock_session = MagicMock()
+
+        # Set up side effects for multiple calls - create two different contexts
+        mock_ctx1 = MagicMock()
+        mock_ctx1.__aenter__ = AsyncMock(return_value=mock_response1)
+        mock_ctx1.__aexit__ = AsyncMock()
+
+        mock_ctx2 = MagicMock()
+        mock_ctx2.__aenter__ = AsyncMock(return_value=mock_response2)
+        mock_ctx2.__aexit__ = AsyncMock()
+
+        # Return different context for each call
+        mock_session.get.side_effect = [mock_ctx1, mock_ctx2]
+        weather_scraper._session = mock_session
 
         # Fetch weather
         await weather_scraper.fetch_weather()

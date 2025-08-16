@@ -41,6 +41,7 @@ services:
     restart: unless-stopped
     ports:
       - "2000:2000/udp"  # UDP listener port
+      - "8080:8080"      # API server port
     user: '1026:65537'
     environment:
       # General settings

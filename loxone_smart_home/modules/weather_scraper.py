@@ -156,7 +156,9 @@ class WeatherScraper(BaseModule):
 
         # Validate response structure
         if "hourly" not in js:
-            self.logger.error(f"OpenMeteo weather response missing 'hourly' key. Keys: {list(js.keys())}")
+            self.logger.error(
+                f"OpenMeteo weather response missing 'hourly' key. Keys: {list(js.keys())}"
+            )
             if "error" in js:
                 self.logger.error(f"API error: {js['error']}")
             return []
@@ -184,7 +186,9 @@ class WeatherScraper(BaseModule):
             if "hourly" in js_air:
                 js["hourly"].update(js_air["hourly"])
             elif js_air:  # Only log if we got a response but no hourly data
-                self.logger.warning(f"Air quality response missing 'hourly' key. Keys: {list(js_air.keys())}")
+                self.logger.warning(
+                    f"Air quality response missing 'hourly' key. Keys: {list(js_air.keys())}"
+                )
                 if "error" in js_air:
                     self.logger.warning(f"Air quality API error: {js_air['error']}")
         except Exception as e:

@@ -93,21 +93,21 @@ class TestLoxoneSmartHome:
         """Test successful application run."""
         with patch.object(
             app, "initialize_modules", new_callable=AsyncMock
-        ) as mock_init, patch.object(app, "start_modules", new_callable=AsyncMock) as mock_start:
-            # Set shutdown event after a short delay
-            async def set_shutdown() -> None:
-                await asyncio.sleep(0.1)
-                app.shutdown_event.set()
-
-            task = asyncio.create_task(set_shutdown())
+        ) as mock_init, patch.object(
+            app, "start_modules", new_callable=AsyncMock
+        ) as mock_start, patch.object(
+            app, "stop_api_server", new_callable=AsyncMock
+        ), patch.object(
+            app, "shutdown", new_callable=AsyncMock
+        ):
+            # Mock the shutdown event to be set immediately
+            app.shutdown_event = AsyncMock()
+            app.shutdown_event.wait = AsyncMock(return_value=True)
 
             await app.run()
 
             mock_init.assert_called_once()
             mock_start.assert_called_once()
-
-            # Ensure task is completed
-            await task
 
     @pytest.mark.asyncio
     async def test_run_with_error(self, app: LoxoneSmartHome) -> None:

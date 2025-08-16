@@ -1,5 +1,6 @@
 """Tests for the OTE price collector module."""
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -79,13 +80,16 @@ async def test_fetch_prices_for_date(
     mock_ote_response: Dict[str, Any],
 ) -> None:
     """Test fetching prices for a specific date."""
-    # Mock HTTP session
+    # Mock HTTP session with proper async context manager
     mock_response = AsyncMock()
     mock_response.status = 200
     mock_response.json = AsyncMock(return_value=mock_ote_response)
 
-    mock_session = AsyncMock()
-    mock_session.get.return_value.__aenter__.return_value = mock_response
+    mock_session = MagicMock()
+    mock_get = MagicMock()
+    mock_get.__aenter__ = AsyncMock(return_value=mock_response)
+    mock_get.__aexit__ = AsyncMock()
+    mock_session.get.return_value = mock_get
 
     ote_collector._session = mock_session
 
@@ -371,18 +375,22 @@ async def test_stop(
     mock_influxdb_client: AsyncMock,
 ) -> None:
     """Test stopping the collector."""
-    # Create mock session and task
+    # Create mock session
     mock_session = AsyncMock()
-    mock_task = AsyncMock()
-    mock_task.done.return_value = False
+
+    # Create a proper async task mock
+    async def mock_task_coro():
+        raise asyncio.CancelledError()
+
+    mock_task = asyncio.create_task(mock_task_coro())
 
     ote_collector._session = mock_session
     ote_collector._daily_update_task = mock_task
 
     await ote_collector.stop()
 
-    # Verify task cancellation
-    mock_task.cancel.assert_called_once()
+    # Verify task was cancelled
+    assert mock_task.cancelled()
 
     # Verify session closure
     mock_session.close.assert_called_once()
