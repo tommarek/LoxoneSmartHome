@@ -117,6 +117,9 @@ class GrowattController(BaseModule):
         self._ac_enabled: Optional[bool] = None
         self._export_enabled: Optional[bool] = None
 
+        # Track inverter clock drift
+        self._clock_drift_seconds: float = 0
+
         # Default scheduler function (will be set properly in _calculate_and_schedule_next_day)
         self._schedule_func = self._schedule_at_time
 
@@ -393,6 +396,109 @@ class GrowattController(BaseModule):
             self._eur_czk_rate_updated = now
             return fallback
 
+    async def _get_inverter_time(self) -> Optional[datetime]:
+        """Query current time from the inverter."""
+        if self.config.simulation_mode:
+            return self._get_local_now()
+
+        try:
+            assert self.mqtt_client is not None
+            # Send request to get inverter datetime
+            topic = "energy/solar/command/datetime/get"
+
+            # We need to implement a request-response pattern here
+            # For now, log that we would query the time
+            self.logger.debug(f"Would query inverter time via {topic}")
+
+            # In real implementation, this would wait for response
+            # For now, return None to indicate we couldn't get it
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Failed to get inverter time: {e}")
+            return None
+
+    async def _sync_inverter_time(self) -> bool:
+        """Synchronize inverter time with server time.
+
+        Returns True if sync was successful or not needed.
+        """
+        if self.config.simulation_mode:
+            return True
+
+        try:
+            server_time = self._get_local_now()
+            inverter_time = await self._get_inverter_time()
+
+            if inverter_time is None:
+                self.logger.warning("Could not get inverter time, assuming it's correct")
+                self._clock_drift_seconds = 0
+                return True
+
+            # Calculate drift
+            drift = (server_time - inverter_time).total_seconds()
+            self._clock_drift_seconds = drift
+
+            if abs(drift) > 30:  # More than 30 seconds drift
+                self.logger.warning(
+                    f"Inverter clock drift detected: {drift:.0f} seconds. "
+                    f"Server: {server_time.strftime('%Y-%m-%d %H:%M:%S')}, "
+                    f"Inverter: {inverter_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
+                # Optionally update inverter time
+                if abs(drift) > 120:  # More than 2 minutes
+                    self.logger.info("Updating inverter time to match server")
+                    assert self.mqtt_client is not None
+                    topic = "energy/solar/command/datetime/set"
+                    payload = {"value": server_time.strftime("%Y-%m-%d %H:%M:%S")}
+                    await self.mqtt_client.publish(topic, json.dumps(payload))
+                    self._clock_drift_seconds = 0
+                    return True
+            else:
+                self.logger.debug(f"Inverter time is in sync (drift: {drift:.0f}s)")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to sync inverter time: {e}", exc_info=True)
+            self._clock_drift_seconds = 0
+            return False
+
+    def _ensure_future_start(
+        self, start_str: str, stop_str: str, min_future_minutes: int = 1
+    ) -> Tuple[str, str]:
+        """Ensure start time is at least min_future_minutes in the future.
+
+        Returns adjusted (start, stop) times.
+        """
+        now = self._get_local_now()
+
+        # Parse times
+        start_time = self._parse_hhmm(start_str)
+        stop_time = self._parse_hhmm(stop_str)
+
+        # Calculate start as datetime for today
+        start_dt = datetime.combine(now.date(), start_time, self._local_tz)
+        stop_dt = datetime.combine(now.date(), stop_time, self._local_tz)
+
+        # If stop is before start, it's tomorrow
+        if stop_dt <= start_dt:
+            stop_dt += timedelta(days=1)
+
+        # Check if start is in the past or too soon
+        min_start = now + timedelta(minutes=min_future_minutes)
+
+        if start_dt <= min_start:
+            # Need to adjust start time to be in the future
+            self.logger.debug(
+                f"Adjusting start time from {start_str} to {min_start.strftime('%H:%M')} "
+                f"(+{min_future_minutes}min from now)"
+            )
+            return min_start.strftime("%H:%M"), stop_str
+
+        return start_str, stop_str
+
     async def _get_season_mode(self) -> str:
         """Determine season mode based on 3-day temperature average."""
         # Check cache first (refresh once per day)
@@ -483,6 +589,11 @@ class GrowattController(BaseModule):
     async def start(self) -> None:
         """Start the Growatt controller."""
         self._running = True  # Set the flag so daily loop runs
+
+        # Sync inverter time on startup
+        self.logger.info("Checking inverter time synchronization...")
+        await self._sync_inverter_time()
+
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
 
@@ -596,7 +707,7 @@ class GrowattController(BaseModule):
 
         # Small delay before AC charging control
         await asyncio.sleep(0.5)
-        
+
         # AC charging (honor summer mode rule)
         season = await self._get_season_mode()
         if season == "summer" and want_ac:
@@ -610,7 +721,7 @@ class GrowattController(BaseModule):
 
         # Small delay before export control
         await asyncio.sleep(0.5)
-        
+
         # Export control
         if want_export:
             await self._enable_export()
@@ -892,23 +1003,27 @@ class GrowattController(BaseModule):
 
     async def _set_battery_first(self, start_hour: str, stop_hour: str) -> None:
         """Set battery-first mode for specified time window."""
+        # Ensure start time is in the future for inverter to trigger
+        adjusted_start, adjusted_stop = self._ensure_future_start(start_hour, stop_hour)
+
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
-                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} "
-                f"(simulated at {current_time})"
+                f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
+                f"(original: {start_hour}-{stop_hour}, simulated at {current_time})"
             )
             return
 
-        payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
+        payload = {"start": adjusted_start, "stop": adjusted_stop, "enabled": True, "slot": 1}
 
         assert self.mqtt_client is not None
-        self.logger.debug(f"Enabling battery-first mode for {start_hour}-{stop_hour}")
+        self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
-            f"🔋 BATTERY-FIRST MODE SET: {start_hour}-{stop_hour} "
-            f"(action at {current_time}) → Topic: {self.config.battery_first_topic}"
+            f"🔋 BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
+            f"(original: {start_hour}-{stop_hour}, action at {current_time}) → "
+            f"Topic: {self.config.battery_first_topic}"
         )
 
     async def _set_ac_charge(self, enabled: bool) -> None:
@@ -923,7 +1038,7 @@ class GrowattController(BaseModule):
             self._ac_enabled = enabled
             return
 
-        payload = {"value": enabled}
+        payload = {"value": 1 if enabled else 0}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -1009,6 +1124,9 @@ class GrowattController(BaseModule):
         stop_soc: Battery level to stop discharging at (default 20%)
         power_rate: Discharge rate in % (default 10%)
         """
+        # Ensure start time is in the future for inverter to trigger
+        adjusted_start, adjusted_stop = self._ensure_future_start(start_hour, stop_hour)
+
         # Validate and clamp parameters to safe ranges
         stop_soc = max(5, min(100, stop_soc))
         power_rate = max(1, min(100, power_rate))
@@ -1016,8 +1134,9 @@ class GrowattController(BaseModule):
         if self.config.simulation_mode:
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
-                f"🔌 [SIMULATE] GRID-FIRST MODE SET: {start_hour}-{stop_hour} "
-                f"(stopSOC={stop_soc}%, powerRate={power_rate}%, simulated at {current_time})"
+                f"🔌 [SIMULATE] GRID-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
+                f"(original: {start_hour}-{stop_hour}, stopSOC={stop_soc}%, "
+                f"powerRate={power_rate}%, simulated at {current_time})"
             )
             return
 
@@ -1045,14 +1164,17 @@ class GrowattController(BaseModule):
         await asyncio.sleep(0.5)
 
         # Finally set the time slot to enable the mode
-        timeslot_payload = {"start": start_hour, "stop": stop_hour, "enabled": True, "slot": 1}
-        self.logger.debug(f"Enabling grid-first mode for {start_hour}-{stop_hour}")
+        timeslot_payload = {
+            "start": adjusted_start, "stop": adjusted_stop, "enabled": True, "slot": 1
+        }
+        self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
-            f"🔌 GRID-FIRST MODE SET: {start_hour}-{stop_hour} "
-            f"(stopSOC={stop_soc}%, powerRate={power_rate}%) at {current_time} → "
+            f"🔌 GRID-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
+            f"(original: {start_hour}-{stop_hour}, stopSOC={stop_soc}%, "
+            f"powerRate={power_rate}%) at {current_time} → "
             f"Topics: {self.config.grid_first_topic}, {self.config.grid_first_stopsoc_topic}, "
             f"{self.config.grid_first_powerrate_topic}"
         )
