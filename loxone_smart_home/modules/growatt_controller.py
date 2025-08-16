@@ -551,22 +551,66 @@ class GrowattController(BaseModule):
             return fallback
 
     async def _get_inverter_time(self) -> Optional[datetime]:
-        """Query current time from the inverter."""
+        """Query current time from the inverter via MQTT request/response."""
         if self._optional_config.get("simulation_mode", False):
             return self._get_local_now()
 
         try:
             assert self.mqtt_client is not None
-            # Send request to get inverter datetime
-            topic = "energy/solar/command/datetime/get"
-
-            # We need to implement a request-response pattern here
-            # For now, log that we would query the time
-            self.logger.debug(f"Would query inverter time via {topic}")
-
-            # In real implementation, this would wait for response
-            # For now, return None to indicate we couldn't get it
-            return None
+            
+            # Set up the request/response pattern
+            request_topic = "energy/solar/command/datetime/get"
+            response_topic = "energy/solar/response/datetime"
+            
+            # Create a future to wait for the response
+            loop = asyncio.get_running_loop()
+            response_future: asyncio.Future[datetime] = loop.create_future()
+            
+            # Handler for the response
+            async def response_handler(topic: str, payload: Any) -> None:
+                try:
+                    # Payload could be bytes or string
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    data = json.loads(payload)
+                    value = data.get("value")  # Expected format: "YYYY-MM-DD HH:MM:SS"
+                    
+                    if value:
+                        # Parse the datetime string
+                        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+                        # Add timezone info
+                        dt = dt.replace(tzinfo=self._local_tz)
+                        
+                        if not response_future.done():
+                            response_future.set_result(dt)
+                            self.logger.debug(f"Received inverter time: {value}")
+                    else:
+                        if not response_future.done():
+                            response_future.set_exception(ValueError("No value in response"))
+                            
+                except Exception as e:
+                    self.logger.error(f"Error parsing inverter time response: {e}")
+                    if not response_future.done():
+                        response_future.set_exception(e)
+            
+            # Subscribe to response topic
+            await self.mqtt_client.subscribe(response_topic, response_handler)
+            
+            try:
+                # Send the request
+                self.logger.debug(f"Requesting inverter time via {request_topic}")
+                await self.mqtt_client.publish(request_topic, json.dumps({"value": True}))
+                
+                # Wait for response with timeout
+                inverter_time = await asyncio.wait_for(response_future, timeout=3.0)
+                return inverter_time
+                
+            except asyncio.TimeoutError:
+                self.logger.warning("Inverter time request timed out after 3 seconds")
+                return None
+            finally:
+                # Unsubscribe from response topic
+                await self.mqtt_client.unsubscribe(response_topic)
 
         except Exception as e:
             self.logger.error(f"Failed to get inverter time: {e}")
@@ -1217,9 +1261,15 @@ class GrowattController(BaseModule):
             await asyncio.sleep(0.5)
 
     async def _set_battery_first(
-        self, start_hour: str, stop_hour: str, *, preserve_duration: bool = True
+        self, start_hour: str, stop_hour: str, stop_soc: int = 90, power_rate: int = 100,
+        *, preserve_duration: bool = True
     ) -> None:
-        """Set battery-first mode for specified time window."""
+        """Set battery-first mode for specified time window.
+        
+        Battery-first mode prioritizes charging battery from grid/solar.
+        stop_soc: Battery level to stop charging at (default 90%)
+        power_rate: Charge rate in % (default 100%)
+        """
         # Preserve duration when bumping start so the window semantics stay intact
         adjusted_start, adjusted_stop = self._ensure_future_start(
             start_hour, stop_hour, preserve_duration=preserve_duration
@@ -1233,8 +1283,12 @@ class GrowattController(BaseModule):
             )
             return
 
+        # Validate and clamp parameters to safe ranges
+        stop_soc = max(5, min(100, stop_soc))
+        power_rate = max(1, min(100, power_rate))
+
         # Per-mode idempotence keyed by APPLIED params
-        sig = ("battery_first", adjusted_start, adjusted_stop)
+        sig = ("battery_first", adjusted_start, adjusted_stop, stop_soc, power_rate)
         if self._last_applied.get("battery_first") == sig:
             self.logger.debug(
                 f"Battery-first {adjusted_start}-{adjusted_stop} already applied, skipping"
@@ -1245,26 +1299,47 @@ class GrowattController(BaseModule):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
-                f"(original: {start_hour}-{stop_hour}, simulated at {current_time})"
+                f"(original: {start_hour}-{stop_hour}, stopSOC={stop_soc}%, "
+                f"powerRate={power_rate}%) at {current_time}"
             )
             self._last_applied["battery_first"] = sig
             return
 
+        assert self.mqtt_client is not None
+
         # Ensure exclusive mode before setting
         await self._ensure_exclusive("battery_first")
+
+        # Optional: Set battery-first parameters if different from defaults
+        # These are rarely used as battery-first typically charges at max rate to max SOC
+        if stop_soc != 90:
+            # Set stop SOC (battery level to stop charging)
+            stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
+            stopsoc_payload = {"value": stop_soc}
+            self.logger.debug(f"Setting battery-first stopSOC to {stop_soc}%")
+            await self.mqtt_client.publish(stopsoc_topic, json.dumps(stopsoc_payload))
+            await asyncio.sleep(0.5)
+
+        if power_rate != 100:
+            # Set power rate (charge rate)
+            powerrate_topic = "energy/solar/command/batteryfirst/set/powerrate"
+            powerrate_payload = {"value": power_rate}
+            self.logger.debug(f"Setting battery-first powerRate to {power_rate}%")
+            await self.mqtt_client.publish(powerrate_topic, json.dumps(powerrate_payload))
+            await asyncio.sleep(0.5)
 
         # Convert to HH:MM format required by device
         start_dev = self._to_device_hhmm(adjusted_start)
         stop_dev = self._to_device_hhmm(adjusted_stop)
         payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
 
-        assert self.mqtt_client is not None
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
-            f"(original: {start_hour}-{stop_hour}, action at {current_time}) → "
+            f"(original: {start_hour}-{stop_hour}, stopSOC={stop_soc}%, "
+            f"powerRate={power_rate}%) at {current_time} → "
             f"Topic: {self.config.battery_first_topic}"
         )
         self._last_applied["battery_first"] = sig
@@ -1318,7 +1393,20 @@ class GrowattController(BaseModule):
         )
 
     async def _set_export(self, enabled: bool) -> None:
-        """Set export state (unified setter handling edge-triggered topics)."""
+        """Set export state (unified setter handling edge-triggered topics).
+        
+        NOTE: Export control is NOT handled by the Growatt inverter firmware.
+        These topics are consumed by external systems:
+        - Smart meter relay control
+        - Loxone home automation
+        - DSO (Distribution System Operator) limiter
+        - Other energy management systems
+        
+        The edge-triggered design means:
+        - export/enable topic triggers export ON
+        - export/disable topic triggers export OFF
+        - Both use {"value": true} as payload (topic determines action)
+        """
         if self._export_enabled == enabled:
             return  # Already in desired state
 
