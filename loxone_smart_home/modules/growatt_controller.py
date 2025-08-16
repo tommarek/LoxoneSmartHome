@@ -560,14 +560,19 @@ class GrowattController(BaseModule):
             
             # Set up the request/response pattern
             request_topic = "energy/solar/command/datetime/get"
-            response_topic = "energy/solar/response/datetime"
+            # Primary: mirror the full path under /response/
+            response_topic_primary = request_topic.replace("/command/", "/response/")  
+            # This becomes: energy/solar/response/datetime/get
+            
+            # Legacy/fallback some bridges use (without /get)
+            response_topic_legacy = "energy/solar/response/datetime"
             
             # Create a future to wait for the response
             loop = asyncio.get_running_loop()
             response_future: asyncio.Future[datetime] = loop.create_future()
             
-            # Handler for the response
-            async def response_handler(topic: str, payload: Any) -> None:
+            # Handler for the response (ignoring topic param to avoid unused warning)
+            async def response_handler(_topic: str, payload: Any) -> None:
                 try:
                     # Payload could be bytes or string
                     if isinstance(payload, bytes):
@@ -578,6 +583,13 @@ class GrowattController(BaseModule):
                     if value:
                         # Parse the datetime string
                         dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+                        
+                        # Handle potential year issue: firmware may return 2-digit year
+                        # If year < 100, it's likely years since 2000, so add 2000
+                        if dt.year < 100:
+                            dt = dt.replace(year=dt.year + 2000)
+                            self.logger.debug(f"Adjusted 2-digit year to {dt.year}")
+                        
                         # Add timezone info
                         dt = dt.replace(tzinfo=self._local_tz)
                         
@@ -593,24 +605,30 @@ class GrowattController(BaseModule):
                     if not response_future.done():
                         response_future.set_exception(e)
             
-            # Subscribe to response topic
-            await self.mqtt_client.subscribe(response_topic, response_handler)
+            # Subscribe to both possible response topics
+            await self.mqtt_client.subscribe(response_topic_primary, response_handler)
+            await self.mqtt_client.subscribe(response_topic_legacy, response_handler)
             
             try:
-                # Send the request
+                # Send the request (get handler ignores payload, so {} is fine)
                 self.logger.debug(f"Requesting inverter time via {request_topic}")
-                await self.mqtt_client.publish(request_topic, json.dumps({"value": True}))
+                self.logger.debug(f"Listening on {response_topic_primary} and {response_topic_legacy}")
+                await self.mqtt_client.publish(request_topic, json.dumps({}))
                 
-                # Wait for response with timeout
-                inverter_time = await asyncio.wait_for(response_future, timeout=3.0)
+                # Wait for response with timeout (give inverter more time)
+                inverter_time = await asyncio.wait_for(response_future, timeout=5.0)
                 return inverter_time
                 
             except asyncio.TimeoutError:
-                self.logger.warning("Inverter time request timed out after 3 seconds")
+                self.logger.warning(
+                    f"Inverter time request timed out after 5 seconds. "
+                    f"Expected response on {response_topic_primary} or {response_topic_legacy}"
+                )
                 return None
             finally:
-                # Unsubscribe from response topic
-                await self.mqtt_client.unsubscribe(response_topic)
+                # Unsubscribe from both response topics
+                await self.mqtt_client.unsubscribe(response_topic_primary)
+                await self.mqtt_client.unsubscribe(response_topic_legacy)
 
         except Exception as e:
             self.logger.error(f"Failed to get inverter time: {e}")
