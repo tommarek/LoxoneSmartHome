@@ -100,19 +100,18 @@ class GrowattController(BaseModule):
         if missing:
             raise ValueError(f"Growatt config missing keys: {', '.join(missing)}")
 
-        # Set sensible defaults for optional flags
-        if not hasattr(self.config, "dst_merge_policy"):
-            self.config.dst_merge_policy = "avg"
-        if not hasattr(self.config, "suppress_export_during_ac_charge"):
-            self.config.suppress_export_during_ac_charge = True
-        if not hasattr(self.config, "eur_czk_rate"):
-            self.config.eur_czk_rate = 25.0
-        if not hasattr(self.config, "temperature_avg_days"):
-            self.config.temperature_avg_days = 3
-        if not hasattr(self.config, "summer_temp_threshold"):
-            self.config.summer_temp_threshold = 15.0
-        if not hasattr(self.config, "simulation_mode"):
-            self.config.simulation_mode = False
+        # Set sensible defaults for optional flags in a separate dict
+        # (Pydantic models don't allow dynamic attribute assignment)
+        self._optional_config = {
+            "dst_merge_policy": getattr(self.config, "dst_merge_policy", "avg"),
+            "suppress_export_during_ac_charge": getattr(
+                self.config, "suppress_export_during_ac_charge", True
+            ),
+            "eur_czk_rate": getattr(self.config, "eur_czk_rate", 25.0),
+            "temperature_avg_days": getattr(self.config, "temperature_avg_days", 3),
+            "summer_temp_threshold": getattr(self.config, "summer_temp_threshold", 15.0),
+            "simulation_mode": getattr(self.config, "simulation_mode", False),
+        }
 
         # Validate and clamp schedule time
         if hasattr(self.config, "schedule_hour"):
@@ -191,6 +190,9 @@ class GrowattController(BaseModule):
             settings=settings,
         )
         self.config = settings.growatt
+
+        # Initialize optional config dict before validation
+        self._optional_config: Dict[str, Any] = {}
 
         # Validate config and set defaults
         self._validate_config()
@@ -496,7 +498,7 @@ class GrowattController(BaseModule):
                             f"Failed to fetch CNB exchange rate: HTTP {response.status}"
                         )
                         fallback = (
-                            self.config.eur_czk_rate if self.config.eur_czk_rate > 0 else 25.0
+                            self._optional_config.get("eur_czk_rate", 25.0)
                         )
                         # Cache the fallback to avoid repeated API calls
                         self._eur_czk_rate = fallback
@@ -533,7 +535,7 @@ class GrowattController(BaseModule):
 
             self.logger.warning("EUR not found in CNB exchange rate data")
             # Return default fallback (25 CZK per EUR is typical)
-            fallback = self.config.eur_czk_rate if self.config.eur_czk_rate > 0 else 25.0
+            fallback = self._optional_config.get("eur_czk_rate", 25.0)
             # Cache the fallback to avoid repeated API calls
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
@@ -542,7 +544,7 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error fetching EUR/CZK exchange rate: {e}")
             # Return default fallback (25 CZK per EUR is typical)
-            fallback = self.config.eur_czk_rate if self.config.eur_czk_rate > 0 else 25.0
+            fallback = self._optional_config.get("eur_czk_rate", 25.0)
             # Cache the fallback to avoid repeated API calls on errors
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
@@ -550,7 +552,7 @@ class GrowattController(BaseModule):
 
     async def _get_inverter_time(self) -> Optional[datetime]:
         """Query current time from the inverter."""
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             return self._get_local_now()
 
         try:
@@ -575,7 +577,7 @@ class GrowattController(BaseModule):
 
         Returns True if sync was successful or not needed.
         """
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             return True
 
         try:
@@ -695,7 +697,7 @@ class GrowattController(BaseModule):
             # Query InfluxDB for temperature data
             if self.influxdb_client:
                 # Build Flux query for last 3 days of temperature
-                days = self.config.temperature_avg_days
+                days = self._optional_config.get("temperature_avg_days", 3)
                 query = f'''
                     from(bucket: "{self.settings.influxdb.bucket_loxone}")
                     |> range(start: -{days}d)
@@ -717,13 +719,14 @@ class GrowattController(BaseModule):
 
                 if avg_temp is not None:
                     # Determine season based on temperature threshold
-                    season = "summer" if avg_temp > self.config.summer_temp_threshold else "winter"
+                    temp_threshold = self._optional_config.get("summer_temp_threshold", 15.0)
+                    season = "summer" if avg_temp > temp_threshold else "winter"
                     self._season_mode = season
                     self._season_mode_updated = now
                     self.logger.info(
                         f"Season mode determined: {self._season_mode} "
                         f"(3-day avg temp: {avg_temp:.1f}°C, "
-                        f"threshold: {self.config.summer_temp_threshold}°C)"
+                        f"threshold: {self._optional_config.get('summer_temp_threshold', 15.0)}°C)"
                     )
                     return self._season_mode
                 else:
@@ -1000,7 +1003,7 @@ class GrowattController(BaseModule):
                 price_data = sorted(price_data, key=_pkey)
 
                 # DST merge policy for 25-hour days (fall back)
-                merge_policy = getattr(self.config, "dst_merge_policy", "avg")
+                merge_policy = self._optional_config.get("dst_merge_policy", "avg")
 
                 def _merge_duplicate(existing: float, new: float) -> float:
                     """Merge duplicate hour prices during DST transitions."""
@@ -1238,7 +1241,7 @@ class GrowattController(BaseModule):
             )
             return
 
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔋 [SIMULATE] BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
@@ -1271,7 +1274,7 @@ class GrowattController(BaseModule):
         if self._ac_enabled == enabled:
             return  # Already in desired state
 
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             state = "ENABLED" if enabled else "DISABLED"
             self.logger.info(f"⚡ [SIMULATE] AC CHARGING {state} (simulated at {current_time})")
@@ -1298,7 +1301,7 @@ class GrowattController(BaseModule):
 
     async def _disable_battery_first(self) -> None:
         """Disable battery-first mode."""
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})"
@@ -1319,7 +1322,7 @@ class GrowattController(BaseModule):
         if self._export_enabled == enabled:
             return  # Already in desired state
 
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             state = "ENABLED" if enabled else "DISABLED"
             emoji = '⬆️' if enabled else '⬇️'
@@ -1391,7 +1394,7 @@ class GrowattController(BaseModule):
             )
             return
 
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔌 [SIMULATE] GRID-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
@@ -1449,7 +1452,7 @@ class GrowattController(BaseModule):
 
     async def _disable_grid_first(self) -> None:
         """Disable grid-first mode."""
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"🔌 [SIMULATE] GRID-FIRST MODE DISABLED (simulated at {current_time})")
             return
@@ -1469,7 +1472,7 @@ class GrowattController(BaseModule):
         Load-first is the default mode where the inverter supplies loads
         from solar/battery without forcing grid or battery priority.
         """
-        if self.config.simulation_mode:
+        if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⚖️ [SIMULATE] LOAD-FIRST MODE SET (simulated at {current_time})")
             return
@@ -2111,7 +2114,7 @@ class GrowattController(BaseModule):
             # Each export slice already schedules its own disable at slice end
 
             # Check if export overlaps with AC charging (if suppression enabled)
-            suppress_export = getattr(self.config, "suppress_export_during_ac_charge", True)
+            suppress_export = self._optional_config.get("suppress_export_during_ac_charge", True)
             export_slices: List[Tuple[dt_time, dt_time]] = []
 
             if suppress_export and _overlaps_ac(
