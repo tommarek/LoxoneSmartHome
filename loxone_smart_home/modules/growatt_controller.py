@@ -551,7 +551,14 @@ class GrowattController(BaseModule):
             return fallback
 
     async def _get_inverter_time(self) -> Optional[datetime]:
-        """Query current time from the inverter via MQTT request/response."""
+        """Query current time from the inverter via MQTT request/response.
+        
+        Protocol details (tested and working):
+        - Request topic: energy/solar/command/datetime/get
+        - Response topic: energy/solar/result
+        - Response contains: {"value": "YYYY-MM-DD HH:MM:SS", "command": "datetime/get", 
+                             "success": true, "message": "..."}
+        """
         if self._optional_config.get("simulation_mode", False):
             return self._get_local_now()
 
@@ -560,25 +567,39 @@ class GrowattController(BaseModule):
             
             # Set up the request/response pattern
             request_topic = "energy/solar/command/datetime/get"
-            # Primary: mirror the full path under /response/
-            response_topic_primary = request_topic.replace("/command/", "/response/")  
-            # This becomes: energy/solar/response/datetime/get
+            # The inverter responds on a common result topic
+            response_topic = "energy/solar/result"
             
-            # Legacy/fallback some bridges use (without /get)
-            response_topic_legacy = "energy/solar/response/datetime"
+            # Create a correlation ID for tracking this specific request
+            import uuid
+            correlation_id = f"datetime-{uuid.uuid4().hex[:8]}"
             
             # Create a future to wait for the response
             loop = asyncio.get_running_loop()
             response_future: asyncio.Future[datetime] = loop.create_future()
             
-            # Handler for the response (ignoring topic param to avoid unused warning)
+            # Handler for the response
             async def response_handler(_topic: str, payload: Any) -> None:
                 try:
                     # Payload could be bytes or string
                     if isinstance(payload, bytes):
                         payload = payload.decode()
                     data = json.loads(payload)
-                    value = data.get("value")  # Expected format: "YYYY-MM-DD HH:MM:SS"
+                    
+                    # Check if this is our datetime response
+                    if data.get("command") != "datetime/get":
+                        return  # Not our response, ignore
+                    
+                    # Check success
+                    if not data.get("success", False):
+                        error_msg = data.get("message", "Unknown error")
+                        if not response_future.done():
+                            response_future.set_exception(
+                                ValueError(f"Inverter returned error: {error_msg}")
+                            )
+                        return
+                    
+                    value = data.get("value")  # Format: "YYYY-MM-DD HH:MM:SS"
                     
                     if value:
                         # Parse the datetime string
@@ -605,30 +626,31 @@ class GrowattController(BaseModule):
                     if not response_future.done():
                         response_future.set_exception(e)
             
-            # Subscribe to both possible response topics
-            await self.mqtt_client.subscribe(response_topic_primary, response_handler)
-            await self.mqtt_client.subscribe(response_topic_legacy, response_handler)
+            # Subscribe to the result topic
+            await self.mqtt_client.subscribe(response_topic, response_handler)
             
             try:
-                # Send the request (get handler ignores payload, so {} is fine)
-                self.logger.debug(f"Requesting inverter time via {request_topic}")
-                self.logger.debug(f"Listening on {response_topic_primary} and {response_topic_legacy}")
-                await self.mqtt_client.publish(request_topic, json.dumps({}))
+                # Send the request with correlation ID
+                request_payload = {"correlationId": correlation_id}
+                self.logger.debug(
+                    f"Requesting inverter time via {request_topic} "
+                    f"with correlationId: {correlation_id}"
+                )
+                await self.mqtt_client.publish(request_topic, json.dumps(request_payload))
                 
-                # Wait for response with timeout (give inverter more time)
+                # Wait for response with timeout
                 inverter_time = await asyncio.wait_for(response_future, timeout=5.0)
                 return inverter_time
                 
             except asyncio.TimeoutError:
                 self.logger.warning(
                     f"Inverter time request timed out after 5 seconds. "
-                    f"Expected response on {response_topic_primary} or {response_topic_legacy}"
+                    f"Expected response on {response_topic} with command=datetime/get"
                 )
                 return None
             finally:
-                # Unsubscribe from both response topics
-                await self.mqtt_client.unsubscribe(response_topic_primary)
-                await self.mqtt_client.unsubscribe(response_topic_legacy)
+                # Unsubscribe from result topic
+                await self.mqtt_client.unsubscribe(response_topic)
 
         except Exception as e:
             self.logger.error(f"Failed to get inverter time: {e}")
