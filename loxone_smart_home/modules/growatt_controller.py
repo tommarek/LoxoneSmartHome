@@ -1369,6 +1369,7 @@ class GrowattController(BaseModule):
             await asyncio.sleep(0.5)
 
         # Convert to HH:MM format required by device
+        # Note: We use slot 1 for battery-first mode
         start_dev = self._to_device_hhmm(adjusted_start)
         stop_dev = self._to_device_hhmm(adjusted_stop)
         payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
@@ -1558,12 +1559,15 @@ class GrowattController(BaseModule):
         # Small delay before enabling the mode
         await asyncio.sleep(0.5)
 
-        # Finally set the time slot to enable the mode (use slot 2 for grid-first)
+        # Finally set the time slot to enable the mode
+        # IMPORTANT: Both battery-first and grid-first MUST use slot 1!
+        # The inverter prioritizes slot 1, so using slot 2 for grid-first prevents
+        # proper export functionality when switching between modes.
         # Convert to HH:MM format required by device
         start_dev = self._to_device_hhmm(adjusted_start)
         stop_dev = self._to_device_hhmm(adjusted_stop)
         timeslot_payload = {
-            "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 2
+            "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1
         }
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
@@ -1585,7 +1589,7 @@ class GrowattController(BaseModule):
             self.logger.info(f"🔌 [SIMULATE] GRID-FIRST MODE DISABLED (simulated at {current_time})")
             return
 
-        payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 2}
+        payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(payload))
         current_time = self._get_local_now().strftime("%H:%M:%S")
