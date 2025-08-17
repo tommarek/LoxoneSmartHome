@@ -23,6 +23,13 @@ extend-exclude = '''
 profile = "black"
 line_length = 100
 
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+explicit_package_bases = true
+namespace_packages = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]

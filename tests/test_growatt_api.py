@@ -11,7 +11,7 @@ import pytest  # noqa: E402
 from aiohttp import web  # noqa: E402
 from aiohttp.test_utils import AioHTTPTestCase  # noqa: E402
 
-from modules.growatt.api import create_growatt_api  # noqa: E402
+from modules.growatt.api import GROWATT_CONTROLLER_KEY, create_growatt_api  # noqa: E402
 
 
 class TestGrowattAPI(AioHTTPTestCase):
@@ -92,7 +92,7 @@ class TestGrowattAPI(AioHTTPTestCase):
     async def test_get_status_no_controller(self) -> None:
         """Test GET /api/growatt/status without controller."""
         # Remove controller
-        self.app['growatt_controller'] = None
+        self.app[GROWATT_CONTROLLER_KEY] = None
 
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 503)

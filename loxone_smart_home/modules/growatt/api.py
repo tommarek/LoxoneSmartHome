@@ -10,6 +10,9 @@ from aiohttp import web
 
 from modules.growatt_controller import GrowattController
 
+# Define AppKey for proper aiohttp usage
+GROWATT_CONTROLLER_KEY = web.AppKey("growatt_controller", GrowattController)
+
 # Global cache for telemetry data
 _telemetry_cache: Dict[str, Any] = {}
 _telemetry_last_update: Optional[datetime] = None
@@ -102,10 +105,10 @@ def create_growatt_api(
     Args:
         app: The aiohttp web application
         controller: The GrowattController instance (can be set later via
-                   app['growatt_controller'])
+                   app[GROWATT_CONTROLLER_KEY])
     """
     if controller:
-        app['growatt_controller'] = controller
+        app[GROWATT_CONTROLLER_KEY] = controller
         # Setup persistent subscriptions on startup
         asyncio.create_task(_setup_telemetry_subscription(controller))
         asyncio.create_task(_setup_result_subscription(controller))
@@ -130,7 +133,7 @@ async def get_status(request: web.Request) -> web.Response:
     Returns:
         JSON with current mode, periods, season mode, and live inverter data.
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -224,7 +227,7 @@ async def get_schedule(request: web.Request) -> web.Response:
     Returns:
         JSON with scheduled periods and their parameters.
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -277,7 +280,7 @@ async def get_prices(request: web.Request) -> web.Response:
     Returns:
         JSON with current and upcoming energy prices.
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -313,7 +316,7 @@ async def set_mode(request: web.Request) -> web.Response:
         }
     }
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -366,7 +369,7 @@ async def sync_time(request: web.Request) -> web.Response:
         "force": true  # Force sync even if drift is small
     }
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -411,7 +414,7 @@ async def get_config(request: web.Request) -> web.Response:
     Returns:
         JSON with current configuration parameters.
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
@@ -568,7 +571,7 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
     - Energy prices and optimization status
     - Daily statistics and performance metrics
     """
-    controller: GrowattController = request.app.get('growatt_controller')
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
         return web.json_response(
             {"error": "Controller not initialized"},
@@ -581,11 +584,6 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
 
         # Get real-time inverter data
         realtime_data = await _query_inverter_realtime(controller)
-
-        # Skip inverter time query - not essential for dashboard
-        # This was causing excessive queries (every 30s) and error logs
-        inverter_time = None
-        time_offset = None
 
         # Find active periods and current mode
         active_periods = []
@@ -631,16 +629,10 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
                 "mode": mode_name
             })
 
-        # Get price data if available
-        # TODO: Implement price data caching in controller
-        price_data = {}
-
         # Build comprehensive status response
         status = {
             "connected": controller._running,
             "current_mode": mode_display,
-            "inverter_time": inverter_time.isoformat() if inverter_time else None,
-            "time_offset_minutes": round(time_offset, 1) if time_offset else None,
             "simulation_mode": controller._optional_config.get("simulation_mode", False),
 
             # Power flow data
@@ -655,13 +647,8 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
             "battery_current": realtime_data.get("battery_current", 0),
             "battery_temp": realtime_data.get("battery_temp", 0),
 
-            # Energy prices
-            "current_price": price_data.get("current_price", 0),
-            "avg_price_today": price_data.get("avg_price_today", 0),
-            "min_price_today": price_data.get("min_price_today", 0),
-            "max_price_today": price_data.get("max_price_today", 0),
+            # Configuration
             "export_threshold": controller.config.export_price_threshold,
-            "hourly_prices": price_data.get("hourly_prices", []),
 
             # Schedule
             "schedule": schedule,
