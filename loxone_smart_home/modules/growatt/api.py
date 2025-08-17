@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -94,57 +93,6 @@ async def _setup_telemetry_subscription(controller: GrowattController) -> None:
         pass
 
 
-async def _query_inverter_mode(
-    controller: GrowattController, command: str
-) -> Optional[Dict[str, Any]]:
-    """Query inverter for mode status via MQTT.
-
-    Args:
-        controller: The GrowattController instance
-        command: The command to send (e.g., "batteryfirst/get",
-                  "gridfirst/get")
-
-    Returns:
-        Response data or None if failed
-    """
-    try:
-        if not controller.mqtt_client:
-            return None
-
-        # Ensure result subscription is active
-        await _setup_result_subscription(controller)
-
-        # Set up request/response pattern
-        request_topic = f"energy/solar/command/{command}"
-        correlation_id = f"{command}-{uuid.uuid4().hex[:8]}"
-
-        # Create future for response
-        loop = asyncio.get_running_loop()
-        response_future: asyncio.Future[Dict[str, Any]] = loop.create_future()
-
-        # Register the future for this command
-        _command_responses[command] = response_future
-
-        try:
-            await controller.mqtt_client.publish(
-                request_topic,
-                json.dumps({"correlationId": correlation_id})
-            )
-
-            # Wait for response with short timeout
-            result = await asyncio.wait_for(response_future, timeout=2.0)
-            return result.get("value") if result.get("success") else None
-
-        except asyncio.TimeoutError:
-            return None
-        finally:
-            # Clean up the future from the response map
-            _command_responses.pop(command, None)
-
-    except Exception:
-        return None
-
-
 def create_growatt_api(
     app: web.Application,
     controller: Optional[GrowattController] = None
@@ -211,40 +159,40 @@ async def get_status(request: web.Request) -> web.Response:
             if active_modes else "load_first"
         )
 
-        # Try to get real-time inverter data
+        # Get inverter mode data from telemetry cache and scheduled periods
+        # This avoids excessive MQTT commands that can fail
         inverter_data = {}
         if not controller._optional_config.get("simulation_mode", False):
-            try:
-                # Get inverter time for drift calculation
-                inverter_time = await controller._get_inverter_time()
-                if inverter_time:
-                    drift = (now - inverter_time).total_seconds()
-                    inverter_data["time"] = inverter_time.isoformat()
-                    inverter_data["time_drift_seconds"] = drift
+            # Use cached telemetry data if available
+            if _telemetry_cache:
+                # Active power rate is available in telemetry
+                inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
 
-                # Query battery-first mode status
-                bf_status = await _query_inverter_mode(
-                    controller, "batteryfirst/get"
-                )
-                if bf_status:
-                    inverter_data["battery_first_status"] = bf_status
+            # Infer battery/grid mode status from scheduled periods
+            # Check if we're currently in a battery-first or grid-first period
+            for period in active_periods:
+                if period["kind"] == "battery_first":
+                    inverter_data["battery_first_status"] = {
+                        "enabled": True,
+                        "start": period["start"],
+                        "end": period["end"],
+                        "stop_soc": period["params"].get("stop_soc", 90),
+                        "power_rate": period["params"].get("power_rate", 100)
+                    }
+                elif period["kind"] == "grid_first":
+                    inverter_data["grid_first_status"] = {
+                        "enabled": True,
+                        "start": period["start"],
+                        "end": period["end"],
+                        "stop_soc": period["params"].get("stop_soc", 20),
+                        "power_rate": period["params"].get("power_rate", 10)
+                    }
 
-                # Query grid-first mode status
-                gf_status = await _query_inverter_mode(
-                    controller, "gridfirst/get"
-                )
-                if gf_status:
-                    inverter_data["grid_first_status"] = gf_status
-
-                # Query active power rate
-                power_rate = await _query_inverter_mode(
-                    controller, "power/get/activerate"
-                )
-                if power_rate:
-                    inverter_data["active_power_rate"] = power_rate
-
-            except Exception as e:
-                inverter_data["error"] = f"Failed to query inverter: {str(e)}"
+            # If no active periods, modes are disabled
+            if "battery_first_status" not in inverter_data:
+                inverter_data["battery_first_status"] = {"enabled": False}
+            if "grid_first_status" not in inverter_data:
+                inverter_data["grid_first_status"] = {"enabled": False}
 
         status = {
             "running": controller._running,
@@ -634,11 +582,10 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
         # Get real-time inverter data
         realtime_data = await _query_inverter_realtime(controller)
 
-        # Get inverter time and calculate offset
-        inverter_time = await controller._get_inverter_time()
+        # Skip inverter time query - not essential for dashboard
+        # This was causing excessive queries (every 30s) and error logs
+        inverter_time = None
         time_offset = None
-        if inverter_time:
-            time_offset = (now - inverter_time).total_seconds() / 60  # in minutes
 
         # Find active periods and current mode
         active_periods = []

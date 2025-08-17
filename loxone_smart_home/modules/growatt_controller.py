@@ -653,7 +653,11 @@ class GrowattController(BaseModule):
                 await self.mqtt_client.unsubscribe(response_topic)
 
         except Exception as e:
-            self.logger.error(f"Failed to get inverter time: {e}")
+            # Log as debug if it's a known transient error, otherwise as warning
+            if "Failed to read date/time" in str(e):
+                self.logger.debug(f"Inverter temporarily unavailable for time sync: {e}")
+            else:
+                self.logger.warning(f"Failed to get inverter time: {e}")
             return None
 
     async def _sync_inverter_time(self) -> bool:

@@ -99,6 +99,12 @@
             border-bottom: none;
         }
         
+        .metric.sub-metric {
+            padding-left: 30px;
+            font-size: 13px;
+            opacity: 0.9;
+        }
+        
         .metric-label {
             color: #6b7280;
             font-size: 14px;
@@ -130,7 +136,8 @@
             font-weight: 500;
         }
         
-        .mode-badge.battery-first {
+        .mode-badge.battery-first,
+        .mode-badge.mode-battery {
             background: #dbeafe;
             color: #1e40af;
         }
@@ -140,7 +147,8 @@
             color: #92400e;
         }
         
-        .mode-badge.grid-first {
+        .mode-badge.grid-first,
+        .mode-badge.mode-grid {
             background: #dcfce7;
             color: #166534;
         }
@@ -271,14 +279,27 @@
     
     <script>
         let updateInterval;
+        let apiStatusData = null;
         
         async function fetchInverterData() {
             try {
-                const response = await fetch('/inverter/status');
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
+                // Fetch both dashboard status and API status
+                const [dashboardResponse, apiResponse] = await Promise.all([
+                    fetch('/inverter/status'),
+                    fetch('/api/growatt/status')
+                ]);
+                
+                if (!dashboardResponse.ok) {
+                    throw new Error(`Dashboard HTTP error! status: ${dashboardResponse.status}`);
                 }
-                const data = await response.json();
+                
+                const data = await dashboardResponse.json();
+                
+                // Try to get API status data if available
+                if (apiResponse.ok) {
+                    apiStatusData = await apiResponse.json();
+                }
+                
                 updateDashboard(data);
                 document.getElementById('errorMessage').style.display = 'none';
             } catch (error) {
@@ -408,6 +429,17 @@
                     ${renderPriceChart(data.hourly_prices)}
                 </div>
                 
+                <!-- Mode Control Status Card -->
+                <div class="card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z"/>
+                        </svg>
+                        Mode Control Status
+                    </h2>
+                    ${renderModeStatus()}
+                </div>
+                
                 <!-- Schedule Card -->
                 <div class="card">
                     <h2>
@@ -486,6 +518,74 @@
         function formatTime(timestamp) {
             if (!timestamp) return '--';
             return new Date(timestamp).toLocaleTimeString();
+        }
+        
+        function renderModeStatus() {
+            // Use API status data if available
+            if (!apiStatusData || !apiStatusData.inverter_data) {
+                return '<div class="metric"><span class="metric-label">Mode data not available</span></div>';
+            }
+            
+            const inverterData = apiStatusData.inverter_data;
+            let html = '';
+            
+            // Active Power Rate
+            html += `
+                <div class="metric">
+                    <span class="metric-label">Active Power Rate</span>
+                    <span class="metric-value">${inverterData.active_power_rate || 100}%</span>
+                </div>
+            `;
+            
+            // Battery First Mode Status
+            const bfStatus = inverterData.battery_first_status || {};
+            html += `
+                <div class="metric">
+                    <span class="metric-label">Battery First Mode</span>
+                    <span class="metric-value">
+                        <span class="mode-badge ${bfStatus.enabled ? 'mode-battery' : ''}">${bfStatus.enabled ? 'ACTIVE' : 'Inactive'}</span>
+                    </span>
+                </div>
+            `;
+            
+            if (bfStatus.enabled) {
+                html += `
+                    <div class="metric sub-metric">
+                        <span class="metric-label">Time Window</span>
+                        <span class="metric-value">${bfStatus.start} - ${bfStatus.end}</span>
+                    </div>
+                    <div class="metric sub-metric">
+                        <span class="metric-label">Stop SOC / Power Rate</span>
+                        <span class="metric-value">${bfStatus.stop_soc}% / ${bfStatus.power_rate}%</span>
+                    </div>
+                `;
+            }
+            
+            // Grid First Mode Status
+            const gfStatus = inverterData.grid_first_status || {};
+            html += `
+                <div class="metric">
+                    <span class="metric-label">Grid First Mode</span>
+                    <span class="metric-value">
+                        <span class="mode-badge ${gfStatus.enabled ? 'mode-grid' : ''}">${gfStatus.enabled ? 'ACTIVE' : 'Inactive'}</span>
+                    </span>
+                </div>
+            `;
+            
+            if (gfStatus.enabled) {
+                html += `
+                    <div class="metric sub-metric">
+                        <span class="metric-label">Time Window</span>
+                        <span class="metric-value">${gfStatus.start} - ${gfStatus.end}</span>
+                    </div>
+                    <div class="metric sub-metric">
+                        <span class="metric-label">Stop SOC / Power Rate</span>
+                        <span class="metric-value">${gfStatus.stop_soc}% / ${gfStatus.power_rate}%</span>
+                    </div>
+                `;
+            }
+            
+            return html;
         }
         
         function renderSchedule(schedule) {

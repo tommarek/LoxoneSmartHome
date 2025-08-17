@@ -295,18 +295,15 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "Could not read inverter time")
 
-    @patch('modules.growatt.api._query_inverter_mode')
+    @patch('modules.growatt.api._telemetry_cache')
     async def test_get_status_with_inverter_data(
         self,
-        mock_query: AsyncMock
+        mock_cache: MagicMock
     ) -> None:
-        """Test GET /api/growatt/status with real inverter data."""
-        # Mock inverter responses
-        mock_query.side_effect = [
-            {"enabled": True, "start": "08:00", "stop": "10:00"},  # battery_first
-            {"enabled": False},  # grid_first
-            50  # active_power_rate
-        ]
+        """Test GET /api/growatt/status with cached telemetry data."""
+        # Mock telemetry cache with data
+        mock_cache.__bool__.return_value = True
+        mock_cache.get.return_value = 50  # ActivePowerRate
 
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 200)
@@ -314,10 +311,15 @@ class TestGrowattAPI(AioHTTPTestCase):
         data = await resp.json()
         self.assertIn("inverter_data", data)
         inverter = data["inverter_data"]
-        self.assertIn("battery_first_status", inverter)
-        self.assertIn("grid_first_status", inverter)
+        # Check we have active_power_rate from telemetry cache
         self.assertIn("active_power_rate", inverter)
         self.assertEqual(inverter["active_power_rate"], 50)
+        # Check we have mode status inferred from periods
+        self.assertIn("battery_first_status", inverter)
+        self.assertIn("grid_first_status", inverter)
+        # Since no periods are active, both should be disabled
+        self.assertFalse(inverter["battery_first_status"]["enabled"])
+        self.assertFalse(inverter["grid_first_status"]["enabled"])
 
 
 if __name__ == "__main__":

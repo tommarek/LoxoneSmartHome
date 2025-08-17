@@ -124,8 +124,8 @@ class LoxoneSmartHome:
             # Register Growatt API routes
             create_growatt_api(self.api_app, self.growatt_controller)
 
-            # Create and start runner
-            self.api_runner = web.AppRunner(self.api_app)
+            # Create and start runner (disable access logging to reduce noise)
+            self.api_runner = web.AppRunner(self.api_app, access_log=None)
             await self.api_runner.setup()
 
             # Create TCP site on port 8080
