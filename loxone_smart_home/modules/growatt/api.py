@@ -3,13 +3,95 @@
 import asyncio
 import json
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 from aiohttp import web
 
 from modules.growatt_controller import GrowattController
+
+# Global cache for telemetry data
+_telemetry_cache: Dict[str, Any] = {}
+_telemetry_last_update: Optional[datetime] = None
+_telemetry_subscription_active = False
+
+# Global cache for command responses
+_command_responses: Dict[str, asyncio.Future] = {}
+_result_subscription_active = False
+
+
+async def _setup_result_subscription(controller: GrowattController) -> None:
+    """Setup subscription to energy/solar/result topic for command responses.
+
+    This subscribes once and handles all command responses, avoiding
+    repeated subscribe/unsubscribe operations.
+    """
+    global _result_subscription_active
+
+    if _result_subscription_active or not controller.mqtt_client:
+        return
+
+    async def result_handler(_topic: str, payload: Any) -> None:
+        """Handle incoming command responses from energy/solar/result topic."""
+        try:
+            if isinstance(payload, bytes):
+                payload = payload.decode()
+            data = json.loads(payload) if isinstance(payload, str) else payload
+
+            # Get the command from the response
+            command = data.get("command")
+            if command and command in _command_responses:
+                # Find the future waiting for this response
+                future = _command_responses.get(command)
+                if future and not future.done():
+                    future.set_result(data)
+
+        except Exception:
+            # Silently ignore parse errors to avoid log spam
+            pass
+
+    try:
+        await controller.mqtt_client.subscribe("energy/solar/result", result_handler)
+        _result_subscription_active = True
+    except Exception:
+        # Silently fail if subscription fails
+        pass
+
+
+async def _setup_telemetry_subscription(controller: GrowattController) -> None:
+    """Setup subscription to energy/solar topic for telemetry data.
+
+    This subscribes once and caches all telemetry data that the inverter
+    publishes every 5 seconds, avoiding the need for individual queries.
+    """
+    global _telemetry_subscription_active
+
+    if _telemetry_subscription_active or not controller.mqtt_client:
+        return
+
+    async def telemetry_handler(_topic: str, payload: Any) -> None:
+        """Handle incoming telemetry data from energy/solar topic."""
+        global _telemetry_cache, _telemetry_last_update
+        try:
+            if isinstance(payload, bytes):
+                payload = payload.decode()
+            data = json.loads(payload) if isinstance(payload, str) else payload
+
+            # Update cache with new telemetry data
+            _telemetry_cache = data
+            _telemetry_last_update = datetime.now()
+
+        except Exception:
+            # Silently ignore parse errors to avoid log spam
+            pass
+
+    try:
+        await controller.mqtt_client.subscribe("energy/solar", telemetry_handler)
+        _telemetry_subscription_active = True
+    except Exception:
+        # Silently fail if subscription fails
+        pass
 
 
 async def _query_inverter_mode(
@@ -29,32 +111,19 @@ async def _query_inverter_mode(
         if not controller.mqtt_client:
             return None
 
+        # Ensure result subscription is active
+        await _setup_result_subscription(controller)
+
         # Set up request/response pattern
         request_topic = f"energy/solar/command/{command}"
-        response_topic = "energy/solar/result"
         correlation_id = f"{command}-{uuid.uuid4().hex[:8]}"
 
         # Create future for response
         loop = asyncio.get_running_loop()
         response_future: asyncio.Future[Dict[str, Any]] = loop.create_future()
 
-        async def response_handler(_topic: str, payload: Any) -> None:
-            try:
-                if isinstance(payload, bytes):
-                    payload = payload.decode()
-                data = json.loads(payload)
-
-                # Check if this is our response
-                if data.get("command") == command:
-                    if not response_future.done():
-                        response_future.set_result(data)
-            except Exception:
-                pass
-
-        # Subscribe and request
-        await controller.mqtt_client.subscribe(
-            response_topic, response_handler
-        )
+        # Register the future for this command
+        _command_responses[command] = response_future
 
         try:
             await controller.mqtt_client.publish(
@@ -69,7 +138,8 @@ async def _query_inverter_mode(
         except asyncio.TimeoutError:
             return None
         finally:
-            await controller.mqtt_client.unsubscribe(response_topic)
+            # Clean up the future from the response map
+            _command_responses.pop(command, None)
 
     except Exception:
         return None
@@ -88,6 +158,9 @@ def create_growatt_api(
     """
     if controller:
         app['growatt_controller'] = controller
+        # Setup persistent subscriptions on startup
+        asyncio.create_task(_setup_telemetry_subscription(controller))
+        asyncio.create_task(_setup_result_subscription(controller))
 
     # Register routes
     app.router.add_get('/api/growatt/status', get_status)
@@ -463,42 +536,77 @@ async def serve_dashboard(request: web.Request) -> web.Response:
 async def _query_inverter_realtime(
     controller: GrowattController
 ) -> Dict[str, Any]:
-    """Query real-time inverter data via MQTT.
+    """Get real-time inverter data from cached telemetry.
 
-    Returns comprehensive inverter status including power flows,
-    battery state, and system parameters.
+    Returns comprehensive inverter status from the cached telemetry data
+    that is automatically published by the inverter every 5 seconds.
     """
-    data = {}
+    # Ensure telemetry subscription is active
+    await _setup_telemetry_subscription(controller)
 
-    try:
-        if not controller.mqtt_client:
-            return data
+    # Check if cache is fresh (less than 10 seconds old)
+    if _telemetry_last_update and (datetime.now() - _telemetry_last_update) < timedelta(seconds=10):
+        # Map telemetry fields to our expected format
+        # Based on actual MQTT telemetry data structure
+        # Calculate battery power (negative = discharging, positive = charging)
+        charge_pwr = _telemetry_cache.get("ChargePower", 0)
+        discharge_pwr = _telemetry_cache.get("DischargePower", 0)
+        battery_power = charge_pwr - discharge_pwr
 
-        # List of data points to query
-        queries = [
-            ("power/get/solar", "solar_power"),
-            ("power/get/battery", "battery_power"),
-            ("power/get/grid", "grid_power"),
-            ("power/get/load", "load_power"),
-            ("battery/get/soc", "battery_soc"),
-            ("battery/get/voltage", "battery_voltage"),
-            ("battery/get/current", "battery_current"),
-            ("battery/get/temperature", "battery_temp"),
-            ("system/get/status", "system_status"),
-            ("stats/get/daily/production", "daily_production"),
-            ("stats/get/daily/consumption", "daily_consumption"),
-            ("stats/get/daily/import", "daily_import"),
-            ("stats/get/daily/export", "daily_export"),
-        ]
+        # Calculate grid power (ACPowerToGrid - ACPowerToUser)
+        to_grid = _telemetry_cache.get("ACPowerToGrid", 0)
+        to_user = _telemetry_cache.get("ACPowerToUser", 0)
+        grid_power = to_grid - to_user
 
-        # Query each data point
-        for command, key in queries:
-            result = await _query_inverter_mode(controller, command)
-            if result is not None:
-                data[key] = result
+        # Calculate battery current from power and voltage
+        batt_voltage = _telemetry_cache.get("BatteryVoltage", 1)
+        batt_current = battery_power / batt_voltage if batt_voltage > 0 else 0
 
-    except Exception as e:
-        data["error"] = str(e)
+        data = {
+            "solar_power": _telemetry_cache.get("InputPower", 0),
+            "battery_power": battery_power,
+            "grid_power": grid_power,
+            "load_power": _telemetry_cache.get("INVPowerToLocalLoad", 0),
+            "battery_soc": _telemetry_cache.get("SOC", 0),
+            "battery_voltage": batt_voltage,
+            "battery_current": batt_current,
+            "battery_temp": _telemetry_cache.get("BatteryTemperature", 0),
+            "system_status": _telemetry_cache.get("InverterStatus", 0),
+            "daily_production": _telemetry_cache.get("TodayGenerateEnergy", 0),
+            "daily_consumption": _telemetry_cache.get("LocalLoadEnergyToday", 0),
+            "daily_import": _telemetry_cache.get("ACChargeEnergyToday", 0),
+            "daily_export": _telemetry_cache.get("EnergyToGridToday", 0),
+            # Additional useful fields from telemetry
+            "pv1_power": _telemetry_cache.get("PV1InputPower", 0),
+            "pv2_power": _telemetry_cache.get("PV2InputPower", 0),
+            "pv1_voltage": _telemetry_cache.get("PV1Voltage", 0),
+            "pv2_voltage": _telemetry_cache.get("PV2Voltage", 0),
+            "grid_voltage": _telemetry_cache.get("L1ThreePhaseGridVoltage", 0),
+            "grid_frequency": _telemetry_cache.get("GridFrequency", 0),
+            "inverter_temp": _telemetry_cache.get("InverterTemperature", 0),
+            "charge_power": _telemetry_cache.get("ChargePower", 0),
+            "discharge_power": _telemetry_cache.get("DischargePower", 0),
+            "battery_state": _telemetry_cache.get("BatteryState", 0),
+            "active_power_rate": _telemetry_cache.get("ActivePowerRate", 100),
+        }
+    else:
+        # Cache is stale or doesn't exist, return empty data
+        # Dashboard will show zeros until telemetry data arrives
+        data = {
+            "solar_power": 0,
+            "battery_power": 0,
+            "grid_power": 0,
+            "load_power": 0,
+            "battery_soc": 0,
+            "battery_voltage": 0,
+            "battery_current": 0,
+            "battery_temp": 0,
+            "system_status": "Waiting for data...",
+            "daily_production": 0,
+            "daily_consumption": 0,
+            "daily_import": 0,
+            "daily_export": 0,
+        }
 
     return data
 
@@ -577,33 +685,8 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
             })
 
         # Get price data if available
+        # TODO: Implement price data caching in controller
         price_data = {}
-        if hasattr(controller, '_current_prices'):
-            prices = controller._current_prices
-            if prices:
-                # Current hour price
-                current_hour = now.hour
-                if current_hour < len(prices):
-                    price_data["current_price"] = prices[current_hour]
-
-                # Calculate min/max/avg
-                price_data["min_price_today"] = min(prices)
-                price_data["max_price_today"] = max(prices)
-                price_data["avg_price_today"] = sum(prices) / len(prices)
-
-                # Create hourly price chart data
-                hourly_prices = []
-                for hour, price in enumerate(prices):
-                    is_cheapest = hour in getattr(controller, '_cheapest_hours', [])
-                    is_expensive = price > controller.config.export_price_threshold
-
-                    hourly_prices.append({
-                        "hour": hour,
-                        "price": price,
-                        "is_cheapest": is_cheapest,
-                        "is_expensive": is_expensive
-                    })
-                price_data["hourly_prices"] = hourly_prices
 
         # Build comprehensive status response
         status = {

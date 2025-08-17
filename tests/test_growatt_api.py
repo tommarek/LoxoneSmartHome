@@ -1,14 +1,17 @@
 """Unit tests for Growatt API endpoints."""
 
-import json
+import sys
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
-from aiohttp import web
-from aiohttp.test_utils import AioHTTPTestCase
+sys.path.insert(0, str(Path(__file__).parent.parent / "loxone_smart_home"))
 
-from loxone_smart_home.modules.growatt.api import create_growatt_api
+import pytest  # noqa: E402
+from aiohttp import web  # noqa: E402
+from aiohttp.test_utils import AioHTTPTestCase  # noqa: E402
+
+from modules.growatt.api import create_growatt_api  # noqa: E402
 
 
 class TestGrowattAPI(AioHTTPTestCase):
@@ -17,7 +20,7 @@ class TestGrowattAPI(AioHTTPTestCase):
     async def get_application(self) -> web.Application:
         """Create test application."""
         app = web.Application()
-        
+
         # Create mock controller
         self.mock_controller = MagicMock()
         self.mock_controller._running = True
@@ -49,7 +52,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.mock_controller._set_battery_first = AsyncMock()
         self.mock_controller._set_grid_first = AsyncMock()
         self.mock_controller._set_load_first = AsyncMock()
-        
+
         # Mock config
         self.mock_controller.config = MagicMock()
         self.mock_controller.config.battery_capacity = 10.0
@@ -63,20 +66,20 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.mock_controller.config.device_serial = "ABC123"
         self.mock_controller.config.schedule_hour = 23
         self.mock_controller.config.schedule_minute = 59
-        
+
         # Mock MQTT client
         self.mock_controller.mqtt_client = AsyncMock()
-        
+
         # Register API with mock controller
         create_growatt_api(app, self.mock_controller)
-        
+
         return app
 
     async def test_get_status(self) -> None:
         """Test GET /api/growatt/status endpoint."""
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("running", data)
         self.assertIn("current_mode", data)
@@ -90,10 +93,10 @@ class TestGrowattAPI(AioHTTPTestCase):
         """Test GET /api/growatt/status without controller."""
         # Remove controller
         self.app['growatt_controller'] = None
-        
+
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 503)
-        
+
         data = await resp.json()
         self.assertIn("error", data)
         self.assertEqual(data["error"], "Controller not initialized")
@@ -102,7 +105,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         """Test GET /api/growatt/schedule endpoint."""
         resp = await self.client.request("GET", "/api/growatt/schedule")
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("schedule", data)
         self.assertIn("active_now", data)
@@ -113,7 +116,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         """Test GET /api/growatt/prices endpoint."""
         resp = await self.client.request("GET", "/api/growatt/prices")
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("message", data)
         self.assertIn("eur_czk_rate", data)
@@ -123,7 +126,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         """Test GET /api/growatt/config endpoint."""
         resp = await self.client.request("GET", "/api/growatt/config")
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("battery_capacity", data)
         self.assertIn("max_charge_power", data)
@@ -145,20 +148,20 @@ class TestGrowattAPI(AioHTTPTestCase):
                 "power_rate": 95
             }
         }
-        
+
         resp = await self.client.request(
             "POST",
             "/api/growatt/mode",
             json=payload
         )
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("success", data)
         self.assertIn("mode", data)
         self.assertTrue(data["success"])
         self.assertEqual(data["mode"], "battery_first")
-        
+
         # Verify controller method was called
         self.mock_controller._set_battery_first.assert_called_once_with(
             "08:00", "10:00",
@@ -177,18 +180,18 @@ class TestGrowattAPI(AioHTTPTestCase):
                 "power_rate": 15
             }
         }
-        
+
         resp = await self.client.request(
             "POST",
             "/api/growatt/mode",
             json=payload
         )
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["mode"], "grid_first")
-        
+
         # Verify controller method was called
         self.mock_controller._set_grid_first.assert_called_once_with(
             "17:00", "20:00",
@@ -199,32 +202,32 @@ class TestGrowattAPI(AioHTTPTestCase):
     async def test_set_mode_load_first(self) -> None:
         """Test POST /api/growatt/mode for load_first."""
         payload = {"mode": "load_first"}
-        
+
         resp = await self.client.request(
             "POST",
             "/api/growatt/mode",
             json=payload
         )
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertTrue(data["success"])
         self.assertEqual(data["mode"], "load_first")
-        
+
         # Verify controller method was called
         self.mock_controller._set_load_first.assert_called_once()
 
     async def test_set_mode_invalid(self) -> None:
         """Test POST /api/growatt/mode with invalid mode."""
         payload = {"mode": "invalid_mode"}
-        
+
         resp = await self.client.request(
             "POST",
             "/api/growatt/mode",
             json=payload
         )
         self.assertEqual(resp.status, 400)
-        
+
         data = await resp.json()
         self.assertIn("error", data)
         self.assertEqual(data["error"], "Invalid mode")
@@ -232,14 +235,14 @@ class TestGrowattAPI(AioHTTPTestCase):
     async def test_sync_time(self) -> None:
         """Test POST /api/growatt/sync-time endpoint."""
         payload = {"force": True}
-        
+
         resp = await self.client.request(
             "POST",
             "/api/growatt/sync-time",
             json=payload
         )
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("success", data)
         self.assertIn("inverter_time", data)
@@ -247,7 +250,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertIn("drift_seconds", data)
         self.assertIn("synced", data)
         self.assertTrue(data["synced"])
-        
+
         # Verify controller methods were called
         self.mock_controller._get_inverter_time.assert_called()
         self.mock_controller._sync_inverter_time.assert_called_once()
@@ -261,12 +264,12 @@ class TestGrowattAPI(AioHTTPTestCase):
             data=""
         )
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("success", data)
         # With small drift and no force, sync should not happen
         self.assertFalse(data["synced"])
-        
+
         # Verify controller methods were called
         self.mock_controller._get_inverter_time.assert_called()
         # Sync should not be called with small drift
@@ -277,7 +280,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.mock_controller._get_inverter_time = AsyncMock(
             return_value=None
         )
-        
+
         payload = {"force": True}
         resp = await self.client.request(
             "POST",
@@ -285,14 +288,14 @@ class TestGrowattAPI(AioHTTPTestCase):
             json=payload
         )
         self.assertEqual(resp.status, 500)
-        
+
         data = await resp.json()
         self.assertIn("success", data)
         self.assertIn("message", data)
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "Could not read inverter time")
 
-    @patch('loxone_smart_home.modules.growatt.api._query_inverter_mode')
+    @patch('modules.growatt.api._query_inverter_mode')
     async def test_get_status_with_inverter_data(
         self,
         mock_query: AsyncMock
@@ -304,10 +307,10 @@ class TestGrowattAPI(AioHTTPTestCase):
             {"enabled": False},  # grid_first
             50  # active_power_rate
         ]
-        
+
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 200)
-        
+
         data = await resp.json()
         self.assertIn("inverter_data", data)
         inverter = data["inverter_data"]

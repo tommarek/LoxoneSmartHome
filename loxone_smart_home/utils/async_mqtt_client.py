@@ -191,7 +191,7 @@ class AsyncMQTTClient:
                 # Subscribe if connected
                 if self.client and self._connected:
                     await self.client.subscribe(topic)
-                    self.logger.info(f"Subscribed to topic: {topic}")
+                    self.logger.debug(f"Subscribed to topic: {topic}")
 
             self.subscribers[topic].add(callback)
 
@@ -209,7 +209,7 @@ class AsyncMQTTClient:
                 # Unsubscribe if no more callbacks
                 if topic not in self.subscribers and self.client and self._connected:
                     await self.client.unsubscribe(topic)
-                    self.logger.info(f"Unsubscribed from topic: {topic}")
+                    self.logger.debug(f"Unsubscribed from topic: {topic}")
 
     async def _read_messages(self) -> None:
         """Read messages from subscribed topics."""
