@@ -37,6 +37,37 @@ class TestGrowattAPI(AioHTTPTestCase):
         }
         self.mock_controller._eur_czk_rate = 25.0
         self.mock_controller._eur_czk_rate_updated = datetime.now()
+        
+        # Mock price data
+        self.mock_controller._current_prices = {
+            ("00:00", "01:00"): 60.0,
+            ("01:00", "02:00"): 55.0,
+            ("02:00", "03:00"): 50.0,
+            ("03:00", "04:00"): 48.0,
+            ("04:00", "05:00"): 52.0,
+            ("05:00", "06:00"): 58.0,
+            ("06:00", "07:00"): 65.0,
+            ("07:00", "08:00"): 75.0,
+            ("08:00", "09:00"): 85.0,
+            ("09:00", "10:00"): 90.0,
+            ("10:00", "11:00"): 88.0,
+            ("11:00", "12:00"): 86.0,
+            ("12:00", "13:00"): 84.0,
+            ("13:00", "14:00"): 82.0,
+            ("14:00", "15:00"): 80.0,
+            ("15:00", "16:00"): 78.0,
+            ("16:00", "17:00"): 82.0,
+            ("17:00", "18:00"): 95.0,
+            ("18:00", "19:00"): 100.0,
+            ("19:00", "20:00"): 98.0,
+            ("20:00", "21:00"): 90.0,
+            ("21:00", "22:00"): 75.0,
+            ("22:00", "23:00"): 65.0,
+            ("23:00", "24:00"): 60.0,
+        }
+        self.mock_controller._prices_date = "2024-12-17"
+        self.mock_controller._prices_updated = datetime.now()
+        
         self.mock_controller._get_local_now = MagicMock(
             return_value=datetime.now()
         )
@@ -118,9 +149,15 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertEqual(resp.status, 200)
 
         data = await resp.json()
-        self.assertIn("message", data)
+        self.assertIn("has_data", data)
+        self.assertTrue(data["has_data"])
         self.assertIn("eur_czk_rate", data)
         self.assertEqual(data["eur_czk_rate"], 25.0)
+        self.assertIn("hourly_prices", data)
+        self.assertEqual(len(data["hourly_prices"]), 24)
+        self.assertIn("average_today_czk_kwh", data)
+        self.assertIn("min_price_czk_kwh", data)
+        self.assertIn("max_price_czk_kwh", data)
 
     async def test_get_config(self) -> None:
         """Test GET /api/growatt/config endpoint."""

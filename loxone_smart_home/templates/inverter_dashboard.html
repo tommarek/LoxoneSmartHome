@@ -220,37 +220,6 @@
             font-weight: 500;
         }
         
-        .price-chart {
-            margin-top: 15px;
-            height: 150px;
-            position: relative;
-        }
-        
-        .chart-bar {
-            display: inline-block;
-            width: calc(100% / 24 - 2px);
-            background: #e5e7eb;
-            margin: 0 1px;
-            vertical-align: bottom;
-            position: relative;
-            transition: background 0.3s;
-        }
-        
-        .chart-bar:hover {
-            background: #9ca3af;
-        }
-        
-        .chart-bar.active {
-            background: #6366f1;
-        }
-        
-        .chart-bar.cheapest {
-            background: #10b981;
-        }
-        
-        .chart-bar.expensive {
-            background: #ef4444;
-        }
     </style>
 </head>
 <body>
@@ -333,14 +302,6 @@
                         </span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Inverter Time</span>
-                        <span class="metric-value">${formatTime(data.inverter_time)}</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Time Offset</span>
-                        <span class="metric-value ${data.time_offset_minutes > 5 ? 'warning' : ''}">${data.time_offset_minutes || 0} min</span>
-                    </div>
-                    <div class="metric">
                         <span class="metric-label">Simulation Mode</span>
                         <span class="metric-value">${data.simulation_mode ? 'Yes' : 'No'}</span>
                     </div>
@@ -408,25 +369,24 @@
                         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                             <path d="M12 2v20M17 5H9.5a3.5 3.5 0 000 7h5a3.5 3.5 0 010 7H6"/>
                         </svg>
-                        Energy Prices
+                        Configuration
                     </h2>
                     <div class="metric">
-                        <span class="metric-label">Current Price</span>
-                        <span class="metric-value">${formatPrice(data.current_price)} CZK/kWh</span>
+                        <span class="metric-label">Export Price Threshold</span>
+                        <span class="metric-value">${data.export_threshold} EUR/MWh</span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Average Today</span>
-                        <span class="metric-value">${formatPrice(data.avg_price_today)} CZK/kWh</span>
+                        <span class="metric-label">Season Mode</span>
+                        <span class="metric-value">${data.season_mode || 'Unknown'}</span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Min/Max Today</span>
-                        <span class="metric-value">${formatPrice(data.min_price_today)} - ${formatPrice(data.max_price_today)}</span>
+                        <span class="metric-label">AC Enabled</span>
+                        <span class="metric-value">${data.ac_enabled ? 'Yes' : 'No'}</span>
                     </div>
                     <div class="metric">
-                        <span class="metric-label">Export Threshold</span>
-                        <span class="metric-value">${formatPrice(data.export_threshold)} CZK/kWh</span>
+                        <span class="metric-label">Export Enabled</span>
+                        <span class="metric-value">${data.export_enabled ? 'Yes' : 'No'}</span>
                     </div>
-                    ${renderPriceChart(data.hourly_prices)}
                 </div>
                 
                 <!-- Mode Control Status Card -->
@@ -601,27 +561,6 @@
             `).join('');
         }
         
-        function renderPriceChart(prices) {
-            if (!prices || prices.length === 0) {
-                return '<div class="price-chart"><p style="text-align: center; color: #9ca3af;">No price data available</p></div>';
-            }
-            
-            const maxPrice = Math.max(...prices.map(p => p.price));
-            const minPrice = Math.min(...prices.map(p => p.price));
-            const currentHour = new Date().getHours();
-            
-            const bars = prices.map((item, index) => {
-                const height = ((item.price - minPrice) / (maxPrice - minPrice)) * 100;
-                let className = 'chart-bar';
-                if (index === currentHour) className += ' active';
-                if (item.is_cheapest) className += ' cheapest';
-                if (item.is_expensive) className += ' expensive';
-                
-                return `<div class="${className}" style="height: ${height}%" title="${item.hour}:00 - ${item.price.toFixed(2)} CZK/kWh"></div>`;
-            }).join('');
-            
-            return `<div class="price-chart">${bars}</div>`;
-        }
         
         function showError(message) {
             const errorDiv = document.getElementById('errorMessage');

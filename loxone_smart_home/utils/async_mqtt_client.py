@@ -241,15 +241,9 @@ class AsyncMQTTClient:
             try:
                 payload = message.payload.decode("utf-8")
             except UnicodeDecodeError as e:
-                # Use debug level for energy/solar topic as occasional corruption is expected
-                if topic == "energy/solar":
-                    self.logger.debug(
-                        f"Failed to decode message payload as UTF-8 for topic {topic}: {e}"
-                    )
-                else:
-                    self.logger.warning(
-                        f"Failed to decode message payload as UTF-8 for topic {topic}: {e}"
-                    )
+                self.logger.warning(
+                    f"Failed to decode message payload as UTF-8 for topic {topic}: {e}"
+                )
                 # Try with error handling - replace invalid characters
                 try:
                     payload = message.payload.decode("utf-8", errors="replace")

@@ -310,9 +310,10 @@ async def test_calculate_and_schedule_next_day_no_prices(
 ) -> None:
     """Test scheduling with no price data available."""
     with patch.object(growatt_controller, "_fetch_dam_energy_prices", return_value={}):
-        with patch.object(growatt_controller, "_schedule_fallback_mode") as mock_fallback:
-            await growatt_controller._calculate_and_schedule_next_day()
-            mock_fallback.assert_called_once()
+        with patch.object(growatt_controller, "_generate_mock_prices", return_value={}):
+            with patch.object(growatt_controller, "_schedule_fallback_mode") as mock_fallback:
+                await growatt_controller._calculate_and_schedule_next_day()
+                mock_fallback.assert_called_once()
 
 
 @pytest.mark.asyncio

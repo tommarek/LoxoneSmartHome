@@ -287,15 +287,63 @@ async def get_prices(request: web.Request) -> web.Response:
         )
 
     try:
-        # This would need access to price data stored in the controller
-        # For now, return a placeholder
+        # Get current time and price for current hour
+        now = controller._get_local_now()
+        current_hour = now.strftime("%H:00")
+        
+        # Convert EUR/MWh prices to CZK/kWh for display
+        eur_czk_rate = controller._eur_czk_rate or 25.0
+        
+        # Find current price
+        current_price_eur = None
+        for (start, _), price in controller._current_prices.items():
+            if start == current_hour:
+                current_price_eur = price
+                break
+        
+        # Calculate statistics
+        prices_list = list(controller._current_prices.values())
+        if prices_list:
+            avg_price_eur = sum(prices_list) / len(prices_list)
+            min_price_eur = min(prices_list)
+            max_price_eur = max(prices_list)
+        else:
+            avg_price_eur = min_price_eur = max_price_eur = None
+        
+        # Convert to CZK/kWh (EUR/MWh * rate / 1000)
+        def to_czk_kwh(eur_mwh):
+            if eur_mwh is None:
+                return None
+            return round(eur_mwh * eur_czk_rate / 1000, 2)
+        
+        # Build hourly prices list for chart
+        hourly_data = []
+        for (start, end), price_eur in sorted(controller._current_prices.items()):
+            hourly_data.append({
+                "hour": start,
+                "end": end,
+                "price_eur_mwh": price_eur,
+                "price_czk_kwh": to_czk_kwh(price_eur)
+            })
+        
         return web.json_response({
-            "message": "Price data endpoint - to be implemented",
-            "eur_czk_rate": controller._eur_czk_rate,
+            "current_price_czk_kwh": to_czk_kwh(current_price_eur),
+            "average_today_czk_kwh": to_czk_kwh(avg_price_eur),
+            "min_price_czk_kwh": to_czk_kwh(min_price_eur),
+            "max_price_czk_kwh": to_czk_kwh(max_price_eur),
+            "export_threshold_czk_kwh": controller.config.export_price_threshold,
+            "eur_czk_rate": eur_czk_rate,
             "eur_czk_rate_updated": (
                 controller._eur_czk_rate_updated.isoformat()
                 if controller._eur_czk_rate_updated else None
-            )
+            ),
+            "prices_date": controller._prices_date,
+            "prices_updated": (
+                controller._prices_updated.isoformat()
+                if controller._prices_updated else None
+            ),
+            "hourly_prices": hourly_data,
+            "has_data": bool(controller._current_prices)
         })
 
     except Exception as e:

@@ -227,6 +227,11 @@ class GrowattController(BaseModule):
         self._eur_czk_rate: Optional[float] = None
         self._eur_czk_rate_updated: Optional[datetime] = None
 
+        # Energy price data cache
+        self._current_prices: Dict[Tuple[str, str], float] = {}
+        self._prices_date: Optional[str] = None
+        self._prices_updated: Optional[datetime] = None
+
         # Track AC and Export states to prevent duplicate commands
         self._ac_enabled: Optional[bool] = None
         self._export_enabled: Optional[bool] = None
@@ -653,11 +658,7 @@ class GrowattController(BaseModule):
                 await self.mqtt_client.unsubscribe(response_topic)
 
         except Exception as e:
-            # Log as debug if it's a known transient error, otherwise as warning
-            if "Failed to read date/time" in str(e):
-                self.logger.debug(f"Inverter temporarily unavailable for time sync: {e}")
-            else:
-                self.logger.warning(f"Failed to get inverter time: {e}")
+            self.logger.error(f"Failed to get inverter time: {e}")
             return None
 
     async def _sync_inverter_time(self) -> bool:
@@ -1146,6 +1147,45 @@ class GrowattController(BaseModule):
             self.logger.error(f"Error fetching DAM prices: {e}", exc_info=True)
             return {}
 
+    def _generate_mock_prices(self, date: str) -> Dict[Tuple[str, str], float]:
+        """Generate mock energy prices for testing when OTE data unavailable.
+        
+        Creates a realistic price pattern with:
+        - Lower prices at night (2-6 AM)
+        - Higher prices during peak hours (8-10 AM, 5-8 PM)
+        - Medium prices during day
+        """
+        import random
+        random.seed(date)  # Consistent prices for same date
+        
+        hourly_prices: Dict[Tuple[str, str], float] = {}
+        base_price = 80.0  # EUR/MWh
+        
+        for hour in range(24):
+            start = f"{hour:02d}:00"
+            end = f"{(hour + 1) % 24:02d}:00" if hour < 23 else "24:00"
+            
+            # Night valley (2-6 AM) - cheapest
+            if 2 <= hour < 6:
+                price = base_price * random.uniform(0.5, 0.7)
+            # Morning peak (8-10 AM) - expensive
+            elif 8 <= hour < 10:
+                price = base_price * random.uniform(1.3, 1.5)
+            # Evening peak (17-20 PM) - most expensive
+            elif 17 <= hour < 20:
+                price = base_price * random.uniform(1.4, 1.6)
+            # Night (22-2 AM) - cheap
+            elif hour >= 22 or hour < 2:
+                price = base_price * random.uniform(0.6, 0.8)
+            # Day hours - medium
+            else:
+                price = base_price * random.uniform(0.9, 1.1)
+                
+            hourly_prices[(start, end)] = round(price, 2)
+            
+        self.logger.warning(f"Using mock prices for {date} (OTE data unavailable)")
+        return hourly_prices
+
     def _find_cheapest_consecutive_hours(
         self, prices: Dict[Tuple[str, str], float], x: int = 2
     ) -> List[Tuple[str, str, float]]:
@@ -1306,18 +1346,23 @@ class GrowattController(BaseModule):
 
     async def _set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 90, power_rate: int = 100,
-        *, preserve_duration: bool = True
+        *, preserve_duration: bool = True, pre_scheduled: bool = False
     ) -> None:
         """Set battery-first mode for specified time window.
 
         Battery-first mode prioritizes charging battery from grid/solar.
         stop_soc: Battery level to stop charging at (default 90%)
         power_rate: Charge rate in % (default 100%)
+        pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         """
-        # Preserve duration when bumping start so the window semantics stay intact
-        adjusted_start, adjusted_stop = self._ensure_future_start(
-            start_hour, stop_hour, preserve_duration=preserve_duration
-        )
+        # Only adjust time if not pre-scheduled (pre-scheduled commands are sent 1 min early)
+        if pre_scheduled:
+            adjusted_start, adjusted_stop = start_hour, stop_hour
+        else:
+            # Preserve duration when bumping start so the window semantics stay intact
+            adjusted_start, adjusted_stop = self._ensure_future_start(
+                start_hour, stop_hour, preserve_duration=preserve_duration
+            )
 
         # Guard against collapsed windows (start == stop)
         if adjusted_start == adjusted_stop:
@@ -1493,18 +1538,23 @@ class GrowattController(BaseModule):
 
     async def _set_grid_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 10,
-        *, preserve_duration: bool = True
+        *, preserve_duration: bool = True, pre_scheduled: bool = False
     ) -> None:
         """Set grid-first mode for specified time window.
 
         Grid-first mode prioritizes selling to grid over charging battery.
         stop_soc: Battery level to stop discharging at (default 20%)
         power_rate: Discharge rate in % (default 10%)
+        pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         """
-        # Ensure start time is in the future for inverter to trigger
-        adjusted_start, adjusted_stop = self._ensure_future_start(
-            start_hour, stop_hour, preserve_duration=preserve_duration
-        )
+        # Only adjust time if not pre-scheduled (pre-scheduled commands are sent 1 min early)
+        if pre_scheduled:
+            adjusted_start, adjusted_stop = start_hour, stop_hour
+        else:
+            # Ensure start time is in the future for inverter to trigger
+            adjusted_start, adjusted_stop = self._ensure_future_start(
+                start_hour, stop_hour, preserve_duration=preserve_duration
+            )
 
         # Guard against collapsed windows (start == stop)
         if adjusted_start == adjusted_stop:
@@ -1669,16 +1719,28 @@ class GrowattController(BaseModule):
         hourly_prices = await self._fetch_dam_energy_prices(date=target_date)
 
         if not hourly_prices:
-            self.logger.error(
-                "Failed to retrieve energy prices. Setting load-first mode and disabling export."
+            self.logger.warning(
+                "Failed to retrieve real energy prices. Using mock prices for testing."
             )
-            # Schedule fallback mode
-            await self._schedule_fallback_mode()
-            # Apply safe state immediately (not just at midnight)
-            await self._set_load_first()
-            await self._disable_export()
-            self.logger.info("Applied safe state immediately due to price fetch failure")
-            return
+            # Use mock prices as fallback
+            hourly_prices = self._generate_mock_prices(target_date)
+            
+            if not hourly_prices:
+                self.logger.error(
+                    "Failed to generate mock prices. Setting load-first mode and disabling export."
+                )
+                # Schedule fallback mode
+                await self._schedule_fallback_mode()
+                # Apply safe state immediately (not just at midnight)
+                await self._set_load_first()
+                await self._disable_export()
+                self.logger.info("Applied safe state immediately due to price generation failure")
+                return
+
+        # Store prices in cache
+        self._current_prices = hourly_prices
+        self._prices_date = target_date
+        self._prices_updated = datetime.now()
 
         # Get exchange rate once for consistency
         eur_czk_rate = await self._get_eur_czk_rate()
@@ -1805,7 +1867,36 @@ class GrowattController(BaseModule):
         Uses self._schedule_func which is set based on whether we're scheduling
         for today (use _schedule_today) or tomorrow (use _schedule_at_time).
         """
-        return asyncio.create_task(self._schedule_func(time_str, coro_func, *args))
+        # Check if this is a mode change command (via _emit_device_window)
+        if coro_func == self._emit_device_window and len(args) >= 3:
+            # For mode changes, schedule 1 minute early and mark as pre_scheduled
+            adjusted_time = self._subtract_minutes_from_time(time_str, 1)
+            # Create a wrapper that adds pre_scheduled=True
+
+            async def wrapper() -> None:
+                await self._emit_device_window(*args, pre_scheduled=True)
+            return asyncio.create_task(self._schedule_func(adjusted_time, wrapper))
+        else:
+            # For other actions, schedule normally
+            return asyncio.create_task(self._schedule_func(time_str, coro_func, *args))
+
+    def _subtract_minutes_from_time(self, time_str: str, minutes: int) -> str:
+        """Subtract minutes from a time string (HH:MM or HH:MM:SS).
+
+        Handles midnight wrap-around (00:00 -> 23:59).
+        """
+        # Parse the time
+        target_time = self._parse_time_any(time_str)
+        now = self._get_local_now()
+
+        # Create datetime for today with this time
+        target_dt = datetime.combine(now.date(), target_time, self._local_tz)
+
+        # Subtract minutes
+        adjusted_dt = target_dt - timedelta(minutes=minutes)
+
+        # Return as HH:MM:SS string
+        return adjusted_dt.strftime("%H:%M:%S")
 
     async def _schedule_summer_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
@@ -2385,6 +2476,7 @@ class GrowattController(BaseModule):
         stop_hhmm: str,
         *extra: Any,
         preserve_when_same_day: bool = True,
+        pre_scheduled: bool = False,
     ) -> None:
         """Call the device setter once or split across midnight if start > stop.
 
@@ -2393,6 +2485,7 @@ class GrowattController(BaseModule):
         Args:
             preserve_when_same_day: Whether to preserve duration for same-day windows.
                                    Set to False for immediate apply to avoid spillover.
+            pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         """
         st = self._parse_hhmm(start_hhmm)
         en = self._parse_hhmm(stop_hhmm)
@@ -2400,13 +2493,23 @@ class GrowattController(BaseModule):
             # If we're aiming at the EOD barrier, never preserve duration on bumps.
             # Otherwise, allow the caller to choose.
             preserve = False if stop_hhmm in (EOD_HHMM, EOD_HHMMSS) else preserve_when_same_day
-            await setter(start_hhmm, stop_hhmm, *extra, preserve_duration=preserve)
+            await setter(
+                start_hhmm, stop_hhmm, *extra,
+                preserve_duration=preserve, pre_scheduled=pre_scheduled
+            )
         else:
             # Split wrap: [start → 23:59] U [00:00 → stop]
             self.logger.debug(f"Splitting midnight-wrap window {start_hhmm}-{stop_hhmm}")
-            await setter(start_hhmm, EOD_HHMM, *extra, preserve_duration=False)  # Keep hard EOD
+            # Keep hard EOD
+            await setter(
+                start_hhmm, EOD_HHMM, *extra,
+                preserve_duration=False, pre_scheduled=pre_scheduled
+            )
             await asyncio.sleep(0.5)  # Delay between split commands
-            await setter("00:00", stop_hhmm, *extra, preserve_duration=True)
+            await setter(
+                "00:00", stop_hhmm, *extra,
+                preserve_duration=True, pre_scheduled=pre_scheduled
+            )
 
     async def _schedule_today(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule only if the time is still ahead *today* (no rollover).
