@@ -43,6 +43,7 @@ async def _setup_result_subscription(controller: GrowattController) -> None:
 
             # Get the command from the response
             command = data.get("command")
+            
             if command and command in _command_responses:
                 # Find the future waiting for this response
                 future = _command_responses.get(command)
