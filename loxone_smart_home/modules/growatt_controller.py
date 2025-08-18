@@ -156,24 +156,7 @@ class GrowattController(BaseModule):
                     f"(was {old_val} → now {self.config.individual_cheapest_hours})"
                 )
 
-        # Validate price thresholds
-        if hasattr(self.config, "summer_price_threshold"):
-            if self.config.summer_price_threshold < 0:
-                old_val = self.config.summer_price_threshold
-                self.config.summer_price_threshold = max(0, self.config.summer_price_threshold)
-                self.logger.warning(
-                    f"Invalid summer_price_threshold, setting to 0 "
-                    f"(was {old_val} → now {self.config.summer_price_threshold})"
-                )
-
-        if hasattr(self.config, "export_price_threshold"):
-            if self.config.export_price_threshold < 0:
-                old_val = self.config.export_price_threshold
-                self.config.export_price_threshold = max(0, self.config.export_price_threshold)
-                self.logger.warning(
-                    f"Invalid export_price_threshold, setting to 0 "
-                    f"(was {old_val} → now {self.config.export_price_threshold})"
-                )
+        # Note: Price thresholds validation not needed as Pydantic Field has gt=0 constraint
 
     def __init__(
         self,
@@ -191,8 +174,7 @@ class GrowattController(BaseModule):
         )
         self.config = settings.growatt
 
-        # Initialize optional config dict before validation
-        self._optional_config: Dict[str, Any] = {}
+        # Optional config will be set during validation
 
         # Validate config and set defaults
         self._validate_config()
@@ -298,8 +280,8 @@ class GrowattController(BaseModule):
             t = datetime.strptime(hhmm, "%H:%M:%S")
         except ValueError:
             t = datetime.strptime(hhmm, "%H:%M")
-        t = (t + timedelta(seconds=seconds)).time()
-        return t.strftime("%H:%M:%S")
+        t_with_delta = (t + timedelta(seconds=seconds)).time()
+        return t_with_delta.strftime("%H:%M:%S")
 
     def _to_device_hhmm(self, s: str) -> str:
         """Convert time string to HH:MM format required by device timeslot endpoints.
@@ -340,7 +322,7 @@ class GrowattController(BaseModule):
         """
         target_date = self._get_local_now().date() + timedelta(days=days_ahead)
         s = sun(self._location.observer, date=target_date, tzinfo=self._local_tz)
-        sunrise = s['sunrise']
+        sunrise: datetime = s['sunrise']
 
         # Round to nearest 15 minutes (not floor)
         total_minutes = sunrise.hour * 60 + sunrise.minute
@@ -502,7 +484,7 @@ class GrowattController(BaseModule):
                         self.logger.warning(
                             f"Failed to fetch CNB exchange rate: HTTP {response.status}"
                         )
-                        fallback = (
+                        fallback = float(
                             self._optional_config.get("eur_czk_rate", 25.0)
                         )
                         # Cache the fallback to avoid repeated API calls
@@ -540,7 +522,7 @@ class GrowattController(BaseModule):
 
             self.logger.warning("EUR not found in CNB exchange rate data")
             # Return default fallback (25 CZK per EUR is typical)
-            fallback = self._optional_config.get("eur_czk_rate", 25.0)
+            fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
             # Cache the fallback to avoid repeated API calls
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
@@ -549,7 +531,7 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error fetching EUR/CZK exchange rate: {e}")
             # Return default fallback (25 CZK per EUR is typical)
-            fallback = self._optional_config.get("eur_czk_rate", 25.0)
+            fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
             # Cache the fallback to avoid repeated API calls on errors
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
@@ -942,9 +924,13 @@ class GrowattController(BaseModule):
 
         # Collect all active period types at current time
         active: set[PeriodType] = set()
+        active_period: Optional[Period] = None
         for period in self._scheduled_periods:
             if period.contains_time(now_t):
                 active.add(period.kind)
+                # Track the primary period for time window
+                if period.kind in ("grid_first", "battery_first") and active_period is None:
+                    active_period = period
                 self.logger.info(
                     f"Currently in {period.kind} period "
                     f"({period.start.strftime('%H:%M')}-{period.end.strftime('%H:%M')})"
@@ -972,33 +958,51 @@ class GrowattController(BaseModule):
         want_export = "export" in active
         want_ac = "ac_charge" in active
 
+        # Always reset to load_first before applying new mode to ensure clean state
+        if desired_mode[0] != "load_first":
+            self.logger.info("Resetting to load-first mode before applying new mode...")
+            await self._set_load_first()
+            await asyncio.sleep(0.5)  # Small delay after reset
+
         # Apply mode
         self.logger.info(f"Applying mode: {desired_mode[0]}")
-        # Use narrower window (current hour to next hour) to avoid overwriting whole day
-        current_hour = now.strftime("%H:00")
-        end = now + timedelta(hours=1)
-        # Handle midnight crossing safely
-        if end.date() != now.date():
-            next_hour = EOD_HHMMSS  # Stop at end of day
+
+        # Use the actual period end time if available, otherwise use current time
+        if active_period and desired_mode[0] in ("grid_first", "battery_first"):
+            # Use the actual scheduled period times
+            current_hour = now.strftime("%H:%M")
+            # Format the end time from the period
+            period_end = active_period.end.strftime("%H:%M")
+            # Check if period ends at midnight (00:00) and convert to 24:00
+            if period_end == "00:00":
+                period_end = "24:00"
         else:
-            next_hour = end.strftime("%H:00")
+            # Fallback to narrow window if no period found (shouldn't happen)
+            current_hour = now.strftime("%H:00")
+            end = now + timedelta(hours=1)
+            # Handle midnight crossing safely
+            if end.date() != now.date():
+                period_end = EOD_HHMMSS  # Stop at end of day
+            else:
+                period_end = end.strftime("%H:00")
 
         if desired_mode[0] == "battery_first":
             # Use _emit_device_window to handle midnight wrap properly
-            # Don't preserve duration to avoid spillover past the hour
+            # Preserve duration since we're using the full period
             await self._emit_device_window(
-                self._set_battery_first, current_hour, next_hour, preserve_when_same_day=False
+                self._set_battery_first, current_hour, period_end, preserve_when_same_day=True
             )
         elif desired_mode[0] == "grid_first":
             # Use _emit_device_window to handle midnight wrap properly
-            # Don't preserve duration to avoid spillover past the hour
+            # Preserve duration since we're using the full period
             await self._emit_device_window(
-                self._set_grid_first, current_hour, next_hour,
+                self._set_grid_first, current_hour, period_end,
                 desired_mode[1], desired_mode[2],
-                preserve_when_same_day=False,
+                preserve_when_same_day=True,
             )
-        else:
-            await self._set_load_first()
+        elif desired_mode[0] == "load_first":
+            # Already set above if needed
+            pass
 
         # Small delay before AC charging control
         await asyncio.sleep(0.5)
@@ -1149,7 +1153,7 @@ class GrowattController(BaseModule):
 
     def _generate_mock_prices(self, date: str) -> Dict[Tuple[str, str], float]:
         """Generate mock energy prices for testing when OTE data unavailable.
-        
+
         Creates a realistic price pattern with:
         - Lower prices at night (2-6 AM)
         - Higher prices during peak hours (8-10 AM, 5-8 PM)
@@ -1157,14 +1161,14 @@ class GrowattController(BaseModule):
         """
         import random
         random.seed(date)  # Consistent prices for same date
-        
+
         hourly_prices: Dict[Tuple[str, str], float] = {}
         base_price = 80.0  # EUR/MWh
-        
+
         for hour in range(24):
             start = f"{hour:02d}:00"
             end = f"{(hour + 1) % 24:02d}:00" if hour < 23 else "24:00"
-            
+
             # Night valley (2-6 AM) - cheapest
             if 2 <= hour < 6:
                 price = base_price * random.uniform(0.5, 0.7)
@@ -1180,9 +1184,9 @@ class GrowattController(BaseModule):
             # Day hours - medium
             else:
                 price = base_price * random.uniform(0.9, 1.1)
-                
+
             hourly_prices[(start, end)] = round(price, 2)
-            
+
         self.logger.warning(f"Using mock prices for {date} (OTE data unavailable)")
         return hourly_prices
 
@@ -1336,13 +1340,17 @@ class GrowattController(BaseModule):
         return groups
 
     async def _ensure_exclusive(self, primary: PeriodType) -> None:
-        """Ensure modes are mutually exclusive at the device level."""
-        if primary == "battery_first":
-            await self._disable_grid_first()
-            await asyncio.sleep(0.5)
-        elif primary == "grid_first":
-            await self._disable_battery_first()
-            await asyncio.sleep(0.5)
+        """Ensure modes are mutually exclusive at the device level.
+
+        First resets to load-first mode to ensure clean state, then applies the requested mode.
+        """
+        # Always reset to neutral state first for clean transitions
+        await self._disable_battery_first()
+        await asyncio.sleep(0.3)
+        await self._disable_grid_first()
+        await asyncio.sleep(0.3)
+
+        self.logger.debug(f"Reset to load-first mode before applying {primary}")
 
     async def _set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 90, power_rate: int = 100,
@@ -1724,7 +1732,7 @@ class GrowattController(BaseModule):
             )
             # Use mock prices as fallback
             hourly_prices = self._generate_mock_prices(target_date)
-            
+
             if not hourly_prices:
                 self.logger.error(
                     "Failed to generate mock prices. Setting load-first mode and disabling export."
