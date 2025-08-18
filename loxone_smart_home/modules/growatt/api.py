@@ -171,30 +171,35 @@ async def get_status(request: web.Request) -> web.Response:
                 # Active power rate is available in telemetry
                 inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
 
-            # Infer battery/grid mode status from scheduled periods
-            # Check if we're currently in a battery-first or grid-first period
-            for period in active_periods:
-                if period["kind"] == "battery_first":
-                    inverter_data["battery_first_status"] = {
-                        "enabled": True,
-                        "start": period["start"],
-                        "end": period["end"],
-                        "stop_soc": period["params"].get("stop_soc", 90),
-                        "power_rate": period["params"].get("power_rate", 100)
-                    }
-                elif period["kind"] == "grid_first":
-                    inverter_data["grid_first_status"] = {
-                        "enabled": True,
-                        "start": period["start"],
-                        "end": period["end"],
-                        "stop_soc": period["params"].get("stop_soc", 20),
-                        "power_rate": period["params"].get("power_rate", 10)
-                    }
+            # Infer battery/grid mode status from active scheduled periods
+            # Look for battery-first or grid-first periods that are currently active
+            battery_first_found = False
+            grid_first_found = False
+            for period in controller._scheduled_periods:
+                if period.contains_time(now_t):
+                    if period.kind == "battery_first":
+                        battery_first_found = True
+                        inverter_data["battery_first_status"] = {
+                            "enabled": True,
+                            "start": period.start.strftime("%H:%M"),
+                            "end": period.end.strftime("%H:%M"),
+                            "stop_soc": period.params.get("stop_soc", 90),
+                            "power_rate": period.params.get("power_rate", 100)
+                        }
+                    elif period.kind == "grid_first":
+                        grid_first_found = True
+                        inverter_data["grid_first_status"] = {
+                            "enabled": True,
+                            "start": period.start.strftime("%H:%M"),
+                            "end": period.end.strftime("%H:%M"),
+                            "stop_soc": period.params.get("stop_soc", 20),
+                            "power_rate": period.params.get("power_rate", 10)
+                        }
 
-            # If no active periods, modes are disabled
-            if "battery_first_status" not in inverter_data:
+            # If no active periods found, modes are disabled
+            if not battery_first_found:
                 inverter_data["battery_first_status"] = {"enabled": False}
-            if "grid_first_status" not in inverter_data:
+            if not grid_first_found:
                 inverter_data["grid_first_status"] = {"enabled": False}
 
         status = {
