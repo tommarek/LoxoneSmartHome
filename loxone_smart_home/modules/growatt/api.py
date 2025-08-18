@@ -173,7 +173,7 @@ async def get_status(request: web.Request) -> web.Response:
                 inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
 
             # Debug: log scheduled periods
-            logger.debug(f"Checking {len(controller._scheduled_periods)} scheduled periods at {now_t.strftime('%H:%M')}")
+            controller.logger.debug(f"Checking {len(controller._scheduled_periods)} scheduled periods at {now_t.strftime('%H:%M')}")
             
             # Infer battery/grid mode status from active scheduled periods
             # Look for battery-first or grid-first periods that are currently active
@@ -230,7 +230,7 @@ async def get_status(request: web.Request) -> web.Response:
 
     except Exception as e:
         import traceback
-        logger.error(f"Error in get_status: {e}", exc_info=True)
+        controller.logger.error(f"Error in get_status: {e}", exc_info=True)
         return web.json_response({"error": str(e), "traceback": traceback.format_exc()}, status=500)
 
 
