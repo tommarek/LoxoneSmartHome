@@ -44,14 +44,19 @@ async def _setup_result_subscription(controller: GrowattController) -> None:
             # Get the command from the response
             command = data.get("command")
             
+            # Debug logging for get commands
+            if command in ["batteryfirst/get", "gridfirst/get"]:
+                controller.logger.info(f"Result handler received {command}, futures waiting: {list(_command_responses.keys())}")
+            
             if command and command in _command_responses:
                 # Find the future waiting for this response
                 future = _command_responses.get(command)
                 if future and not future.done():
                     future.set_result(data)
+                    controller.logger.info(f"Set result for {command}")
 
-        except Exception:
-            # Silently ignore parse errors to avoid log spam
+        except Exception as e:
+            controller.logger.error(f"Error in result handler: {e}")
             pass
 
     try:
@@ -119,16 +124,18 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
         
         # Send the query with correct topic and empty JSON
         await controller.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
+        controller.logger.info(f"Sent batteryfirst/get query, waiting for response...")
         
         # Wait for response with timeout
         bf_response = await asyncio.wait_for(bf_future, timeout=2.0)
         # Return the raw response, whatever it is
         result["battery_first_raw"] = bf_response
+        controller.logger.info(f"Got batteryfirst/get response: {bf_response.get('success')}")
     except asyncio.TimeoutError:
-        controller.logger.debug("Timeout querying battery-first status")
+        controller.logger.warning(f"Timeout querying battery-first status, subscription active: {_result_subscription_active}")
         result["battery_first_raw"] = {"error": "timeout"}
     except Exception as e:
-        controller.logger.debug(f"Error querying battery-first status: {e}")
+        controller.logger.error(f"Error querying battery-first status: {e}")
         result["battery_first_raw"] = {"error": str(e)}
     finally:
         # Clean up the future
@@ -174,8 +181,9 @@ def create_growatt_api(
     if controller:
         app[GROWATT_CONTROLLER_KEY] = controller
         # Setup persistent subscriptions on startup
+        # Note: These need to be awaited before first use, but we create tasks here
+        # The actual subscription will happen when _query_inverter_slots calls _setup_result_subscription
         asyncio.create_task(_setup_telemetry_subscription(controller))
-        asyncio.create_task(_setup_result_subscription(controller))
 
     # Register routes
     app.router.add_get('/api/growatt/status', get_status)
