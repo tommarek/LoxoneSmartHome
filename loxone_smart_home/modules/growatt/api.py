@@ -165,12 +165,16 @@ async def get_status(request: web.Request) -> web.Response:
         # Get inverter mode data from telemetry cache and scheduled periods
         # This avoids excessive MQTT commands that can fail
         inverter_data = {}
-        if not controller._optional_config.get("simulation_mode", False):
+        # Check if optional_config exists (it should be set during init)
+        if hasattr(controller, '_optional_config') and not controller._optional_config.get("simulation_mode", False):
             # Use cached telemetry data if available
             if _telemetry_cache:
                 # Active power rate is available in telemetry
                 inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
 
+            # Debug: log scheduled periods
+            logger.debug(f"Checking {len(controller._scheduled_periods)} scheduled periods at {now_t.strftime('%H:%M')}")
+            
             # Infer battery/grid mode status from active scheduled periods
             # Look for battery-first or grid-first periods that are currently active
             battery_first_found = False
@@ -179,21 +183,23 @@ async def get_status(request: web.Request) -> web.Response:
                 if period.contains_time(now_t):
                     if period.kind == "battery_first":
                         battery_first_found = True
+                        params = period.params or {}
                         inverter_data["battery_first_status"] = {
                             "enabled": True,
                             "start": period.start.strftime("%H:%M"),
                             "end": period.end.strftime("%H:%M"),
-                            "stop_soc": period.params.get("stop_soc", 90),
-                            "power_rate": period.params.get("power_rate", 100)
+                            "stop_soc": params.get("stop_soc", 90) if params else 90,
+                            "power_rate": params.get("power_rate", 100) if params else 100
                         }
                     elif period.kind == "grid_first":
                         grid_first_found = True
+                        params = period.params or {}
                         inverter_data["grid_first_status"] = {
                             "enabled": True,
                             "start": period.start.strftime("%H:%M"),
                             "end": period.end.strftime("%H:%M"),
-                            "stop_soc": period.params.get("stop_soc", 20),
-                            "power_rate": period.params.get("power_rate", 10)
+                            "stop_soc": params.get("stop_soc", 20) if params else 20,
+                            "power_rate": params.get("power_rate", 10) if params else 10
                         }
 
             # If no active periods found, modes are disabled
@@ -216,14 +222,16 @@ async def get_status(request: web.Request) -> web.Response:
             "current_time": now.isoformat(),
             "simulation_mode": controller._optional_config.get(
                 "simulation_mode", False
-            ),
+            ) if hasattr(controller, '_optional_config') else False,
             "inverter_data": inverter_data
         }
 
         return web.json_response(status)
 
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+        import traceback
+        logger.error(f"Error in get_status: {e}", exc_info=True)
+        return web.json_response({"error": str(e), "traceback": traceback.format_exc()}, status=500)
 
 
 async def get_schedule(request: web.Request) -> web.Response:
@@ -494,19 +502,19 @@ async def get_config(request: web.Request) -> web.Response:
             ),
             "summer_temp_threshold": controller._optional_config.get(
                 "summer_temp_threshold", 15.0
-            ),
+            ) if hasattr(controller, '_optional_config') else 15.0,
             "summer_price_threshold": (
                 controller.config.summer_price_threshold
             ),
             "temperature_avg_days": controller._optional_config.get(
                 "temperature_avg_days", 3
-            ),
+            ) if hasattr(controller, '_optional_config') else 3,
             "eur_czk_rate": controller._optional_config.get(
                 "eur_czk_rate", 25.0
-            ),
+            ) if hasattr(controller, '_optional_config') else 25.0,
             "simulation_mode": controller._optional_config.get(
                 "simulation_mode", False
-            ),
+            ) if hasattr(controller, '_optional_config') else False,
             "device_serial": controller.config.device_serial,
             "schedule_hour": controller.config.schedule_hour,
             "schedule_minute": controller.config.schedule_minute
@@ -686,7 +694,7 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
         status = {
             "connected": controller._running,
             "current_mode": mode_display,
-            "simulation_mode": controller._optional_config.get("simulation_mode", False),
+            "simulation_mode": controller._optional_config.get("simulation_mode", False) if hasattr(controller, '_optional_config') else False,
 
             # Power flow data
             "solar_power": realtime_data.get("solar_power", 0),
