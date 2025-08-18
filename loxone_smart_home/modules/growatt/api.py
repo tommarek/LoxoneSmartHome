@@ -116,8 +116,8 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
         bf_future: asyncio.Future = asyncio.Future()
         _command_responses["batteryfirst/get"] = bf_future
         
-        # Send the query
-        await controller.mqtt_client.publish("energy/solar/batteryfirst/get", "")
+        # Send the query with correct topic and empty JSON
+        await controller.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
         
         # Wait for response with timeout
         bf_response = await asyncio.wait_for(bf_future, timeout=2.0)
@@ -139,8 +139,8 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
         gf_future: asyncio.Future = asyncio.Future()
         _command_responses["gridfirst/get"] = gf_future
         
-        # Send the query
-        await controller.mqtt_client.publish("energy/solar/gridfirst/get", "")
+        # Send the query with correct topic and empty JSON
+        await controller.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
         
         # Wait for response with timeout
         gf_response = await asyncio.wait_for(gf_future, timeout=2.0)
