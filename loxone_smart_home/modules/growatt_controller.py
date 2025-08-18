@@ -217,6 +217,16 @@ class GrowattController(BaseModule):
         # Track AC and Export states to prevent duplicate commands
         self._ac_enabled: Optional[bool] = None
         self._export_enabled: Optional[bool] = None
+        
+        # Track current slot configurations
+        self._battery_first_slots: Dict[int, Dict[str, Any]] = {
+            1: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 90, "power_rate": 100},
+            2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 90, "power_rate": 100}
+        }
+        self._grid_first_slots: Dict[int, Dict[str, Any]] = {
+            1: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 10},
+            2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 10}
+        }
 
         # Track inverter clock drift
         self._clock_drift_seconds: float = 0
@@ -1433,6 +1443,16 @@ class GrowattController(BaseModule):
 
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        
+        # Track the configuration
+        self._battery_first_slots[1] = {
+            "enabled": True,
+            "start": start_dev,
+            "stop": stop_dev,
+            "stop_soc": stop_soc,
+            "power_rate": power_rate
+        }
+        
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE SET: {adjusted_start}-{adjusted_stop} "
@@ -1484,6 +1504,16 @@ class GrowattController(BaseModule):
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        
+        # Track the configuration
+        self._battery_first_slots[1] = {
+            "enabled": False,
+            "start": "00:00",
+            "stop": "00:00",
+            "stop_soc": 90,
+            "power_rate": 100
+        }
+        
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → "

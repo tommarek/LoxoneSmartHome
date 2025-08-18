@@ -500,48 +500,24 @@
             }
             
             const inverterData = apiStatusData.inverter_data;
-            const bfStatus = inverterData.battery_first_status || {};
+            const batteryData = inverterData.battery_first_data || {};
             let html = '';
             
-            // Status
+            // Display raw JSON data from inverter
             html += `
                 <div class="metric">
-                    <span class="metric-label">Status</span>
-                    <span class="metric-value">
-                        <span class="mode-badge ${bfStatus.enabled ? 'mode-battery' : ''}">${bfStatus.enabled ? 'ACTIVE' : 'Inactive'}</span>
-                    </span>
+                    <span class="metric-label">Inverter Response:</span>
                 </div>
+                <pre style="background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px;">
+${JSON.stringify(batteryData, null, 2)}
+                </pre>
             `;
-            
-            if (bfStatus.enabled) {
-                html += `
-                    <div class="metric">
-                        <span class="metric-label">Time Window</span>
-                        <span class="metric-value">${bfStatus.start} - ${bfStatus.end}</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Target SOC</span>
-                        <span class="metric-value">${bfStatus.stop_soc}%</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Charge Power Rate</span>
-                        <span class="metric-value">${bfStatus.power_rate}%</span>
-                    </div>
-                `;
-            } else {
-                html += `
-                    <div class="metric">
-                        <span class="metric-label">Next Schedule</span>
-                        <span class="metric-value">Check schedule below</span>
-                    </div>
-                `;
-            }
             
             // Active Power Rate (applies to all modes)
             if (inverterData.active_power_rate !== undefined) {
                 html += `
-                    <div class="metric">
-                        <span class="metric-label">Current Power Rate</span>
+                    <div class="metric" style="margin-top: 15px;">
+                        <span class="metric-label"><strong>Current Power Rate</strong></span>
                         <span class="metric-value">${inverterData.active_power_rate}%</span>
                     </div>
                 `;
@@ -557,42 +533,18 @@
             }
             
             const inverterData = apiStatusData.inverter_data;
-            const gfStatus = inverterData.grid_first_status || {};
+            const gridData = inverterData.grid_first_data || {};
             let html = '';
             
-            // Status
+            // Display raw JSON data from inverter
             html += `
                 <div class="metric">
-                    <span class="metric-label">Status</span>
-                    <span class="metric-value">
-                        <span class="mode-badge ${gfStatus.enabled ? 'mode-grid' : ''}">${gfStatus.enabled ? 'ACTIVE' : 'Inactive'}</span>
-                    </span>
+                    <span class="metric-label">Inverter Response:</span>
                 </div>
+                <pre style="background: #f0f0f0; padding: 10px; border-radius: 4px; overflow-x: auto; font-size: 12px;">
+${JSON.stringify(gridData, null, 2)}
+                </pre>
             `;
-            
-            if (gfStatus.enabled) {
-                html += `
-                    <div class="metric">
-                        <span class="metric-label">Time Window</span>
-                        <span class="metric-value">${gfStatus.start} - ${gfStatus.end}</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Minimum SOC</span>
-                        <span class="metric-value">${gfStatus.stop_soc}%</span>
-                    </div>
-                    <div class="metric">
-                        <span class="metric-label">Discharge Power Rate</span>
-                        <span class="metric-value">${gfStatus.power_rate}%</span>
-                    </div>
-                `;
-            } else {
-                html += `
-                    <div class="metric">
-                        <span class="metric-label">Next Schedule</span>
-                        <span class="metric-value">Check schedule below</span>
-                    </div>
-                `;
-            }
             
             return html;
         }

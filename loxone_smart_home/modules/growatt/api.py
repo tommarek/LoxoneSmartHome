@@ -96,6 +96,69 @@ async def _setup_telemetry_subscription(controller: GrowattController) -> None:
         pass
 
 
+async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]:
+    """Query the inverter for current battery-first and grid-first slot configurations.
+    
+    Returns:
+        Dict containing raw battery_first and grid_first responses from inverter
+    """
+    if not controller.mqtt_client:
+        return {}
+    
+    # Ensure result subscription is active
+    await _setup_result_subscription(controller)
+    
+    result = {}
+    
+    # Query battery-first status
+    try:
+        # Create a future to wait for the response
+        bf_future: asyncio.Future = asyncio.Future()
+        _command_responses["batteryfirst/get"] = bf_future
+        
+        # Send the query
+        await controller.mqtt_client.publish("energy/solar/batteryfirst/get", "")
+        
+        # Wait for response with timeout
+        bf_response = await asyncio.wait_for(bf_future, timeout=2.0)
+        # Return the raw response, whatever it is
+        result["battery_first_raw"] = bf_response
+    except asyncio.TimeoutError:
+        controller.logger.debug("Timeout querying battery-first status")
+        result["battery_first_raw"] = {"error": "timeout"}
+    except Exception as e:
+        controller.logger.debug(f"Error querying battery-first status: {e}")
+        result["battery_first_raw"] = {"error": str(e)}
+    finally:
+        # Clean up the future
+        _command_responses.pop("batteryfirst/get", None)
+    
+    # Query grid-first status
+    try:
+        # Create a future to wait for the response
+        gf_future: asyncio.Future = asyncio.Future()
+        _command_responses["gridfirst/get"] = gf_future
+        
+        # Send the query
+        await controller.mqtt_client.publish("energy/solar/gridfirst/get", "")
+        
+        # Wait for response with timeout
+        gf_response = await asyncio.wait_for(gf_future, timeout=2.0)
+        # Return the raw response, whatever it is
+        result["grid_first_raw"] = gf_response
+    except asyncio.TimeoutError:
+        controller.logger.debug("Timeout querying grid-first status")
+        result["grid_first_raw"] = {"error": "timeout"}
+    except Exception as e:
+        controller.logger.debug(f"Error querying grid-first status: {e}")
+        result["grid_first_raw"] = {"error": str(e)}
+    finally:
+        # Clean up the future
+        _command_responses.pop("gridfirst/get", None)
+    
+    return result
+
+
 def create_growatt_api(
     app: web.Application,
     controller: Optional[GrowattController] = None
@@ -162,8 +225,7 @@ async def get_status(request: web.Request) -> web.Response:
             if active_modes else "load_first"
         )
 
-        # Get inverter mode data from telemetry cache and scheduled periods
-        # This avoids excessive MQTT commands that can fail
+        # Get inverter mode data from actual device
         inverter_data = {}
         # Check if optional_config exists (it should be set during init)
         if hasattr(controller, '_optional_config') and not controller._optional_config.get("simulation_mode", False):
@@ -172,41 +234,12 @@ async def get_status(request: web.Request) -> web.Response:
                 # Active power rate is available in telemetry
                 inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
 
-            # Debug: log scheduled periods
-            controller.logger.debug(f"Checking {len(controller._scheduled_periods)} scheduled periods at {now_t.strftime('%H:%M')}")
+            # Query actual slot configurations from the inverter
+            slot_data = await _query_inverter_slots(controller)
             
-            # Infer battery/grid mode status from active scheduled periods
-            # Look for battery-first or grid-first periods that are currently active
-            battery_first_found = False
-            grid_first_found = False
-            for period in controller._scheduled_periods:
-                if period.contains_time(now_t):
-                    if period.kind == "battery_first":
-                        battery_first_found = True
-                        params = period.params or {}
-                        inverter_data["battery_first_status"] = {
-                            "enabled": True,
-                            "start": period.start.strftime("%H:%M"),
-                            "end": period.end.strftime("%H:%M"),
-                            "stop_soc": params.get("stop_soc", 90) if params else 90,
-                            "power_rate": params.get("power_rate", 100) if params else 100
-                        }
-                    elif period.kind == "grid_first":
-                        grid_first_found = True
-                        params = period.params or {}
-                        inverter_data["grid_first_status"] = {
-                            "enabled": True,
-                            "start": period.start.strftime("%H:%M"),
-                            "end": period.end.strftime("%H:%M"),
-                            "stop_soc": params.get("stop_soc", 20) if params else 20,
-                            "power_rate": params.get("power_rate", 10) if params else 10
-                        }
-
-            # If no active periods found, modes are disabled
-            if not battery_first_found:
-                inverter_data["battery_first_status"] = {"enabled": False}
-            if not grid_first_found:
-                inverter_data["grid_first_status"] = {"enabled": False}
+            # Just pass through the raw responses
+            inverter_data["battery_first_data"] = slot_data.get("battery_first_raw", {})
+            inverter_data["grid_first_data"] = slot_data.get("grid_first_raw", {})
 
         status = {
             "running": controller._running,
