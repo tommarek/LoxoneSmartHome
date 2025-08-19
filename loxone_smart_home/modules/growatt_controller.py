@@ -510,9 +510,15 @@ class GrowattController(BaseModule):
         """
         # Handle EOD sentinels and 24:00
         if s in ("24:00", "24:00:00", EOD_HHMMSS):
+            # TEMPORARY DEBUG
+            self.logger.debug(f"🔍 DEBUG _to_device_hhmm: Converting {s!r} to {EOD_HHMM!r}")
             return EOD_HHMM  # "23:59"
         # Truncate to HH:MM if longer
-        return s[:5] if len(s) >= 5 else s
+        result = s[:5] if len(s) >= 5 else s
+        # TEMPORARY DEBUG
+        if s != result:
+            self.logger.debug(f"🔍 DEBUG _to_device_hhmm: Converted {s!r} to {result!r}")
+        return result
 
     async def _set_mode(self, mode: str, *args: Any) -> None:
         """Set the inverter mode (thin dispatcher to individual setters)."""
@@ -1703,6 +1709,12 @@ class GrowattController(BaseModule):
         start_dev = self._to_device_hhmm(adjusted_start)
         stop_dev = self._to_device_hhmm(adjusted_stop)
         payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
+        
+        # TEMPORARY DEBUG: Show exact payload
+        self.logger.warning(
+            f"🔍 DEBUG battery-first payload: start={start_dev!r}, stop={stop_dev!r}, "
+            f"enabled=True, slot=1 (adjusted from {adjusted_start} to {adjusted_stop})"
+        )
 
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
         self.logger.info(
@@ -1802,6 +1814,11 @@ class GrowattController(BaseModule):
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
+        # TEMPORARY DEBUG
+        self.logger.warning(
+            f"🔍 DEBUG disable battery-first payload: start='00:00', stop='00:00', "
+            f"enabled=False, slot=1"
+        )
         self.logger.info(
             f"📤 Disabling battery-first: topic={self.config.battery_first_topic}, "
             f"payload={json.dumps(payload)}"
@@ -1970,6 +1987,8 @@ class GrowattController(BaseModule):
         # Set stop SOC (battery level to stop discharging)
         stopsoc_payload = {"value": stop_soc}
         self.logger.debug(f"Setting grid-first stopSOC to {stop_soc}%")
+        # TEMPORARY DEBUG
+        self.logger.warning(f"🔍 DEBUG grid-first stopSOC payload: value={stop_soc}")
         self.logger.info(
             f"📤 Sending grid-first stopSOC: topic={self.config.grid_first_stopsoc_topic}, "
             f"payload={json.dumps(stopsoc_payload)}"
@@ -1984,6 +2003,8 @@ class GrowattController(BaseModule):
         # Set power rate (discharge rate)
         powerrate_payload = {"value": power_rate}
         self.logger.debug(f"Setting grid-first powerRate to {power_rate}%")
+        # TEMPORARY DEBUG
+        self.logger.warning(f"🔍 DEBUG grid-first powerRate payload: value={power_rate}")
         self.logger.info(
             f"📤 Sending grid-first powerRate: topic={self.config.grid_first_powerrate_topic}, "
             f"payload={json.dumps(powerrate_payload)}"
@@ -2005,6 +2026,14 @@ class GrowattController(BaseModule):
         timeslot_payload = {
             "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1
         }
+        
+        # TEMPORARY DEBUG: Show exact payload and parameters
+        self.logger.warning(
+            f"🔍 DEBUG grid-first timeslot payload: start={start_dev!r}, stop={stop_dev!r}, "
+            f"enabled=True, slot=1 (adjusted from {adjusted_start} to {adjusted_stop}), "
+            f"stopSOC={stop_soc}, powerRate={power_rate}"
+        )
+        
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
         self.logger.info(
             f"📤 Sending grid-first SET command: topic={self.config.grid_first_topic}, "
@@ -2055,6 +2084,11 @@ class GrowattController(BaseModule):
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
+        # TEMPORARY DEBUG
+        self.logger.warning(
+            f"🔍 DEBUG disable grid-first payload: start='00:00', stop='00:00', "
+            f"enabled=False, slot=1"
+        )
         self.logger.info(
             f"📤 Disabling grid-first: topic={self.config.grid_first_topic}, "
             f"payload={json.dumps(payload)}"
