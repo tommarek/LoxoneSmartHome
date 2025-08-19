@@ -442,7 +442,7 @@ async def set_mode(request: web.Request) -> web.Response:
             await controller._set_grid_first(
                 start, stop,
                 stop_soc=params.get("stop_soc", 20),
-                power_rate=params.get("power_rate", 10)
+                power_rate=params.get("power_rate", 100)
             )
         else:
             await controller._set_load_first()

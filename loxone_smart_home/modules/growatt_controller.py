@@ -224,8 +224,8 @@ class GrowattController(BaseModule):
             2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 90, "power_rate": 100}
         }
         self._grid_first_slots: Dict[int, Dict[str, Any]] = {
-            1: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 10},
-            2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 10}
+            1: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 100},
+            2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 100}
         }
 
         # Track inverter clock drift
@@ -414,10 +414,10 @@ class GrowattController(BaseModule):
                 gf = next((p for p in slot["periods"] if p.kind == "grid_first" and p.params), None)
                 if gf and gf.params:
                     stop_soc = gf.params.get("stop_soc", 20)
-                    power_rate = gf.params.get("power_rate", 10)
+                    power_rate = gf.params.get("power_rate", 100)
                 else:
                     stop_soc = 20
-                    power_rate = 10
+                    power_rate = 100
                 entry["details"].append(f"StopSOC: {stop_soc}%")
                 entry["details"].append(f"PowerRate: {power_rate}%")
                 entry["details"].append("Priority: Sell to grid")
@@ -952,7 +952,7 @@ class GrowattController(BaseModule):
         if primary == "grid_first":
             # Try to get params from an active scheduled grid-first period
             stop_soc = 20  # Default
-            power_rate = 10  # Default
+            power_rate = 100  # Default
             for p in self._scheduled_periods:
                 if p.kind == "grid_first" and p.contains_time(now_t) and p.params:
                     stop_soc = int(p.params.get("stop_soc", stop_soc))
@@ -1575,14 +1575,14 @@ class GrowattController(BaseModule):
         await self._set_export(False)
 
     async def _set_grid_first(
-        self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 10,
+        self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,
         *, preserve_duration: bool = True, pre_scheduled: bool = False
     ) -> None:
         """Set grid-first mode for specified time window.
 
         Grid-first mode prioritizes selling to grid over charging battery.
         stop_soc: Battery level to stop discharging at (default 20%)
-        power_rate: Discharge rate in % (default 10%)
+        power_rate: Discharge rate in % (default 100%)
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         """
         # Only adjust time if not pre-scheduled (pre-scheduled commands are sent 1 min early)
@@ -1999,7 +1999,7 @@ class GrowattController(BaseModule):
             )
             self._scheduled_periods.append(
                 Period("grid_first", sunrise_time, EOD_DTTIME,
-                       params={"stop_soc": 20, "power_rate": 10})
+                       params={"stop_soc": 20, "power_rate": 100})
             )
             self._scheduled_periods.append(
                 Period("export", sunrise_time, EOD_DTTIME)
@@ -2080,7 +2080,7 @@ class GrowattController(BaseModule):
                     "grid_first",
                     sunrise_time,
                     self._parse_hhmm(grid_first_end),
-                    params={"stop_soc": 20, "power_rate": 10}
+                    params={"stop_soc": 20, "power_rate": 100}
                 )
             )
             self._scheduled_periods.append(
