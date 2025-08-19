@@ -483,6 +483,7 @@
                 }
                 
                 updateDashboard(data);
+                updateActualInverterMode(data);  // Update register 1044 display
                 document.getElementById('errorMessage').style.display = 'none';
             } catch (error) {
                 console.error('Error fetching telemetry data:', error);
@@ -518,6 +519,7 @@
                 }
                 
                 updateDashboard(data);
+                updateActualInverterMode(data);  // Update register 1044 display
                 document.getElementById('errorMessage').style.display = 'none';
             } catch (error) {
                 console.error('Error fetching inverter data:', error);
@@ -651,8 +653,12 @@
                     <!-- Current Status Section -->
                     <div class="manual-status-section">
                         <div class="status-row">
-                            <span>Current Mode:</span>
+                            <span>Scheduled Mode:</span>
                             <span class="current-mode-value" id="currentModeValue">Automatic (Price-Based)</span>
+                        </div>
+                        <div class="status-row">
+                            <span>Actual Inverter Mode (Register 1044):</span>
+                            <span class="current-mode-value" id="actualInverterMode">Reading...</span>
                         </div>
                         <div class="status-row" id="manualEndTime" style="display:none;">
                             <span>Manual Override Until:</span>
@@ -1057,6 +1063,42 @@ ${JSON.stringify(gridData, null, 2)}
             } catch (error) {
                 console.error('Error resetting to automatic:', error);
                 alert('Failed to reset to automatic mode');
+            }
+        }
+        
+        function updateActualInverterMode(data) {
+            // Update the actual inverter mode from register 1044
+            const actualModeElement = document.getElementById('actualInverterMode');
+            if (actualModeElement && data.actual_inverter_mode) {
+                const modeMap = {
+                    'load_first': 'Load First (0)',
+                    'battery_first': 'Battery First (1)',
+                    'grid_first': 'Grid First (2)'
+                };
+                const modeText = modeMap[data.actual_inverter_mode] || `Unknown (${data.actual_inverter_mode})`;
+                actualModeElement.textContent = modeText;
+                
+                // Add color coding based on mode match
+                const scheduledMode = data.current_mode ? data.current_mode.toLowerCase().replace(' ', '_') : '';
+                if (data.actual_inverter_mode === scheduledMode || 
+                    (scheduledMode === 'load_first' && data.actual_inverter_mode === 'load_first')) {
+                    actualModeElement.style.color = '#10b981'; // Green when matches
+                } else {
+                    actualModeElement.style.color = '#f59e0b'; // Orange when mismatch
+                }
+            } else if (actualModeElement) {
+                // Show register 1044 raw data if available
+                if (data.register_1044) {
+                    if (data.register_1044.error) {
+                        actualModeElement.textContent = `Error: ${data.register_1044.error}`;
+                        actualModeElement.style.color = '#ef4444'; // Red for error
+                    } else if (data.register_1044.value !== undefined) {
+                        const valueMap = {0: 'Load First', 1: 'Battery First', 2: 'Grid First'};
+                        actualModeElement.textContent = `${valueMap[data.register_1044.value] || 'Unknown'} (${data.register_1044.value})`;
+                    }
+                } else {
+                    actualModeElement.textContent = 'Not available';
+                }
             }
         }
         
