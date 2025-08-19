@@ -305,6 +305,7 @@ class GrowattController(BaseModule):
                             self.logger.info(f"✅ Command {command_type} succeeded: {message}")
                         else:
                             self.logger.error(f"❌ Command {command_type} FAILED: {message}")
+                            self.logger.error(f"📋 Full error response: {json.dumps(data, indent=2)}")
                             
             except Exception as e:
                 self.logger.error(f"Error parsing command result: {e}")
@@ -377,6 +378,7 @@ class GrowattController(BaseModule):
                             )
                 else:
                     self.logger.warning(f"Failed to query battery-first state: {bf_result.get('message')}")
+                    self.logger.debug(f"📋 Full query response: {json.dumps(bf_result, indent=2)}")
                     
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying battery-first state")
@@ -430,6 +432,7 @@ class GrowattController(BaseModule):
                             )
                 else:
                     self.logger.warning(f"Failed to query grid-first state: {gf_result.get('message')}")
+                    self.logger.debug(f"📋 Full query response: {json.dumps(gf_result, indent=2)}")
                     
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying grid-first state")
@@ -1714,6 +1717,7 @@ class GrowattController(BaseModule):
             self.logger.error(
                 f"⚠️ Battery-first command FAILED! Message: {result.get('message', 'Unknown error')}"
             )
+            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             # Don't update tracking if command failed
             return
         
@@ -1770,6 +1774,7 @@ class GrowattController(BaseModule):
             self.logger.error(
                 f"⚠️ AC charge command failed! Message: {result.get('message', 'Unknown error')}"
             )
+            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             
         current_time = self._get_local_now().strftime("%H:%M:%S")
         state = "ENABLED" if enabled else "DISABLED"
@@ -1810,6 +1815,7 @@ class GrowattController(BaseModule):
                 f"⚠️ Failed to disable battery-first! "
                 f"Message: {result.get('message', 'Unknown error')}"
             )
+            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
         
         # Track the configuration
         self._battery_first_slots[1] = {
@@ -1872,6 +1878,7 @@ class GrowattController(BaseModule):
                 self.logger.error(
                     f"⚠️ Export enable failed! Message: {result.get('message', 'Unknown error')}"
                 )
+                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
                 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {topic}")
@@ -1888,6 +1895,7 @@ class GrowattController(BaseModule):
                 self.logger.error(
                     f"⚠️ Export disable failed! Message: {result.get('message', 'Unknown error')}"
                 )
+                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
                 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {topic}")
@@ -2011,6 +2019,7 @@ class GrowattController(BaseModule):
                 f"❌ Grid-first command FAILED! "
                 f"Message: {result.get('message', 'Unknown error')}"
             )
+            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             self.logger.error(
                 "⚠️ Grid-first mode NOT activated. Inverter may still be in previous mode. "
                 "Check inverter display or query current state."
@@ -2058,6 +2067,7 @@ class GrowattController(BaseModule):
             self.logger.error(
                 f"⚠️ Failed to disable grid-first! Message: {result.get('message', 'Unknown error')}"
             )
+            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
