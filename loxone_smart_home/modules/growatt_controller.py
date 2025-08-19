@@ -264,6 +264,184 @@ class GrowattController(BaseModule):
         self._manual_override_period: Optional[Period] = None
         self._manual_override_end_time: Optional[datetime] = None
         self._manual_override_source: str = ""
+        
+        # Command result tracking
+        self._last_command_results: Dict[str, Dict[str, Any]] = {}
+
+    async def _wait_for_command_result(
+        self, command_type: str, timeout: float = 3.0
+    ) -> Optional[Dict[str, Any]]:
+        """Wait for and capture command result from energy/solar/result topic.
+        
+        Args:
+            command_type: The command type to wait for (e.g., "batteryfirst/set/timeslot")
+            timeout: How long to wait for the result
+            
+        Returns:
+            The result dict if received, None if timeout
+        """
+        if self._optional_config.get("simulation_mode", False):
+            return {"success": True, "message": "Simulated"}
+            
+        result_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
+        
+        async def result_handler(_topic: str, payload: Any) -> None:
+            try:
+                if isinstance(payload, bytes):
+                    payload = payload.decode()
+                data = json.loads(payload)
+                
+                # Check if this is our command result
+                if data.get("command") == command_type:
+                    if not result_future.done():
+                        result_future.set_result(data)
+                        # Store for later reference
+                        self._last_command_results[command_type] = data
+                        
+                        # Log the result
+                        success = data.get("success", False)
+                        message = data.get("message", "No message")
+                        if success:
+                            self.logger.info(f"✅ Command {command_type} succeeded: {message}")
+                        else:
+                            self.logger.error(f"❌ Command {command_type} FAILED: {message}")
+                            
+            except Exception as e:
+                self.logger.error(f"Error parsing command result: {e}")
+        
+        # Subscribe to result topic
+        assert self.mqtt_client is not None
+        await self.mqtt_client.subscribe("energy/solar/result", result_handler)
+        
+        try:
+            # Wait for result with timeout
+            result = await asyncio.wait_for(result_future, timeout=timeout)
+            return result
+        except asyncio.TimeoutError:
+            self.logger.warning(f"⏱️ Timeout waiting for {command_type} result after {timeout}s")
+            return None
+        finally:
+            await self.mqtt_client.unsubscribe("energy/solar/result")
+
+    async def _query_inverter_state(self) -> Dict[str, Any]:
+        """Query current inverter state (battery-first and grid-first settings).
+        
+        Returns:
+            Dict with current state of both modes
+        """
+        if self._optional_config.get("simulation_mode", False):
+            return {
+                "battery_first": self._battery_first_slots,
+                "grid_first": self._grid_first_slots
+            }
+            
+        state = {}
+        
+        # Query battery-first state
+        try:
+            assert self.mqtt_client is not None
+            
+            # Set up result handler
+            bf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
+            
+            async def bf_handler(_topic: str, payload: Any) -> None:
+                try:
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    data = json.loads(payload)
+                    if data.get("command") == "batteryfirst/get":
+                        if not bf_future.done():
+                            bf_future.set_result(data)
+                except Exception as e:
+                    self.logger.error(f"Error parsing battery-first state: {e}")
+            
+            await self.mqtt_client.subscribe("energy/solar/result", bf_handler)
+            
+            # Send query
+            self.logger.debug("Querying battery-first state...")
+            await self.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
+            
+            # Wait for response
+            try:
+                bf_result = await asyncio.wait_for(bf_future, timeout=3.0)
+                state["battery_first"] = bf_result
+                
+                # Log the state
+                if bf_result.get("success"):
+                    slots = bf_result.get("timeSlots", [])
+                    for slot in slots:
+                        if slot.get("enabled"):
+                            self.logger.info(
+                                f"📊 Battery-first slot {slot.get('slot')}: "
+                                f"{slot.get('start')}-{slot.get('stop')} ENABLED"
+                            )
+                else:
+                    self.logger.warning(f"Failed to query battery-first state: {bf_result.get('message')}")
+                    
+            except asyncio.TimeoutError:
+                self.logger.warning("Timeout querying battery-first state")
+                state["battery_first"] = None
+            finally:
+                await self.mqtt_client.unsubscribe("energy/solar/result")
+                
+        except Exception as e:
+            self.logger.error(f"Error querying battery-first state: {e}")
+            state["battery_first"] = None
+            
+        # Query grid-first state
+        try:
+            assert self.mqtt_client is not None
+            
+            # Set up result handler
+            gf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
+            
+            async def gf_handler(_topic: str, payload: Any) -> None:
+                try:
+                    if isinstance(payload, bytes):
+                        payload = payload.decode()
+                    data = json.loads(payload)
+                    if data.get("command") == "gridfirst/get":
+                        if not gf_future.done():
+                            gf_future.set_result(data)
+                except Exception as e:
+                    self.logger.error(f"Error parsing grid-first state: {e}")
+            
+            await self.mqtt_client.subscribe("energy/solar/result", gf_handler)
+            
+            # Send query
+            self.logger.debug("Querying grid-first state...")
+            await self.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
+            
+            # Wait for response
+            try:
+                gf_result = await asyncio.wait_for(gf_future, timeout=3.0)
+                state["grid_first"] = gf_result
+                
+                # Log the state
+                if gf_result.get("success"):
+                    slots = gf_result.get("timeSlots", [])
+                    for slot in slots:
+                        if slot.get("enabled"):
+                            self.logger.info(
+                                f"📊 Grid-first slot {slot.get('slot')}: "
+                                f"{slot.get('start')}-{slot.get('stop')} ENABLED, "
+                                f"stopSOC={gf_result.get('stopSOC')}%, "
+                                f"powerRate={gf_result.get('powerRate')}%"
+                            )
+                else:
+                    self.logger.warning(f"Failed to query grid-first state: {gf_result.get('message')}")
+                    
+            except asyncio.TimeoutError:
+                self.logger.warning("Timeout querying grid-first state")
+                state["grid_first"] = None
+            finally:
+                await self.mqtt_client.unsubscribe("energy/solar/result")
+                
+        except Exception as e:
+            self.logger.error(f"Error querying grid-first state: {e}")
+            state["grid_first"] = None
+            
+        return state
 
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
@@ -1408,6 +1586,8 @@ class GrowattController(BaseModule):
 
         First resets to load-first mode to ensure clean state, then applies the requested mode.
         """
+        self.logger.info(f"🔄 Ensuring exclusive mode for {primary}, resetting other modes...")
+        
         # Always reset to neutral state first for clean transitions
         await self._disable_battery_first()
         await asyncio.sleep(0.3)
@@ -1415,6 +1595,32 @@ class GrowattController(BaseModule):
         await asyncio.sleep(0.3)
 
         self.logger.debug(f"Reset to load-first mode before applying {primary}")
+        
+        # Query state to verify reset worked
+        state = await self._query_inverter_state()
+        
+        # Check if any modes are still active when they shouldn't be
+        if state.get("battery_first"):
+            bf = state["battery_first"]
+            if bf.get("success"):
+                slots = bf.get("timeSlots", [])
+                for slot in slots:
+                    if slot.get("enabled"):
+                        self.logger.warning(
+                            f"⚠️ Battery-first slot {slot.get('slot')} still ENABLED after reset! "
+                            f"({slot.get('start')}-{slot.get('stop')})"
+                        )
+                        
+        if state.get("grid_first"):
+            gf = state["grid_first"]
+            if gf.get("success"):
+                slots = gf.get("timeSlots", [])
+                for slot in slots:
+                    if slot.get("enabled"):
+                        self.logger.warning(
+                            f"⚠️ Grid-first slot {slot.get('slot')} still ENABLED after reset! "
+                            f"({slot.get('start')}-{slot.get('stop')})"
+                        )
 
     async def _set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 90, power_rate: int = 100,
@@ -1496,7 +1702,20 @@ class GrowattController(BaseModule):
         payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
 
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
+        self.logger.info(
+            f"📤 Sending battery-first SET command: topic={self.config.battery_first_topic}, "
+            f"payload={json.dumps(payload)}"
+        )
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        
+        # Wait for command result
+        result = await self._wait_for_command_result("batteryfirst/set/timeslot")
+        if result and not result.get("success", False):
+            self.logger.error(
+                f"⚠️ Battery-first command FAILED! Message: {result.get('message', 'Unknown error')}"
+            )
+            # Don't update tracking if command failed
+            return
         
         # Track the configuration
         self._battery_first_slots[1] = {
@@ -1515,6 +1734,15 @@ class GrowattController(BaseModule):
             f"Topic: {self.config.battery_first_topic}"
         )
         self._last_applied["battery_first"] = sig
+        
+        # Query and log actual state to verify
+        await asyncio.sleep(0.5)  # Give inverter time to process
+        state = await self._query_inverter_state()
+        self.logger.info("📋 Inverter state after battery-first command:")
+        if state.get("battery_first"):
+            self.logger.info(f"   Battery-first: {state['battery_first']}")
+        if state.get("grid_first"):
+            self.logger.info(f"   Grid-first: {state['grid_first']}")
 
     async def _set_ac_charge(self, enabled: bool) -> None:
         """Set AC charging state (unified setter)."""
@@ -1530,7 +1758,19 @@ class GrowattController(BaseModule):
 
         payload = {"value": 1 if enabled else 0}
         assert self.mqtt_client is not None
+        self.logger.info(
+            f"📤 Sending AC charge command: topic={self.config.ac_charge_topic}, "
+            f"payload={json.dumps(payload)}"
+        )
         await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
+        
+        # Wait for result
+        result = await self._wait_for_command_result("batteryfirst/set/acchargeenabled")
+        if result and not result.get("success", False):
+            self.logger.error(
+                f"⚠️ AC charge command failed! Message: {result.get('message', 'Unknown error')}"
+            )
+            
         current_time = self._get_local_now().strftime("%H:%M:%S")
         state = "ENABLED" if enabled else "DISABLED"
         self.logger.info(
@@ -1557,7 +1797,19 @@ class GrowattController(BaseModule):
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
+        self.logger.info(
+            f"📤 Disabling battery-first: topic={self.config.battery_first_topic}, "
+            f"payload={json.dumps(payload)}"
+        )
         await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
+        
+        # Wait for result
+        result = await self._wait_for_command_result("batteryfirst/set/timeslot")
+        if result and not result.get("success", False):
+            self.logger.error(
+                f"⚠️ Failed to disable battery-first! "
+                f"Message: {result.get('message', 'Unknown error')}"
+            )
         
         # Track the configuration
         self._battery_first_slots[1] = {
@@ -1609,12 +1861,34 @@ class GrowattController(BaseModule):
 
         if enabled:
             topic = self.config.export_enable_topic
+            self.logger.info(
+                f"📤 Sending export enable: topic={topic}, payload={json.dumps(payload)}"
+            )
             await self.mqtt_client.publish(topic, json.dumps(payload))
+            
+            # Wait for result
+            result = await self._wait_for_command_result("export/enable")
+            if result and not result.get("success", False):
+                self.logger.error(
+                    f"⚠️ Export enable failed! Message: {result.get('message', 'Unknown error')}"
+                )
+                
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {topic}")
         else:
             topic = self.config.export_disable_topic
+            self.logger.info(
+                f"📤 Sending export disable: topic={topic}, payload={json.dumps(payload)}"
+            )
             await self.mqtt_client.publish(topic, json.dumps(payload))
+            
+            # Wait for result
+            result = await self._wait_for_command_result("export/disable")
+            if result and not result.get("success", False):
+                self.logger.error(
+                    f"⚠️ Export disable failed! Message: {result.get('message', 'Unknown error')}"
+                )
+                
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {topic}")
 
@@ -1688,6 +1962,10 @@ class GrowattController(BaseModule):
         # Set stop SOC (battery level to stop discharging)
         stopsoc_payload = {"value": stop_soc}
         self.logger.debug(f"Setting grid-first stopSOC to {stop_soc}%")
+        self.logger.info(
+            f"📤 Sending grid-first stopSOC: topic={self.config.grid_first_stopsoc_topic}, "
+            f"payload={json.dumps(stopsoc_payload)}"
+        )
         await self.mqtt_client.publish(
             self.config.grid_first_stopsoc_topic, json.dumps(stopsoc_payload)
         )
@@ -1698,6 +1976,10 @@ class GrowattController(BaseModule):
         # Set power rate (discharge rate)
         powerrate_payload = {"value": power_rate}
         self.logger.debug(f"Setting grid-first powerRate to {power_rate}%")
+        self.logger.info(
+            f"📤 Sending grid-first powerRate: topic={self.config.grid_first_powerrate_topic}, "
+            f"payload={json.dumps(powerrate_payload)}"
+        )
         await self.mqtt_client.publish(
             self.config.grid_first_powerrate_topic, json.dumps(powerrate_payload)
         )
@@ -1716,7 +1998,25 @@ class GrowattController(BaseModule):
             "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1
         }
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
+        self.logger.info(
+            f"📤 Sending grid-first SET command: topic={self.config.grid_first_topic}, "
+            f"payload={json.dumps(timeslot_payload)}"
+        )
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
+        
+        # Wait for command result
+        result = await self._wait_for_command_result("gridfirst/set/timeslot")
+        if result and not result.get("success", False):
+            self.logger.error(
+                f"❌ Grid-first command FAILED! "
+                f"Message: {result.get('message', 'Unknown error')}"
+            )
+            self.logger.error(
+                "⚠️ Grid-first mode NOT activated. Inverter may still be in previous mode. "
+                "Check inverter display or query current state."
+            )
+            # Don't update tracking if command failed
+            return
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -1727,6 +2027,15 @@ class GrowattController(BaseModule):
             f"{self.config.grid_first_powerrate_topic}"
         )
         self._last_applied["grid_first"] = sig
+        
+        # Query and log actual state to verify
+        await asyncio.sleep(0.5)  # Give inverter time to process
+        state = await self._query_inverter_state()
+        self.logger.info("📋 Inverter state after grid-first command:")
+        if state.get("battery_first"):
+            self.logger.info(f"   Battery-first: {state['battery_first']}")
+        if state.get("grid_first"):
+            self.logger.info(f"   Grid-first: {state['grid_first']}")
 
     async def _disable_grid_first(self) -> None:
         """Disable grid-first mode."""
@@ -1737,7 +2046,19 @@ class GrowattController(BaseModule):
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
+        self.logger.info(
+            f"📤 Disabling grid-first: topic={self.config.grid_first_topic}, "
+            f"payload={json.dumps(payload)}"
+        )
         await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(payload))
+        
+        # Wait for result
+        result = await self._wait_for_command_result("gridfirst/set/timeslot")
+        if result and not result.get("success", False):
+            self.logger.error(
+                f"⚠️ Failed to disable grid-first! Message: {result.get('message', 'Unknown error')}"
+            )
+            
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔌 GRID-FIRST MODE DISABLED at {current_time} → "
