@@ -56,6 +56,8 @@ class Period:
     start: dt_time
     end: dt_time
     params: Optional[Dict[str, Any]] = None
+    manual: bool = False  # True if this is a manual override
+    source: str = "auto"  # Source of the period (auto, api, dashboard)
 
     def contains_time(self, t: dt_time) -> bool:
         """Check if a time falls within this period, handling midnight wrap."""
@@ -73,7 +75,28 @@ class GrowattController(BaseModule):
     """Growatt controller that manages battery charging based on energy prices."""
 
     def _select_primary_mode(self, modes: set[PeriodType]) -> PeriodType:
-        """Select primary mode based on precedence rules."""
+        """Select primary mode based on precedence rules.
+        
+        Manual overrides take precedence over everything else.
+        """
+        # Check for active manual override first
+        if self._manual_override_period:
+            now = self._get_local_now()
+            # Check if manual override is still valid
+            if self._manual_override_end_time:
+                if now < self._manual_override_end_time:
+                    return self._manual_override_period.kind
+                else:
+                    # Manual override expired, clear it
+                    self.logger.info("Manual override expired, clearing")
+                    self._manual_override_period = None
+                    self._manual_override_end_time = None
+                    self._manual_override_source = ""
+            else:
+                # No end time means manual override is permanent until cleared
+                return self._manual_override_period.kind
+        
+        # Fall back to automatic mode selection
         for m in MODE_PRECEDENCE:
             if m in modes:
                 return m
@@ -236,6 +259,11 @@ class GrowattController(BaseModule):
 
         # Default scheduler function (will be set properly in _calculate_and_schedule_next_day)
         self._schedule_func = self._schedule_at_time
+        
+        # Manual override tracking
+        self._manual_override_period: Optional[Period] = None
+        self._manual_override_end_time: Optional[datetime] = None
+        self._manual_override_source: str = ""
 
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
@@ -927,6 +955,32 @@ class GrowattController(BaseModule):
         self.logger.info(
             f"Checking current state at {now.strftime('%H:%M')} for immediate application..."
         )
+
+        # Check for manual override first
+        if self._manual_override_period:
+            override_status = self.get_manual_override_status()
+            if override_status.get("active"):
+                mode = self._manual_override_period.kind
+                params = self._manual_override_period.params or {}
+                self.logger.info(
+                    f"Manual override active: {mode} "
+                    f"(until {override_status.get('end_time', 'manual clear')})"
+                )
+                
+                # Apply the manual mode
+                if mode == "battery_first":
+                    await self._set_battery_first(
+                        "00:00", "23:59",
+                        stop_soc=params.get("stop_soc", 90),
+                        power_rate=params.get("power_rate", 100)
+                    )
+                elif mode == "grid_first":
+                    await self._set_grid_first(
+                        "00:00", "23:59",
+                        stop_soc=params.get("stop_soc", 20),
+                        power_rate=params.get("power_rate", 10)
+                    )
+                return
 
         if not self._scheduled_periods:
             self.logger.info("No scheduled periods found yet, skipping startup state sync")
@@ -1710,6 +1764,168 @@ class GrowattController(BaseModule):
         self.logger.info(
             f"⚖️ LOAD-FIRST MODE SET (disabled battery & grid first) at {current_time}"
         )
+
+    async def set_manual_override(
+        self,
+        mode: str,
+        duration_type: str,
+        duration_value: Optional[Union[str, int]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        source: str = "api"
+    ) -> Dict[str, Any]:
+        """Set manual mode override.
+        
+        Args:
+            mode: "battery_first" or "grid_first"
+            duration_type: "immediate", "end_of_day", "duration_hours", or "until_time"
+            duration_value: Value for duration (hours for duration_hours, "HH:MM" for until_time)
+            params: Optional parameters (stop_soc, power_rate)
+            source: Source of the override ("api" or "dashboard")
+        
+        Returns:
+            Dict with success status and details
+        """
+        # Validate mode
+        if mode not in ["battery_first", "grid_first"]:
+            raise ValueError(f"Invalid mode: {mode}")
+        
+        # Calculate end time based on duration type
+        now = self._get_local_now()
+        
+        if duration_type == "immediate":
+            end_time = None  # No end time, runs until manually cleared
+        elif duration_type == "end_of_day":
+            end_time = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        elif duration_type == "duration_hours":
+            hours = int(duration_value) if duration_value else 1
+            # Limit to 24 hours maximum
+            hours = min(24, max(1, hours))
+            end_time = now + timedelta(hours=hours)
+        elif duration_type == "until_time":
+            if not duration_value:
+                raise ValueError("Time value required for until_time duration")
+            # Parse time string "HH:MM"
+            time_parts = duration_value.split(":")
+            if len(time_parts) != 2:
+                raise ValueError(f"Invalid time format: {duration_value}")
+            target_time = now.replace(
+                hour=int(time_parts[0]),
+                minute=int(time_parts[1]),
+                second=0,
+                microsecond=0
+            )
+            # If time is in past, assume tomorrow
+            if target_time <= now:
+                target_time += timedelta(days=1)
+            end_time = target_time
+        else:
+            raise ValueError(f"Invalid duration type: {duration_type}")
+        
+        # Set default params if not provided
+        if params is None:
+            params = {}
+        
+        if mode == "battery_first":
+            params.setdefault("stop_soc", 90)
+            params.setdefault("power_rate", 100)
+        else:  # grid_first
+            params.setdefault("stop_soc", 20)
+            params.setdefault("power_rate", 10)
+        
+        # Create manual override period
+        self._manual_override_period = Period(
+            kind=mode,  # type: ignore
+            start=dt_time(0, 0),  # Start time doesn't matter for manual override
+            end=dt_time(23, 59, 59),  # End time doesn't matter, we use _manual_override_end_time
+            params=params,
+            manual=True,
+            source=source
+        )
+        self._manual_override_end_time = end_time
+        self._manual_override_source = source
+        
+        # Apply the mode immediately
+        try:
+            if mode == "battery_first":
+                await self._set_battery_first(
+                    "00:00", "23:59",
+                    stop_soc=params["stop_soc"],
+                    power_rate=params["power_rate"]
+                )
+            else:  # grid_first
+                await self._set_grid_first(
+                    "00:00", "23:59",
+                    stop_soc=params["stop_soc"],
+                    power_rate=params["power_rate"]
+                )
+            
+            # Log manual intervention
+            end_str = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "manual clear"
+            self.logger.info(
+                f"🎯 Manual override set: {mode} until {end_str} "
+                f"(source: {source}, params: {params})"
+            )
+            
+            return {
+                "success": True,
+                "mode": mode,
+                "end_time": end_time.isoformat() if end_time else None,
+                "source": source,
+                "params": params
+            }
+            
+        except Exception as e:
+            # Clear override on error
+            self._manual_override_period = None
+            self._manual_override_end_time = None
+            self._manual_override_source = ""
+            self.logger.error(f"Failed to set manual override: {e}")
+            raise
+
+    async def clear_manual_override(self) -> Dict[str, Any]:
+        """Clear manual override and return to automatic control."""
+        had_override = self._manual_override_period is not None
+        
+        # Clear override
+        self._manual_override_period = None
+        self._manual_override_end_time = None
+        self._manual_override_source = ""
+        
+        if had_override:
+            # Re-evaluate automatic schedule
+            self.logger.info("🔄 Manual override cleared, re-evaluating automatic schedule")
+            await self._sync_startup_state()
+            
+            return {
+                "success": True,
+                "message": "Manual override cleared, returned to automatic control"
+            }
+        else:
+            return {
+                "success": True,
+                "message": "No manual override was active"
+            }
+
+    def get_manual_override_status(self) -> Dict[str, Any]:
+        """Get current manual override status."""
+        if not self._manual_override_period:
+            return {"active": False}
+        
+        # Check if override is still valid
+        if self._manual_override_end_time:
+            now = self._get_local_now()
+            if now >= self._manual_override_end_time:
+                # Override expired
+                return {"active": False, "expired": True}
+        
+        return {
+            "active": True,
+            "mode": self._manual_override_period.kind,
+            "end_time": (self._manual_override_end_time.isoformat()
+                        if self._manual_override_end_time else None),
+            "source": self._manual_override_source,
+            "params": self._manual_override_period.params
+        }
 
     async def _calculate_and_schedule_next_day(self) -> None:
         """Calculate energy prices and schedule battery control for next day."""

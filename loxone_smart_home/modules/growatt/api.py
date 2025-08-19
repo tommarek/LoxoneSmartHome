@@ -185,6 +185,11 @@ def create_growatt_api(
     app.router.add_post('/api/growatt/mode', set_mode)
     app.router.add_post('/api/growatt/sync-time', sync_time)
     app.router.add_get('/api/growatt/config', get_config)
+    
+    # Manual mode control routes
+    app.router.add_post('/api/growatt/manual-mode', manual_mode_set)
+    app.router.add_delete('/api/growatt/manual-mode', manual_mode_clear)
+    app.router.add_get('/api/growatt/manual-mode', manual_mode_status)
 
     # Dashboard routes
     app.router.add_get('/inverter', serve_dashboard)
@@ -243,6 +248,9 @@ async def get_status(request: web.Request) -> web.Response:
             inverter_data["battery_first_data"] = slot_data.get("battery_first_raw", {})
             inverter_data["grid_first_data"] = slot_data.get("grid_first_raw", {})
 
+        # Get manual override status
+        manual_override = controller.get_manual_override_status()
+        
         status = {
             "running": controller._running,
             "current_mode": primary_mode,
@@ -258,7 +266,8 @@ async def get_status(request: web.Request) -> web.Response:
             "simulation_mode": controller._optional_config.get(
                 "simulation_mode", False
             ) if hasattr(controller, '_optional_config') else False,
-            "inverter_data": inverter_data
+            "inverter_data": inverter_data,
+            "manual_override": manual_override
         }
 
         return web.json_response(status)
@@ -453,6 +462,91 @@ async def set_mode(request: web.Request) -> web.Response:
             "message": f"Mode set to {mode}"
         })
 
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def manual_mode_set(request: web.Request) -> web.Response:
+    """Set manual mode override.
+    
+    Expected JSON payload:
+    {
+        "mode": "battery_first" | "grid_first",
+        "duration": {
+            "type": "immediate" | "end_of_day" | "duration_hours" | "until_time",
+            "value": null | 4 | "18:00"  // depends on type
+        },
+        "params": {
+            "stop_soc": 90,     // optional
+            "power_rate": 100   // optional
+        },
+        "source": "dashboard"  // optional, defaults to "api"
+    }
+    """
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
+    if not controller:
+        return web.json_response(
+            {"error": "Controller not initialized"}, status=503
+        )
+    
+    try:
+        data = await request.json()
+        
+        # Extract parameters
+        mode = data.get("mode")
+        if not mode:
+            return web.json_response({"error": "mode is required"}, status=400)
+        
+        duration = data.get("duration", {})
+        duration_type = duration.get("type", "immediate")
+        duration_value = duration.get("value")
+        
+        params = data.get("params")
+        source = data.get("source", "api")
+        
+        # Set manual override
+        result = await controller.set_manual_override(
+            mode=mode,
+            duration_type=duration_type,
+            duration_value=duration_value,
+            params=params,
+            source=source
+        )
+        
+        return web.json_response(result)
+        
+    except ValueError as e:
+        return web.json_response({"error": str(e)}, status=400)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def manual_mode_clear(request: web.Request) -> web.Response:
+    """Clear manual mode override and return to automatic control."""
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
+    if not controller:
+        return web.json_response(
+            {"error": "Controller not initialized"}, status=503
+        )
+    
+    try:
+        result = await controller.clear_manual_override()
+        return web.json_response(result)
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def manual_mode_status(request: web.Request) -> web.Response:
+    """Get current manual mode override status."""
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
+    if not controller:
+        return web.json_response(
+            {"error": "Controller not initialized"}, status=503
+        )
+    
+    try:
+        status = controller.get_manual_override_status()
+        return web.json_response(status)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 

@@ -229,6 +229,205 @@
             cursor: not-allowed;
         }
         
+        /* Manual Control Styles */
+        .manual-control-card {
+            border: 2px solid #3b82f6;
+            background: linear-gradient(135deg, #eff6ff 0%, #ffffff 100%);
+        }
+        
+        .manual-status-badge {
+            font-size: 12px;
+            padding: 4px 8px;
+            border-radius: 12px;
+            background: #10b981;
+            color: white;
+            margin-left: 10px;
+            font-weight: 500;
+        }
+        
+        .manual-status-badge.manual {
+            background: #f59e0b;
+            animation: pulse 2s infinite;
+        }
+        
+        .mode-buttons {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 10px;
+            margin: 15px 0;
+        }
+        
+        .mode-btn {
+            padding: 12px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-size: 14px;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 5px;
+        }
+        
+        .mode-btn:hover {
+            border-color: #3b82f6;
+            transform: translateY(-2px);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+        }
+        
+        .mode-btn.active {
+            background: #3b82f6;
+            color: white;
+            border-color: #3b82f6;
+        }
+        
+        .duration-selector {
+            margin-top: 20px;
+        }
+        
+        .duration-options {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin: 10px 0;
+        }
+        
+        .duration-btn {
+            padding: 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            background: white;
+            cursor: pointer;
+            transition: all 0.2s;
+            font-size: 13px;
+        }
+        
+        .duration-btn:hover {
+            background: #f3f4f6;
+        }
+        
+        .duration-btn.active {
+            background: #dbeafe;
+            border-color: #3b82f6;
+            color: #1e40af;
+        }
+        
+        .duration-input {
+            margin-top: 10px;
+        }
+        
+        .duration-input input {
+            width: 100%;
+            padding: 8px 12px;
+            border: 1px solid #e5e7eb;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        
+        .advanced-params {
+            margin-top: 20px;
+        }
+        
+        .advanced-params summary {
+            cursor: pointer;
+            padding: 10px;
+            background: #f9fafb;
+            border-radius: 6px;
+            font-weight: 500;
+        }
+        
+        .param-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }
+        
+        .param-item label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 13px;
+            color: #6b7280;
+        }
+        
+        .param-item input {
+            width: 100%;
+            padding: 6px 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+        }
+        
+        .action-buttons {
+            display: flex;
+            gap: 10px;
+            margin-top: 20px;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: all 0.3s;
+        }
+        
+        .btn-primary {
+            background: #3b82f6;
+            color: white;
+        }
+        
+        .btn-primary:hover {
+            background: #2563eb;
+        }
+        
+        .btn-secondary {
+            background: #6b7280;
+            color: white;
+        }
+        
+        .btn-secondary:hover {
+            background: #4b5563;
+        }
+        
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        
+        .manual-status-section {
+            background: #f9fafb;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .status-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 8px 0;
+        }
+        
+        .current-mode-value {
+            font-weight: 600;
+            color: #1f2937;
+        }
+        
+        .countdown-timer {
+            color: #f59e0b;
+            font-weight: bold;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
     </style>
 </head>
 <body>
@@ -438,6 +637,109 @@
                     </div>
                 </div>
                 
+                <!-- Manual Mode Control Card -->
+                <div class="card manual-control-card">
+                    <h2>
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 2v20M2 12h20"/>
+                            <circle cx="12" cy="12" r="3" fill="currentColor"/>
+                        </svg>
+                        Manual Mode Control
+                        <span class="manual-status-badge" id="manualStatusBadge">AUTO</span>
+                    </h2>
+                    
+                    <!-- Current Status Section -->
+                    <div class="manual-status-section">
+                        <div class="status-row">
+                            <span>Current Mode:</span>
+                            <span class="current-mode-value" id="currentModeValue">Automatic (Price-Based)</span>
+                        </div>
+                        <div class="status-row" id="manualEndTime" style="display:none;">
+                            <span>Manual Override Until:</span>
+                            <span class="end-time-value" id="endTimeValue">--</span>
+                            <span class="countdown-timer" id="countdownTimer"></span>
+                        </div>
+                    </div>
+                    
+                    <!-- Mode Selection -->
+                    <div class="mode-selector">
+                        <label style="font-weight: 500; margin-bottom: 10px; display: block;">Select Mode:</label>
+                        <div class="mode-buttons">
+                            <button class="mode-btn" data-mode="battery_first" onclick="selectMode('battery_first')">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <rect x="1" y="6" width="18" height="12" rx="2" ry="2"/>
+                                    <line x1="23" y1="13" x2="23" y2="11"/>
+                                </svg>
+                                Battery First
+                            </button>
+                            <button class="mode-btn" data-mode="grid_first" onclick="selectMode('grid_first')">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 2v10l3-3M9 7l3 3"/>
+                                </svg>
+                                Grid First
+                            </button>
+                            <button class="mode-btn active" data-mode="auto" onclick="selectMode('auto')">
+                                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <path d="M12 2l2 7h7l-5.5 4 2 7L12 16l-5.5 4 2-7L3 9h7z"/>
+                                </svg>
+                                Automatic
+                            </button>
+                        </div>
+                    </div>
+                    
+                    <!-- Duration Selection (shows when mode selected) -->
+                    <div class="duration-selector" id="durationSelector" style="display:none;">
+                        <label style="font-weight: 500; margin-bottom: 10px; display: block;">Duration:</label>
+                        <div class="duration-options">
+                            <button class="duration-btn active" data-duration="immediate" onclick="selectDuration('immediate')">
+                                Until Manually Cleared
+                            </button>
+                            <button class="duration-btn" data-duration="eod" onclick="selectDuration('eod')">
+                                Until End of Day
+                            </button>
+                            <button class="duration-btn" data-duration="hours" onclick="selectDuration('hours')">
+                                For X Hours
+                            </button>
+                            <button class="duration-btn" data-duration="until" onclick="selectDuration('until')">
+                                Until Specific Time
+                            </button>
+                        </div>
+                        
+                        <!-- Dynamic input based on duration type -->
+                        <div class="duration-input" id="durationInputHours" style="display:none;">
+                            <input type="number" id="hoursInput" min="1" max="24" value="2" placeholder="Hours">
+                        </div>
+                        <div class="duration-input" id="durationInputTime" style="display:none;">
+                            <input type="time" id="timeInput" value="18:00">
+                        </div>
+                    </div>
+                    
+                    <!-- Advanced Parameters (collapsible) -->
+                    <details class="advanced-params" id="advancedParams">
+                        <summary>Advanced Settings</summary>
+                        <div class="param-grid">
+                            <div class="param-item">
+                                <label>Stop SOC (%):</label>
+                                <input type="number" id="stopSoc" min="10" max="100" value="90">
+                            </div>
+                            <div class="param-item">
+                                <label>Power Rate (%):</label>
+                                <input type="number" id="powerRate" min="10" max="100" value="100">
+                            </div>
+                        </div>
+                    </details>
+                    
+                    <!-- Action Buttons -->
+                    <div class="action-buttons">
+                        <button class="btn btn-primary" id="applyManualMode" onclick="applyManualMode()">
+                            Apply Manual Mode
+                        </button>
+                        <button class="btn btn-secondary" id="resetToAuto" onclick="resetToAutomatic()">
+                            Reset to Automatic
+                        </button>
+                    </div>
+                </div>
+                
                 <!-- Battery First Mode Card -->
                 <div class="card">
                     <h2>
@@ -639,10 +941,212 @@ ${JSON.stringify(gridData, null, 2)}
             refreshBtn.disabled = false;
         }
         
+        // Manual Mode Control Functions
+        let selectedMode = 'auto';
+        let selectedDuration = 'immediate';
+        let countdownInterval = null;
+        
+        function selectMode(mode) {
+            selectedMode = mode;
+            
+            // Update button states
+            document.querySelectorAll('.mode-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`.mode-btn[data-mode="${mode}"]`).classList.add('active');
+            
+            // Show/hide duration selector
+            if (mode === 'auto') {
+                document.getElementById('durationSelector').style.display = 'none';
+                document.getElementById('advancedParams').style.display = 'none';
+            } else {
+                document.getElementById('durationSelector').style.display = 'block';
+                document.getElementById('advancedParams').style.display = 'block';
+                
+                // Update advanced params based on mode
+                if (mode === 'battery_first') {
+                    document.getElementById('stopSoc').value = 90;
+                    document.getElementById('powerRate').value = 100;
+                } else if (mode === 'grid_first') {
+                    document.getElementById('stopSoc').value = 20;
+                    document.getElementById('powerRate').value = 10;
+                }
+            }
+        }
+        
+        function selectDuration(duration) {
+            selectedDuration = duration;
+            
+            // Update button states
+            document.querySelectorAll('.duration-btn').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`.duration-btn[data-duration="${duration}"]`).classList.add('active');
+            
+            // Show/hide input fields
+            document.getElementById('durationInputHours').style.display = duration === 'hours' ? 'block' : 'none';
+            document.getElementById('durationInputTime').style.display = duration === 'until' ? 'block' : 'none';
+        }
+        
+        async function applyManualMode() {
+            if (selectedMode === 'auto') {
+                alert('Please select Battery First or Grid First mode');
+                return;
+            }
+            
+            const payload = {
+                mode: selectedMode,
+                duration: {
+                    type: selectedDuration
+                },
+                params: {
+                    stop_soc: parseInt(document.getElementById('stopSoc').value),
+                    power_rate: parseInt(document.getElementById('powerRate').value)
+                },
+                source: 'dashboard'
+            };
+            
+            // Add duration value based on type
+            if (selectedDuration === 'hours') {
+                payload.duration.value = parseInt(document.getElementById('hoursInput').value);
+            } else if (selectedDuration === 'until') {
+                payload.duration.value = document.getElementById('timeInput').value;
+            } else if (selectedDuration === 'end_of_day') {
+                payload.duration.type = 'end_of_day';
+            }
+            
+            try {
+                const response = await fetch('/api/growatt/manual-mode', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    console.log('Manual mode applied:', result);
+                    await updateManualStatus();
+                    await fetchInverterData();
+                } else {
+                    const error = await response.json();
+                    alert('Failed to apply manual mode: ' + error.error);
+                }
+            } catch (error) {
+                console.error('Error applying manual mode:', error);
+                alert('Failed to apply manual mode');
+            }
+        }
+        
+        async function resetToAutomatic() {
+            if (!confirm('Reset to automatic price-based control?')) return;
+            
+            try {
+                const response = await fetch('/api/growatt/manual-mode', {
+                    method: 'DELETE'
+                });
+                
+                if (response.ok) {
+                    console.log('Reset to automatic mode');
+                    selectMode('auto');
+                    await updateManualStatus();
+                    await fetchInverterData();
+                } else {
+                    const error = await response.json();
+                    alert('Failed to reset: ' + error.error);
+                }
+            } catch (error) {
+                console.error('Error resetting to automatic:', error);
+                alert('Failed to reset to automatic mode');
+            }
+        }
+        
+        async function updateManualStatus() {
+            try {
+                const response = await fetch('/api/growatt/manual-mode');
+                if (response.ok) {
+                    const status = await response.json();
+                    
+                    const badge = document.getElementById('manualStatusBadge');
+                    const currentModeValue = document.getElementById('currentModeValue');
+                    const manualEndTime = document.getElementById('manualEndTime');
+                    
+                    if (status.active) {
+                        // Manual mode is active
+                        badge.textContent = 'MANUAL';
+                        badge.classList.add('manual');
+                        
+                        const modeText = status.mode === 'battery_first' ? 'Battery First' : 'Grid First';
+                        currentModeValue.textContent = `Manual: ${modeText}`;
+                        
+                        if (status.end_time) {
+                            manualEndTime.style.display = 'block';
+                            const endTime = new Date(status.end_time);
+                            document.getElementById('endTimeValue').textContent = endTime.toLocaleString();
+                            updateCountdown(endTime);
+                        } else {
+                            manualEndTime.style.display = 'block';
+                            document.getElementById('endTimeValue').textContent = 'Until manually cleared';
+                            document.getElementById('countdownTimer').textContent = '';
+                        }
+                        
+                        // Update UI to reflect manual mode
+                        selectMode(status.mode);
+                    } else {
+                        // Automatic mode
+                        badge.textContent = 'AUTO';
+                        badge.classList.remove('manual');
+                        currentModeValue.textContent = 'Automatic (Price-Based)';
+                        manualEndTime.style.display = 'none';
+                        
+                        if (countdownInterval) {
+                            clearInterval(countdownInterval);
+                            countdownInterval = null;
+                        }
+                        
+                        selectMode('auto');
+                    }
+                }
+            } catch (error) {
+                console.error('Error fetching manual status:', error);
+            }
+        }
+        
+        function updateCountdown(endTime) {
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
+            }
+            
+            const updateTimer = () => {
+                const now = new Date();
+                const remaining = endTime - now;
+                
+                if (remaining <= 0) {
+                    clearInterval(countdownInterval);
+                    updateManualStatus();
+                    return;
+                }
+                
+                const hours = Math.floor(remaining / 3600000);
+                const minutes = Math.floor((remaining % 3600000) / 60000);
+                document.getElementById('countdownTimer').textContent = 
+                    `(${hours}h ${minutes}m remaining)`;
+            };
+            
+            updateTimer();
+            countdownInterval = setInterval(updateTimer, 60000);
+        }
+        
+        // Update manual status on page load and periodically
+        updateManualStatus();
+        setInterval(updateManualStatus, 30000);
+        
         // Clean up on page unload
         window.addEventListener('beforeunload', () => {
             if (updateInterval) {
                 clearInterval(updateInterval);
+            }
+            if (countdownInterval) {
+                clearInterval(countdownInterval);
             }
         });
     </script>
