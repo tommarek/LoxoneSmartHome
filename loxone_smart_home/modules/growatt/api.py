@@ -44,7 +44,17 @@ async def _setup_result_subscription(controller: GrowattController) -> None:
             # Get the command from the response
             command = data.get("command")
             
-            if command and command in _command_responses:
+            # Handle register get/set responses specially
+            if command in ["register/get", "register/set"]:
+                register = data.get("register")
+                if register == 1044:
+                    # Look for the specific register command
+                    register_command = f"{command}/1044"
+                    if register_command in _command_responses:
+                        future = _command_responses.get(register_command)
+                        if future and not future.done():
+                            future.set_result(data)
+            elif command and command in _command_responses:
                 # Find the future waiting for this response
                 future = _command_responses.get(command)
                 if future and not future.done():
@@ -95,6 +105,115 @@ async def _setup_telemetry_subscription(controller: GrowattController) -> None:
     except Exception:
         # Silently fail if subscription fails
         pass
+
+
+async def _query_register_1044(controller: GrowattController) -> Optional[Dict[str, Any]]:
+    """Query register 1044 for the current inverter operating mode/state.
+    
+    Register 1044 contains the current operating mode:
+    - 0: Load First mode (normal operation)
+    - 1: Battery First mode (prioritize battery charging)  
+    - 2: Grid First mode (prioritize selling to grid)
+    
+    Returns:
+        Dict containing the register value or None on error
+    """
+    if not controller.mqtt_client:
+        return None
+    
+    # Ensure result subscription is active
+    await _setup_result_subscription(controller)
+    
+    try:
+        # Create a future to wait for the response
+        future: asyncio.Future = asyncio.Future()
+        _command_responses["register/get/1044"] = future
+        
+        # Send the query for register 1044
+        await controller.mqtt_client.publish(
+            "energy/solar/command/register/get", 
+            json.dumps({"register": 1044})
+        )
+        
+        # Wait for response with timeout
+        response = await asyncio.wait_for(future, timeout=2.0)
+        return response
+    except asyncio.TimeoutError:
+        controller.logger.debug("Timeout querying register 1044")
+        return {"error": "timeout", "register": 1044}
+    except Exception as e:
+        controller.logger.debug(f"Error querying register 1044: {e}")
+        return {"error": str(e), "register": 1044}
+    finally:
+        # Clean up the future
+        _command_responses.pop("register/get/1044", None)
+
+
+async def _set_register_1044(controller: GrowattController, value: int) -> Optional[Dict[str, Any]]:
+    """Set register 1044 to change the inverter operating mode.
+    
+    This provides a simplified way to change modes by directly writing to register 1044.
+    
+    Args:
+        value: The mode value to set:
+            - 0: Load First mode (normal operation)
+            - 1: Battery First mode (prioritize battery charging)  
+            - 2: Grid First mode (prioritize selling to grid)
+    
+    Returns:
+        Dict containing the response or None on error
+    """
+    if not controller.mqtt_client:
+        return None
+        
+    if value not in [0, 1, 2]:
+        controller.logger.error(f"Invalid register 1044 value: {value}. Must be 0, 1, or 2")
+        return {"error": "invalid_value", "register": 1044, "value": value}
+    
+    # Ensure result subscription is active
+    await _setup_result_subscription(controller)
+    
+    try:
+        # Create a future to wait for the response
+        future: asyncio.Future = asyncio.Future()
+        _command_responses["register/set/1044"] = future
+        
+        # Log the mode change
+        mode_names = {0: "Load First", 1: "Battery First", 2: "Grid First"}
+        controller.logger.info(
+            f"🔧 Setting register 1044 to {value} ({mode_names.get(value, 'Unknown')})"
+        )
+        
+        # Send the command to set register 1044
+        await controller.mqtt_client.publish(
+            "energy/solar/command/register/set", 
+            json.dumps({"register": 1044, "value": value})
+        )
+        
+        # Wait for response with timeout
+        response = await asyncio.wait_for(future, timeout=3.0)
+        
+        # Log result
+        if response.get("success"):
+            controller.logger.info(
+                f"✅ Successfully set register 1044 to {value} ({mode_names.get(value, 'Unknown')})"
+            )
+        else:
+            controller.logger.error(
+                f"❌ Failed to set register 1044: {response.get('message', 'Unknown error')}"
+            )
+            controller.logger.error(f"📋 Full response: {json.dumps(response, indent=2)}")
+            
+        return response
+    except asyncio.TimeoutError:
+        controller.logger.error("Timeout setting register 1044")
+        return {"error": "timeout", "register": 1044, "value": value}
+    except Exception as e:
+        controller.logger.error(f"Error setting register 1044: {e}")
+        return {"error": str(e), "register": 1044, "value": value}
+    finally:
+        # Clean up the future
+        _command_responses.pop("register/set/1044", None)
 
 
 async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]:
@@ -190,6 +309,9 @@ def create_growatt_api(
     app.router.add_post('/api/growatt/manual-mode', manual_mode_set)
     app.router.add_delete('/api/growatt/manual-mode', manual_mode_clear)
     app.router.add_get('/api/growatt/manual-mode', manual_mode_status)
+    
+    # Register 1044 direct mode control
+    app.router.add_post('/api/growatt/set-mode-register', set_mode_via_register)
 
     # Dashboard routes
     app.router.add_get('/inverter', serve_dashboard)
@@ -734,6 +856,79 @@ async def _query_inverter_realtime(
     return data
 
 
+async def set_mode_via_register(request: web.Request) -> web.Response:
+    """Set inverter mode by directly writing to register 1044.
+    
+    This provides a simplified mode control mechanism.
+    
+    Expected JSON payload:
+    {
+        "mode": "load_first" | "battery_first" | "grid_first"
+        // OR
+        "value": 0 | 1 | 2
+    }
+    """
+    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
+    if not controller:
+        return web.json_response(
+            {"error": "Controller not initialized"}, status=503
+        )
+    
+    try:
+        data = await request.json()
+        
+        # Accept either mode name or numeric value
+        if "mode" in data:
+            mode_map = {
+                "load_first": 0,
+                "battery_first": 1, 
+                "grid_first": 2
+            }
+            value = mode_map.get(data["mode"])
+            if value is None:
+                return web.json_response(
+                    {"error": f"Invalid mode: {data['mode']}. Must be load_first, battery_first, or grid_first"},
+                    status=400
+                )
+        elif "value" in data:
+            value = data["value"]
+            if value not in [0, 1, 2]:
+                return web.json_response(
+                    {"error": f"Invalid value: {value}. Must be 0, 1, or 2"},
+                    status=400
+                )
+        else:
+            return web.json_response(
+                {"error": "Must provide either 'mode' or 'value' parameter"},
+                status=400
+            )
+        
+        # Set the register value
+        result = await _set_register_1044(controller, value)
+        
+        if result and not result.get("error"):
+            mode_names = {0: "load_first", 1: "battery_first", 2: "grid_first"}
+            return web.json_response({
+                "success": True,
+                "mode": mode_names[value],
+                "value": value,
+                "register": 1044,
+                "response": result
+            })
+        else:
+            return web.json_response({
+                "success": False,
+                "error": result.get("error", "Failed to set mode"),
+                "response": result
+            }, status=500)
+            
+    except Exception as e:
+        controller.logger.error(f"Error setting mode via register: {e}")
+        return web.json_response(
+            {"error": str(e)}, status=500
+        )
+
+
 async def get_dashboard_status(request: web.Request) -> web.Response:
     """Get comprehensive inverter status for dashboard display.
 
@@ -756,6 +951,15 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
 
         # Get real-time inverter data
         realtime_data = await _query_inverter_realtime(controller)
+        
+        # Query register 1044 for actual inverter mode
+        register_1044 = await _query_register_1044(controller)
+        actual_mode = None
+        if register_1044 and not register_1044.get("error"):
+            mode_value = register_1044.get("value")
+            if mode_value is not None:
+                mode_map = {0: "load_first", 1: "battery_first", 2: "grid_first"}
+                actual_mode = mode_map.get(mode_value, f"unknown_{mode_value}")
 
         # Find active periods and current mode
         active_periods = []
@@ -805,6 +1009,8 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
         status = {
             "connected": controller._running,
             "current_mode": mode_display,
+            "actual_inverter_mode": actual_mode,  # From register 1044
+            "register_1044": register_1044,  # Raw register data
             "simulation_mode": controller._optional_config.get("simulation_mode", False) if hasattr(controller, '_optional_config') else False,
 
             # Power flow data
