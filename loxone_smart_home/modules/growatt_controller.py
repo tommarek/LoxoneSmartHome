@@ -19,10 +19,12 @@ from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 
 
-PeriodType = Literal["battery_first", "grid_first", "load_first", "ac_charge", "export"]
+PeriodType = Literal[
+    "regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid"
+]
 
-# Mode precedence (highest → lowest). load_first is the fallback/default if none match.
-MODE_PRECEDENCE: Tuple[PeriodType, ...] = ("battery_first", "grid_first", "load_first")
+# Mode precedence for backward compatibility - not used with composite modes
+MODE_PRECEDENCE: Tuple[str, ...] = ("battery_first", "grid_first", "load_first")
 
 # Use a single end-of-day barrier everywhere
 EOD_HHMM = "23:59"
@@ -75,8 +77,9 @@ class GrowattController(BaseModule):
     """Growatt controller that manages battery charging based on energy prices."""
 
     def _select_primary_mode(self, modes: set[PeriodType]) -> PeriodType:
-        """Select primary mode based on precedence rules.
-        
+        """Select primary mode from active modes.
+
+        With composite modes, there should only be one active mode at a time.
         Manual overrides take precedence over everything else.
         """
         # Check for active manual override first
@@ -95,12 +98,11 @@ class GrowattController(BaseModule):
             else:
                 # No end time means manual override is permanent until cleared
                 return self._manual_override_period.kind
-        
-        # Fall back to automatic mode selection
-        for m in MODE_PRECEDENCE:
-            if m in modes:
-                return m
-        return "load_first"  # Default mode
+
+        # With composite modes, just return the first (and should be only) mode
+        if modes:
+            return next(iter(modes))
+        return "regular"  # Default composite mode
 
     def _validate_config(self) -> None:
         """Validate required config attributes and set defaults."""
@@ -435,37 +437,39 @@ class GrowattController(BaseModule):
                 "details": []
             }
 
-            # Add mode-specific details
-            if slot["primary_mode"] == "grid_first":
-                entry["mode"] = "GRID-FIRST"
-                # Find the first grid_first period from this slot's contributing periods
-                gf = next((p for p in slot["periods"] if p.kind == "grid_first" and p.params), None)
-                if gf and gf.params:
-                    stop_soc = gf.params.get("stop_soc", 20)
-                    power_rate = gf.params.get("power_rate", 100)
-                else:
-                    stop_soc = 20
-                    power_rate = 100
-                entry["details"].append(f"StopSOC: {stop_soc}%")
-                entry["details"].append(f"PowerRate: {power_rate}%")
-                entry["details"].append("Priority: Sell to grid")
-            elif slot["primary_mode"] == "battery_first":
-                entry["mode"] = "BATTERY-FIRST"
-                entry["details"].append("Priority: Charge battery")
-            elif slot["primary_mode"] == "load_first":
-                entry["mode"] = "LOAD-FIRST"
-                entry["details"].append("Priority: Supply loads")
+            # Add mode-specific details for composite modes
+            period = slot["periods"][0] if slot["periods"] else None
 
-            # Add AC charging status
-            if "ac_charge" in slot["modes"]:
-                entry["details"].append("AC Charging: ENABLED")
-            elif slot["primary_mode"] in ["battery_first", "grid_first"]:
-                entry["details"].append("AC Charging: DISABLED")
-
-            # Add export status
-            if "export" in slot["modes"]:
+            if slot["primary_mode"] == "discharge_to_grid":
+                entry["mode"] = "DISCHARGE-TO-GRID"
+                if period and period.params:
+                    stop_soc = period.params.get("stop_soc", 20)
+                    power_rate = period.params.get("power_rate", 100)
+                    entry["details"].append(f"Discharge to {stop_soc}% SOC")
+                    entry["details"].append(f"Power rate: {power_rate}%")
                 entry["details"].append("Export: ENABLED")
-            else:
+
+            elif slot["primary_mode"] == "charge_from_grid":
+                entry["mode"] = "CHARGE-FROM-GRID"
+                if period and period.params:
+                    stop_soc = period.params.get("stop_soc", 90)
+                    entry["details"].append(f"Charge to {stop_soc}% SOC")
+                entry["details"].append("AC Charging: ENABLED")
+                entry["details"].append("Export: DISABLED")
+
+            elif slot["primary_mode"] == "sell_production":
+                entry["mode"] = "SELL-PRODUCTION"
+                entry["details"].append("Sell solar only (no battery discharge)")
+                entry["details"].append("Export: ENABLED")
+
+            elif slot["primary_mode"] == "regular":
+                entry["mode"] = "REGULAR"
+                entry["details"].append("Normal operation")
+                entry["details"].append("Export: ENABLED")
+
+            elif slot["primary_mode"] == "regular_no_export":
+                entry["mode"] = "REGULAR-NO-EXPORT"
+                entry["details"].append("Normal operation")
                 entry["details"].append("Export: DISABLED")
 
             schedule_entries.append(entry)
@@ -966,130 +970,34 @@ class GrowattController(BaseModule):
                     f"Manual override active: {mode} "
                     f"(until {override_status.get('end_time', 'manual clear')})"
                 )
-                
-                # Apply the manual mode
-                if mode == "battery_first":
-                    await self._set_battery_first(
-                        "00:00", "23:59",
-                        stop_soc=params.get("stop_soc", 90),
-                        power_rate=params.get("power_rate", 100)
-                    )
-                elif mode == "grid_first":
-                    await self._set_grid_first(
-                        "00:00", "23:59",
-                        stop_soc=params.get("stop_soc", 20),
-                        power_rate=params.get("power_rate", 10)
-                    )
+
+                # Apply the composite mode
+                await self._apply_composite_mode(mode, params)
                 return
 
         if not self._scheduled_periods:
-            self.logger.info("No scheduled periods found yet, skipping startup state sync")
+            self.logger.info("No scheduled periods found yet, applying default mode")
+            await self._apply_composite_mode("regular")
             return
 
-        # Collect all active period types at current time
-        active: set[PeriodType] = set()
+        # Find the active period at current time (should be only one with composite modes)
         active_period: Optional[Period] = None
         for period in self._scheduled_periods:
             if period.contains_time(now_t):
-                active.add(period.kind)
-                # Track the primary period for time window
-                if period.kind in ("grid_first", "battery_first") and active_period is None:
-                    active_period = period
+                active_period = period
                 self.logger.info(
                     f"Currently in {period.kind} period "
                     f"({period.start.strftime('%H:%M')}-{period.end.strftime('%H:%M')})"
                 )
+                break
 
-        # Decide desired state with deterministic precedence
-        primary = self._select_primary_mode(active)
-        desired_mode: Tuple[Any, ...]
-        if primary == "grid_first":
-            # Try to get params from an active scheduled grid-first period
-            stop_soc = 20  # Default
-            power_rate = 100  # Default
-            for p in self._scheduled_periods:
-                if p.kind == "grid_first" and p.contains_time(now_t) and p.params:
-                    stop_soc = int(p.params.get("stop_soc", stop_soc))
-                    power_rate = int(p.params.get("power_rate", power_rate))
-                    break
-            desired_mode = ("grid_first", stop_soc, power_rate)
-        elif primary == "battery_first":
-            desired_mode = ("battery_first",)
+        if active_period:
+            # Apply the composite mode for the active period
+            await self._apply_composite_mode(active_period.kind, active_period.params)
         else:
-            desired_mode = ("load_first",)  # Default mode
-
-        # Export and AC charging flags
-        want_export = "export" in active
-        want_ac = "ac_charge" in active
-
-        # Always reset to load_first before applying new mode to ensure clean state
-        if desired_mode[0] != "load_first":
-            self.logger.info("Resetting to load-first mode before applying new mode...")
-            await self._set_load_first()
-            await asyncio.sleep(0.5)  # Small delay after reset
-
-        # Apply mode
-        self.logger.info(f"Applying mode: {desired_mode[0]}")
-
-        # Use the actual period end time if available, otherwise use current time
-        if active_period and desired_mode[0] in ("grid_first", "battery_first"):
-            # Use the actual scheduled period times
-            current_hour = now.strftime("%H:%M")
-            # Format the end time from the period
-            period_end = active_period.end.strftime("%H:%M")
-            # Check if period ends at midnight (00:00) and convert to 24:00
-            if period_end == "00:00":
-                period_end = "24:00"
-        else:
-            # Fallback to narrow window if no period found (shouldn't happen)
-            current_hour = now.strftime("%H:00")
-            end = now + timedelta(hours=1)
-            # Handle midnight crossing safely
-            if end.date() != now.date():
-                period_end = EOD_HHMMSS  # Stop at end of day
-            else:
-                period_end = end.strftime("%H:00")
-
-        if desired_mode[0] == "battery_first":
-            # Use _emit_device_window to handle midnight wrap properly
-            # Preserve duration since we're using the full period
-            await self._emit_device_window(
-                self._set_battery_first, current_hour, period_end, preserve_when_same_day=True
-            )
-        elif desired_mode[0] == "grid_first":
-            # Use _emit_device_window to handle midnight wrap properly
-            # Preserve duration since we're using the full period
-            await self._emit_device_window(
-                self._set_grid_first, current_hour, period_end,
-                desired_mode[1], desired_mode[2],
-                preserve_when_same_day=True,
-            )
-        elif desired_mode[0] == "load_first":
-            # Already set above if needed
-            pass
-
-        # Small delay before AC charging control
-        await asyncio.sleep(0.5)
-
-        # AC charging (honor summer mode rule)
-        season = await self._get_season_mode()
-        if season == "summer" and want_ac:
-            self.logger.info("Summer mode active, disabling AC charging despite schedule")
-            want_ac = False
-
-        if want_ac:
-            await self._enable_ac_charge()
-        else:
-            await self._disable_ac_charge()
-
-        # Small delay before export control
-        await asyncio.sleep(0.5)
-
-        # Export control
-        if want_export:
-            await self._enable_export()
-        else:
-            await self._disable_export()
+            # No active period, apply default mode
+            self.logger.info("No active period found, applying default mode")
+            await self._apply_composite_mode("regular")
 
         self.logger.info("Startup state synchronization complete")
 
@@ -1765,29 +1673,90 @@ class GrowattController(BaseModule):
             f"⚖️ LOAD-FIRST MODE SET (disabled battery & grid first) at {current_time}"
         )
 
+    async def _apply_composite_mode(
+        self,
+        mode: PeriodType,
+        params: Optional[Dict[str, Any]] = None
+    ) -> None:
+        """Apply one of the 5 composite modes.
+
+        Args:
+            mode: One of the 5 composite modes
+            params: Optional parameters (stop_soc, power_rate for discharge modes)
+        """
+        params = params or {}
+
+        # Always reset to load_first first for clean state (matching current behavior)
+        await self._set_load_first()
+        await asyncio.sleep(0.5)
+
+        if mode == "regular":
+            # Load-first with export enabled
+            await self._enable_export()
+            await self._disable_ac_charge()
+            self.logger.info("Applied mode: REGULAR (load-first with export)")
+
+        elif mode == "sell_production":
+            # Grid-first with 100% SOC = only sell solar production
+            await self._set_grid_first("00:00", "23:59", stop_soc=100, power_rate=100)
+            await asyncio.sleep(0.5)
+            await self._enable_export()
+            await self._disable_ac_charge()
+            self.logger.info("Applied mode: SELL_PRODUCTION (grid-first @ 100% SOC)")
+
+        elif mode == "regular_no_export":
+            # Load-first without export
+            await self._disable_export()
+            await self._disable_ac_charge()
+            self.logger.info("Applied mode: REGULAR_NO_EXPORT (load-first, no export)")
+
+        elif mode == "charge_from_grid":
+            # Battery-first with AC charging enabled
+            stop_soc = params.get("stop_soc", 90)
+            power_rate = params.get("power_rate", 100)
+            await self._set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+            await asyncio.sleep(0.5)
+            await self._enable_ac_charge()
+            await self._disable_export()
+            self.logger.info(f"Applied mode: CHARGE_FROM_GRID (battery-first, AC charge to {stop_soc}%)")
+
+        elif mode == "discharge_to_grid":
+            # Grid-first with custom discharge parameters
+            stop_soc = params.get("stop_soc", 20)
+            power_rate = params.get("power_rate", 100)
+            await self._set_grid_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+            await asyncio.sleep(0.5)
+            await self._enable_export()
+            await self._disable_ac_charge()
+            self.logger.info(f"Applied mode: DISCHARGE_TO_GRID (grid-first to {stop_soc}% @ {power_rate}%)")
+
     async def set_manual_override(
         self,
-        mode: str,
+        mode: PeriodType,
         duration_type: str,
         duration_value: Optional[Union[str, int]] = None,
         params: Optional[Dict[str, Any]] = None,
         source: str = "api"
     ) -> Dict[str, Any]:
         """Set manual mode override.
-        
+
         Args:
-            mode: "battery_first" or "grid_first"
+            mode: One of the 5 composite modes
             duration_type: "immediate", "end_of_day", "duration_hours", or "until_time"
             duration_value: Value for duration (hours for duration_hours, "HH:MM" for until_time)
-            params: Optional parameters (stop_soc, power_rate)
+            params: Optional parameters (stop_soc, power_rate for discharge/charge modes)
             source: Source of the override ("api" or "dashboard")
-        
+
         Returns:
             Dict with success status and details
         """
         # Validate mode
-        if mode not in ["battery_first", "grid_first"]:
-            raise ValueError(f"Invalid mode: {mode}")
+        valid_modes = [
+            "regular", "sell_production", "regular_no_export",
+            "charge_from_grid", "discharge_to_grid"
+        ]
+        if mode not in valid_modes:
+            raise ValueError(f"Invalid mode: {mode}. Must be one of {valid_modes}")
         
         # Calculate end time based on duration type
         now = self._get_local_now()
@@ -1821,20 +1790,21 @@ class GrowattController(BaseModule):
         else:
             raise ValueError(f"Invalid duration type: {duration_type}")
         
-        # Set default params if not provided
+        # Set default params if not provided based on mode
         if params is None:
             params = {}
-        
-        if mode == "battery_first":
+
+        # Set sensible defaults for modes that need params
+        if mode == "charge_from_grid":
             params.setdefault("stop_soc", 90)
             params.setdefault("power_rate", 100)
-        else:  # grid_first
+        elif mode == "discharge_to_grid":
             params.setdefault("stop_soc", 20)
-            params.setdefault("power_rate", 10)
-        
+            params.setdefault("power_rate", 100)
+
         # Create manual override period
         self._manual_override_period = Period(
-            kind=mode,  # type: ignore
+            kind=mode,
             start=dt_time(0, 0),  # Start time doesn't matter for manual override
             end=dt_time(23, 59, 59),  # End time doesn't matter, we use _manual_override_end_time
             params=params,
@@ -1843,21 +1813,10 @@ class GrowattController(BaseModule):
         )
         self._manual_override_end_time = end_time
         self._manual_override_source = source
-        
-        # Apply the mode immediately
+
+        # Apply the composite mode immediately
         try:
-            if mode == "battery_first":
-                await self._set_battery_first(
-                    "00:00", "23:59",
-                    stop_soc=params["stop_soc"],
-                    power_rate=params["power_rate"]
-                )
-            else:  # grid_first
-                await self._set_grid_first(
-                    "00:00", "23:59",
-                    stop_soc=params["stop_soc"],
-                    power_rate=params["power_rate"]
-                )
+            await self._apply_composite_mode(mode, params)
             
             # Log manual intervention
             end_str = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "manual clear"
@@ -1894,7 +1853,7 @@ class GrowattController(BaseModule):
         if had_override:
             # Re-evaluate automatic schedule
             self.logger.info("🔄 Manual override cleared, re-evaluating automatic schedule")
-            await self._sync_startup_state()
+            await self._apply_current_state()
             
             return {
                 "success": True,
@@ -2399,39 +2358,21 @@ class GrowattController(BaseModule):
         hourly_prices: Dict[Tuple[str, str], float],
         eur_czk_rate: float,
     ) -> None:
-        """Schedule battery control based on price analysis."""
-        # Group battery-first hours into contiguous blocks
-        battery_first_hours = [
-            (start, stop, hourly_prices[(start, stop)]) for start, stop in all_cheap_hours
-        ]
-        battery_first_groups = self._group_contiguous_hours_simple(battery_first_hours)
-
-        # Schedule battery-first mode for each block
-        for group_start, group_end in battery_first_groups:
-            self.logger.info(f"Scheduling battery-first mode from {group_start} to {group_end}")
-            self._scheduled_periods.append(
-                Period("battery_first", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
-            )
-            task = self._schedule_action(
-                group_start, self._emit_device_window,
-                self._set_battery_first, group_start, group_end
-            )
-            self._scheduled_tasks.append(task)
-
-        # Schedule AC charging during cheapest consecutive hours
+        """Schedule battery control based on price analysis using composite modes."""
+        # Schedule charge_from_grid during cheapest consecutive hours
         if cheapest_consecutive:
-            ac_charge_hours = [
+            charge_hours = [
                 (start, stop, hourly_prices[(start, stop)]) for start, stop in cheapest_consecutive
             ]
-            ac_charge_groups = self._group_contiguous_hours_simple(ac_charge_hours)
+            charge_groups = self._group_contiguous_hours_simple(charge_hours)
 
-            for start_time, stop_time in ac_charge_groups:
+            for start_time, stop_time in charge_groups:
                 # Calculate price statistics for this charging period
                 start_t = self._parse_hhmm(start_time)
                 stop_t = self._parse_hhmm(stop_time)
                 charge_prices = [
                     price
-                    for start, stop, price in ac_charge_hours
+                    for start, stop, price in charge_hours
                     if self._parse_hhmm(start) >= start_t and self._parse_hhmm(stop) <= stop_t
                 ]
                 if charge_prices:
@@ -2439,39 +2380,77 @@ class GrowattController(BaseModule):
                     max_charge_price = max(charge_prices)
                     avg_charge_price = sum(charge_prices) / len(charge_prices)
 
-                    # Convert to CZK/kWh for display (use provided rate)
-                    min_charge_price_czk_kwh = min_charge_price * eur_czk_rate / 1000
-                    max_charge_price_czk_kwh = max_charge_price * eur_czk_rate / 1000
-                    avg_charge_price_czk_kwh = avg_charge_price * eur_czk_rate / 1000
+                    # Convert to CZK/kWh for display
+                    min_charge_price_czk = min_charge_price * eur_czk_rate / 1000
+                    max_charge_price_czk = max_charge_price * eur_czk_rate / 1000
+                    avg_charge_price_czk = avg_charge_price * eur_czk_rate / 1000
 
                     self.logger.info(
-                        f"Scheduling AC charge from {start_time} to {stop_time} "
-                        f"(min: {min_charge_price:.2f}, avg: {avg_charge_price:.2f}, "
-                        f"max: {max_charge_price:.2f} EUR/MWh = "
-                        f"{min_charge_price_czk_kwh:.2f}-{avg_charge_price_czk_kwh:.2f}-"
-                        f"{max_charge_price_czk_kwh:.2f} CZK/kWh)"
+                        f"Scheduling CHARGE_FROM_GRID from {start_time} to {stop_time} "
+                        f"(avg: {avg_charge_price:.2f} EUR/MWh = {avg_charge_price_czk:.2f} CZK/kWh)"
+                    )
+
+                # Schedule charge_from_grid composite mode
+                self._scheduled_periods.append(
+                    Period("charge_from_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
+                           params={"stop_soc": 90})
+                )
+                task = self._schedule_action(start_time, self._apply_composite_mode, "charge_from_grid",
+                                            {"stop_soc": 90})
+                self._scheduled_tasks.append(task)
+
+        # Determine high-price hours for discharge_to_grid
+        threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
+        high_price_hours = [
+            (start, stop, price)
+            for (start, stop), price in hourly_prices.items()
+            if price > threshold_eur_mwh * 1.5  # 50% above threshold for discharge
+        ]
+
+        if high_price_hours:
+            discharge_groups = self._group_contiguous_hours_simple(high_price_hours)
+            for start_time, stop_time in discharge_groups:
+                self.logger.info(f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time}")
+                self._scheduled_periods.append(
+                    Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
+                           params={"stop_soc": 20, "power_rate": 100})
+                )
+                task = self._schedule_action(start_time, self._apply_composite_mode, "discharge_to_grid",
+                                            {"stop_soc": 20, "power_rate": 100})
+                self._scheduled_tasks.append(task)
+
+        # Fill gaps with regular or regular_no_export based on price
+        all_scheduled_times = set()
+        for period in self._scheduled_periods:
+            # Add all hours covered by scheduled periods
+            start_hour = period.start.hour
+            end_hour = period.end.hour if period.end != dt_time(0, 0) else 24
+            if start_hour <= end_hour:
+                for h in range(start_hour, end_hour):
+                    all_scheduled_times.add(f"{h:02d}:00")
+            else:
+                # Wraps midnight
+                for h in range(start_hour, 24):
+                    all_scheduled_times.add(f"{h:02d}:00")
+                for h in range(0, end_hour):
+                    all_scheduled_times.add(f"{h:02d}:00")
+
+        # Schedule regular modes for unscheduled hours
+        for (start, stop), price in sorted(hourly_prices.items()):
+            if start not in all_scheduled_times:
+                if price < threshold_eur_mwh:
+                    # Low price - don't export
+                    self._scheduled_periods.append(
+                        Period("regular_no_export", self._parse_hhmm(start), self._parse_hhmm(stop))
                     )
                 else:
-                    self.logger.info(
-                        f"Scheduling AC charge from {start_time} to {stop_time} (no price data)"
+                    # Normal/high price - allow export
+                    self._scheduled_periods.append(
+                        Period("regular", self._parse_hhmm(start), self._parse_hhmm(stop))
                     )
 
-                # Track AC charge period
-                self._scheduled_periods.append(
-                    Period("ac_charge", self._parse_hhmm(start_time), self._parse_hhmm(stop_time))
-                )
-
-                # Schedule AC charge start
-                task = self._schedule_action(start_time, self._enable_ac_charge)
-                self._scheduled_tasks.append(task)
-
-                # Schedule AC charge stop (normalize if 24:00)
-                stop_time_norm = self._normalize_end_time(stop_time)
-                task = self._schedule_action(stop_time_norm, self._disable_ac_charge)
-                self._scheduled_tasks.append(task)
-
-        # Schedule export control
-        await self._schedule_export_control(hourly_prices, eur_czk_rate)
+        # Export control is now handled by composite modes
+        # No need for separate export scheduling
 
         # Ensure clean end-of-day state
         self._schedule_end_of_day_cleanup()

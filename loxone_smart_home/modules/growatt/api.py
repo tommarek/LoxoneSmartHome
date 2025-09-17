@@ -412,12 +412,10 @@ async def set_mode(request: web.Request) -> web.Response:
 
     Expected JSON payload:
     {
-        "mode": "battery_first" | "grid_first" | "load_first",
-        "start": "HH:MM",
-        "stop": "HH:MM",
+        "mode": "regular" | "sell_production" | "regular_no_export" | "charge_from_grid" | "discharge_to_grid",
         "params": {
-            "stop_soc": 90,
-            "power_rate": 100
+            "stop_soc": 90,     // optional - for charge_from_grid or discharge_to_grid
+            "power_rate": 100   // optional - for discharge_to_grid
         }
     }
     """
@@ -431,35 +429,19 @@ async def set_mode(request: web.Request) -> web.Response:
         data = await request.json()
         mode = data.get("mode")
 
-        if mode not in ["battery_first", "grid_first", "load_first"]:
-            return web.json_response({"error": "Invalid mode"}, status=400)
+        valid_modes = ["regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid"]
+        if mode not in valid_modes:
+            return web.json_response({"error": f"Invalid mode. Must be one of {valid_modes}"}, status=400)
 
-        # Apply the mode
-        if mode == "battery_first":
-            start = data.get("start", "00:00")
-            stop = data.get("stop", "23:59")
-            params = data.get("params", {})
-            await controller._set_battery_first(
-                start, stop,
-                stop_soc=params.get("stop_soc", 90),
-                power_rate=params.get("power_rate", 100)
-            )
-        elif mode == "grid_first":
-            start = data.get("start", "00:00")
-            stop = data.get("stop", "23:59")
-            params = data.get("params", {})
-            await controller._set_grid_first(
-                start, stop,
-                stop_soc=params.get("stop_soc", 20),
-                power_rate=params.get("power_rate", 100)
-            )
-        else:
-            await controller._set_load_first()
+        # Apply the composite mode
+        params = data.get("params", {})
+        await controller._apply_composite_mode(mode, params)
 
         return web.json_response({
             "success": True,
             "mode": mode,
-            "message": f"Mode set to {mode}"
+            "message": f"Mode set to {mode}",
+            "params": params
         })
 
     except Exception as e:
@@ -468,17 +450,17 @@ async def set_mode(request: web.Request) -> web.Response:
 
 async def manual_mode_set(request: web.Request) -> web.Response:
     """Set manual mode override.
-    
+
     Expected JSON payload:
     {
-        "mode": "battery_first" | "grid_first",
+        "mode": "regular" | "sell_production" | "regular_no_export" | "charge_from_grid" | "discharge_to_grid",
         "duration": {
             "type": "immediate" | "end_of_day" | "duration_hours" | "until_time",
             "value": null | 4 | "18:00"  // depends on type
         },
         "params": {
-            "stop_soc": 90,     // optional
-            "power_rate": 100   // optional
+            "stop_soc": 90,     // optional - for charge_from_grid or discharge_to_grid
+            "power_rate": 100   // optional - for discharge_to_grid
         },
         "source": "dashboard"  // optional, defaults to "api"
     }
