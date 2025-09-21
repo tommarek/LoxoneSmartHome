@@ -108,45 +108,22 @@ async def _setup_telemetry_subscription(controller: GrowattController) -> None:
 
 
 async def _query_register_1044(controller: GrowattController) -> Optional[Dict[str, Any]]:
-    """Query register 1044 for the current inverter operating mode/state.
-    
-    Register 1044 contains the current operating mode:
+    """Query register 1044 from telemetry cache.
+
+    Register 1044 (CurrentMode) contains the current operating mode:
     - 0: Load First mode (normal operation)
-    - 1: Battery First mode (prioritize battery charging)  
+    - 1: Battery First mode (prioritize battery charging)
     - 2: Grid First mode (prioritize selling to grid)
-    
+
     Returns:
-        Dict containing the register value or None on error
+        Dict containing the register value from telemetry cache
     """
-    if not controller.mqtt_client:
-        return None
-    
-    # Ensure result subscription is active
-    await _setup_result_subscription(controller)
-    
-    try:
-        # Create a future to wait for the response
-        future: asyncio.Future = asyncio.Future()
-        _command_responses["register/get/1044"] = future
-        
-        # Send the query for register 1044
-        await controller.mqtt_client.publish(
-            "energy/solar/command/register/get", 
-            json.dumps({"register": 1044})
-        )
-        
-        # Wait for response with timeout
-        response = await asyncio.wait_for(future, timeout=2.0)
-        return response
-    except asyncio.TimeoutError:
-        controller.logger.debug("Timeout querying register 1044")
-        return {"error": "timeout", "register": 1044}
-    except Exception as e:
-        controller.logger.debug(f"Error querying register 1044: {e}")
-        return {"error": str(e), "register": 1044}
-    finally:
-        # Clean up the future
-        _command_responses.pop("register/get/1044", None)
+    # Simply return the CurrentMode from telemetry cache
+    if _telemetry_cache:
+        mode_value = _telemetry_cache.get("CurrentMode")
+        if mode_value is not None:
+            return {"value": mode_value, "register": 1044, "source": "telemetry"}
+    return {"error": "no_telemetry_data", "register": 1044}
 
 
 async def _set_register_1044(controller: GrowattController, value: int) -> Optional[Dict[str, Any]]:
@@ -217,65 +194,62 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
 
 
 async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]:
-    """Query the inverter for current battery-first and grid-first slot configurations.
-    
+    """Get battery-first and grid-first slot configurations from telemetry cache.
+
     Returns:
-        Dict containing raw battery_first and grid_first responses from inverter
+        Dict containing battery_first and grid_first data from telemetry
     """
-    if not controller.mqtt_client:
-        return {}
-    
-    # Ensure result subscription is active
-    await _setup_result_subscription(controller)
-    
     result = {}
-    
-    # Query battery-first status
-    try:
-        # Create a future to wait for the response
-        bf_future: asyncio.Future = asyncio.Future()
-        _command_responses["batteryfirst/get"] = bf_future
-        
-        # Send the query with correct topic and empty JSON
-        await controller.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
-        
-        # Wait for response with timeout
-        bf_response = await asyncio.wait_for(bf_future, timeout=2.0)
-        # Return the raw response, whatever it is
-        result["battery_first_raw"] = bf_response
-    except asyncio.TimeoutError:
-        controller.logger.debug("Timeout querying battery-first status")
-        result["battery_first_raw"] = {"error": "timeout"}
-    except Exception as e:
-        controller.logger.debug(f"Error querying battery-first status: {e}")
-        result["battery_first_raw"] = {"error": str(e)}
-    finally:
-        # Clean up the future
-        _command_responses.pop("batteryfirst/get", None)
-    
-    # Query grid-first status
-    try:
-        # Create a future to wait for the response
-        gf_future: asyncio.Future = asyncio.Future()
-        _command_responses["gridfirst/get"] = gf_future
-        
-        # Send the query with correct topic and empty JSON
-        await controller.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
-        
-        # Wait for response with timeout
-        gf_response = await asyncio.wait_for(gf_future, timeout=2.0)
-        # Return the raw response, whatever it is
-        result["grid_first_raw"] = gf_response
-    except asyncio.TimeoutError:
-        controller.logger.debug("Timeout querying grid-first status")
-        result["grid_first_raw"] = {"error": "timeout"}
-    except Exception as e:
-        controller.logger.debug(f"Error querying grid-first status: {e}")
-        result["grid_first_raw"] = {"error": str(e)}
-    finally:
-        # Clean up the future
-        _command_responses.pop("gridfirst/get", None)
-    
+
+    if _telemetry_cache:
+        # Extract battery-first configuration from telemetry
+        result["battery_first_raw"] = {
+            "power_rate": _telemetry_cache.get("BattFirstPwrRate", 100),
+            "stop_soc": _telemetry_cache.get("BattFirstSOC", 100),
+            "ac_charge": _telemetry_cache.get("BattFirstACChrg", 0),
+            "slot1": {
+                "start": _telemetry_cache.get("BattSlot1Start", 0),
+                "stop": _telemetry_cache.get("BattSlot1Stop", 0),
+                "enabled": _telemetry_cache.get("BattSlot1En", 0)
+            },
+            "slot2": {
+                "start": _telemetry_cache.get("BattSlot2Start", 0),
+                "stop": _telemetry_cache.get("BattSlot2Stop", 0),
+                "enabled": _telemetry_cache.get("BattSlot2En", 0)
+            },
+            "slot3": {
+                "start": _telemetry_cache.get("BattSlot3Start", 0),
+                "stop": _telemetry_cache.get("BattSlot3Stop", 0),
+                "enabled": _telemetry_cache.get("BattSlot3En", 0)
+            },
+            "source": "telemetry"
+        }
+
+        # Extract grid-first configuration from telemetry
+        result["grid_first_raw"] = {
+            "power_rate": _telemetry_cache.get("GridFirstPwrRate", 100),
+            "stop_soc": _telemetry_cache.get("GridFirstSOC", 20),
+            "slot1": {
+                "start": _telemetry_cache.get("GridSlot1Start", 0),
+                "stop": _telemetry_cache.get("GridSlot1Stop", 0),
+                "enabled": _telemetry_cache.get("GridSlot1En", 0)
+            },
+            "slot2": {
+                "start": _telemetry_cache.get("GridSlot2Start", 0),
+                "stop": _telemetry_cache.get("GridSlot2Stop", 0),
+                "enabled": _telemetry_cache.get("GridSlot2En", 0)
+            },
+            "slot3": {
+                "start": _telemetry_cache.get("GridSlot3Start", 0),
+                "stop": _telemetry_cache.get("GridSlot3Stop", 0),
+                "enabled": _telemetry_cache.get("GridSlot3En", 0)
+            },
+            "source": "telemetry"
+        }
+    else:
+        result["battery_first_raw"] = {"error": "no_telemetry_data"}
+        result["grid_first_raw"] = {"error": "no_telemetry_data"}
+
     return result
 
 
@@ -354,21 +328,58 @@ async def get_status(request: web.Request) -> web.Response:
             if active_modes else "load_first"
         )
 
-        # Get inverter mode data from actual device
+        # Get inverter mode data from telemetry cache
         inverter_data = {}
         # Check if optional_config exists (it should be set during init)
         if hasattr(controller, '_optional_config') and not controller._optional_config.get("simulation_mode", False):
-            # Use cached telemetry data if available
+            # Use cached telemetry data - all data comes from MQTT now
             if _telemetry_cache:
-                # Active power rate is available in telemetry
+                # Extract all relevant slot configuration from telemetry
                 inverter_data["active_power_rate"] = _telemetry_cache.get("ActivePowerRate", 100)
+                inverter_data["current_mode"] = _telemetry_cache.get("CurrentMode", 0)
 
-            # Query actual slot configurations from the inverter
-            slot_data = await _query_inverter_slots(controller)
-            
-            # Just pass through the raw responses
-            inverter_data["battery_first_data"] = slot_data.get("battery_first_raw", {})
-            inverter_data["grid_first_data"] = slot_data.get("grid_first_raw", {})
+                # Battery-first configuration from telemetry
+                inverter_data["battery_first_data"] = {
+                    "power_rate": _telemetry_cache.get("BattFirstPwrRate", 100),
+                    "stop_soc": _telemetry_cache.get("BattFirstSOC", 100),
+                    "ac_charge": _telemetry_cache.get("BattFirstACChrg", 0),
+                    "slot1": {
+                        "start": _telemetry_cache.get("BattSlot1Start", 0),
+                        "stop": _telemetry_cache.get("BattSlot1Stop", 0),
+                        "enabled": _telemetry_cache.get("BattSlot1En", 0)
+                    },
+                    "slot2": {
+                        "start": _telemetry_cache.get("BattSlot2Start", 0),
+                        "stop": _telemetry_cache.get("BattSlot2Stop", 0),
+                        "enabled": _telemetry_cache.get("BattSlot2En", 0)
+                    },
+                    "slot3": {
+                        "start": _telemetry_cache.get("BattSlot3Start", 0),
+                        "stop": _telemetry_cache.get("BattSlot3Stop", 0),
+                        "enabled": _telemetry_cache.get("BattSlot3En", 0)
+                    }
+                }
+
+                # Grid-first configuration from telemetry
+                inverter_data["grid_first_data"] = {
+                    "power_rate": _telemetry_cache.get("GridFirstPwrRate", 100),
+                    "stop_soc": _telemetry_cache.get("GridFirstSOC", 20),
+                    "slot1": {
+                        "start": _telemetry_cache.get("GridSlot1Start", 0),
+                        "stop": _telemetry_cache.get("GridSlot1Stop", 0),
+                        "enabled": _telemetry_cache.get("GridSlot1En", 0)
+                    },
+                    "slot2": {
+                        "start": _telemetry_cache.get("GridSlot2Start", 0),
+                        "stop": _telemetry_cache.get("GridSlot2Stop", 0),
+                        "enabled": _telemetry_cache.get("GridSlot2En", 0)
+                    },
+                    "slot3": {
+                        "start": _telemetry_cache.get("GridSlot3Start", 0),
+                        "stop": _telemetry_cache.get("GridSlot3Stop", 0),
+                        "enabled": _telemetry_cache.get("GridSlot3En", 0)
+                    }
+                }
 
         # Get manual override status
         manual_override = controller.get_manual_override_status()
@@ -949,14 +960,13 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
         now = controller._get_local_now()
         now_t = now.time()
 
-        # Get real-time inverter data
+        # Get real-time inverter data from telemetry cache
         realtime_data = await _query_inverter_realtime(controller)
-        
-        # Query register 1044 for actual inverter mode
-        register_1044 = await _query_register_1044(controller)
+
+        # Get actual inverter mode from telemetry (CurrentMode field)
         actual_mode = None
-        if register_1044 and not register_1044.get("error"):
-            mode_value = register_1044.get("value")
+        if _telemetry_cache:
+            mode_value = _telemetry_cache.get("CurrentMode")
             if mode_value is not None:
                 mode_map = {0: "load_first", 1: "battery_first", 2: "grid_first"}
                 actual_mode = mode_map.get(mode_value, f"unknown_{mode_value}")
@@ -1009,8 +1019,7 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
         status = {
             "connected": controller._running,
             "current_mode": mode_display,
-            "actual_inverter_mode": actual_mode,  # From register 1044
-            "register_1044": register_1044,  # Raw register data
+            "actual_inverter_mode": actual_mode,  # From telemetry CurrentMode field
             "simulation_mode": controller._optional_config.get("simulation_mode", False) if hasattr(controller, '_optional_config') else False,
 
             # Power flow data
@@ -1036,11 +1045,78 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
             "daily_consumption": realtime_data.get("daily_consumption", 0),
             "daily_import": realtime_data.get("daily_import", 0),
             "daily_export": realtime_data.get("daily_export", 0),
+            "daily_charge": _telemetry_cache.get("ChargeEnergyToday", 0) if _telemetry_cache else 0,
+            "daily_discharge": _telemetry_cache.get("DischargeEnergyToday", 0) if _telemetry_cache else 0,
 
             # System info
             "season_mode": controller._season_mode,
             "ac_enabled": controller._ac_enabled,
             "export_enabled": controller._export_enabled,
+
+            # Additional telemetry data for dashboard
+            "telemetry": {
+                "last_update": _telemetry_last_update.isoformat() if _telemetry_last_update else None,
+                "export_limit": _telemetry_cache.get("ExportLimitValue", 0) if _telemetry_cache else 0,
+                "export_limit_enabled": _telemetry_cache.get("ExportLimitFlag", 0) if _telemetry_cache else 0,
+                "wifi_rssi": _telemetry_cache.get("WifiRSSI", 0) if _telemetry_cache else 0,
+                "uptime": _telemetry_cache.get("Uptime", 0) if _telemetry_cache else 0,
+                "pv1_power": realtime_data.get("pv1_power", 0),
+                "pv2_power": realtime_data.get("pv2_power", 0),
+                "pv1_voltage": realtime_data.get("pv1_voltage", 0),
+                "pv2_voltage": realtime_data.get("pv2_voltage", 0),
+                "grid_voltage": realtime_data.get("grid_voltage", 0),
+                "grid_frequency": realtime_data.get("grid_frequency", 0),
+                "inverter_temp": realtime_data.get("inverter_temp", 0),
+                "active_power_rate": realtime_data.get("active_power_rate", 100),
+                "battery_state": realtime_data.get("battery_state", 0),
+                "system_time": {
+                    "year": _telemetry_cache.get("SystemYear", 0) if _telemetry_cache else 0,
+                    "month": _telemetry_cache.get("SystemMonth", 0) if _telemetry_cache else 0,
+                    "day": _telemetry_cache.get("SystemDay", 0) if _telemetry_cache else 0,
+                    "hour": _telemetry_cache.get("SystemHour", 0) if _telemetry_cache else 0,
+                    "minute": _telemetry_cache.get("SystemMinute", 0) if _telemetry_cache else 0,
+                    "second": _telemetry_cache.get("SystemSecond", 0) if _telemetry_cache else 0
+                },
+                "battery_first_slots": {
+                    "power_rate": _telemetry_cache.get("BattFirstPwrRate", 100) if _telemetry_cache else 100,
+                    "stop_soc": _telemetry_cache.get("BattFirstSOC", 100) if _telemetry_cache else 100,
+                    "ac_charge": _telemetry_cache.get("BattFirstACChrg", 0) if _telemetry_cache else 0,
+                    "slot1": {
+                        "start": _telemetry_cache.get("BattSlot1Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("BattSlot1Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("BattSlot1En", 0) if _telemetry_cache else 0
+                    },
+                    "slot2": {
+                        "start": _telemetry_cache.get("BattSlot2Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("BattSlot2Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("BattSlot2En", 0) if _telemetry_cache else 0
+                    },
+                    "slot3": {
+                        "start": _telemetry_cache.get("BattSlot3Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("BattSlot3Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("BattSlot3En", 0) if _telemetry_cache else 0
+                    }
+                },
+                "grid_first_slots": {
+                    "power_rate": _telemetry_cache.get("GridFirstPwrRate", 100) if _telemetry_cache else 100,
+                    "stop_soc": _telemetry_cache.get("GridFirstSOC", 20) if _telemetry_cache else 20,
+                    "slot1": {
+                        "start": _telemetry_cache.get("GridSlot1Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("GridSlot1Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("GridSlot1En", 0) if _telemetry_cache else 0
+                    },
+                    "slot2": {
+                        "start": _telemetry_cache.get("GridSlot2Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("GridSlot2Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("GridSlot2En", 0) if _telemetry_cache else 0
+                    },
+                    "slot3": {
+                        "start": _telemetry_cache.get("GridSlot3Start", 0) if _telemetry_cache else 0,
+                        "stop": _telemetry_cache.get("GridSlot3Stop", 0) if _telemetry_cache else 0,
+                        "enabled": _telemetry_cache.get("GridSlot3En", 0) if _telemetry_cache else 0
+                    }
+                }
+            },
         }
 
         return web.json_response(status)
