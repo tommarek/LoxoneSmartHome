@@ -155,6 +155,8 @@ class GrowattScheduler:
 
         # 4. Schedule hourly periods based on price threshold
         previous_mode = None
+        period_start = None
+
         for hour in range(start_hour, 24):
             hour_str = f"{hour:02d}:00"
             next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
@@ -173,15 +175,19 @@ class GrowattScheduler:
                 mode = "regular"
                 mode_desc = f"export @ {price_czk:.3f} CZK/kWh"
 
-            # Only create a new period if mode changes
-            if mode != previous_mode:
-                self.logger.info(f"Hour {hour_str}: {mode} ({mode_desc})")
+            self.logger.info(f"Hour {hour_str}: {mode} ({mode_desc})")
 
-                # Create period for this hour (or until end of day for last period)
-                end_time = EOD_DTTIME if hour == 23 else dt_time(hour + 1, 0)
-                self.controller._scheduled_periods.append(
-                    Period(mode, dt_time(hour, 0), end_time)
-                )
+            # Handle mode changes or continuation
+            if mode != previous_mode:
+                # Close previous period if exists
+                if previous_mode is not None and period_start is not None:
+                    # End the previous period at current hour
+                    self.controller._scheduled_periods.append(
+                        Period(previous_mode, period_start, dt_time(hour, 0))
+                    )
+
+                # Start new period
+                period_start = dt_time(hour, 0)
 
                 # Schedule mode change
                 task = self.controller._schedule_action(
@@ -191,18 +197,24 @@ class GrowattScheduler:
 
                 previous_mode = mode
 
-            # Log summary
-            low_hours = sum(
-                1 for (start, _), price in hourly_prices.items()
-                if price < threshold_eur_mwh and
-                datetime.strptime(start, "%H:%M").time() >= sunrise_hour_time
+        # Close the last period
+        if previous_mode is not None and period_start is not None:
+            self.controller._scheduled_periods.append(
+                Period(previous_mode, period_start, EOD_DTTIME)
             )
-            high_hours = 24 - sunrise_hour - low_hours
 
-            self.logger.info(
-                f"Summer schedule: {low_hours} low-price hours (charge_from_solar), "
-                f"{high_hours} high-price hours (regular/sell_production)"
-            )
+        # Log summary (moved outside the loop)
+        low_hours = sum(
+            1 for (start, _), price in hourly_prices.items()
+            if price < threshold_eur_mwh and
+            datetime.strptime(start, "%H:%M").time() >= sunrise_hour_time
+        )
+        high_hours = 24 - sunrise_hour - low_hours
+
+        self.logger.info(
+            f"Summer schedule: {low_hours} low-price hours (charge_from_solar), "
+            f"{high_hours} high-price hours (regular/sell_production)"
+        )
 
     async def schedule_winter_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
