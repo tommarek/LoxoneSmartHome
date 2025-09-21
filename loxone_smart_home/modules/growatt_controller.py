@@ -20,7 +20,8 @@ from utils.async_mqtt_client import AsyncMQTTClient
 
 
 PeriodType = Literal[
-    "regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid"
+    "regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid",
+    "charge_from_solar"
 ]
 
 # Mode precedence for backward compatibility - not used with composite modes
@@ -2043,11 +2044,11 @@ class GrowattController(BaseModule):
         mode: PeriodType,
         params: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Apply one of the 5 composite modes.
+        """Apply one of the 6 composite modes.
 
         Args:
-            mode: One of the 5 composite modes
-            params: Optional parameters (stop_soc, power_rate for discharge modes)
+            mode: One of the 6 composite modes
+            params: Optional parameters (stop_soc, power_rate for discharge/charge modes)
         """
         params = params or {}
 
@@ -2095,6 +2096,16 @@ class GrowattController(BaseModule):
             await self._disable_ac_charge()
             self.logger.info(f"Applied mode: DISCHARGE_TO_GRID (grid-first to {stop_soc}% @ {power_rate}%)")
 
+        elif mode == "charge_from_solar":
+            # Battery-first without AC charging (solar only)
+            stop_soc = params.get("stop_soc", 100)
+            power_rate = params.get("power_rate", 100)
+            await self._set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+            await asyncio.sleep(0.5)
+            await self._disable_ac_charge()  # Critical: no grid charging
+            await self._disable_export()      # Don't export at low prices
+            self.logger.info(f"Applied mode: CHARGE_FROM_SOLAR (battery-first from solar only to {stop_soc}%)")
+
     async def set_manual_override(
         self,
         mode: PeriodType,
@@ -2106,7 +2117,7 @@ class GrowattController(BaseModule):
         """Set manual mode override.
 
         Args:
-            mode: One of the 5 composite modes
+            mode: One of the 6 composite modes
             duration_type: "immediate", "end_of_day", "duration_hours", or "until_time"
             duration_value: Value for duration (hours for duration_hours, "HH:MM" for until_time)
             params: Optional parameters (stop_soc, power_rate for discharge/charge modes)
@@ -2118,7 +2129,7 @@ class GrowattController(BaseModule):
         # Validate mode
         valid_modes = [
             "regular", "sell_production", "regular_no_export",
-            "charge_from_grid", "discharge_to_grid"
+            "charge_from_grid", "discharge_to_grid", "charge_from_solar"
         ]
         if mode not in valid_modes:
             raise ValueError(f"Invalid mode: {mode}. Must be one of {valid_modes}")
@@ -2479,247 +2490,121 @@ class GrowattController(BaseModule):
     async def _schedule_summer_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
-        """Schedule summer battery strategy with grid-first and low-price storage.
+        """Schedule summer operations with dynamic price-based mode switching.
 
-        Export Logic:
-        - DISABLED during low-price hours (< threshold, typically < 1 CZK/kWh)
-        - ENABLED during all other periods (prices > threshold)
-        - This maximizes profit by avoiding sales at low prices
+        In summer:
+        - Night (00:00 to sunrise): regular_no_export
+        - After sunrise until first low price: sell_production (export all solar)
+        - When price < threshold: charge_from_solar (store solar, no export)
+        - When price >= threshold: regular (normal operation with export)
         """
         # Convert threshold from CZK/kWh to EUR/MWh for comparison
         # Minimal guard against division by zero
         eur_czk_rate = max(eur_czk_rate, 1.0)
         threshold_eur_mwh = self.config.summer_price_threshold * 1000 / eur_czk_rate
 
-        # Find hours below the summer threshold (typically <1 CZK/kWh)
-        low_price_hours = [
-            (start, stop, price)
-            for (start, stop), price in hourly_prices.items()
-            if price < threshold_eur_mwh
-        ]
-
-        if not low_price_hours:
-            # No low-price hours - optimize based on time of day
-            self.logger.info(
-                f"Summer mode: No hours below "
-                f"{self.config.summer_price_threshold:.2f} CZK/kWh."
-            )
-
-            # Get sunrise time
-            now = self._get_local_now()
-            days_ahead = 1 if now.time() >= dt_time(23, 45) else 0
-            sunrise_time = self._get_sunrise_time(days_ahead)
-            sunrise_str = sunrise_time.strftime("%H:%M")
-            self.logger.info(f"Sunrise time: {sunrise_str}")
-
-            # Schedule Load-First from midnight until sunrise
-            if sunrise_time != dt_time(0, 0):
-                self.logger.info(
-                    f"Scheduling load-first from 00:00 to {sunrise_str} (overnight consumption)"
-                )
-                self._scheduled_periods.append(
-                    Period("load_first", dt_time(0, 0), sunrise_time)
-                )
-                # Since no hours are below threshold, all prices are good - enable export
-                self._scheduled_periods.append(
-                    Period("export", dt_time(0, 0), sunrise_time)
-                )
-
-                task = self._schedule_action("00:00", self._set_load_first)
-                self._scheduled_tasks.append(task)
-
-                # Enable export for overnight period (prices above threshold)
-                task = self._schedule_action(MIDNIGHT_JITTER, self._enable_export)
-                self._scheduled_tasks.append(task)
-
-            # Schedule Grid-First from sunrise to end of day (sell solar + battery at 10% rate)
-            self.logger.info(
-                f"Scheduling grid-first from {sunrise_str} to {EOD_HHMM} "
-                f"(sell solar + battery, stopSOC=20%, powerRate=10%)"
-            )
-            self._scheduled_periods.append(
-                Period("grid_first", sunrise_time, EOD_DTTIME,
-                       params={"stop_soc": 20, "power_rate": 100})
-            )
-            self._scheduled_periods.append(
-                Period("export", sunrise_time, EOD_DTTIME)
-            )
-
-            task = self._schedule_action(
-                sunrise_str, self._emit_device_window,
-                self._set_grid_first, sunrise_str, EOD_HHMM, 20, 10
-            )
-            self._scheduled_tasks.append(task)
-
-            # Enable export after sunrise
-            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._enable_export)
-            self._scheduled_tasks.append(task)
-            return
-
-        # Group low-price hours into contiguous periods
-        low_price_groups = self._group_contiguous_hours_simple(low_price_hours)
-
-        # Find the earliest and latest low-price times
-        first_low_start = min(start for start, _ in low_price_groups)
-        last_low_end = max(end for _, end in low_price_groups)
-
-        self.logger.info(
-            f"Summer mode: Found {len(low_price_hours)} hours below "
-            f"{self.config.summer_price_threshold:.2f} CZK/kWh. "
-            f"First low: {first_low_start}, Last low: {last_low_end}"
-        )
-
-        # Get sunrise time for the target day (tomorrow if scheduling after 23:45)
+        # Get sunrise time and round to hour boundary
         now = self._get_local_now()
         days_ahead = 1 if now.time() >= dt_time(23, 45) else 0
         sunrise_time = self._get_sunrise_time(days_ahead)
 
-        # Round sunrise to next hour boundary for hourly price alignment
+        # Round sunrise to next hour boundary
         sunrise_hour = sunrise_time.hour
         if sunrise_time.minute > 0:
             sunrise_hour = (sunrise_hour + 1) % 24
         sunrise_hour_time = dt_time(sunrise_hour, 0)
         sunrise_str = f"{sunrise_hour:02d}:00"
 
-        self.logger.info(f"Sunrise time: {sunrise_time.strftime('%H:%M')} -> rounded to {sunrise_str}")
+        self.logger.info(f"Sunrise: {sunrise_time.strftime('%H:%M')} -> rounded to {sunrise_str}")
 
-        # Schedule regular mode without export from midnight until sunrise hour
+        # 1. Schedule night period (00:00 to sunrise)
         if sunrise_hour > 0:
-            self.logger.info(
-                f"Scheduling regular_no_export from 00:00 to {sunrise_str} (overnight consumption)"
-            )
+            self.logger.info(f"Scheduling regular_no_export from 00:00 to {sunrise_str} (night)")
             self._scheduled_periods.append(
                 Period("regular_no_export", dt_time(0, 0), sunrise_hour_time)
             )
-
-            # Check if overnight prices are above threshold - if so, enable export
-            overnight_above_threshold = any(
-                (datetime.strptime(start, "%H:%M").time() < sunrise_hour_time)
-                and (price >= threshold_eur_mwh)
-                for ((start, _), price) in hourly_prices.items()
-            )
-
-            if overnight_above_threshold:
-                # Change to regular mode (with export) for overnight high prices
-                self.logger.info("Overnight prices above threshold, using regular mode with export")
-                self._scheduled_periods[-1] = Period("regular", dt_time(0, 0), sunrise_hour_time)
-
-            task = self._schedule_action(
-                "00:00",
-                self._apply_composite_mode,
-                "regular" if overnight_above_threshold else "regular_no_export"
-            )
+            task = self._schedule_action("00:00", self._apply_composite_mode, "regular_no_export")
             self._scheduled_tasks.append(task)
 
-        # Filter low price hours to only those AFTER sunrise
-        low_price_hours_after_sunrise = [
-            (start, end) for start, end in low_price_hours
-            if datetime.strptime(start, "%H:%M").time() >= sunrise_hour_time
-        ]
+        # 2. Find first low-price hour after sunrise
+        first_low_hour_after_sunrise = None
+        for hour in range(sunrise_hour, 24):
+            hour_str = f"{hour:02d}:00"
+            next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
+            price = hourly_prices.get((hour_str, next_hour_str), float('inf'))
+            if price < threshold_eur_mwh:
+                first_low_hour_after_sunrise = hour
+                break
 
-        if not low_price_hours_after_sunrise:
-            # No low prices after sunrise - use regular mode for the day
-            self.logger.info("No low-price hours after sunrise, using regular mode for the day")
-            if sunrise_hour < 24:
-                self._scheduled_periods.append(
-                    Period("regular", sunrise_hour_time, EOD_DTTIME)
-                )
-            return
-
-        # Group contiguous low-price hours after sunrise
-        low_groups_after_sunrise = self._group_contiguous_hours_simple(
-            [(start, end, hourly_prices[(start, end)])
-             for start, end in low_price_hours_after_sunrise]
-        )
-
-        first_low_start = low_groups_after_sunrise[0][0]
-        first_low_t = self._parse_hhmm(first_low_start)
-
-        # Schedule sell_production from sunrise until first low price (if there's a gap)
-        if first_low_t > sunrise_hour_time:
-            # Schedule sell_production mode for morning high prices
-            sell_end = first_low_start
+        # 3. Schedule sell_production from sunrise until first low price (if exists)
+        if first_low_hour_after_sunrise is not None and first_low_hour_after_sunrise > sunrise_hour:
+            sell_end_str = f"{first_low_hour_after_sunrise:02d}:00"
             self.logger.info(
-                f"Scheduling sell_production from {sunrise_str} to {sell_end} "
-                f"(sell morning solar at high prices)"
+                f"Scheduling sell_production from {sunrise_str} to {sell_end_str} "
+                f"(export all solar before cheap hours)"
             )
             self._scheduled_periods.append(
                 Period(
                     "sell_production",
                     sunrise_hour_time,
-                    self._parse_hhmm(sell_end)
+                    dt_time(first_low_hour_after_sunrise, 0)
                 )
             )
-
-            # Apply sell_production mode at sunrise
-            task = self._schedule_action(
-                sunrise_str,
-                self._apply_composite_mode,
-                "sell_production"
-            )
+            task = self._schedule_action(sunrise_str, self._apply_composite_mode, "sell_production")
             self._scheduled_tasks.append(task)
+            start_hour = first_low_hour_after_sunrise
+        else:
+            # No low prices found or they start immediately at sunrise
+            start_hour = sunrise_hour
 
-        # Schedule regular_no_export during each low-price period AFTER sunrise
-        previous_end = sunrise_str  # Start tracking from sunrise
-        for group_start, group_end in low_groups_after_sunrise:
-            # If there's a gap from previous period, schedule regular mode
-            if previous_end:
-                prev_end_t = self._parse_hhmm(previous_end)
-                group_start_t = self._parse_hhmm(group_start)
-                if prev_end_t < group_start_t:
-                    self.logger.info(
-                        f"Scheduling regular from {previous_end} to {group_start} (price gap with export)"
-                    )
-                    self._scheduled_periods.append(
-                        Period(
-                            "regular",
-                            self._parse_hhmm(previous_end),
-                            self._parse_hhmm(group_start)
-                        )
-                    )
-                    task = self._schedule_action(
-                        previous_end,
-                        self._apply_composite_mode,
-                        "regular"
-                    )
-                    self._scheduled_tasks.append(task)
+        # 4. Schedule hourly periods based on price threshold
+        previous_mode = None
+        for hour in range(start_hour, 24):
+            hour_str = f"{hour:02d}:00"
+            next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
 
-            # Schedule regular_no_export for this low-price period
-            # Battery will charge naturally from solar, but we don't export at low prices
-            self.logger.info(
-                f"Scheduling regular_no_export from {group_start} to {group_end} "
-                f"(store solar naturally, no export at low prices)"
-            )
-            self._scheduled_periods.append(
-                Period("regular_no_export", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
-            )
+            # Get price for this hour
+            price = hourly_prices.get((hour_str, next_hour_str), 0)
+            price_czk = price * eur_czk_rate / 1000
 
-            # Apply regular_no_export mode at start of low period
-            task = self._schedule_action(
-                group_start,
-                self._apply_composite_mode,
-                "regular_no_export"
-            )
-            self._scheduled_tasks.append(task)
+            # Determine mode based on price
+            if price < threshold_eur_mwh:
+                # Low price: store solar, no export
+                mode = "charge_from_solar"
+                mode_desc = f"store solar @ {price_czk:.3f} CZK/kWh"
+            else:
+                # High price: normal operation with export
+                mode = "regular"
+                mode_desc = f"export @ {price_czk:.3f} CZK/kWh"
 
-            previous_end = group_end
+            # Only create a new period if mode changes
+            if mode != previous_mode:
+                self.logger.info(f"Hour {hour_str}: {mode} ({mode_desc})")
 
-        # Schedule regular mode for evening (after last low price)
-        last_low_end = low_groups_after_sunrise[-1][1] if low_groups_after_sunrise else sunrise_str
-        if not _is_24(last_low_end):
-            self.logger.info(
-                f"Scheduling regular from {last_low_end} to {EOD_HHMM} (use stored energy with export)"
-            )
-            self._scheduled_periods.append(
-                Period("regular", self._parse_hhmm(last_low_end), EOD_DTTIME)
-            )
+                # Create period for this hour (or until end of day for last period)
+                end_time = EOD_DTTIME if hour == 23 else dt_time(hour + 1, 0)
+                self._scheduled_periods.append(
+                    Period(mode, dt_time(hour, 0), end_time)
+                )
 
-            task = self._schedule_action(
-                last_low_end,
-                self._apply_composite_mode,
-                "regular"
-            )
-            self._scheduled_tasks.append(task)
+                # Schedule mode change
+                task = self._schedule_action(hour_str, self._apply_composite_mode, mode)
+                self._scheduled_tasks.append(task)
+
+                previous_mode = mode
+
+        # Log summary
+        low_hours = sum(
+            1 for (start, _), price in hourly_prices.items()
+            if price < threshold_eur_mwh and
+            datetime.strptime(start, "%H:%M").time() >= sunrise_hour_time
+        )
+        high_hours = 24 - sunrise_hour - low_hours
+
+        self.logger.info(
+            f"Summer schedule: {low_hours} low-price hours (charge_from_solar), "
+            f"{high_hours} high-price hours (regular/sell_production)"
+        )
 
     async def _schedule_battery_control(
         self,
