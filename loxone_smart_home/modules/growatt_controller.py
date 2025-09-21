@@ -15,6 +15,7 @@ from astral.sun import sun
 
 from config.settings import Settings
 from modules.base import BaseModule
+from modules.growatt.scheduling import GrowattScheduler
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 
@@ -2490,121 +2491,16 @@ class GrowattController(BaseModule):
     async def _schedule_summer_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
-        """Schedule summer operations with dynamic price-based mode switching.
+        """Delegate to scheduler module."""
+        scheduler = GrowattScheduler(self)
+        await scheduler.schedule_summer_strategy(hourly_prices, eur_czk_rate)
 
-        In summer:
-        - Night (00:00 to sunrise): regular_no_export
-        - After sunrise until first low price: sell_production (export all solar)
-        - When price < threshold: charge_from_solar (store solar, no export)
-        - When price >= threshold: regular (normal operation with export)
-        """
-        # Convert threshold from CZK/kWh to EUR/MWh for comparison
-        # Minimal guard against division by zero
-        eur_czk_rate = max(eur_czk_rate, 1.0)
-        threshold_eur_mwh = self.config.summer_price_threshold * 1000 / eur_czk_rate
-
-        # Get sunrise time and round to hour boundary
-        now = self._get_local_now()
-        days_ahead = 1 if now.time() >= dt_time(23, 45) else 0
-        sunrise_time = self._get_sunrise_time(days_ahead)
-
-        # Round sunrise to next hour boundary
-        sunrise_hour = sunrise_time.hour
-        if sunrise_time.minute > 0:
-            sunrise_hour = (sunrise_hour + 1) % 24
-        sunrise_hour_time = dt_time(sunrise_hour, 0)
-        sunrise_str = f"{sunrise_hour:02d}:00"
-
-        self.logger.info(f"Sunrise: {sunrise_time.strftime('%H:%M')} -> rounded to {sunrise_str}")
-
-        # 1. Schedule night period (00:00 to sunrise)
-        if sunrise_hour > 0:
-            self.logger.info(f"Scheduling regular_no_export from 00:00 to {sunrise_str} (night)")
-            self._scheduled_periods.append(
-                Period("regular_no_export", dt_time(0, 0), sunrise_hour_time)
-            )
-            task = self._schedule_action("00:00", self._apply_composite_mode, "regular_no_export")
-            self._scheduled_tasks.append(task)
-
-        # 2. Find first low-price hour after sunrise
-        first_low_hour_after_sunrise = None
-        for hour in range(sunrise_hour, 24):
-            hour_str = f"{hour:02d}:00"
-            next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
-            price = hourly_prices.get((hour_str, next_hour_str), float('inf'))
-            if price < threshold_eur_mwh:
-                first_low_hour_after_sunrise = hour
-                break
-
-        # 3. Schedule sell_production from sunrise until first low price (if exists)
-        if first_low_hour_after_sunrise is not None and first_low_hour_after_sunrise > sunrise_hour:
-            sell_end_str = f"{first_low_hour_after_sunrise:02d}:00"
-            self.logger.info(
-                f"Scheduling sell_production from {sunrise_str} to {sell_end_str} "
-                f"(export all solar before cheap hours)"
-            )
-            self._scheduled_periods.append(
-                Period(
-                    "sell_production",
-                    sunrise_hour_time,
-                    dt_time(first_low_hour_after_sunrise, 0)
-                )
-            )
-            task = self._schedule_action(sunrise_str, self._apply_composite_mode, "sell_production")
-            self._scheduled_tasks.append(task)
-            start_hour = first_low_hour_after_sunrise
-        else:
-            # No low prices found or they start immediately at sunrise
-            start_hour = sunrise_hour
-
-        # 4. Schedule hourly periods based on price threshold
-        previous_mode = None
-        for hour in range(start_hour, 24):
-            hour_str = f"{hour:02d}:00"
-            next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
-
-            # Get price for this hour
-            price = hourly_prices.get((hour_str, next_hour_str), 0)
-            price_czk = price * eur_czk_rate / 1000
-
-            # Determine mode based on price
-            if price < threshold_eur_mwh:
-                # Low price: store solar, no export
-                mode = "charge_from_solar"
-                mode_desc = f"store solar @ {price_czk:.3f} CZK/kWh"
-            else:
-                # High price: normal operation with export
-                mode = "regular"
-                mode_desc = f"export @ {price_czk:.3f} CZK/kWh"
-
-            # Only create a new period if mode changes
-            if mode != previous_mode:
-                self.logger.info(f"Hour {hour_str}: {mode} ({mode_desc})")
-
-                # Create period for this hour (or until end of day for last period)
-                end_time = EOD_DTTIME if hour == 23 else dt_time(hour + 1, 0)
-                self._scheduled_periods.append(
-                    Period(mode, dt_time(hour, 0), end_time)
-                )
-
-                # Schedule mode change
-                task = self._schedule_action(hour_str, self._apply_composite_mode, mode)
-                self._scheduled_tasks.append(task)
-
-                previous_mode = mode
-
-        # Log summary
-        low_hours = sum(
-            1 for (start, _), price in hourly_prices.items()
-            if price < threshold_eur_mwh and
-            datetime.strptime(start, "%H:%M").time() >= sunrise_hour_time
-        )
-        high_hours = 24 - sunrise_hour - low_hours
-
-        self.logger.info(
-            f"Summer schedule: {low_hours} low-price hours (charge_from_solar), "
-            f"{high_hours} high-price hours (regular/sell_production)"
-        )
+    async def _schedule_winter_strategy(
+        self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
+    ) -> None:
+        """Delegate to scheduler module."""
+        scheduler = GrowattScheduler(self)
+        await scheduler.schedule_winter_strategy(hourly_prices, eur_czk_rate)
 
     async def _schedule_battery_control(
         self,
@@ -2613,7 +2509,20 @@ class GrowattController(BaseModule):
         hourly_prices: Dict[Tuple[str, str], float],
         eur_czk_rate: float,
     ) -> None:
-        """Schedule battery control based on price analysis using composite modes."""
+        """Delegate to scheduler module for compatibility."""
+        scheduler = GrowattScheduler(self)
+        await scheduler.schedule_battery_control(
+            all_cheap_hours, cheapest_consecutive, hourly_prices, eur_czk_rate
+        )
+
+    async def _schedule_battery_control_old(
+        self,
+        all_cheap_hours: set[Tuple[str, str]],
+        cheapest_consecutive: set[Tuple[str, str]],
+        hourly_prices: Dict[Tuple[str, str], float],
+        eur_czk_rate: float,
+    ) -> None:
+        """Original implementation - archived."""
         # Schedule charge_from_grid during cheapest consecutive hours
         if cheapest_consecutive:
             charge_hours = [
