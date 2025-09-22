@@ -62,6 +62,9 @@ class GrowattScheduler:
             # Simple mode switching: regular with export when high, regular_no_export when low
             self.logger.info("Summer: No prices below 1 CZK/kWh - using simple price-based switching")
 
+            previous_mode = None
+            period_start = None
+
             for hour in range(24):
                 hour_str = f"{hour:02d}:00"
                 next_hour_str = f"{hour+1:02d}:00" if hour < 23 else "24:00"
@@ -76,19 +79,33 @@ class GrowattScheduler:
                     mode = "regular_no_export"
                     mode_desc = f"no export @ {price_czk:.3f} CZK/kWh"
 
-                # Create period for each hour
-                end_time = EOD_DTTIME if hour == 23 else dt_time(hour + 1, 0)
-                self.controller._scheduled_periods.append(
-                    Period(mode, dt_time(hour, 0), end_time)
-                )
-
-                # Schedule mode change
-                task = self.controller._schedule_action(
-                    hour_str, self.controller._apply_composite_mode, mode
-                )
-                self.controller._scheduled_tasks.append(task)
-
                 self.logger.debug(f"Hour {hour_str}: {mode} ({mode_desc})")
+
+                # Handle mode changes or continuation
+                if mode != previous_mode:
+                    # Close previous period if exists
+                    if previous_mode is not None and period_start is not None:
+                        # End the previous period at current hour
+                        self.controller._scheduled_periods.append(
+                            Period(previous_mode, period_start, dt_time(hour, 0))
+                        )
+
+                    # Start new period
+                    period_start = dt_time(hour, 0)
+
+                    # Schedule mode change
+                    task = self.controller._schedule_action(
+                        hour_str, self.controller._apply_composite_mode, mode
+                    )
+                    self.controller._scheduled_tasks.append(task)
+
+                    previous_mode = mode
+
+            # Close the last period
+            if previous_mode is not None and period_start is not None:
+                self.controller._scheduled_periods.append(
+                    Period(previous_mode, period_start, EOD_DTTIME)
+                )
 
             return  # Exit early for simple mode
 
