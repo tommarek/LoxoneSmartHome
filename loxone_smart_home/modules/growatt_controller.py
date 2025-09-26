@@ -1859,17 +1859,38 @@ class GrowattController(BaseModule):
                 self._scheduled_tasks.append(task)
 
         # Determine high-price hours for discharge_to_grid
-        threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
-        high_price_hours = [
+        # Only discharge during the most expensive hours, not all hours above threshold
+        # Get top 4-6 most expensive hours for discharge
+        most_expensive_hours = self._price_analyzer.find_n_most_expensive_hours(
+            hourly_prices, n=min(4, len(hourly_prices) // 6)  # Max 4 hours or 1/6 of day
+        )
+
+        # Filter to only truly high prices (at least 20% above average)
+        avg_price = sum(hourly_prices.values()) / len(hourly_prices)
+        high_price_threshold = avg_price * 1.2  # 20% above average
+
+        # Also ensure price is significantly above charging costs
+        discharge_hours = [
             (start, stop, price)
-            for (start, stop), price in hourly_prices.items()
-            if price > threshold_eur_mwh * 1.5  # 50% above threshold for discharge
+            for start, stop, price in most_expensive_hours
+            if price > high_price_threshold and (start, stop) not in cheapest_consecutive
         ]
 
-        if high_price_hours:
-            discharge_groups = self._price_analyzer.group_contiguous_hours_simple(high_price_hours)
+        if discharge_hours:
+            # Group consecutive hours for cleaner scheduling
+            discharge_groups = self._price_analyzer.group_contiguous_hours_simple(discharge_hours)
             for start_time, stop_time in discharge_groups:
-                self.logger.info(f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time}")
+                # Calculate average price for this discharge period
+                period_prices = [p for s, e, p in discharge_hours
+                                if self._parse_hhmm(s) >= self._parse_hhmm(start_time)
+                                and self._parse_hhmm(e) <= self._parse_hhmm(stop_time)]
+                avg_period_price = sum(period_prices) / len(period_prices) if period_prices else 0
+                avg_period_czk = avg_period_price * eur_czk_rate / 1000
+
+                self.logger.info(
+                    f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time} "
+                    f"(avg: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh)"
+                )
                 self._scheduled_periods.append(
                     Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
                            params={"stop_soc": 20, "power_rate": 100})
@@ -1879,6 +1900,9 @@ class GrowattController(BaseModule):
                 self._scheduled_tasks.append(task)
 
         # Fill gaps with regular or regular_no_export based on price
+        # Calculate threshold for export control
+        threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
+
         all_scheduled_times = set()
         for period in self._scheduled_periods:
             # Add all hours covered by scheduled periods

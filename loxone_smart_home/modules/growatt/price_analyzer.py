@@ -234,6 +234,16 @@ class PriceAnalyzer:
         )
         return sorted_prices[:n]
 
+    def find_n_most_expensive_hours(
+        self, prices: Dict[Tuple[str, str], float], n: int = 4
+    ) -> List[Tuple[str, str, float]]:
+        """Find N most expensive individual hours."""
+        sorted_prices = sorted(
+            [(start, stop, price) for (start, stop), price in prices.items()],
+            key=lambda x: x[2], reverse=True
+        )
+        return sorted_prices[:n]
+
     def categorize_prices_into_quadrants(
         self, prices: Dict[Tuple[str, str], float]
     ) -> Dict[str, List[Tuple[str, str, float]]]:
