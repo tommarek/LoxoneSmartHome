@@ -102,9 +102,7 @@ class UDPListener(BaseModule):
         # Start MQTT publishing task if enabled
         if self._mqtt_enabled and self.mqtt_client:
             self._mqtt_task = asyncio.create_task(self._mqtt_publisher())
-            self.logger.info(f"MQTT publishing enabled on topic: {self._mqtt_topic}, interval: {self._mqtt_interval}s")
-        else:
-            self.logger.warning(f"MQTT publishing disabled or client not available (enabled={self._mqtt_enabled}, client={self.mqtt_client is not None})")
+            self.logger.info(f"MQTT publishing enabled on topic: {self._mqtt_topic}")
 
     async def stop(self) -> None:
         """Stop the UDP listener."""
@@ -300,9 +298,8 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
 
                 # Publish initial status to MQTT
                 if self._mqtt_enabled and self.mqtt_client:
-                    self.logger.info(f"MQTT enabled: {self._mqtt_enabled}, client available: {self.mqtt_client is not None}")
                     await self._publish_mqtt_status()
-                    self.logger.info(f"Published initial status to MQTT topic: {self._mqtt_topic}")
+                    self.logger.info("Published initial status to MQTT")
             else:
                 self.logger.info("No recent data found in InfluxDB, starting with empty cache")
 
