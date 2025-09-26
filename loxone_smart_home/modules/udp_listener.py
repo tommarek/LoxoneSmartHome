@@ -203,8 +203,12 @@ class UDPListener(BaseModule):
                 timestamp=utc_time,
             )
 
-            # Update cache for MQTT publishing
+            # Update cache and publish to MQTT
             await self._update_cache(measurement_type, measurement_name, value, room_name, tag1, tag2, utc_time)
+
+            # Publish every update to MQTT
+            if self._mqtt_enabled and self.mqtt_client:
+                await self._publish_mqtt_status()
 
             # Update statistics instead of logging each packet
             async with self.stats_lock:
@@ -389,26 +393,6 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
                 "timestamp": timestamp.isoformat(),
             }
 
-            # Check for significant changes that warrant immediate publish
-            should_publish = False
-
-            # Publish on significant value changes
-            if old_value is not None:
-                # For power measurements, publish if changed by more than 1000W
-                if "power" in measurement_name.lower() and abs(value - old_value) > 1000:
-                    should_publish = True
-                    self.logger.debug(f"Power measurement '{measurement_name}' changed: {old_value}W -> {value}W")
-
-                # For relay states, publish on any change
-                elif measurement_type == "relay" and old_value != value:
-                    should_publish = True
-                    state = "ON" if value == 1 else "OFF"
-                    self.logger.debug(f"Relay '{measurement_name}' changed to {state}")
-
-            # Publish immediately if triggered
-            if should_publish and self._mqtt_enabled and self.mqtt_client:
-                self.logger.debug(f"Significant change detected, publishing immediately")
-                await self._publish_mqtt_status()
 
 
     async def _publish_mqtt_status(self, final: bool = False) -> None:
@@ -450,12 +434,11 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
 
             # Publish to MQTT
             message = json.dumps(status, separators=(",", ":"))
-            self.logger.debug(f"Publishing to MQTT topic '{self._mqtt_topic}' ({len(message)} bytes)")
             await self.mqtt_client.publish(self._mqtt_topic, message, retain=True)
 
             self._last_publish = datetime.now()
             if not final:
-                self.logger.info(f"Published status to MQTT topic '{self._mqtt_topic}' ({len(message)} bytes)")
+                self.logger.debug(f"Published status to MQTT topic '{self._mqtt_topic}' ({len(message)} bytes)")
 
         except Exception as e:
             self.logger.error(f"Failed to publish MQTT status: {e}", exc_info=True)
