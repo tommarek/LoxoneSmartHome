@@ -218,9 +218,8 @@ class GrowattController(BaseModule):
         self._high_loads_active: bool = False
         self._home_status_topic = "loxone/status"
         self._scheduled_mode: Optional[PeriodType] = None  # Track what mode SHOULD be active
-        self._high_load_override: bool = False  # Track if we've overridden due to high load
-        self._high_load_protected_mode_active: bool = False  # Track if we're in protected mode
-        self._pre_high_load_soc: int = 20  # Default SOC before high load
+        self._current_mode: Optional[str] = None  # Track the currently applied mode
+        self._battery_soc: float = 50.0  # Default battery SOC, updated from status
 
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
@@ -1153,6 +1152,21 @@ class GrowattController(BaseModule):
 
             self._home_status = data
 
+            # Update battery SOC if available in status
+            solar_data = data.get("solar", {})
+            if solar_data:
+                # Try to find battery SOC in various possible formats
+                for key in ["battery_soc", "batterysoc", "soc", "battery_level"]:
+                    if key in solar_data:
+                        soc_data = solar_data[key]
+                        if isinstance(soc_data, dict):
+                            soc_value = soc_data.get("value", self._battery_soc)
+                        else:
+                            soc_value = soc_data
+                        if isinstance(soc_value, (int, float)) and 0 <= soc_value <= 100:
+                            self._battery_soc = float(soc_value)
+                            break
+
             # Detect high loads from the raw data
             high_loads = self._detect_high_loads_from_status(data)
             was_high_load = self._high_loads_active
@@ -1174,9 +1188,6 @@ class GrowattController(BaseModule):
                     await self._handle_high_load_start()
                 else:
                     self.logger.info("✅ High loads cleared - Restoring scheduled operation")
-                    # Clear override flag and restore scheduled mode
-                    if self._high_load_override:
-                        self._high_load_override = False
                     # Use decision tree to determine what mode to apply now
                     await self._determine_and_apply_mode()
 
@@ -1253,19 +1264,20 @@ class GrowattController(BaseModule):
             override_status = self.get_manual_override_status()
             if override_status.get("active"):
                 mode = self._manual_override_period.kind
-                params = self._manual_override_period.params or {}
                 self.logger.info(
                     f"Manual override active: {mode} "
                     f"(until {override_status.get('end_time', 'manual clear')})"
                 )
 
-                # Apply the composite mode
-                await self._apply_composite_mode(mode, params)
+                # Apply the manual override mode
+                self._scheduled_mode = mode
+                await self._determine_and_apply_mode()
                 return
 
         if not self._scheduled_periods:
             self.logger.info("No scheduled periods found yet, applying default mode")
-            await self._apply_composite_mode("regular")
+            self._scheduled_mode = "regular"
+            await self._determine_and_apply_mode()
             return
 
         # Find the active period at current time (should be only one with composite modes)
@@ -1280,12 +1292,14 @@ class GrowattController(BaseModule):
                 break
 
         if active_period:
-            # Apply the composite mode for the active period
-            await self._apply_composite_mode(active_period.kind, active_period.params)
+            # Apply the scheduled mode for the active period
+            self._scheduled_mode = active_period.kind
+            await self._determine_and_apply_mode()
         else:
             # No active period, apply default mode
             self.logger.info("No active period found, applying default mode")
-            await self._apply_composite_mode("regular")
+            self._scheduled_mode = "regular"
+            await self._determine_and_apply_mode()
 
         self.logger.info("Startup state synchronization complete")
 
@@ -1296,17 +1310,14 @@ class GrowattController(BaseModule):
     async def _determine_and_apply_mode(self) -> None:
         """Use decision engine to determine and apply the appropriate mode."""
         try:
-            # Get current battery SOC (would need to be retrieved from actual system)
-            battery_soc = 50.0  # TODO: Get actual battery SOC from inverter status
-
             # Build decision context
             context = DecisionContext(
                 manual_override_active=bool(self._manual_override_period),
                 manual_override_mode=self._manual_override_period.kind if self._manual_override_period else None,
                 high_loads_active=self._high_loads_active,
                 scheduled_mode=self._scheduled_mode,
-                battery_soc=battery_soc,
-                current_mode=None  # TODO: Track current applied mode
+                battery_soc=self._battery_soc,
+                current_mode=self._current_mode
             )
 
             # Get decision from engine
@@ -1321,6 +1332,7 @@ class GrowattController(BaseModule):
 
             # Apply the decided mode
             await self._apply_decided_mode(mode)
+            self._current_mode = mode  # Track the applied mode
 
         except Exception as e:
             self.logger.error(f"Failed to determine and apply mode: {e}", exc_info=True)
@@ -1382,25 +1394,6 @@ class GrowattController(BaseModule):
             f"{mode_def.get('description', 'No description')} "
             f"({inverter_mode} @ {stop_soc}% SOC)"
         )
-
-    async def _apply_composite_mode(
-        self,
-        mode: PeriodType,
-        params: Optional[Dict[str, Any]] = None
-    ) -> None:
-        """Apply one of the 5 composite modes - now delegates to decision engine.
-
-        Args:
-            mode: One of the 5 composite modes
-            params: Optional parameters (stop_soc, power_rate for discharge modes)
-        """
-        params = params or {}
-
-        # Track the scheduled mode (what SHOULD be active without high load override)
-        self._scheduled_mode = mode
-
-        # Use decision engine to determine actual mode to apply
-        await self._determine_and_apply_mode()
 
     async def set_manual_override(
         self,
@@ -1486,9 +1479,10 @@ class GrowattController(BaseModule):
         self._manual_override_end_time = end_time
         self._manual_override_source = source
 
-        # Apply the composite mode immediately
+        # Apply the manual override mode immediately
         try:
-            await self._apply_composite_mode(mode, params)
+            self._scheduled_mode = mode
+            await self._determine_and_apply_mode()
             
             # Log manual intervention
             end_str = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "manual clear"
@@ -2071,8 +2065,11 @@ class GrowattController(BaseModule):
                     Period("charge_from_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
                            params={"stop_soc": self.config.max_soc})
                 )
-                task = self._schedule_action(start_time, self._apply_composite_mode, "charge_from_grid",
-                                            {"stop_soc": self.config.max_soc})
+                # Create closure to apply mode at scheduled time
+                async def apply_charge_mode():
+                    self._scheduled_mode = "charge_from_grid"
+                    await self._determine_and_apply_mode()
+                task = self._schedule_action(start_time, apply_charge_mode)
                 self._scheduled_tasks.append(task)
 
         # Smart discharge economics: only discharge when profitable
@@ -2141,8 +2138,11 @@ class GrowattController(BaseModule):
                     Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
                            params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
                 )
-                task = self._schedule_action(start_time, self._apply_composite_mode, "discharge_to_grid",
-                                            {"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
+                # Create closure to apply mode at scheduled time
+                async def apply_discharge_mode():
+                    self._scheduled_mode = "discharge_to_grid"
+                    await self._determine_and_apply_mode()
+                task = self._schedule_action(start_time, apply_discharge_mode)
                 self._scheduled_tasks.append(task)
 
         # Fill gaps with regular or regular_no_export based on price
