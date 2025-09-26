@@ -83,9 +83,6 @@ class GrowattController(BaseModule):
         # (Pydantic models don't allow dynamic attribute assignment)
         self._optional_config = {
             "dst_merge_policy": getattr(self.config, "dst_merge_policy", "avg"),
-            "suppress_export_during_ac_charge": getattr(
-                self.config, "suppress_export_during_ac_charge", True
-            ),
             "eur_czk_rate": getattr(self.config, "eur_czk_rate", 25.0),
             "temperature_avg_days": getattr(self.config, "temperature_avg_days", 3),
             "summer_temp_threshold": getattr(self.config, "summer_temp_threshold", 15.0),
@@ -1180,8 +1177,8 @@ class GrowattController(BaseModule):
             await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
             await asyncio.sleep(0.5)
             await self._mode_manager.enable_ac_charge()
-            await self._mode_manager.disable_export()
-            self.logger.info(f"Applied mode: CHARGE_FROM_GRID (battery-first, AC charge to {stop_soc}%)")
+            await self._mode_manager.enable_export()  # Keep export enabled to allow excess solar to be sold
+            self.logger.info(f"Applied mode: CHARGE_FROM_GRID (battery-first, AC charge to {stop_soc}%, export enabled)")
 
         elif mode == "discharge_to_grid":
             # Grid-first with custom discharge parameters
@@ -1473,6 +1470,9 @@ class GrowattController(BaseModule):
 
         # Calculate price statistics
         all_prices = list(hourly_prices.values())
+        if not all_prices:
+            self.logger.warning("No prices available for scheduling")
+            return
         min_price = min(all_prices)
         max_price = max(all_prices)
         avg_price = sum(all_prices) / len(all_prices)
