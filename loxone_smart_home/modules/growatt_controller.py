@@ -1230,11 +1230,12 @@ class GrowattController(BaseModule):
     async def _handle_high_load_start(self) -> None:
         """Handle high loads by switching to battery-first @ 100% SOC."""
         try:
-            # Check current mode
-            current_modes = self._mode_manager.get_active_modes()
+            # Check what mode is scheduled/expected to be active
+            current_mode = self._scheduled_mode
 
-            # Check if we need to intervene
-            if "discharge_to_grid" in current_modes or "sell_production" in current_modes:
+            # Always switch to battery-first @ 100% SOC when high loads detected
+            # This prevents discharge regardless of what mode was active
+            if not self._high_load_override:
                 self.logger.warning("⚡ High loads detected - switching to battery-first @ 100% SOC")
                 # Apply battery-first with 100% SOC (prevents discharge)
                 await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
@@ -1242,24 +1243,9 @@ class GrowattController(BaseModule):
                 # Maintain export enabled to allow solar export if available
                 await self._mode_manager.enable_export()
                 self._high_load_override = True
-
-            elif "charge_from_grid" not in current_modes:
-                # Not discharging but also not in battery-first, switch to safe mode
-                self.logger.info("High loads detected - switching to battery-first @ 100% SOC")
-                await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
-                await asyncio.sleep(0.5)
-                await self._mode_manager.enable_export()
-                self._high_load_override = True
-
+                self.logger.info(f"Override applied - was in mode: {current_mode or 'unknown'}")
             else:
-                # Already in charge_from_grid mode
-                current_soc = self._mode_manager._battery_first_slots[1].get("stop_soc", 100)
-                if current_soc < 100:
-                    self.logger.info(f"High loads detected - adjusting battery-first SOC from {current_soc}% to 100%")
-                    await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
-                    self._high_load_override = True
-                else:
-                    self.logger.info("High loads detected but already in battery-first @ 100% SOC")
+                self.logger.debug("High loads detected but override already active")
 
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
