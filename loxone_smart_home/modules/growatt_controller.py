@@ -1637,7 +1637,7 @@ class GrowattController(BaseModule):
             )
             self._scheduled_periods.append(
                 Period("grid_first", sunrise_time, EOD_DTTIME,
-                       params={"stop_soc": 20, "power_rate": 100})
+                       params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
             )
             self._scheduled_periods.append(
                 Period("export", sunrise_time, EOD_DTTIME)
@@ -1718,7 +1718,7 @@ class GrowattController(BaseModule):
                     "grid_first",
                     sunrise_time,
                     self._parse_hhmm(grid_first_end),
-                    params={"stop_soc": 20, "power_rate": 100}
+                    params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate}
                 )
             )
             self._scheduled_periods.append(
@@ -1913,7 +1913,7 @@ class GrowattController(BaseModule):
                     self.logger.info(
                         f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time} "
                         f"(price: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh, "
-                        f"profit: {profit_pct:.1f}%)"
+                        f"profit: {profit_pct:.1f}%, power: {self.config.discharge_power_rate}%)"
                     )
                 else:
                     self.logger.info(
@@ -1922,10 +1922,10 @@ class GrowattController(BaseModule):
                     )
                 self._scheduled_periods.append(
                     Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
-                           params={"stop_soc": 20, "power_rate": 100})
+                           params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
                 )
                 task = self._schedule_action(start_time, self._apply_composite_mode, "discharge_to_grid",
-                                            {"stop_soc": 20, "power_rate": 100})
+                                            {"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
                 self._scheduled_tasks.append(task)
 
         # Fill gaps with regular or regular_no_export based on price
