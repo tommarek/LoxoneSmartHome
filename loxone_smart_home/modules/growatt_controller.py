@@ -1991,6 +1991,8 @@ class GrowattController(BaseModule):
                     all_scheduled_times.add(f"{h:02d}:00")
 
         # Schedule regular modes for unscheduled hours
+        regular_count = 0
+        no_export_count = 0
         for (start, stop), price in sorted(hourly_prices.items()):
             if start not in all_scheduled_times:
                 if price < threshold_eur_mwh:
@@ -1998,17 +2000,28 @@ class GrowattController(BaseModule):
                     self._scheduled_periods.append(
                         Period("regular_no_export", self._parse_hhmm(start), self._parse_hhmm(stop))
                     )
+                    no_export_count += 1
                 else:
                     # Normal/high price - allow export
                     self._scheduled_periods.append(
                         Period("regular", self._parse_hhmm(start), self._parse_hhmm(stop))
                     )
+                    regular_count += 1
+
+        if regular_count > 0 or no_export_count > 0:
+            self.logger.info(
+                f"Scheduled {regular_count} regular hours and {no_export_count} no-export hours "
+                f"(export threshold: {self.config.export_price_threshold} CZK/kWh = {threshold_eur_mwh:.2f} EUR/MWh)"
+            )
 
         # Export control is now handled by composite modes
         # No need for separate export scheduling
 
         # Ensure clean end-of-day state
-        self._schedule_end_of_day_cleanup()
+        try:
+            self._schedule_end_of_day_cleanup()
+        except Exception as e:
+            self.logger.error(f"Error scheduling end-of-day cleanup: {e}", exc_info=True)
 
     async def _schedule_export_control(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
@@ -2341,10 +2354,10 @@ class GrowattController(BaseModule):
         """Ensure we land in a neutral state at end of day."""
         # Small jittered disables are safe & idempotent.
         self._scheduled_tasks.append(
-            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._disable_export))
+            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_export))
         )
         self._scheduled_tasks.append(
-            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._disable_ac_charge))
+            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_ac_charge))
         )
 
     async def _schedule_daily_calculation(self) -> None:
