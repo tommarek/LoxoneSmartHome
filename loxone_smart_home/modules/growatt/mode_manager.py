@@ -528,14 +528,23 @@ class ModeManager:
             f"Topic: {self.config.grid_first_topic}"
         )
 
-    async def set_load_first(self) -> None:
+    async def set_load_first(self, stop_soc: Optional[int] = None) -> None:
         """Set load-first mode (default/neutral mode).
 
         This is the inverter's default state where it prioritizes powering loads.
+        stop_soc: Minimum battery level to maintain in load-first mode (default from config.min_soc)
         """
+        if stop_soc is None:
+            stop_soc = int(self.config.min_soc)
+
+        stop_soc = max(5, min(100, stop_soc))
+
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
-            self.logger.info(f"🏠 [SIMULATE] LOAD-FIRST MODE SET (simulated at {current_time})")
+            self.logger.info(
+                f"🏠 [SIMULATE] LOAD-FIRST MODE SET with stopSOC={stop_soc}% "
+                f"(simulated at {current_time})"
+            )
             return
 
         # Load-first is achieved by disabling both battery-first and grid-first
@@ -545,9 +554,33 @@ class ModeManager:
         await self.disable_battery_first()
         await asyncio.sleep(0.3)
         await self.disable_grid_first()
+        await asyncio.sleep(0.3)
+
+        # Set the stop SOC for load-first mode
+        if hasattr(self.config, 'load_first_stopsoc_topic'):
+            stopsoc_payload = {"value": stop_soc}
+            self.logger.debug(f"Setting load-first stopSOC to {stop_soc}%")
+            self.logger.info(
+                f"📤 Sending load-first stopSOC: topic={self.config.load_first_stopsoc_topic}, "
+                f"payload={json.dumps(stopsoc_payload)}"
+            )
+            assert self.mqtt_client is not None
+            await self.mqtt_client.publish(
+                self.config.load_first_stopsoc_topic, json.dumps(stopsoc_payload)
+            )
+
+            result = await self._wait_for_command_result("loadfirst/set/stopsoc")
+            if result and not result.get("success", False):
+                self.logger.error(
+                    f"⚠️ Load-first stopSOC command failed! "
+                    f"Message: {result.get('message', 'Unknown error')}"
+                )
+                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
-        self.logger.info(f"🏠 LOAD-FIRST MODE SET at {current_time}")
+        self.logger.info(
+            f"🏠 LOAD-FIRST MODE SET with stopSOC={stop_soc}% at {current_time}"
+        )
 
     def get_ac_charge_enabled(self) -> bool:
         """Get current AC charge enabled state."""

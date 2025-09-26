@@ -179,6 +179,9 @@ class GrowattConfig(BaseModel):
     grid_first_stopsoc_topic: str = "energy/solar/command/gridfirst/set/stopsoc"
     grid_first_powerrate_topic: str = "energy/solar/command/gridfirst/set/powerrate"
 
+    # Load-first mode topics
+    load_first_stopsoc_topic: str = "energy/solar/command/loadfirst/set/stopsoc"
+
     # Scheduling
     schedule_hour: int = Field(default=23, ge=0, le=23)  # Daily calculation hour
     schedule_minute: int = Field(default=59, ge=0, le=59)  # Daily calculation minute
