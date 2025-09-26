@@ -150,7 +150,7 @@ class GrowattConfig(BaseModel):
     battery_capacity: float = Field(default=10.0, gt=0)  # kWh
     max_charge_power: float = Field(default=3.0, gt=0)  # kW
     min_soc: float = Field(default=20.0, ge=0, le=100)  # %
-    max_soc: float = Field(default=90.0, ge=0, le=100)  # %
+    max_soc: float = Field(default=100.0, ge=0, le=100)  # %
 
     # Price thresholds and control parameters
     export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
