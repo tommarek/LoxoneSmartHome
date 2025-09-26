@@ -26,6 +26,7 @@ from .growatt.models import (
 )
 from .growatt.price_analyzer import PriceAnalyzer
 from .growatt.mode_manager import ModeManager
+from .growatt.decision_engine import GrowattDecisionEngine, DecisionContext, MODE_DEFINITIONS
 
 
 class GrowattController(BaseModule):
@@ -210,6 +211,7 @@ class GrowattController(BaseModule):
         # Initialize refactored modules
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
         self._mode_manager = ModeManager(self)
+        self._decision_engine = GrowattDecisionEngine(self.logger)
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
@@ -217,6 +219,8 @@ class GrowattController(BaseModule):
         self._home_status_topic = "loxone/status"
         self._scheduled_mode: Optional[PeriodType] = None  # Track what mode SHOULD be active
         self._high_load_override: bool = False  # Track if we've overridden due to high load
+        self._high_load_protected_mode_active: bool = False  # Track if we're in protected mode
+        self._pre_high_load_soc: int = 20  # Default SOC before high load
 
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
@@ -1173,8 +1177,8 @@ class GrowattController(BaseModule):
                     # Clear override flag and restore scheduled mode
                     if self._high_load_override:
                         self._high_load_override = False
-                        # Re-apply current scheduled state
-                        await self._apply_current_state()
+                    # Use decision tree to determine what mode to apply now
+                    await self._determine_and_apply_mode()
 
         except Exception as e:
             self.logger.error(f"Failed to process home status: {e}", exc_info=True)
@@ -1228,25 +1232,11 @@ class GrowattController(BaseModule):
         return result
 
     async def _handle_high_load_start(self) -> None:
-        """Handle high loads by switching to battery-first @ 100% SOC."""
+        """Handle high loads by applying decision tree logic."""
         try:
-            # Check what mode is scheduled/expected to be active
-            current_mode = self._scheduled_mode
-
-            # Always switch to battery-first @ 100% SOC when high loads detected
-            # This prevents discharge regardless of what mode was active
-            if not self._high_load_override:
-                self.logger.warning("⚡ High loads detected - switching to battery-first @ 100% SOC")
-                # Apply battery-first with 100% SOC (prevents discharge)
-                await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
-                await asyncio.sleep(0.5)
-                # Maintain export enabled to allow solar export if available
-                await self._mode_manager.enable_export()
-                self._high_load_override = True
-                self.logger.info(f"Override applied - was in mode: {current_mode or 'unknown'}")
-            else:
-                self.logger.debug("High loads detected but override already active")
-
+            self.logger.info("⚡ High loads detected - using decision tree to determine action")
+            # The decision tree will handle this - just re-evaluate current state
+            await self._determine_and_apply_mode()
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
@@ -1303,12 +1293,102 @@ class GrowattController(BaseModule):
 
     # Mode management methods moved to ModeManager module
 
+    async def _determine_and_apply_mode(self) -> None:
+        """Use decision engine to determine and apply the appropriate mode."""
+        try:
+            # Get current battery SOC (would need to be retrieved from actual system)
+            battery_soc = 50.0  # TODO: Get actual battery SOC from inverter status
+
+            # Build decision context
+            context = DecisionContext(
+                manual_override_active=bool(self._manual_override_period),
+                manual_override_mode=self._manual_override_period.kind if self._manual_override_period else None,
+                high_loads_active=self._high_loads_active,
+                scheduled_mode=self._scheduled_mode,
+                battery_soc=battery_soc,
+                current_mode=None  # TODO: Track current applied mode
+            )
+
+            # Get decision from engine
+            mode = self._decision_engine.decide(context)
+
+            # Get explanation for logging
+            explanation = self._decision_engine.explain_decision()
+            self.logger.info(
+                f"📊 Decision: Apply '{mode}' mode - "
+                f"Reason: {explanation['reason']} (Priority: {explanation['priority']['name']})"
+            )
+
+            # Apply the decided mode
+            await self._apply_decided_mode(mode)
+
+        except Exception as e:
+            self.logger.error(f"Failed to determine and apply mode: {e}", exc_info=True)
+            # Fallback to safe default
+            await self._apply_decided_mode("regular")
+
+    async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Apply a mode based on its definition from MODE_DEFINITIONS.
+
+        Args:
+            mode: Mode name from decision engine
+            params: Optional parameters for configurable modes
+        """
+        params = params or {}
+
+        # Get mode definition
+        mode_def = MODE_DEFINITIONS.get(mode)
+        if not mode_def:
+            self.logger.error(f"Unknown mode: {mode}, falling back to regular")
+            mode = "regular"
+            mode_def = MODE_DEFINITIONS["regular"]
+
+        # Determine actual SOC value
+        stop_soc = mode_def.get("stop_soc", 20)
+        if stop_soc == "configurable":
+            stop_soc = params.get("stop_soc", int(self.config.max_soc))
+
+        inverter_mode = mode_def.get("inverter_mode", "load_first")
+
+        # Apply the inverter mode with appropriate SOC
+        if inverter_mode == "load_first":
+            await self._mode_manager.set_load_first(stop_soc=stop_soc)
+        elif inverter_mode == "battery_first":
+            power_rate = params.get("power_rate", 100)
+            await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+        elif inverter_mode == "grid_first":
+            power_rate = params.get("power_rate", self.config.discharge_power_rate if hasattr(self.config, 'discharge_power_rate') else 100)
+            await self._mode_manager.set_grid_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+
+        await asyncio.sleep(0.5)
+
+        # Set export state
+        if mode_def.get("export", True):
+            await self._mode_manager.enable_export()
+        else:
+            await self._mode_manager.disable_export()
+
+        # Set AC charging state
+        if mode_def.get("ac_charge", False):
+            await self._mode_manager.enable_ac_charge()
+        else:
+            await self._mode_manager.disable_ac_charge()
+
+        # Track if we're in high load protected mode
+        self._high_load_protected_mode_active = (mode == "high_load_protected")
+
+        self.logger.info(
+            f"✅ Applied mode: {mode.upper()} - "
+            f"{mode_def.get('description', 'No description')} "
+            f"({inverter_mode} @ {stop_soc}% SOC)"
+        )
+
     async def _apply_composite_mode(
         self,
         mode: PeriodType,
         params: Optional[Dict[str, Any]] = None
     ) -> None:
-        """Apply one of the 5 composite modes.
+        """Apply one of the 5 composite modes - now delegates to decision engine.
 
         Args:
             mode: One of the 5 composite modes
@@ -1319,54 +1399,8 @@ class GrowattController(BaseModule):
         # Track the scheduled mode (what SHOULD be active without high load override)
         self._scheduled_mode = mode
 
-        # If high load override is active, don't change modes
-        if self._high_load_override and self._high_loads_active:
-            self.logger.info(f"High load override active - ignoring scheduled mode change to {mode}")
-            return  # Don't apply any mode change
-
-        # Always reset to load_first first for clean state (matching current behavior)
-        await self._mode_manager.set_load_first()
-        await asyncio.sleep(0.5)
-
-        if mode == "regular":
-            # Load-first with export enabled
-            await self._mode_manager.enable_export()
-            await self._mode_manager.disable_ac_charge()
-            self.logger.info("Applied mode: REGULAR (load-first with export)")
-
-        elif mode == "sell_production":
-            # Grid-first with 100% SOC = only sell solar production
-            await self._mode_manager.set_grid_first("00:00", "23:59", stop_soc=100, power_rate=100)
-            await asyncio.sleep(0.5)
-            await self._mode_manager.enable_export()
-            await self._mode_manager.disable_ac_charge()
-            self.logger.info("Applied mode: SELL_PRODUCTION (grid-first @ 100% SOC)")
-
-        elif mode == "regular_no_export":
-            # Load-first without export
-            await self._mode_manager.disable_export()
-            await self._mode_manager.disable_ac_charge()
-            self.logger.info("Applied mode: REGULAR_NO_EXPORT (load-first, no export)")
-
-        elif mode == "charge_from_grid":
-            # Battery-first with AC charging enabled
-            stop_soc = params.get("stop_soc", self.config.max_soc)
-            power_rate = params.get("power_rate", 100)
-            await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
-            await asyncio.sleep(0.5)
-            await self._mode_manager.enable_ac_charge()
-            await self._mode_manager.enable_export()  # Keep export enabled to allow excess solar to be sold
-            self.logger.info(f"Applied mode: CHARGE_FROM_GRID (battery-first, AC charge to {stop_soc}%, export enabled)")
-
-        elif mode == "discharge_to_grid":
-            # Grid-first with custom discharge parameters
-            stop_soc = params.get("stop_soc", self.config.discharge_min_soc)
-            power_rate = params.get("power_rate", self.config.discharge_power_rate)
-            await self._mode_manager.set_grid_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
-            await asyncio.sleep(0.5)
-            await self._mode_manager.enable_export()
-            await self._mode_manager.disable_ac_charge()
-            self.logger.info(f"Applied mode: DISCHARGE_TO_GRID (grid-first to {stop_soc}% @ {power_rate}%)")
+        # Use decision engine to determine actual mode to apply
+        await self._determine_and_apply_mode()
 
     async def set_manual_override(
         self,
