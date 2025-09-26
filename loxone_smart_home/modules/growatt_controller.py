@@ -1476,6 +1476,11 @@ class GrowattController(BaseModule):
         # Log the complete schedule summary
         self._log_schedule_summary()
 
+        # Apply the current state immediately after scheduling
+        # This ensures we're in the correct mode right after midnight calculation
+        self.logger.info("Applying current state after scheduling...")
+        await self._apply_current_state()
+
     async def _schedule_winter_strategy(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
