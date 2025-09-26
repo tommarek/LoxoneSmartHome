@@ -152,6 +152,10 @@ class GrowattConfig(BaseModel):
     min_soc: float = Field(default=20.0, ge=0, le=100)  # %
     max_soc: float = Field(default=100.0, ge=0, le=100)  # %
 
+    # Battery economics
+    battery_efficiency: float = Field(default=0.85, gt=0, le=1)  # Round-trip efficiency (85%)
+    discharge_profit_margin: float = Field(default=1.2, ge=1)  # Minimum profit margin (20%)
+
     # Price thresholds and control parameters
     export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
     battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging

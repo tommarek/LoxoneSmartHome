@@ -1858,22 +1858,40 @@ class GrowattController(BaseModule):
                                             {"stop_soc": self.config.max_soc})
                 self._scheduled_tasks.append(task)
 
-        # Determine high-price hours for discharge_to_grid
-        # Only discharge during the most expensive hours, not all hours above threshold
-        # Get top 4-6 most expensive hours for discharge
+        # Smart discharge economics: only discharge when profitable
+        # Calculate average charging cost from scheduled charge periods
+        avg_charge_price = 0.0
+        if cheapest_consecutive:
+            charge_prices = [hourly_prices[(s, e)] for s, e in cheapest_consecutive]
+            avg_charge_price = sum(charge_prices) / len(charge_prices) if charge_prices else 0.0
+
+            # Calculate minimum profitable discharge price
+            # Account for battery round-trip efficiency and required profit margin
+            min_discharge_price = (avg_charge_price / self.config.battery_efficiency) * self.config.discharge_profit_margin
+
+            # Log economics calculation
+            charge_czk = avg_charge_price * eur_czk_rate / 1000
+            min_discharge_czk = min_discharge_price * eur_czk_rate / 1000
+            self.logger.info(
+                f"Battery economics: Charge cost={charge_czk:.2f} CZK/kWh, "
+                f"Min discharge price={min_discharge_czk:.2f} CZK/kWh "
+                f"(efficiency={self.config.battery_efficiency:.0%}, margin={self.config.discharge_profit_margin-1:.0%})"
+            )
+        else:
+            # No charging scheduled, use average price as baseline
+            avg_price = sum(hourly_prices.values()) / len(hourly_prices)
+            min_discharge_price = avg_price * 1.3  # Require 30% premium without known charge cost
+
+        # Find most expensive hours that exceed minimum profitable price
         most_expensive_hours = self._price_analyzer.find_n_most_expensive_hours(
-            hourly_prices, n=min(4, len(hourly_prices) // 6)  # Max 4 hours or 1/6 of day
+            hourly_prices, n=min(6, len(hourly_prices) // 4)  # Max 6 hours or 1/4 of day
         )
 
-        # Filter to only truly high prices (at least 20% above average)
-        avg_price = sum(hourly_prices.values()) / len(hourly_prices)
-        high_price_threshold = avg_price * 1.2  # 20% above average
-
-        # Also ensure price is significantly above charging costs
+        # Filter for profitable discharge only
         discharge_hours = [
             (start, stop, price)
             for start, stop, price in most_expensive_hours
-            if price > high_price_threshold and (start, stop) not in cheapest_consecutive
+            if price > min_discharge_price and (start, stop) not in cheapest_consecutive
         ]
 
         if discharge_hours:
@@ -1887,10 +1905,21 @@ class GrowattController(BaseModule):
                 avg_period_price = sum(period_prices) / len(period_prices) if period_prices else 0
                 avg_period_czk = avg_period_price * eur_czk_rate / 1000
 
-                self.logger.info(
-                    f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time} "
-                    f"(avg: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh)"
-                )
+                # Calculate profit margin for this discharge period
+                if avg_charge_price > 0:
+                    effective_charge_cost = avg_charge_price / self.config.battery_efficiency
+                    profit_ratio = avg_period_price / effective_charge_cost
+                    profit_pct = (profit_ratio - 1) * 100
+                    self.logger.info(
+                        f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time} "
+                        f"(price: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh, "
+                        f"profit: {profit_pct:.1f}%)"
+                    )
+                else:
+                    self.logger.info(
+                        f"Scheduling DISCHARGE_TO_GRID from {start_time} to {stop_time} "
+                        f"(price: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh)"
+                    )
                 self._scheduled_periods.append(
                     Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
                            params={"stop_soc": 20, "power_rate": 100})
