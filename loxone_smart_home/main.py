@@ -90,7 +90,7 @@ class LoxoneSmartHome:
 
         # Initialize modules based on configuration
         if self.settings.modules.udp_listener_enabled:
-            self.udp_listener = UDPListener(self.influxdb_client, self.settings)
+            self.udp_listener = UDPListener(self.influxdb_client, self.settings, self.mqtt_client)
             logger.info("UDP Listener module initialized")
 
         if self.settings.modules.mqtt_bridge_enabled:

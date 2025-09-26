@@ -211,6 +211,13 @@ class GrowattController(BaseModule):
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
         self._mode_manager = ModeManager(self)
 
+        # Home status monitoring for high load detection
+        self._home_status: Dict[str, Any] = {}
+        self._high_loads_active: bool = False
+        self._home_status_topic = "loxone/status"
+        self._scheduled_mode: Optional[PeriodType] = None  # Track what mode SHOULD be active
+        self._high_load_override: bool = False  # Track if we've overridden due to high load
+
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
@@ -1023,6 +1030,11 @@ class GrowattController(BaseModule):
         self.logger.info("Resetting inverter to clean state...")
         await self._reset_inverter_state()
 
+        # Subscribe to home status for high load detection
+        if self.mqtt_client:
+            self.logger.info(f"Subscribing to home status topic: {self._home_status_topic}")
+            await self.mqtt_client.subscribe(self._home_status_topic, self._on_home_status)
+
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
 
@@ -1118,6 +1130,140 @@ class GrowattController(BaseModule):
             self.logger.error(f"Failed to reset inverter state: {e}", exc_info=True)
             # Continue anyway - the scheduled mode will try to set the correct state
 
+    async def _on_home_status(self, topic: str, payload: Any) -> None:
+        """Handle home status updates from UDP listener.
+
+        Args:
+            topic: The MQTT topic (should be loxone/status)
+            payload: The status JSON payload
+        """
+        try:
+            # Parse the payload
+            if isinstance(payload, bytes):
+                payload = payload.decode()
+
+            if isinstance(payload, str):
+                data = json.loads(payload)
+            else:
+                data = payload
+
+            self._home_status = data
+
+            # Detect high loads from the raw data
+            high_loads = self._detect_high_loads_from_status(data)
+            was_high_load = self._high_loads_active
+
+            self._high_loads_active = high_loads["active"]
+
+            # Log significant changes
+            if self._high_loads_active != was_high_load:
+                if self._high_loads_active:
+                    details = []
+                    if high_loads.get("ev_charging"):
+                        details.append(f"EV: {high_loads['ev_power']:.0f}W")
+                    if high_loads.get("heating_active"):
+                        details.append(f"Heating: {len(high_loads.get('heating_relays', []))} relays")
+                    self.logger.warning(
+                        f"⚡ High loads detected! {', '.join(details)} - Checking if action needed"
+                    )
+                    # Handle high load start
+                    await self._handle_high_load_start()
+                else:
+                    self.logger.info("✅ High loads cleared - Restoring scheduled operation")
+                    # Clear override flag and restore scheduled mode
+                    if self._high_load_override:
+                        self._high_load_override = False
+                        # Re-apply current scheduled state
+                        await self._apply_current_state()
+
+        except Exception as e:
+            self.logger.error(f"Failed to process home status: {e}", exc_info=True)
+
+    def _detect_high_loads_from_status(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        """Detect high load conditions from home status data.
+
+        Args:
+            status: The status data from UDP listener
+
+        Returns:
+            Dictionary with high load detection results
+        """
+        result = {
+            "active": False,
+            "ev_charging": False,
+            "ev_power": 0,
+            "heating_active": False,
+            "heating_relays": []
+        }
+
+        # Check EV charging (power > 100W threshold)
+        ev_data = status.get("ev", {})
+        ev_power_total = 0
+        for name, data in ev_data.items():
+            if isinstance(data, dict) and "power" in name.lower():
+                value = data.get("value", 0)
+                if value > 100:  # EV charging threshold
+                    ev_power_total += value
+
+        if ev_power_total > 100:
+            result["ev_charging"] = True
+            result["ev_power"] = ev_power_total
+
+        # Check heating relays (ANY relay with tag1 = "heating" that is ON)
+        relay_data = status.get("relay", {})
+
+        for name, data in relay_data.items():
+            if isinstance(data, dict):
+                value = data.get("value", 0)
+                tag1 = data.get("tag1", "")
+
+                # If ANY heating relay is ON, heating is active
+                if value == 1 and tag1 == "heating":
+                    result["heating_active"] = True
+                    result["heating_relays"].append(name)
+
+        # Set active flag if EV charging or heating is active
+        result["active"] = result["ev_charging"] or result["heating_active"]
+
+        return result
+
+    async def _handle_high_load_start(self) -> None:
+        """Handle high loads by switching to battery-first @ 100% SOC."""
+        try:
+            # Check current mode
+            current_modes = self._mode_manager.get_active_modes()
+
+            # Check if we need to intervene
+            if "discharge_to_grid" in current_modes or "sell_production" in current_modes:
+                self.logger.warning("⚡ High loads detected - switching to battery-first @ 100% SOC")
+                # Apply battery-first with 100% SOC (prevents discharge)
+                await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
+                await asyncio.sleep(0.5)
+                # Maintain export enabled to allow solar export if available
+                await self._mode_manager.enable_export()
+                self._high_load_override = True
+
+            elif "charge_from_grid" not in current_modes:
+                # Not discharging but also not in battery-first, switch to safe mode
+                self.logger.info("High loads detected - switching to battery-first @ 100% SOC")
+                await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
+                await asyncio.sleep(0.5)
+                await self._mode_manager.enable_export()
+                self._high_load_override = True
+
+            else:
+                # Already in charge_from_grid mode
+                current_soc = self._mode_manager._battery_first_slots[1].get("stop_soc", 100)
+                if current_soc < 100:
+                    self.logger.info(f"High loads detected - adjusting battery-first SOC from {current_soc}% to 100%")
+                    await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=100, power_rate=100)
+                    self._high_load_override = True
+                else:
+                    self.logger.info("High loads detected but already in battery-first @ 100% SOC")
+
+        except Exception as e:
+            self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
+
     async def _apply_current_state(self) -> None:
         """Apply the appropriate state based on current time and scheduled periods."""
         now = self._get_local_now()
@@ -1183,6 +1329,14 @@ class GrowattController(BaseModule):
             params: Optional parameters (stop_soc, power_rate for discharge modes)
         """
         params = params or {}
+
+        # Track the scheduled mode (what SHOULD be active without high load override)
+        self._scheduled_mode = mode
+
+        # If high load override is active, don't change modes
+        if self._high_load_override and self._high_loads_active:
+            self.logger.info(f"High load override active - ignoring scheduled mode change to {mode}")
+            return  # Don't apply any mode change
 
         # Always reset to load_first first for clean state (matching current behavior)
         await self._mode_manager.set_load_first()

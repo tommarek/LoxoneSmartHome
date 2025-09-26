@@ -62,6 +62,11 @@ class UDPListenerConfig(BaseModel):
     delimiter: str = ";"
     timezone: str = "Europe/Prague"
 
+    # MQTT publishing configuration
+    mqtt_publish_enabled: bool = True
+    mqtt_status_topic: str = "loxone/status"
+    mqtt_publish_interval: int = Field(default=30, ge=1)  # seconds
+
 
 class LoxoneBridgeConfig(BaseModel):
     """Loxone Bridge configuration."""

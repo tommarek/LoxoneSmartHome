@@ -1,26 +1,34 @@
 """UDP Listener module - receives data from Loxone and stores in InfluxDB."""
 
 import asyncio
+import json
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import pytz
 
 from config.settings import Settings
 from modules.base import BaseModule
 from utils.async_influxdb_client import AsyncInfluxDBClient
+from utils.async_mqtt_client import AsyncMQTTClient
 
 
 class UDPListener(BaseModule):
     """UDP Listener that receives data from Loxone and stores it in InfluxDB."""
 
-    def __init__(self, influxdb_client: AsyncInfluxDBClient, settings: Settings) -> None:
+    def __init__(
+        self,
+        influxdb_client: AsyncInfluxDBClient,
+        settings: Settings,
+        mqtt_client: Optional[AsyncMQTTClient] = None,
+    ) -> None:
         """Initialize the UDP listener."""
         super().__init__(
             name="UDPListener",
             service_name="UDP",
             influxdb_client=influxdb_client,
+            mqtt_client=mqtt_client,
             settings=settings,
         )
         self.transport: Optional[asyncio.DatagramTransport] = None
@@ -37,6 +45,31 @@ class UDPListener(BaseModule):
         self.stats_interval = 3600  # Log stats every hour
         self._stats_task: Optional[asyncio.Task[None]] = None
 
+        # Value cache for MQTT publishing
+        self._value_cache: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "ev": {},
+            "relay": {},
+            "temperature": {},
+            "target_temp": {},
+            "humidity": {},
+            "brightness": {},
+            "presence": {},
+            "current_weather": {},
+            "rain": {},
+            "storm_warning": {},
+            "sunshine": {},
+            "wind_speed": {},
+            "default": {},  # For uncategorized measurements
+        }
+        self._cache_lock = asyncio.Lock()
+
+        # MQTT publishing configuration
+        self._mqtt_enabled = settings.udp_listener.mqtt_publish_enabled
+        self._mqtt_topic = settings.udp_listener.mqtt_status_topic
+        self._mqtt_interval = settings.udp_listener.mqtt_publish_interval
+        self._mqtt_task: Optional[asyncio.Task[None]] = None
+        self._last_publish = datetime.now()
+
     async def start(self) -> None:
         """Start the UDP listener."""
         loop = asyncio.get_event_loop()
@@ -51,6 +84,10 @@ class UDPListener(BaseModule):
             f"UDP listener started on {self.settings.udp_listener.host}:"
             f"{self.settings.udp_listener.port}"
         )
+
+        # Initialize cache from InfluxDB
+        await self._initialize_cache_from_influxdb()
+
         self.logger.info("Starting to accept data.")
         delim = self.settings.udp_listener.delimiter
         self.logger.info(
@@ -62,6 +99,11 @@ class UDPListener(BaseModule):
         # Start statistics logging task
         self._stats_task = asyncio.create_task(self._stats_logger())
 
+        # Start MQTT publishing task if enabled
+        if self._mqtt_enabled and self.mqtt_client:
+            self._mqtt_task = asyncio.create_task(self._mqtt_publisher())
+            self.logger.info(f"MQTT publishing enabled on topic: {self._mqtt_topic}")
+
     async def stop(self) -> None:
         """Stop the UDP listener."""
         # Stop statistics task
@@ -72,10 +114,21 @@ class UDPListener(BaseModule):
             except asyncio.CancelledError:
                 pass
 
+        # Stop MQTT publishing task
+        if self._mqtt_task and not self._mqtt_task.done():
+            self._mqtt_task.cancel()
+            try:
+                await self._mqtt_task
+            except asyncio.CancelledError:
+                pass
+
         if self.transport:
             self.transport.close()
             # Log final statistics
             await self._log_statistics(final=True)
+            # Publish final status
+            if self._mqtt_enabled and self.mqtt_client:
+                await self._publish_mqtt_status(final=True)
             self.logger.info("UDP listener stopped")
 
     async def process_data(self, data: bytes, addr: Tuple[str, int]) -> None:
@@ -148,6 +201,9 @@ class UDPListener(BaseModule):
                 timestamp=utc_time,
             )
 
+            # Update cache for MQTT publishing
+            await self._update_cache(measurement_type, measurement_name, value, room_name, tag1, tag2, utc_time)
+
             # Update statistics instead of logging each packet
             async with self.stats_lock:
                 self.packet_count += 1
@@ -164,6 +220,88 @@ class UDPListener(BaseModule):
             self.logger.error(f"Failed to process incoming data: {e}", exc_info=True)
             async with self.stats_lock:
                 self.error_count += 1
+
+    async def _initialize_cache_from_influxdb(self) -> None:
+        """Initialize the value cache from the most recent values in InfluxDB."""
+        if not self.influxdb_client:
+            self.logger.warning("InfluxDB client not available, skipping cache initialization")
+            return
+
+        try:
+            self.logger.info("Initializing cache from InfluxDB...")
+
+            # Flux query to get the last value for each measurement/field combination
+            query = f'''
+from(bucket: "{self.settings.influxdb.bucket_loxone}")
+  |> range(start: -24h)
+  |> filter(fn: (r) =>
+      r._measurement == "ev" or
+      r._measurement == "relay" or
+      r._measurement == "temperature" or
+      r._measurement == "target_temp" or
+      r._measurement == "humidity" or
+      r._measurement == "brightness" or
+      r._measurement == "presence" or
+      r._measurement == "current_weather" or
+      r._measurement == "rain" or
+      r._measurement == "storm_warning" or
+      r._measurement == "sunshine" or
+      r._measurement == "wind_speed"
+  )
+  |> group(columns: ["_measurement", "_field", "room", "tag1", "tag2"])
+  |> last()
+  |> yield(name: "last")
+'''
+
+            # Execute query
+            result = await self.influxdb_client.query(query)
+
+            # Parse results and populate cache
+            count_by_type: Dict[str, int] = defaultdict(int)
+            total_count = 0
+
+            async with self._cache_lock:
+                for table in result:
+                    for record in table.records:
+                        measurement_type = record.get_measurement()
+                        measurement_name = record.get_field()
+                        value = record.get_value()
+                        room = record.values.get("room", "_")
+                        tag1 = record.values.get("tag1", "_")
+                        tag2 = record.values.get("tag2", "_")
+                        timestamp = record.get_time()
+
+                        # Ensure measurement_type exists in cache
+                        if measurement_type not in self._value_cache:
+                            self._value_cache[measurement_type] = {}
+
+                        # Store in cache
+                        self._value_cache[measurement_type][measurement_name] = {
+                            "value": value,
+                            "room": room,
+                            "tag1": tag1,
+                            "tag2": tag2,
+                            "timestamp": timestamp.isoformat() if timestamp else datetime.now(pytz.UTC).isoformat(),
+                        }
+
+                        count_by_type[measurement_type] += 1
+                        total_count += 1
+
+            # Log summary
+            if total_count > 0:
+                summary = ", ".join([f"{k}: {v}" for k, v in sorted(count_by_type.items())])
+                self.logger.info(f"Cache initialized with {total_count} values ({summary})")
+
+                # Publish initial status to MQTT
+                if self._mqtt_enabled and self.mqtt_client:
+                    await self._publish_mqtt_status()
+                    self.logger.info("Published initial status to MQTT")
+            else:
+                self.logger.info("No recent data found in InfluxDB, starting with empty cache")
+
+        except Exception as e:
+            self.logger.error(f"Failed to initialize cache from InfluxDB: {e}", exc_info=True)
+            self.logger.info("Continuing with empty cache")
 
     async def _stats_logger(self) -> None:
         """Periodically log statistics summary."""
@@ -217,6 +355,116 @@ class UDPListener(BaseModule):
                 self.measurement_counts.clear()
                 self.room_counts.clear()
                 self.last_stats_log = now
+
+    async def _update_cache(
+        self,
+        measurement_type: str,
+        measurement_name: str,
+        value: float,
+        room: str,
+        tag1: str,
+        tag2: str,
+        timestamp: datetime,
+    ) -> None:
+        """Update the value cache and check for significant changes."""
+        async with self._cache_lock:
+            # Ensure measurement_type exists in cache
+            if measurement_type not in self._value_cache:
+                self._value_cache[measurement_type] = {}
+
+            # Check for significant change
+            old_value = None
+            if measurement_name in self._value_cache[measurement_type]:
+                old_value = self._value_cache[measurement_type][measurement_name].get("value")
+
+            # Update cache
+            self._value_cache[measurement_type][measurement_name] = {
+                "value": value,
+                "room": room,
+                "tag1": tag1,
+                "tag2": tag2,
+                "timestamp": timestamp.isoformat(),
+            }
+
+            # Check for significant changes that warrant immediate publish
+            should_publish = False
+
+            # Publish on significant value changes
+            if old_value is not None:
+                # For power measurements, publish if changed by more than 1000W
+                if "power" in measurement_name.lower() and abs(value - old_value) > 1000:
+                    should_publish = True
+                    self.logger.debug(f"Power measurement '{measurement_name}' changed: {old_value}W -> {value}W")
+
+                # For relay states, publish on any change
+                elif measurement_type == "relay" and old_value != value:
+                    should_publish = True
+                    state = "ON" if value == 1 else "OFF"
+                    self.logger.debug(f"Relay '{measurement_name}' changed to {state}")
+
+            # Publish immediately if triggered
+            if should_publish and self._mqtt_enabled and self.mqtt_client:
+                await self._publish_mqtt_status()
+
+
+    async def _publish_mqtt_status(self, final: bool = False) -> None:
+        """Publish current status to MQTT."""
+        if not self.mqtt_client:
+            return
+
+        try:
+            async with self._cache_lock:
+                # Build status message
+                status = {
+                    "timestamp": datetime.now(pytz.UTC).isoformat(),
+                }
+
+                # Add all cached measurements by type
+                for measurement_type, measurements in self._value_cache.items():
+                    if measurements:
+                        # Create simplified structure with values and metadata
+                        type_data = {}
+                        for name, data in measurements.items():
+                            # Include value and room for context
+                            type_data[name] = {
+                                "value": data["value"],
+                                "room": data.get("room", "_"),
+                            }
+                            # Add tags only if meaningful (not "_")
+                            if data.get("tag1") and data["tag1"] != "_":
+                                type_data[name]["tag1"] = data["tag1"]
+                            if data.get("tag2") and data["tag2"] != "_":
+                                type_data[name]["tag2"] = data["tag2"]
+                        if type_data:
+                            status[measurement_type] = type_data
+
+                # Add metadata
+                status["_metadata"] = {
+                    "final": final,
+                    "cache_size": sum(len(m) for m in self._value_cache.values()),
+                }
+
+            # Publish to MQTT
+            message = json.dumps(status, separators=(",", ":"))
+            await self.mqtt_client.publish(self._mqtt_topic, message, retain=True)
+
+            self._last_publish = datetime.now()
+            if not final:
+                self.logger.debug(f"Published status to MQTT ({len(message)} bytes)")
+
+        except Exception as e:
+            self.logger.error(f"Failed to publish MQTT status: {e}", exc_info=True)
+
+    async def _mqtt_publisher(self) -> None:
+        """Periodically publish status to MQTT."""
+        while self._running:
+            try:
+                await asyncio.sleep(self._mqtt_interval)
+                await self._publish_mqtt_status()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in MQTT publisher: {e}")
 
 
 class UDPProtocol(asyncio.DatagramProtocol):
