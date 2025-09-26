@@ -1570,13 +1570,13 @@ class GrowattController(BaseModule):
         """Schedule fallback mode when price data is unavailable."""
         # Schedule to disable battery-first at midnight with jitter
         task = asyncio.create_task(
-            self._schedule_at_time(MIDNIGHT_JITTER, self._disable_battery_first)
+            self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_battery_first)
         )
         self._scheduled_tasks.append(task)
 
         # Schedule to disable export at midnight with jitter
         task = asyncio.create_task(
-            self._schedule_at_time(MIDNIGHT_DISABLE_JITTER, self._disable_export)
+            self._schedule_at_time(MIDNIGHT_DISABLE_JITTER, self._mode_manager.disable_export)
         )
         self._scheduled_tasks.append(task)
 
@@ -1666,11 +1666,11 @@ class GrowattController(BaseModule):
                     Period("export", dt_time(0, 0), sunrise_time)
                 )
 
-                task = self._schedule_action("00:00", self._set_load_first)
+                task = self._schedule_action("00:00", self._mode_manager.set_load_first)
                 self._scheduled_tasks.append(task)
 
                 # Enable export for overnight period (prices above threshold)
-                task = self._schedule_action(MIDNIGHT_JITTER, self._enable_export)
+                task = self._schedule_action(MIDNIGHT_JITTER, self._mode_manager.enable_export)
                 self._scheduled_tasks.append(task)
 
             # Schedule Grid-First from sunrise to end of day (sell solar + battery at 10% rate)
@@ -1688,12 +1688,12 @@ class GrowattController(BaseModule):
 
             task = self._schedule_action(
                 sunrise_str, self._emit_device_window,
-                self._set_grid_first, sunrise_str, EOD_HHMM, 20, 10
+                self._mode_manager.set_grid_first, sunrise_str, EOD_HHMM, 20, 10
             )
             self._scheduled_tasks.append(task)
 
             # Enable export after sunrise
-            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._enable_export)
+            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._mode_manager.enable_export)
             self._scheduled_tasks.append(task)
             return
 
@@ -1739,10 +1739,10 @@ class GrowattController(BaseModule):
                 self._scheduled_periods.append(
                     Period("export", dt_time(0, 0), sunrise_time)
                 )
-                task = self._schedule_action(MIDNIGHT_JITTER, self._enable_export)
+                task = self._schedule_action(MIDNIGHT_JITTER, self._mode_manager.enable_export)
                 self._scheduled_tasks.append(task)
 
-            task = self._schedule_action("00:00", self._set_load_first)
+            task = self._schedule_action("00:00", self._mode_manager.set_load_first)
             self._scheduled_tasks.append(task)
 
         # Schedule Grid-First from sunrise until first low price
@@ -1771,12 +1771,12 @@ class GrowattController(BaseModule):
             # Set grid-first at sunrise with stopSOC=20% and powerRate=10%
             task = self._schedule_action(
                 sunrise_str, self._emit_device_window,
-                self._set_grid_first, sunrise_str, grid_first_end, 20, 10
+                self._mode_manager.set_grid_first, sunrise_str, grid_first_end, 20, 10
             )
             self._scheduled_tasks.append(task)
 
             # Enable export during morning high prices
-            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._enable_export)
+            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._mode_manager.enable_export)
             self._scheduled_tasks.append(task)
 
         # Schedule battery-first during each low-price period
@@ -1804,12 +1804,12 @@ class GrowattController(BaseModule):
                             self._parse_hhmm(group_start)
                         )
                     )  # Track export period
-                    task = self._schedule_action(previous_end, self._set_load_first)
+                    task = self._schedule_action(previous_end, self._mode_manager.set_load_first)
                     self._scheduled_tasks.append(task)
 
                     # Re-enable export during the gap (prices above threshold)
                     enable_time = self._bump_time(previous_end, 5)
-                    task = self._schedule_action(enable_time, self._enable_export)
+                    task = self._schedule_action(enable_time, self._mode_manager.enable_export)
                     self._scheduled_tasks.append(task)
 
             # Schedule battery-first for this low-price period
@@ -1824,16 +1824,16 @@ class GrowattController(BaseModule):
             # Switch to battery-first at start of low period
             task = self._schedule_action(
                 group_start, self._emit_device_window,
-                self._set_battery_first, group_start, group_end
+                self._mode_manager.set_battery_first, group_start, group_end
             )
             self._scheduled_tasks.append(task)
 
             # Ensure AC charging is disabled (we only want solar charging)
-            task = self._schedule_action(self._bump_time(group_start, 5), self._disable_ac_charge)
+            task = self._schedule_action(self._bump_time(group_start, 5), self._mode_manager.disable_ac_charge)
             self._scheduled_tasks.append(task)
 
             # Disable export during low prices (no point selling below operator costs)
-            task = self._schedule_action(self._bump_time(group_start, 10), self._disable_export)
+            task = self._schedule_action(self._bump_time(group_start, 10), self._mode_manager.disable_export)
             self._scheduled_tasks.append(task)
 
             previous_end = group_end
@@ -1850,11 +1850,11 @@ class GrowattController(BaseModule):
                 Period("export", self._parse_hhmm(last_low_end), EOD_DTTIME)
             )  # Enable export for excess
 
-            task = self._schedule_action(last_low_end, self._set_load_first)
+            task = self._schedule_action(last_low_end, self._mode_manager.set_load_first)
             self._scheduled_tasks.append(task)
 
             # Enable export for evening (in case of excess energy)
-            task = self._schedule_action(self._bump_time(last_low_end, 5), self._enable_export)
+            task = self._schedule_action(self._bump_time(last_low_end, 5), self._mode_manager.enable_export)
             self._scheduled_tasks.append(task)
 
     async def _schedule_battery_control(
@@ -2112,7 +2112,7 @@ class GrowattController(BaseModule):
             )
             # Schedule disable at midnight with small delay to avoid conflicts
             task = asyncio.create_task(
-                self._schedule_at_time(MIDNIGHT_JITTER, self._disable_export)
+                self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_export)
             )
             self._scheduled_tasks.append(task)
             return
@@ -2221,19 +2221,19 @@ class GrowattController(BaseModule):
                     midnight_enable_scheduled = True
 
                 # Schedule export enable at start
-                task = self._schedule_action(slice_start, self._enable_export)
+                task = self._schedule_action(slice_start, self._mode_manager.enable_export)
                 self._scheduled_tasks.append(task)
 
                 # Schedule export disable at end (normalize to EOD sentinel if needed)
                 disable_at = self._normalize_for_schedule(slice_end)
-                task = self._schedule_action(disable_at, self._disable_export)
+                task = self._schedule_action(disable_at, self._mode_manager.disable_export)
                 self._scheduled_tasks.append(task)
 
         # Check if we need a midnight disable (only if we didn't schedule a 00:00 enable)
         if not midnight_enable_scheduled:
             # Use constant for better readability
             task = asyncio.create_task(
-                self._schedule_at_time(MIDNIGHT_JITTER, self._disable_export)
+                self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_export)
             )
             self._scheduled_tasks.append(task)
             self.logger.info(f"Scheduled export disable at {MIDNIGHT_JITTER} for clean daily start")
