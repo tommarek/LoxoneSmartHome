@@ -1019,6 +1019,10 @@ class GrowattController(BaseModule):
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
 
+        # Reset inverter to clean state on startup
+        self.logger.info("Resetting inverter to clean state...")
+        await self._reset_inverter_state()
+
         await self._schedule_daily_calculation()
         self.logger.info("Growatt controller started")
 
@@ -1054,31 +1058,65 @@ class GrowattController(BaseModule):
         self._scheduled_tasks.clear()
         self._daily_schedule_task = None
 
-        # Land fully neutral - disable all modes to ensure predictable state
+        # Reset to clean state on shutdown - same as startup state
+        self.logger.info("🔄 Resetting inverter to safe shutdown state...")
         try:
+            # Set to load-first (safest mode)
+            await self._mode_manager.set_load_first()
+            await asyncio.sleep(0.5)
+
+            # Disable battery-first and grid-first (redundant but explicit)
             await self._mode_manager.disable_battery_first()
-            await asyncio.sleep(0.5)  # Delay between shutdown commands
-        except Exception as e:
-            self.logger.error(f"Error disabling battery first on shutdown: {e}")
-
-        try:
+            await asyncio.sleep(0.5)
             await self._mode_manager.disable_grid_first()
-            await asyncio.sleep(0.5)  # Delay between shutdown commands
-        except Exception as e:
-            self.logger.error(f"Error disabling grid first on shutdown: {e}")
+            await asyncio.sleep(0.5)
 
-        try:
-            await self._mode_manager.disable_export()
-            await asyncio.sleep(0.2)  # Small delay before AC disable
-        except Exception as e:
-            self.logger.error(f"Error disabling export on shutdown: {e}")
-
-        try:
+            # Disable AC charging
             await self._mode_manager.disable_ac_charge()
+            await asyncio.sleep(0.5)
+
+            # Enable export (default safe state)
+            await self._mode_manager.enable_export()
+
+            self.logger.info("✅ Inverter shutdown state: load-first mode, export enabled, AC charging disabled")
         except Exception as e:
-            self.logger.error(f"Error disabling AC charge on shutdown: {e}")
+            self.logger.error(f"Error during shutdown reset: {e}", exc_info=True)
 
         self.logger.info("Growatt controller stopped")
+
+    async def _reset_inverter_state(self) -> None:
+        """Reset inverter to a clean, known state on startup.
+
+        This ensures the inverter starts in a predictable state regardless of
+        what mode it was in when the service was last stopped.
+        """
+        try:
+            self.logger.info("🔄 Resetting inverter to default state...")
+
+            # Step 1: Set to load-first mode (safest default)
+            await self._mode_manager.set_load_first()
+            await asyncio.sleep(0.5)
+
+            # Step 2: Disable AC charging (will be enabled if needed by schedule)
+            await self._mode_manager.disable_ac_charge()
+            await asyncio.sleep(0.5)
+
+            # Step 3: Enable export (default state, will be disabled if needed)
+            await self._mode_manager.enable_export()
+            await asyncio.sleep(0.5)
+
+            # Step 4: Clear any battery-first or grid-first modes
+            # This is implicitly done by set_load_first, but we can be explicit
+            await self._mode_manager.disable_battery_first()
+            await asyncio.sleep(0.5)
+            await self._mode_manager.disable_grid_first()
+            await asyncio.sleep(0.5)
+
+            self.logger.info("✅ Inverter reset complete: load-first mode, export enabled, AC charging disabled")
+
+        except Exception as e:
+            self.logger.error(f"Failed to reset inverter state: {e}", exc_info=True)
+            # Continue anyway - the scheduled mode will try to set the correct state
 
     async def _apply_current_state(self) -> None:
         """Apply the appropriate state based on current time and scheduled periods."""
