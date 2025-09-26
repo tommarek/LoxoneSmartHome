@@ -1185,8 +1185,8 @@ class GrowattController(BaseModule):
 
         elif mode == "discharge_to_grid":
             # Grid-first with custom discharge parameters
-            stop_soc = params.get("stop_soc", 20)
-            power_rate = params.get("power_rate", 100)
+            stop_soc = params.get("stop_soc", self.config.discharge_min_soc)
+            power_rate = params.get("power_rate", self.config.discharge_power_rate)
             await self._mode_manager.set_grid_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
             await asyncio.sleep(0.5)
             await self._mode_manager.enable_export()
@@ -1262,8 +1262,8 @@ class GrowattController(BaseModule):
             params.setdefault("stop_soc", self.config.max_soc)
             params.setdefault("power_rate", 100)
         elif mode == "discharge_to_grid":
-            params.setdefault("stop_soc", 20)
-            params.setdefault("power_rate", 100)
+            params.setdefault("stop_soc", self.config.discharge_min_soc)
+            params.setdefault("power_rate", self.config.discharge_power_rate)
 
         # Create manual override period
         self._manual_override_period = Period(
@@ -1637,7 +1637,7 @@ class GrowattController(BaseModule):
             )
             self._scheduled_periods.append(
                 Period("grid_first", sunrise_time, EOD_DTTIME,
-                       params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
+                       params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
             )
             self._scheduled_periods.append(
                 Period("export", sunrise_time, EOD_DTTIME)
@@ -1718,7 +1718,7 @@ class GrowattController(BaseModule):
                     "grid_first",
                     sunrise_time,
                     self._parse_hhmm(grid_first_end),
-                    params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate}
+                    params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate}
                 )
             )
             self._scheduled_periods.append(
@@ -1922,10 +1922,10 @@ class GrowattController(BaseModule):
                     )
                 self._scheduled_periods.append(
                     Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
-                           params={"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
+                           params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
                 )
                 task = self._schedule_action(start_time, self._apply_composite_mode, "discharge_to_grid",
-                                            {"stop_soc": self.config.min_soc, "power_rate": self.config.discharge_power_rate})
+                                            {"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
                 self._scheduled_tasks.append(task)
 
         # Fill gaps with regular or regular_no_export based on price

@@ -151,6 +151,7 @@ class GrowattConfig(BaseModel):
     max_charge_power: float = Field(default=3.0, gt=0)  # kW
     min_soc: float = Field(default=20.0, ge=0, le=100)  # %
     max_soc: float = Field(default=100.0, ge=0, le=100)  # %
+    discharge_min_soc: float = Field(default=20.0, ge=0, le=100)  # % - Stop discharge at this SOC
 
     # Battery economics
     battery_efficiency: float = Field(default=0.85, gt=0, le=1)  # Round-trip efficiency (85%)
