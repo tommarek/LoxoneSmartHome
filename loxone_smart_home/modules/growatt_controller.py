@@ -583,7 +583,7 @@ class GrowattController(BaseModule):
                     stop_soc = period.params.get("stop_soc", self.config.max_soc)
                     entry["details"].append(f"Charge to {stop_soc}% SOC")
                 entry["details"].append("AC Charging: ENABLED")
-                entry["details"].append("Export: DISABLED")
+                entry["details"].append("Export: ENABLED")  # Export now enabled during charging
 
             elif slot["primary_mode"] == "sell_production":
                 entry["mode"] = "SELL-PRODUCTION"
@@ -1990,28 +1990,39 @@ class GrowattController(BaseModule):
                 for h in range(0, end_hour):
                     all_scheduled_times.add(f"{h:02d}:00")
 
-        # Schedule regular modes for unscheduled hours
-        regular_count = 0
-        no_export_count = 0
+        # Group regular modes for unscheduled hours
+        regular_hours = []
+        no_export_hours = []
+
         for (start, stop), price in sorted(hourly_prices.items()):
             if start not in all_scheduled_times:
                 if price < threshold_eur_mwh:
                     # Low price - don't export
-                    self._scheduled_periods.append(
-                        Period("regular_no_export", self._parse_hhmm(start), self._parse_hhmm(stop))
-                    )
-                    no_export_count += 1
+                    no_export_hours.append((start, stop, price))
                 else:
                     # Normal/high price - allow export
-                    self._scheduled_periods.append(
-                        Period("regular", self._parse_hhmm(start), self._parse_hhmm(stop))
-                    )
-                    regular_count += 1
+                    regular_hours.append((start, stop, price))
 
-        if regular_count > 0 or no_export_count > 0:
+        # Group consecutive regular hours into multi-hour periods
+        if regular_hours:
+            regular_groups = self._price_analyzer.group_contiguous_hours_simple(regular_hours)
+            for group_start, group_end in regular_groups:
+                self._scheduled_periods.append(
+                    Period("regular", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                )
             self.logger.info(
-                f"Scheduled {regular_count} regular hours and {no_export_count} no-export hours "
-                f"(export threshold: {self.config.export_price_threshold} CZK/kWh = {threshold_eur_mwh:.2f} EUR/MWh)"
+                f"Scheduled {len(regular_groups)} regular period(s) covering {len(regular_hours)} hours"
+            )
+
+        # Group consecutive no-export hours into multi-hour periods
+        if no_export_hours:
+            no_export_groups = self._price_analyzer.group_contiguous_hours_simple(no_export_hours)
+            for group_start, group_end in no_export_groups:
+                self._scheduled_periods.append(
+                    Period("regular_no_export", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                )
+            self.logger.info(
+                f"Scheduled {len(no_export_groups)} no-export period(s) covering {len(no_export_hours)} hours"
             )
 
         # Export control is now handled by composite modes
