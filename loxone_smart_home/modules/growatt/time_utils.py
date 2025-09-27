@@ -76,8 +76,8 @@ def bump_time(hhmm: str, seconds: int) -> str:
         t = datetime.strptime(hhmm, "%H:%M:%S")
     except ValueError:
         t = datetime.strptime(hhmm, "%H:%M")
-    t = (t + timedelta(seconds=seconds)).time()
-    return t.strftime("%H:%M:%S")
+    adjusted = (t + timedelta(seconds=seconds)).time()
+    return adjusted.strftime("%H:%M:%S")
 
 
 def to_device_hhmm(s: str) -> str:

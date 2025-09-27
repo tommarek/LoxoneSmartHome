@@ -1,18 +1,21 @@
 """Mode management for Growatt controller - handles battery and grid modes."""
 
+from __future__ import annotations
+
 import asyncio
 import json
 from datetime import datetime
-from datetime import time as dt_time
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from .models import PeriodType
+
+if TYPE_CHECKING:
+    from modules.growatt_controller import GrowattController
 
 
 class ModeManager:
     """Manages Growatt inverter modes including battery-first, grid-first, and load-first."""
 
-    def __init__(self, controller):
+    def __init__(self, controller: GrowattController) -> None:
         """Initialize ModeManager with reference to main controller.
 
         Args:
@@ -53,7 +56,7 @@ class ModeManager:
         """Query inverter state."""
         return await self.controller._query_inverter_state()
 
-    async def ensure_exclusive(self, primary: PeriodType) -> None:
+    async def ensure_exclusive(self, primary: str) -> None:
         """Ensure modes are mutually exclusive at the device level.
 
         First resets to load-first mode to ensure clean state, then applies the requested mode.
@@ -177,7 +180,8 @@ class ModeManager:
         result = await self._wait_for_command_result("batteryfirst/set/timeslot")
         if result and not result.get("success", False):
             self.logger.error(
-                f"⚠️ Battery-first command FAILED! Message: {result.get('message', 'Unknown error')}"
+                f"⚠️ Battery-first command FAILED! "
+                f"Message: {result.get('message', 'Unknown error')}"
             )
             self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             return
@@ -262,8 +266,8 @@ class ModeManager:
         assert self.mqtt_client is not None
         # DEBUG
         self.logger.warning(
-            f"🔍 DEBUG disable battery-first payload: start='00:00', stop='00:00', "
-            f"enabled=False, slot=1"
+            "🔍 DEBUG disable battery-first payload: start='00:00', stop='00:00', "
+            "enabled=False, slot=1"
         )
         self.logger.info(
             f"📤 Disabling battery-first: topic={self.config.battery_first_topic}, "
@@ -506,8 +510,8 @@ class ModeManager:
         assert self.mqtt_client is not None
         # DEBUG
         self.logger.warning(
-            f"🔍 DEBUG disable grid-first payload: start='00:00', stop='00:00', "
-            f"enabled=False, slot=1"
+            "🔍 DEBUG disable grid-first payload: start='00:00', stop='00:00', "
+            "enabled=False, slot=1"
         )
         self.logger.info(
             f"📤 Disabling grid-first: topic={self.config.grid_first_topic}, "
@@ -518,7 +522,8 @@ class ModeManager:
         result = await self._wait_for_command_result("gridfirst/set/timeslot")
         if result and not result.get("success", False):
             self.logger.error(
-                f"⚠️ Failed to disable grid-first! Message: {result.get('message', 'Unknown error')}"
+                f"⚠️ Failed to disable grid-first! "
+                f"Message: {result.get('message', 'Unknown error')}"
             )
             self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
 

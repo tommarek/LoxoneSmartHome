@@ -1,9 +1,8 @@
 """Enhanced logging utilities with timezone support and service prefixes."""
 
 import logging
-import time
 import zoneinfo
-from typing import Optional
+from typing import Any, Optional
 
 import colorlog
 
@@ -17,7 +16,7 @@ class TimezoneAwareFormatter(colorlog.ColoredFormatter):
         datefmt: Optional[str] = None,
         timezone: str = "Europe/Prague",
         service_name: Optional[str] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> None:
         """Initialize the timezone-aware formatter.
 
@@ -42,10 +41,6 @@ class TimezoneAwareFormatter(colorlog.ColoredFormatter):
 
     def formatTime(self, record: logging.LogRecord, datefmt: Optional[str] = None) -> str:
         """Format time in the specified timezone."""
-        # Convert the record timestamp to local timezone
-        dt = time.localtime(record.created)
-        local_time = time.struct_time(dt)
-
         # Create a datetime object and convert to our timezone
         import datetime
 

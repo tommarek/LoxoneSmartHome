@@ -134,7 +134,9 @@ class TestWinterModeScheduling:
         await controller._schedule_winter_strategy(hourly_prices, 24.29)
 
         # Check discharge periods
-        discharge_periods = [p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"]
+        discharge_periods = [
+            p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"
+        ]
 
         # With 3x margin, only 260 EUR/MWh hour should trigger discharge
         if discharge_periods:
@@ -160,7 +162,9 @@ class TestWinterModeScheduling:
         await controller._schedule_winter_strategy(hourly_prices, 24.29)
 
         # Check no discharge scheduled
-        discharge_periods = [p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"]
+        discharge_periods = [
+            p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"
+        ]
         assert len(discharge_periods) == 0, "Should not schedule discharge when unprofitable"
 
         # With these prices (need 247 EUR/MWh), no discharge should occur
@@ -197,7 +201,9 @@ class TestDischargeEconomics:
         await controller._schedule_winter_strategy(hourly_prices, 24.29)
 
         # Verify discharge decision based on economics
-        discharge_periods = [p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"]
+        discharge_periods = [
+            p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"
+        ]
 
         if discharge_periods:
             # Should only discharge during profitable hour (19:00)
@@ -219,7 +225,9 @@ class TestDischargeEconomics:
         await controller._schedule_winter_strategy(hourly_prices, 24.29)
 
         # Check discharge parameters
-        discharge_periods = [p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"]
+        discharge_periods = [
+            p for p in controller._scheduled_periods if p.kind == "discharge_to_grid"
+        ]
 
         if discharge_periods:
             for period in discharge_periods:
@@ -267,7 +275,9 @@ class TestExportControl:
         # Verify that periods are being created based on price thresholds
         for period in controller._scheduled_periods:
             # Just verify the structure is correct
-            assert period.kind in ["charge_from_grid", "discharge_to_grid", "regular", "regular_no_export"]
+            assert period.kind in [
+                "charge_from_grid", "discharge_to_grid", "regular", "regular_no_export"
+            ]
 
 
 class TestScheduleIntegration:
@@ -306,7 +316,7 @@ class TestScheduleIntegration:
 
         # Verify no overlapping periods
         for i, period1 in enumerate(all_periods):
-            for period2 in all_periods[i+1:]:
+            for period2 in all_periods[i + 1:]:
                 # Simple overlap check (would need more logic for midnight wrap)
                 if period1.kind in ["charge_from_grid", "discharge_to_grid"]:
                     if period2.kind in ["charge_from_grid", "discharge_to_grid"]:

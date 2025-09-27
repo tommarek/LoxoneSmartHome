@@ -156,7 +156,9 @@ async def test_winter_strategy_with_ac_charging(controller, mock_influxdb_client
             price = 60.0
         mock_prices[(f"{h:02d}:00", f"{h+1:02d}:00")] = price
 
-    with patch.object(controller._price_analyzer, 'fetch_dam_energy_prices', return_value=mock_prices):
+    with patch.object(
+        controller._price_analyzer, 'fetch_dam_energy_prices', return_value=mock_prices
+    ):
         await controller._calculate_and_schedule_next_day()
 
     # Check that charging from grid is scheduled

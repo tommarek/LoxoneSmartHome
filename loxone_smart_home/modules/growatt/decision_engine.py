@@ -31,7 +31,7 @@ class DecisionContext:
     current_mode: Optional[str]
     is_battery_charging_scheduled: bool = False  # True if charge_from_grid is scheduled now
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         """Derive additional context after initialization."""
         # Check if the scheduled mode is battery charging
         if self.scheduled_mode == "charge_from_grid":
@@ -172,7 +172,7 @@ class GrowattDecisionEngine:
                 name="Scheduled Mode",
                 priority=Priority.SCHEDULED_MODE,
                 condition=lambda ctx: ctx.scheduled_mode is not None,
-                action=lambda ctx: ctx.scheduled_mode,
+                action=lambda ctx: ctx.scheduled_mode or "regular",
                 explanation="Applying scheduled mode for current time period"
             ),
 

@@ -226,7 +226,7 @@ def test_explanation_with_context(
 
     # Explain without making decision first
     decision_engine._last_decision = None
-    mode = decision_engine.decide(base_context)
+    decision_engine.decide(base_context)
     explanation = decision_engine.explain_decision(base_context)
 
     assert explanation["decision"] == "high_load_protected"

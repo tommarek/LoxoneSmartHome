@@ -202,7 +202,9 @@ class UDPListener(BaseModule):
             )
 
             # Update cache and publish to MQTT
-            await self._update_cache(measurement_type, measurement_name, value, room_name, tag1, tag2, utc_time)
+            await self._update_cache(
+                measurement_type, measurement_name, value, room_name, tag1, tag2, utc_time
+            )
 
             # Publish every update to MQTT
             if self._mqtt_enabled and self.mqtt_client:
@@ -285,7 +287,10 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
                             "room": room,
                             "tag1": tag1,
                             "tag2": tag2,
-                            "timestamp": timestamp.isoformat() if timestamp else datetime.now(pytz.UTC).isoformat(),
+                            "timestamp": (
+                                timestamp.isoformat() if timestamp
+                                else datetime.now(pytz.UTC).isoformat()
+                            ),
                         }
 
                         count_by_type[measurement_type] += 1
@@ -377,9 +382,9 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
                 self._value_cache[measurement_type] = {}
 
             # Check for significant change
-            old_value = None
+            # Check if measurement exists in cache (for future use if needed)
             if measurement_name in self._value_cache[measurement_type]:
-                old_value = self._value_cache[measurement_type][measurement_name].get("value")
+                pass  # Could track changes here if needed
 
             # Update cache
             self._value_cache[measurement_type][measurement_name] = {
@@ -390,8 +395,6 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
                 "timestamp": timestamp.isoformat(),
             }
 
-
-
     async def _publish_mqtt_status(self, final: bool = False) -> None:
         """Publish current status to MQTT."""
         if not self.mqtt_client:
@@ -400,7 +403,7 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
         try:
             async with self._cache_lock:
                 # Build status message
-                status = {
+                status: Dict[str, Any] = {
                     "timestamp": datetime.now(pytz.UTC).isoformat(),
                 }
 
@@ -435,7 +438,10 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
 
             self._last_publish = datetime.now()
             if not final:
-                self.logger.debug(f"Published status to MQTT topic '{self._mqtt_topic}' ({len(message)} bytes)")
+                self.logger.debug(
+                    f"Published status to MQTT topic '{self._mqtt_topic}' "
+                    f"({len(message)} bytes)"
+                )
 
         except Exception as e:
             self.logger.error(f"Failed to publish MQTT status: {e}", exc_info=True)

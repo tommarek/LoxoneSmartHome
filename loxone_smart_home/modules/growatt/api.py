@@ -43,7 +43,7 @@ async def _setup_result_subscription(controller: GrowattController) -> None:
 
             # Get the command from the response
             command = data.get("command")
-            
+
             # Handle register get/set responses specially
             if command in ["register/get", "register/set"]:
                 register = data.get("register")
@@ -109,32 +109,32 @@ async def _setup_telemetry_subscription(controller: GrowattController) -> None:
 
 async def _query_register_1044(controller: GrowattController) -> Optional[Dict[str, Any]]:
     """Query register 1044 for the current inverter operating mode/state.
-    
+
     Register 1044 contains the current operating mode:
     - 0: Load First mode (normal operation)
-    - 1: Battery First mode (prioritize battery charging)  
+    - 1: Battery First mode (prioritize battery charging)
     - 2: Grid First mode (prioritize selling to grid)
-    
+
     Returns:
         Dict containing the register value or None on error
     """
     if not controller.mqtt_client:
         return None
-    
+
     # Ensure result subscription is active
     await _setup_result_subscription(controller)
-    
+
     try:
         # Create a future to wait for the response
         future: asyncio.Future = asyncio.Future()
         _command_responses["register/get/1044"] = future
-        
+
         # Send the query for register 1044
         await controller.mqtt_client.publish(
-            "energy/solar/command/register/get", 
+            "energy/solar/command/register/get",
             json.dumps({"register": 1044})
         )
-        
+
         # Wait for response with timeout
         response = await asyncio.wait_for(future, timeout=2.0)
         return response
@@ -151,48 +151,48 @@ async def _query_register_1044(controller: GrowattController) -> Optional[Dict[s
 
 async def _set_register_1044(controller: GrowattController, value: int) -> Optional[Dict[str, Any]]:
     """Set register 1044 to change the inverter operating mode.
-    
+
     This provides a simplified way to change modes by directly writing to register 1044.
-    
+
     Args:
         value: The mode value to set:
             - 0: Load First mode (normal operation)
-            - 1: Battery First mode (prioritize battery charging)  
+            - 1: Battery First mode (prioritize battery charging)
             - 2: Grid First mode (prioritize selling to grid)
-    
+
     Returns:
         Dict containing the response or None on error
     """
     if not controller.mqtt_client:
         return None
-        
+
     if value not in [0, 1, 2]:
         controller.logger.error(f"Invalid register 1044 value: {value}. Must be 0, 1, or 2")
         return {"error": "invalid_value", "register": 1044, "value": value}
-    
+
     # Ensure result subscription is active
     await _setup_result_subscription(controller)
-    
+
     try:
         # Create a future to wait for the response
         future: asyncio.Future = asyncio.Future()
         _command_responses["register/set/1044"] = future
-        
+
         # Log the mode change
         mode_names = {0: "Load First", 1: "Battery First", 2: "Grid First"}
         controller.logger.info(
             f"🔧 Setting register 1044 to {value} ({mode_names.get(value, 'Unknown')})"
         )
-        
+
         # Send the command to set register 1044
         await controller.mqtt_client.publish(
-            "energy/solar/command/register/set", 
+            "energy/solar/command/register/set",
             json.dumps({"register": 1044, "value": value})
         )
-        
+
         # Wait for response with timeout
         response = await asyncio.wait_for(future, timeout=3.0)
-        
+
         # Log result
         if response.get("success"):
             controller.logger.info(
@@ -203,7 +203,7 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
                 f"❌ Failed to set register 1044: {response.get('message', 'Unknown error')}"
             )
             controller.logger.error(f"📋 Full response: {json.dumps(response, indent=2)}")
-            
+
         return response
     except asyncio.TimeoutError:
         controller.logger.error("Timeout setting register 1044")
@@ -218,27 +218,27 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
 
 async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]:
     """Query the inverter for current battery-first and grid-first slot configurations.
-    
+
     Returns:
         Dict containing raw battery_first and grid_first responses from inverter
     """
     if not controller.mqtt_client:
         return {}
-    
+
     # Ensure result subscription is active
     await _setup_result_subscription(controller)
-    
+
     result = {}
-    
+
     # Query battery-first status
     try:
         # Create a future to wait for the response
         bf_future: asyncio.Future = asyncio.Future()
         _command_responses["batteryfirst/get"] = bf_future
-        
+
         # Send the query with correct topic and empty JSON
         await controller.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
-        
+
         # Wait for response with timeout
         bf_response = await asyncio.wait_for(bf_future, timeout=2.0)
         # Return the raw response, whatever it is
@@ -252,16 +252,16 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
     finally:
         # Clean up the future
         _command_responses.pop("batteryfirst/get", None)
-    
+
     # Query grid-first status
     try:
         # Create a future to wait for the response
         gf_future: asyncio.Future = asyncio.Future()
         _command_responses["gridfirst/get"] = gf_future
-        
+
         # Send the query with correct topic and empty JSON
         await controller.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
-        
+
         # Wait for response with timeout
         gf_response = await asyncio.wait_for(gf_future, timeout=2.0)
         # Return the raw response, whatever it is
@@ -275,7 +275,7 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
     finally:
         # Clean up the future
         _command_responses.pop("gridfirst/get", None)
-    
+
     return result
 
 
@@ -294,7 +294,8 @@ def create_growatt_api(
         app[GROWATT_CONTROLLER_KEY] = controller
         # Setup persistent subscriptions on startup
         # Note: These need to be awaited before first use, but we create tasks here
-        # The actual subscription will happen when _query_inverter_slots calls _setup_result_subscription
+        # The actual subscription will happen when _query_inverter_slots calls
+        # _setup_result_subscription
         asyncio.create_task(_setup_telemetry_subscription(controller))
 
     # Register routes
@@ -304,12 +305,12 @@ def create_growatt_api(
     app.router.add_post('/api/growatt/mode', set_mode)
     app.router.add_post('/api/growatt/sync-time', sync_time)
     app.router.add_get('/api/growatt/config', get_config)
-    
+
     # Manual mode control routes
     app.router.add_post('/api/growatt/manual-mode', manual_mode_set)
     app.router.add_delete('/api/growatt/manual-mode', manual_mode_clear)
     app.router.add_get('/api/growatt/manual-mode', manual_mode_status)
-    
+
     # Register 1044 direct mode control
     app.router.add_post('/api/growatt/set-mode-register', set_mode_via_register)
 
@@ -357,7 +358,8 @@ async def get_status(request: web.Request) -> web.Response:
         # Get inverter mode data from actual device
         inverter_data = {}
         # Check if optional_config exists (it should be set during init)
-        if hasattr(controller, '_optional_config') and not controller._optional_config.get("simulation_mode", False):
+        if (hasattr(controller, '_optional_config')
+                and not controller._optional_config.get("simulation_mode", False)):
             # Use cached telemetry data if available
             if _telemetry_cache:
                 # Active power rate is available in telemetry
@@ -365,14 +367,14 @@ async def get_status(request: web.Request) -> web.Response:
 
             # Query actual slot configurations from the inverter
             slot_data = await _query_inverter_slots(controller)
-            
+
             # Just pass through the raw responses
             inverter_data["battery_first_data"] = slot_data.get("battery_first_raw", {})
             inverter_data["grid_first_data"] = slot_data.get("grid_first_raw", {})
 
         # Get manual override status
         manual_override = controller.get_manual_override_status()
-        
+
         status = {
             "running": controller._running,
             "current_mode": primary_mode,
@@ -469,17 +471,17 @@ async def get_prices(request: web.Request) -> web.Response:
         # Get current time and price for current hour
         now = controller._get_local_now()
         current_hour = now.strftime("%H:00")
-        
+
         # Convert EUR/MWh prices to CZK/kWh for display
         eur_czk_rate = controller._eur_czk_rate or 25.0
-        
+
         # Find current price
         current_price_eur = None
         for (start, _), price in controller._current_prices.items():
             if start == current_hour:
                 current_price_eur = price
                 break
-        
+
         # Calculate statistics
         prices_list = list(controller._current_prices.values())
         if prices_list:
@@ -488,13 +490,13 @@ async def get_prices(request: web.Request) -> web.Response:
             max_price_eur = max(prices_list)
         else:
             avg_price_eur = min_price_eur = max_price_eur = None
-        
+
         # Convert to CZK/kWh (EUR/MWh * rate / 1000)
         def to_czk_kwh(eur_mwh):
             if eur_mwh is None:
                 return None
             return round(eur_mwh * eur_czk_rate / 1000, 2)
-        
+
         # Build hourly prices list for chart
         hourly_data = []
         for (start, end), price_eur in sorted(controller._current_prices.items()):
@@ -504,7 +506,7 @@ async def get_prices(request: web.Request) -> web.Response:
                 "price_eur_mwh": price_eur,
                 "price_czk_kwh": to_czk_kwh(price_eur)
             })
-        
+
         return web.json_response({
             "current_price_czk_kwh": to_czk_kwh(current_price_eur),
             "average_today_czk_kwh": to_czk_kwh(avg_price_eur),
@@ -534,7 +536,8 @@ async def set_mode(request: web.Request) -> web.Response:
 
     Expected JSON payload:
     {
-        "mode": "regular" | "sell_production" | "regular_no_export" | "charge_from_grid" | "discharge_to_grid",
+        "mode": "regular" | "sell_production" | "regular_no_export" |
+                "charge_from_grid" | "discharge_to_grid",
         "params": {
             "stop_soc": 90,     // optional - for charge_from_grid or discharge_to_grid
             "power_rate": 100   // optional - for discharge_to_grid
@@ -551,9 +554,15 @@ async def set_mode(request: web.Request) -> web.Response:
         data = await request.json()
         mode = data.get("mode")
 
-        valid_modes = ["regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid"]
+        valid_modes = [
+            "regular", "sell_production", "regular_no_export",
+            "charge_from_grid", "discharge_to_grid"
+        ]
         if mode not in valid_modes:
-            return web.json_response({"error": f"Invalid mode. Must be one of {valid_modes}"}, status=400)
+            return web.json_response(
+                {"error": f"Invalid mode. Must be one of {valid_modes}"},
+                status=400
+            )
 
         # Apply the composite mode
         params = data.get("params", {})
@@ -575,7 +584,8 @@ async def manual_mode_set(request: web.Request) -> web.Response:
 
     Expected JSON payload:
     {
-        "mode": "regular" | "sell_production" | "regular_no_export" | "charge_from_grid" | "discharge_to_grid",
+        "mode": "regular" | "sell_production" | "regular_no_export" |
+                "charge_from_grid" | "discharge_to_grid",
         "duration": {
             "type": "immediate" | "end_of_day" | "duration_hours" | "until_time",
             "value": null | 4 | "18:00"  // depends on type
@@ -592,22 +602,22 @@ async def manual_mode_set(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
         )
-    
+
     try:
         data = await request.json()
-        
+
         # Extract parameters
         mode = data.get("mode")
         if not mode:
             return web.json_response({"error": "mode is required"}, status=400)
-        
+
         duration = data.get("duration", {})
         duration_type = duration.get("type", "immediate")
         duration_value = duration.get("value")
-        
+
         params = data.get("params")
         source = data.get("source", "api")
-        
+
         # Set manual override
         result = await controller.set_manual_override(
             mode=mode,
@@ -616,9 +626,9 @@ async def manual_mode_set(request: web.Request) -> web.Response:
             params=params,
             source=source
         )
-        
+
         return web.json_response(result)
-        
+
     except ValueError as e:
         return web.json_response({"error": str(e)}, status=400)
     except Exception as e:
@@ -632,7 +642,7 @@ async def manual_mode_clear(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
         )
-    
+
     try:
         result = await controller.clear_manual_override()
         return web.json_response(result)
@@ -647,7 +657,7 @@ async def manual_mode_status(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
         )
-    
+
     try:
         status = controller.get_manual_override_status()
         return web.json_response(status)
@@ -858,9 +868,9 @@ async def _query_inverter_realtime(
 
 async def set_mode_via_register(request: web.Request) -> web.Response:
     """Set inverter mode by directly writing to register 1044.
-    
+
     This provides a simplified mode control mechanism.
-    
+
     Expected JSON payload:
     {
         "mode": "load_first" | "battery_first" | "grid_first"
@@ -873,21 +883,22 @@ async def set_mode_via_register(request: web.Request) -> web.Response:
         return web.json_response(
             {"error": "Controller not initialized"}, status=503
         )
-    
+
     try:
         data = await request.json()
-        
+
         # Accept either mode name or numeric value
         if "mode" in data:
             mode_map = {
                 "load_first": 0,
-                "battery_first": 1, 
+                "battery_first": 1,
                 "grid_first": 2
             }
             value = mode_map.get(data["mode"])
             if value is None:
                 return web.json_response(
-                    {"error": f"Invalid mode: {data['mode']}. Must be load_first, battery_first, or grid_first"},
+                    {"error": f"Invalid mode: {data['mode']}. "
+                     f"Must be load_first, battery_first, or grid_first"},
                     status=400
                 )
         elif "value" in data:
@@ -902,10 +913,10 @@ async def set_mode_via_register(request: web.Request) -> web.Response:
                 {"error": "Must provide either 'mode' or 'value' parameter"},
                 status=400
             )
-        
+
         # Set the register value
         result = await _set_register_1044(controller, value)
-        
+
         if result and not result.get("error"):
             mode_names = {0: "load_first", 1: "battery_first", 2: "grid_first"}
             return web.json_response({
@@ -921,7 +932,7 @@ async def set_mode_via_register(request: web.Request) -> web.Response:
                 "error": result.get("error", "Failed to set mode"),
                 "response": result
             }, status=500)
-            
+
     except Exception as e:
         controller.logger.error(f"Error setting mode via register: {e}")
         return web.json_response(
@@ -951,7 +962,7 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
 
         # Get real-time inverter data
         realtime_data = await _query_inverter_realtime(controller)
-        
+
         # Query register 1044 for actual inverter mode
         register_1044 = await _query_register_1044(controller)
         actual_mode = None
@@ -1011,7 +1022,10 @@ async def get_dashboard_status(request: web.Request) -> web.Response:
             "current_mode": mode_display,
             "actual_inverter_mode": actual_mode,  # From register 1044
             "register_1044": register_1044,  # Raw register data
-            "simulation_mode": controller._optional_config.get("simulation_mode", False) if hasattr(controller, '_optional_config') else False,
+            "simulation_mode": (
+                controller._optional_config.get("simulation_mode", False)
+                if hasattr(controller, '_optional_config') else False
+            ),
 
             # Power flow data
             "solar_power": realtime_data.get("solar_power", 0),

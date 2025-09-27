@@ -1,9 +1,6 @@
 """Tests for the Growatt controller module."""
 
-import asyncio
 import json
-import zoneinfo
-from datetime import datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest

@@ -196,11 +196,11 @@ class GrowattController(BaseModule):
         self._last_applied: Dict[str, Tuple[Any, ...]] = {}
 
         self._schedule_func = self._schedule_at_time
-        
+
         self._manual_override_period: Optional[Period] = None
         self._manual_override_end_time: Optional[datetime] = None
         self._manual_override_source: str = ""
-        
+
         self._last_command_results: Dict[str, Dict[str, Any]] = {}
 
         # Initialize refactored modules
@@ -220,32 +220,32 @@ class GrowattController(BaseModule):
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
         """Wait for and capture command result from energy/solar/result topic.
-        
+
         Args:
             command_type: The command type to wait for (e.g., "batteryfirst/set/timeslot")
             timeout: How long to wait for the result
-            
+
         Returns:
             The result dict if received, None if timeout
         """
         if self._optional_config.get("simulation_mode", False):
             return {"success": True, "message": "Simulated"}
-            
+
         result_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-        
+
         async def result_handler(_topic: str, payload: Any) -> None:
             try:
                 if isinstance(payload, bytes):
                     payload = payload.decode()
                 data = json.loads(payload)
-                
+
                 # Check if this is our command result
                 if data.get("command") == command_type:
                     if not result_future.done():
                         result_future.set_result(data)
                         # Store for later reference
                         self._last_command_results[command_type] = data
-                        
+
                         # Log the result
                         success = data.get("success", False)
                         message = data.get("message", "No message")
@@ -253,15 +253,17 @@ class GrowattController(BaseModule):
                             self.logger.info(f"✅ Command {command_type} succeeded: {message}")
                         else:
                             self.logger.error(f"❌ Command {command_type} FAILED: {message}")
-                            self.logger.error(f"📋 Full error response: {json.dumps(data, indent=2)}")
-                            
+                            self.logger.error(
+                                f"📋 Full error response: {json.dumps(data, indent=2)}"
+                            )
+
             except Exception as e:
                 self.logger.error(f"Error parsing command result: {e}")
-        
+
         # Subscribe to result topic
         assert self.mqtt_client is not None
         await self.mqtt_client.subscribe("energy/solar/result", result_handler)
-        
+
         try:
             # Wait for result with timeout
             result = await asyncio.wait_for(result_future, timeout=timeout)
@@ -274,25 +276,28 @@ class GrowattController(BaseModule):
 
     async def _query_inverter_state(self) -> Dict[str, Any]:
         """Query current inverter state (battery-first and grid-first settings).
-        
+
         Returns:
             Dict with current state of both modes
         """
         if self._optional_config.get("simulation_mode", False):
             return {
-                "battery_first": self._mode_manager.get_battery_first_slots() if hasattr(self, '_mode_manager') else {},
+                "battery_first": (
+                    self._mode_manager.get_battery_first_slots()
+                    if hasattr(self, '_mode_manager') else {}
+                ),
                 "grid_first": {}  # No longer tracking grid-first slots
             }
-            
+
         state = {}
-        
+
         # Query battery-first state
         try:
             assert self.mqtt_client is not None
-            
+
             # Set up result handler
             bf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-            
+
             async def bf_handler(_topic: str, payload: Any) -> None:
                 try:
                     if isinstance(payload, bytes):
@@ -303,18 +308,18 @@ class GrowattController(BaseModule):
                             bf_future.set_result(data)
                 except Exception as e:
                     self.logger.error(f"Error parsing battery-first state: {e}")
-            
+
             await self.mqtt_client.subscribe("energy/solar/result", bf_handler)
-            
+
             # Send query
             self.logger.debug("Querying battery-first state...")
             await self.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
-            
+
             # Wait for response
             try:
                 bf_result = await asyncio.wait_for(bf_future, timeout=3.0)
                 state["battery_first"] = bf_result
-                
+
                 # Log the state
                 if bf_result.get("success"):
                     slots = bf_result.get("timeSlots", [])
@@ -325,26 +330,28 @@ class GrowattController(BaseModule):
                                 f"{slot.get('start')}-{slot.get('stop')} ENABLED"
                             )
                 else:
-                    self.logger.warning(f"Failed to query battery-first state: {bf_result.get('message')}")
+                    self.logger.warning(
+                        f"Failed to query battery-first state: {bf_result.get('message')}"
+                    )
                     self.logger.debug(f"📋 Full query response: {json.dumps(bf_result, indent=2)}")
-                    
+
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying battery-first state")
                 state["battery_first"] = None
             finally:
                 await self.mqtt_client.unsubscribe("energy/solar/result")
-                
+
         except Exception as e:
             self.logger.error(f"Error querying battery-first state: {e}")
             state["battery_first"] = None
-            
+
         # Query grid-first state
         try:
             assert self.mqtt_client is not None
-            
+
             # Set up result handler
             gf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-            
+
             async def gf_handler(_topic: str, payload: Any) -> None:
                 try:
                     if isinstance(payload, bytes):
@@ -355,18 +362,18 @@ class GrowattController(BaseModule):
                             gf_future.set_result(data)
                 except Exception as e:
                     self.logger.error(f"Error parsing grid-first state: {e}")
-            
+
             await self.mqtt_client.subscribe("energy/solar/result", gf_handler)
-            
+
             # Send query
             self.logger.debug("Querying grid-first state...")
             await self.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
-            
+
             # Wait for response
             try:
                 gf_result = await asyncio.wait_for(gf_future, timeout=3.0)
                 state["grid_first"] = gf_result
-                
+
                 # Log the state
                 if gf_result.get("success"):
                     slots = gf_result.get("timeSlots", [])
@@ -379,19 +386,21 @@ class GrowattController(BaseModule):
                                 f"powerRate={gf_result.get('powerRate')}%"
                             )
                 else:
-                    self.logger.warning(f"Failed to query grid-first state: {gf_result.get('message')}")
+                    self.logger.warning(
+                        f"Failed to query grid-first state: {gf_result.get('message')}"
+                    )
                     self.logger.debug(f"📋 Full query response: {json.dumps(gf_result, indent=2)}")
-                    
+
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying grid-first state")
                 state["grid_first"] = {}
             finally:
                 await self.mqtt_client.unsubscribe("energy/solar/result")
-                
+
         except Exception as e:
             self.logger.error(f"Error querying grid-first state: {e}")
             state["grid_first"] = {}
-            
+
         return state
 
     def _get_local_now(self) -> datetime:
@@ -1138,7 +1147,9 @@ class GrowattController(BaseModule):
                     if high_loads.get("ev_charging"):
                         details.append(f"EV: {high_loads['ev_power']:.0f}W")
                     if high_loads.get("heating_active"):
-                        details.append(f"Heating: {len(high_loads.get('heating_relays', []))} relays")
+                        details.append(
+                            f"Heating: {len(high_loads.get('heating_relays', []))} relays"
+                        )
                     self.logger.warning(
                         f"⚡ High loads detected! {', '.join(details)} - Checking if action needed"
                     )
@@ -1271,7 +1282,9 @@ class GrowattController(BaseModule):
             # Build decision context
             context = DecisionContext(
                 manual_override_active=bool(self._manual_override_period),
-                manual_override_mode=self._manual_override_period.kind if self._manual_override_period else None,
+                manual_override_mode=(
+                    self._manual_override_period.kind if self._manual_override_period else None
+                ),
                 high_loads_active=self._high_loads_active,
                 scheduled_mode=self._scheduled_mode,
                 battery_soc=self._battery_soc,
@@ -1325,10 +1338,18 @@ class GrowattController(BaseModule):
             await self._mode_manager.set_load_first(stop_soc=stop_soc)
         elif inverter_mode == "battery_first":
             power_rate = params.get("power_rate", 100)
-            await self._mode_manager.set_battery_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+            await self._mode_manager.set_battery_first(
+                "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
+            )
         elif inverter_mode == "grid_first":
-            power_rate = params.get("power_rate", self.config.discharge_power_rate if hasattr(self.config, 'discharge_power_rate') else 100)
-            await self._mode_manager.set_grid_first("00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate)
+            power_rate = params.get(
+                "power_rate",
+                self.config.discharge_power_rate
+                if hasattr(self.config, 'discharge_power_rate') else 100
+            )
+            await self._mode_manager.set_grid_first(
+                "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
+            )
 
         await asyncio.sleep(0.5)
 
@@ -1380,10 +1401,10 @@ class GrowattController(BaseModule):
         ]
         if mode not in valid_modes:
             raise ValueError(f"Invalid mode: {mode}. Must be one of {valid_modes}")
-        
+
         # Calculate end time based on duration type
         now = self._get_local_now()
-        
+
         if duration_type == "immediate":
             end_time = None  # No end time, runs until manually cleared
         elif duration_type == "end_of_day":
@@ -1412,7 +1433,7 @@ class GrowattController(BaseModule):
             end_time = target_time
         else:
             raise ValueError(f"Invalid duration type: {duration_type}")
-        
+
         # Set default params if not provided based on mode
         if params is None:
             params = {}
@@ -1441,14 +1462,14 @@ class GrowattController(BaseModule):
         try:
             self._scheduled_mode = mode
             await self._determine_and_apply_mode()
-            
+
             # Log manual intervention
             end_str = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "manual clear"
             self.logger.info(
                 f"🎯 Manual override set: {mode} until {end_str} "
                 f"(source: {source}, params: {params})"
             )
-            
+
             return {
                 "success": True,
                 "mode": mode,
@@ -1456,7 +1477,7 @@ class GrowattController(BaseModule):
                 "source": source,
                 "params": params
             }
-            
+
         except Exception as e:
             # Clear override on error
             self._manual_override_period = None
@@ -1468,17 +1489,17 @@ class GrowattController(BaseModule):
     async def clear_manual_override(self) -> Dict[str, Any]:
         """Clear manual override and return to automatic control."""
         had_override = self._manual_override_period is not None
-        
+
         # Clear override
         self._manual_override_period = None
         self._manual_override_end_time = None
         self._manual_override_source = ""
-        
+
         if had_override:
             # Re-evaluate automatic schedule
             self.logger.info("🔄 Manual override cleared, re-evaluating automatic schedule")
             await self._apply_current_state()
-            
+
             return {
                 "success": True,
                 "message": "Manual override cleared, returned to automatic control"
@@ -1493,19 +1514,19 @@ class GrowattController(BaseModule):
         """Get current manual override status."""
         if not self._manual_override_period:
             return {"active": False}
-        
+
         # Check if override is still valid
         if self._manual_override_end_time:
             now = self._get_local_now()
             if now >= self._manual_override_end_time:
                 # Override expired
                 return {"active": False, "expired": True}
-        
+
         return {
             "active": True,
             "mode": self._manual_override_period.kind,
             "end_time": (self._manual_override_end_time.isoformat()
-                        if self._manual_override_end_time else None),
+                         if self._manual_override_end_time else None),
             "source": self._manual_override_source,
             "params": self._manual_override_period.params
         }
@@ -1792,14 +1813,18 @@ class GrowattController(BaseModule):
                 task = self._schedule_action("00:00", apply_overnight_mode)
                 self._scheduled_tasks.append(task)
 
-            # Schedule Grid-First from sunrise to end of day (sell solar + battery at 10% rate)
+            # Schedule Grid-First from sunrise to end of day
+            # (sell solar + battery at 10% rate)
             self.logger.info(
                 f"Scheduling grid-first from {sunrise_str} to {EOD_HHMM} "
                 f"(sell solar + battery, stopSOC=20%, powerRate=10%)"
             )
             self._scheduled_periods.append(
                 Period("discharge_to_grid", sunrise_time, EOD_DTTIME,
-                       params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
+                       params={
+                           "stop_soc": self.config.discharge_min_soc,
+                           "power_rate": self.config.discharge_power_rate
+                       })
             )
 
             # Schedule discharge mode at sunrise
@@ -1872,10 +1897,13 @@ class GrowattController(BaseModule):
             )
             self._scheduled_periods.append(
                 Period(
-                    "grid_first",
+                    "sell_production",  # Use sell_production instead of grid_first
                     sunrise_time,
                     self._parse_hhmm(grid_first_end),
-                    params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate}
+                    params={
+                        "stop_soc": self.config.discharge_min_soc,
+                        "power_rate": self.config.discharge_power_rate
+                    }
                 )
             )
             # Export is handled by the sell_production mode itself
@@ -1888,7 +1916,9 @@ class GrowattController(BaseModule):
             self._scheduled_tasks.append(task)
 
             # Enable export during morning high prices
-            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._mode_manager.enable_export)
+            task = self._schedule_action(
+                self._bump_time(sunrise_str, 5), self._mode_manager.enable_export
+            )
             self._scheduled_tasks.append(task)
 
         # Schedule battery-first during each low-price period
@@ -1904,18 +1934,13 @@ class GrowattController(BaseModule):
                     )
                     self._scheduled_periods.append(
                         Period(
-                            "load_first",
+                            "regular",  # Use regular instead of load_first
                             self._parse_hhmm(previous_end),
                             self._parse_hhmm(group_start)
                         )
                     )
-                    self._scheduled_periods.append(
-                        Period(
-                            "export",
-                            self._parse_hhmm(previous_end),
-                            self._parse_hhmm(group_start)
-                        )
-                    )  # Track export period
+                    # Removed export Period - export is controlled via mode
+                    # settings - Track export period
                     task = self._schedule_action(previous_end, self._mode_manager.set_load_first)
                     self._scheduled_tasks.append(task)
 
@@ -1931,7 +1956,11 @@ class GrowattController(BaseModule):
             )
             # During low prices, use regular_no_export (store solar, don't sell)
             self._scheduled_periods.append(
-                Period("regular_no_export", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                Period(
+                    "regular_no_export",
+                    self._parse_hhmm(group_start),
+                    self._parse_hhmm(group_end)
+                )
             )
 
             # Schedule mode switch at start of low price period
@@ -1991,15 +2020,20 @@ class GrowattController(BaseModule):
 
                     self.logger.info(
                         f"Scheduling CHARGE_FROM_GRID from {start_time} to {stop_time} "
-                        f"(avg: {avg_charge_price:.2f} EUR/MWh = {avg_charge_price_czk:.2f} CZK/kWh)"
+                        f"(avg: {avg_charge_price:.2f} EUR/MWh = "
+                        f"{avg_charge_price_czk:.2f} CZK/kWh)"
                     )
 
                 # Schedule charge_from_grid composite mode
                 self._scheduled_periods.append(
-                    Period("charge_from_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
-                           params={"stop_soc": self.config.max_soc})
+                    Period(
+                        "charge_from_grid",
+                        self._parse_hhmm(start_time),
+                        self._parse_hhmm(stop_time),
+                        params={"stop_soc": self.config.max_soc})
                 )
                 # Create closure to apply mode at scheduled time
+
                 async def apply_charge_mode():
                     self._scheduled_mode = "charge_from_grid"
                     await self._determine_and_apply_mode()
@@ -2015,7 +2049,10 @@ class GrowattController(BaseModule):
 
             # Calculate minimum profitable discharge price
             # Account for battery round-trip efficiency and required profit margin
-            min_discharge_price = (avg_charge_price / self.config.battery_efficiency) * self.config.discharge_profit_margin
+            min_discharge_price = (
+                (avg_charge_price / self.config.battery_efficiency)
+                * self.config.discharge_profit_margin
+            )
 
             # Log economics calculation
             charge_czk = avg_charge_price * eur_czk_rate / 1000
@@ -2023,7 +2060,8 @@ class GrowattController(BaseModule):
             self.logger.info(
                 f"Battery economics: Charge cost={charge_czk:.2f} CZK/kWh, "
                 f"Min discharge price={min_discharge_czk:.2f} CZK/kWh "
-                f"(efficiency={self.config.battery_efficiency:.0%}, margin={self.config.discharge_profit_margin-1:.0%})"
+                f"(efficiency={self.config.battery_efficiency:.0%}, "
+                f"margin={self.config.discharge_profit_margin-1:.0%})"
             )
         else:
             # No charging scheduled, use average price as baseline
@@ -2048,8 +2086,8 @@ class GrowattController(BaseModule):
             for start_time, stop_time in discharge_groups:
                 # Calculate average price for this discharge period
                 period_prices = [p for s, e, p in discharge_hours
-                                if self._parse_hhmm(s) >= self._parse_hhmm(start_time)
-                                and self._parse_hhmm(e) <= self._parse_hhmm(stop_time)]
+                                 if self._parse_hhmm(s) >= self._parse_hhmm(start_time)
+                                 and self._parse_hhmm(e) <= self._parse_hhmm(stop_time)]
                 avg_period_price = sum(period_prices) / len(period_prices) if period_prices else 0
                 avg_period_czk = avg_period_price * eur_czk_rate / 1000
 
@@ -2069,10 +2107,17 @@ class GrowattController(BaseModule):
                         f"(price: {avg_period_price:.2f} EUR/MWh = {avg_period_czk:.2f} CZK/kWh)"
                     )
                 self._scheduled_periods.append(
-                    Period("discharge_to_grid", self._parse_hhmm(start_time), self._parse_hhmm(stop_time),
-                           params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
+                    Period(
+                        "discharge_to_grid",
+                        self._parse_hhmm(start_time),
+                        self._parse_hhmm(stop_time),
+                        params={
+                            "stop_soc": self.config.discharge_min_soc,
+                            "power_rate": self.config.discharge_power_rate
+                        })
                 )
                 # Create closure to apply mode at scheduled time
+
                 async def apply_discharge_mode():
                     self._scheduled_mode = "discharge_to_grid"
                     await self._determine_and_apply_mode()
@@ -2116,10 +2161,15 @@ class GrowattController(BaseModule):
             regular_groups = self._price_analyzer.group_contiguous_hours_simple(regular_hours)
             for group_start, group_end in regular_groups:
                 self._scheduled_periods.append(
-                    Period("regular", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                    Period(
+                        "regular",
+                        self._parse_hhmm(group_start),
+                        self._parse_hhmm(group_end)
+                    )
                 )
             self.logger.info(
-                f"Scheduled {len(regular_groups)} regular period(s) covering {len(regular_hours)} hours"
+                f"Scheduled {len(regular_groups)} regular period(s) "
+                f"covering {len(regular_hours)} hours"
             )
 
         # Group consecutive no-export hours into multi-hour periods
@@ -2127,10 +2177,15 @@ class GrowattController(BaseModule):
             no_export_groups = self._price_analyzer.group_contiguous_hours_simple(no_export_hours)
             for group_start, group_end in no_export_groups:
                 self._scheduled_periods.append(
-                    Period("regular_no_export", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                    Period(
+                        "regular_no_export",
+                        self._parse_hhmm(group_start),
+                        self._parse_hhmm(group_end)
+                    )
                 )
             self.logger.info(
-                f"Scheduled {len(no_export_groups)} no-export period(s) covering {len(no_export_hours)} hours"
+                f"Scheduled {len(no_export_groups)} no-export period(s) "
+                f"covering {len(no_export_hours)} hours"
             )
 
         # Export control is now handled by composite modes
@@ -2385,7 +2440,9 @@ class GrowattController(BaseModule):
             # Expected on shutdown; keep quiet
             raise
         except Exception as e:
-            self.logger.error(f"Error in scheduled task at {time_str}: {e}", exc_info=True)
+            self.logger.error(
+                f"Error in scheduled task at {time_str}: {e}", exc_info=True
+            )
 
     async def _emit_device_window(
         self,
@@ -2465,16 +2522,22 @@ class GrowattController(BaseModule):
             # Expected on shutdown
             raise
         except Exception as e:
-            self.logger.error(f"Error in scheduled task at {time_str}: {e}", exc_info=True)
+            self.logger.error(
+                f"Error in scheduled task at {time_str}: {e}", exc_info=True
+            )
 
     def _schedule_end_of_day_cleanup(self) -> None:
         """Ensure we land in a neutral state at end of day."""
         # Small jittered disables are safe & idempotent.
         self._scheduled_tasks.append(
-            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_export))
+            asyncio.create_task(
+                self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_export)
+            )
         )
         self._scheduled_tasks.append(
-            asyncio.create_task(self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_ac_charge))
+            asyncio.create_task(
+                self._schedule_at_time(EOD_HHMMSS, self._mode_manager.disable_ac_charge)
+            )
         )
 
     async def _schedule_daily_calculation(self) -> None:

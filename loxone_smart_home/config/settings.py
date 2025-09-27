@@ -161,7 +161,9 @@ class GrowattConfig(BaseModel):
     # Battery economics
     battery_efficiency: float = Field(default=0.85, gt=0, le=1)  # Round-trip efficiency (85%)
     discharge_profit_margin: float = Field(default=3.0, ge=1)  # Minimum profit margin (200% = 3x)
-    discharge_power_rate: int = Field(default=25, ge=10, le=100)  # Discharge power rate % (25% = gentle)
+    discharge_power_rate: int = Field(
+        default=25, ge=10, le=100
+    )  # Discharge power rate % (25% = gentle)
 
     # Price thresholds and control parameters
     export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
