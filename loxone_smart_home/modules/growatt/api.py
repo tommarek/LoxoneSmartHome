@@ -3,7 +3,6 @@
 import asyncio
 import json
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 from aiohttp import web
@@ -314,10 +313,7 @@ def create_growatt_api(
     # Register 1044 direct mode control
     app.router.add_post('/api/growatt/set-mode-register', set_mode_via_register)
 
-    # Dashboard routes
-    app.router.add_get('/inverter', serve_dashboard)
-    app.router.add_get('/inverter/', serve_dashboard)
-    app.router.add_get('/inverter/status', get_dashboard_status)
+    # Dashboard routes removed - GUI no longer supported
 
 
 async def get_status(request: web.Request) -> web.Response:
@@ -594,7 +590,7 @@ async def manual_mode_set(request: web.Request) -> web.Response:
             "stop_soc": 90,     // optional - for charge_from_grid or discharge_to_grid
             "power_rate": 100   // optional - for discharge_to_grid
         },
-        "source": "dashboard"  // optional, defaults to "api"
+        "source": "api"  // optional source identifier
     }
     """
     controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
@@ -769,25 +765,6 @@ async def get_config(request: web.Request) -> web.Response:
         return web.json_response({"error": str(e)}, status=500)
 
 
-async def serve_dashboard(request: web.Request) -> web.Response:
-    """Serve the inverter dashboard HTML."""
-    template_path = Path(__file__).parent.parent.parent / "templates" / "inverter_dashboard.html"
-
-    if not template_path.exists():
-        return web.Response(
-            text="Dashboard template not found",
-            status=404
-        )
-
-    with open(template_path, 'r') as f:
-        html_content = f.read()
-
-    return web.Response(
-        text=html_content,
-        content_type='text/html'
-    )
-
-
 async def _query_inverter_realtime(
     controller: GrowattController
 ) -> Dict[str, Any]:
@@ -937,130 +914,4 @@ async def set_mode_via_register(request: web.Request) -> web.Response:
         controller.logger.error(f"Error setting mode via register: {e}")
         return web.json_response(
             {"error": str(e)}, status=500
-        )
-
-
-async def get_dashboard_status(request: web.Request) -> web.Response:
-    """Get comprehensive inverter status for dashboard display.
-
-    Returns all data needed for the web dashboard including:
-    - Current operating mode and schedule
-    - Real-time power flows and battery state
-    - Energy prices and optimization status
-    - Daily statistics and performance metrics
-    """
-    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
-    if not controller:
-        return web.json_response(
-            {"error": "Controller not initialized"},
-            status=503
-        )
-
-    try:
-        now = controller._get_local_now()
-        now_t = now.time()
-
-        # Get real-time inverter data
-        realtime_data = await _query_inverter_realtime(controller)
-
-        # Query register 1044 for actual inverter mode
-        register_1044 = await _query_register_1044(controller)
-        actual_mode = None
-        if register_1044 and not register_1044.get("error"):
-            mode_value = register_1044.get("value")
-            if mode_value is not None:
-                mode_map = {0: "load_first", 1: "battery_first", 2: "grid_first"}
-                actual_mode = mode_map.get(mode_value, f"unknown_{mode_value}")
-
-        # Find active periods and current mode
-        active_periods = []
-        for period in controller._scheduled_periods:
-            if period.contains_time(now_t):
-                active_periods.append({
-                    "kind": period.kind,
-                    "start": period.start.strftime("%H:%M"),
-                    "end": period.end.strftime("%H:%M"),
-                    "params": period.params
-                })
-
-        # Determine primary mode
-        active_modes = {p["kind"] for p in active_periods}
-        current_mode = (
-            controller._select_primary_mode(active_modes)
-            if active_modes else "load_first"
-        )
-
-        # Format mode for display
-        mode_display = {
-            "battery_first": "Battery First",
-            "grid_first": "Grid First",
-            "load_first": "Load First",
-            "ac_charge": "AC Charge",
-            "export": "Export Mode"
-        }.get(current_mode, current_mode)
-
-        # Get today's schedule
-        schedule = []
-        for period in sorted(controller._scheduled_periods,
-                             key=lambda p: p.start):
-            mode_name = {
-                "battery_first": "Battery First",
-                "grid_first": "Grid First",
-                "load_first": "Load First",
-                "ac_charge": "AC Charge",
-                "export": "Export"
-            }.get(period.kind, period.kind)
-
-            schedule.append({
-                "time": period.start.strftime("%H:%M"),
-                "mode": mode_name
-            })
-
-        # Build comprehensive status response
-        status = {
-            "connected": controller._running,
-            "current_mode": mode_display,
-            "actual_inverter_mode": actual_mode,  # From register 1044
-            "register_1044": register_1044,  # Raw register data
-            "simulation_mode": (
-                controller._optional_config.get("simulation_mode", False)
-                if hasattr(controller, '_optional_config') else False
-            ),
-
-            # Power flow data
-            "solar_power": realtime_data.get("solar_power", 0),
-            "battery_power": realtime_data.get("battery_power", 0),
-            "grid_power": realtime_data.get("grid_power", 0),
-            "load_power": realtime_data.get("load_power", 0),
-
-            # Battery status
-            "battery_soc": realtime_data.get("battery_soc", 0),
-            "battery_voltage": realtime_data.get("battery_voltage", 0),
-            "battery_current": realtime_data.get("battery_current", 0),
-            "battery_temp": realtime_data.get("battery_temp", 0),
-
-            # Configuration
-            "export_threshold": controller.config.export_price_threshold,
-
-            # Schedule
-            "schedule": schedule,
-
-            # Daily statistics
-            "daily_production": realtime_data.get("daily_production", 0),
-            "daily_consumption": realtime_data.get("daily_consumption", 0),
-            "daily_import": realtime_data.get("daily_import", 0),
-            "daily_export": realtime_data.get("daily_export", 0),
-
-            # System info
-            "season_mode": controller._season_mode,
-            "ac_enabled": controller._ac_enabled,
-            "export_enabled": controller._export_enabled,
-        }
-
-        return web.json_response(status)
-
-    except Exception as e:
-        return web.json_response(
-            {"error": str(e)},
-            status=500
         )
