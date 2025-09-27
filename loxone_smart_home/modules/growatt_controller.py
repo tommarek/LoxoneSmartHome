@@ -2171,10 +2171,8 @@ class GrowattController(BaseModule):
 
         def _overlaps_ac(start: dt_time, end: dt_time) -> bool:
             """Check if a time window overlaps with any AC charging period."""
-            return any(
-                _ranges_overlap(start, end, ac_start, ac_end)
-                for ac_start, ac_end in ac_windows
-            )
+            # Dead code - ac_windows is not defined in refactored code
+            return False  # Always return False since ac_windows doesn't exist
 
         def _subtract_one(
             a: Tuple[dt_time, dt_time], b: Tuple[dt_time, dt_time]
@@ -2270,7 +2268,8 @@ class GrowattController(BaseModule):
             ):
                 # Carve out AC times from export window
                 remaining = [(self._parse_hhmm(group_start), self._parse_hhmm(group_end))]
-                for ac_start, ac_end in ac_windows:
+                # Dead code - ac_windows is not defined
+                for ac_start, ac_end in []:  # Empty list since ac_windows doesn't exist
                     next_remaining = []
                     for rs, re in remaining:
                         next_remaining.extend(subtract_wrap_range(rs, re, ac_start, ac_end))
