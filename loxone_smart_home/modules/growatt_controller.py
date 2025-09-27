@@ -21,7 +21,6 @@ from utils.async_mqtt_client import AsyncMQTTClient
 from .growatt.models import (
     Period, PeriodType,
     EOD_HHMM, EOD_HHMMSS, EOD_DTTIME,
-    MIDNIGHT_JITTER,
     is_24
 )
 from .growatt.price_analyzer import PriceAnalyzer
@@ -2198,217 +2197,18 @@ class GrowattController(BaseModule):
             self.logger.error(f"Error scheduling end-of-day cleanup: {e}", exc_info=True)
 
     async def _schedule_export_control(
-        self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
+        self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float  # noqa: F841
     ) -> None:
-        """Schedule export enable/disable based on price thresholds.
+        """Schedule export control based on price analysis.
 
-        DEPRECATED: Export control is now handled by the decision engine based on mode.
-        This method is kept for compatibility but does nothing.
+        DEPRECATED: Export control is now handled by composite modes in the decision engine.
+        - "regular" and "sell_production" modes have export enabled
+        - "regular_no_export" mode has export disabled
+        - "charge_from_grid" and "discharge_to_grid" control export as needed
+
+        This method is kept as a no-op for backward compatibility.
         """
         pass
-
-        def _segments(start: dt_time, end: dt_time) -> List[Tuple[dt_time, dt_time]]:
-            """Split a possibly midnight-wrapping range into 1-2 non-wrapping segments."""
-            if start <= end:
-                return [(start, end)]
-            # Wraps midnight: [start, EOD) U [00:00, end)
-            return [(start, EOD_DTTIME), (dt_time(0, 0), end)]
-
-        def _ranges_overlap(
-            a_start: dt_time, a_end: dt_time, b_start: dt_time, b_end: dt_time
-        ) -> bool:
-            """Proper overlap test for possibly wrapping half-open time ranges."""
-            for s1, e1 in _segments(a_start, a_end):
-                for s2, e2 in _segments(b_start, b_end):
-                    if s1 < e2 and e1 > s2:
-                        return True
-            return False
-
-        def _overlaps_ac(start: dt_time, end: dt_time) -> bool:
-            """Check if a time window overlaps with any AC charging period."""
-            # Dead code - ac_windows is not defined in refactored code
-            return False  # Always return False since ac_windows doesn't exist
-
-        def _subtract_one(
-            a: Tuple[dt_time, dt_time], b: Tuple[dt_time, dt_time]
-        ) -> List[Tuple[dt_time, dt_time]]:
-            """Return A\\B for non-wrapping [start,end) dt_time ranges."""
-            (as_, ae), (bs, be) = a, b
-            # No overlap
-            if ae <= bs or as_ >= be:
-                return [a]
-            # Full cover
-            if bs <= as_ and be >= ae:
-                return []
-            pieces = []
-            if bs > as_:
-                pieces.append((as_, bs))
-            if be < ae:
-                pieces.append((be, ae))
-            return pieces
-
-        def subtract_wrap_range(
-            a_start: dt_time, a_end: dt_time, b_start: dt_time, b_end: dt_time
-        ) -> List[Tuple[dt_time, dt_time]]:
-            """Return (possibly multiple) non-wrapping export slices = A \\ B, with wrap handled."""
-            a_parts = _segments(a_start, a_end)
-            b_parts = _segments(b_start, b_end)
-            out: List[Tuple[dt_time, dt_time]] = []
-            for ap in a_parts:
-                cur = [ap]
-                for bp in b_parts:
-                    nxt: List[Tuple[dt_time, dt_time]] = []
-                    for seg in cur:
-                        nxt.extend(_subtract_one(seg, bp))
-                    cur = nxt
-                out.extend(cur)
-            return out
-
-        # Convert threshold from CZK/kWh to EUR/MWh for comparison with API data
-        # API prices are in EUR/MWh, threshold is in CZK/kWh
-        # Conversion: 1 MWh = 1000 kWh
-        # Minimal guard against division by zero
-        eur_czk_rate = max(eur_czk_rate, 1.0)
-        threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
-
-        export_hours = [
-            (start, stop)
-            for (start, stop), price in hourly_prices.items()
-            if price >= threshold_eur_mwh
-        ]
-
-        if not export_hours:
-            self.logger.info(
-                f"No hours above export price threshold "
-                f"({threshold_eur_mwh:.2f} EUR/MWh = "
-                f"{self.config.export_price_threshold:.2f} CZK/kWh)"
-            )
-            # Schedule disable at midnight with small delay to avoid conflicts
-            task = asyncio.create_task(
-                self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_export)
-            )
-            self._scheduled_tasks.append(task)
-            return
-
-        # Group export hours into contiguous blocks (ignore price differences for export)
-        export_hours_with_price = [
-            (start, stop, hourly_prices[(start, stop)]) for start, stop in export_hours
-        ]
-        export_groups = self._price_analyzer.group_contiguous_hours_simple(export_hours_with_price)
-
-        self.logger.info(
-            f"Found {len(export_groups)} export periods above "
-            f"{threshold_eur_mwh:.2f} EUR/MWh threshold"
-        )
-
-        # Sort groups by start time to handle them in order
-        export_groups.sort(key=lambda x: self._parse_hhmm(x[0]))
-
-        # Track if we actually scheduled a 00:00 enable
-        midnight_enable_scheduled = False
-
-        for group_start, group_end in export_groups:
-            # DO NOT normalize here; keep HH:MM or "24:00" for logic
-            # group_end_norm will be used only when calling _schedule_at_time
-
-            # Note: Gap-disable between export groups removed as redundant
-            # Each export slice already schedules its own disable at slice end
-
-            # Check if export overlaps with AC charging (if suppression enabled)
-            suppress_export = self._optional_config.get("suppress_export_during_ac_charge", True)
-            export_slices: List[Tuple[dt_time, dt_time]] = []
-
-            if suppress_export and _overlaps_ac(
-                self._parse_hhmm(group_start), self._parse_hhmm(group_end)
-            ):
-                # Carve out AC times from export window
-                remaining = [(self._parse_hhmm(group_start), self._parse_hhmm(group_end))]
-                # Dead code - ac_windows is not defined
-                for ac_start, ac_end in []:  # Empty list since ac_windows doesn't exist
-                    next_remaining = []
-                    for rs, re in remaining:
-                        next_remaining.extend(subtract_wrap_range(rs, re, ac_start, ac_end))
-                    remaining = next_remaining
-
-                if remaining:
-                    export_slices = remaining
-                    self.logger.info(
-                        f"Export {group_start}-{group_end} overlaps AC charge, "
-                        f"scheduling {len(export_slices)} non-overlapping slice(s)"
-                    )
-                else:
-                    self.logger.info(
-                        f"Export {group_start}-{group_end} fully overlaps AC charge, skipping"
-                    )
-                    continue
-            else:
-                # No AC overlap, use full window
-                export_slices = [(self._parse_hhmm(group_start), self._parse_hhmm(group_end))]
-
-            # Schedule each export slice
-            for slice_start_t, slice_end_t in export_slices:
-                slice_start = slice_start_t.strftime("%H:%M")
-                # Keep the exact EOD barrier if the slice ends at EOD_DTTIME
-                if slice_end_t == EOD_DTTIME:
-                    slice_end = EOD_HHMMSS
-                else:
-                    slice_end = self._normalize_end_time(slice_end_t.strftime("%H:%M"))
-
-                # Calculate price statistics for this slice
-                group_prices = [
-                    price
-                    for start, stop, price in export_hours_with_price
-                    if (self._parse_hhmm(start) >= slice_start_t
-                        and self._parse_hhmm(stop) <= slice_end_t)
-                ]
-                if group_prices:
-                    min_price = min(group_prices)
-                    max_price = max(group_prices)
-                    avg_price = sum(group_prices) / len(group_prices)
-
-                    # Convert prices to CZK/kWh for display
-                    min_price_czk_kwh = min_price * eur_czk_rate / 1000
-                    max_price_czk_kwh = max_price * eur_czk_rate / 1000
-                    avg_price_czk_kwh = avg_price * eur_czk_rate / 1000
-
-                    self.logger.info(
-                        f"Scheduling export enable from {slice_start} to {slice_end} "
-                        f"(min: {min_price:.2f}, avg: {avg_price:.2f}, "
-                        f"max: {max_price:.2f} EUR/MWh = "
-                        f"{min_price_czk_kwh:.2f}-{avg_price_czk_kwh:.2f}-"
-                        f"{max_price_czk_kwh:.2f} CZK/kWh, "
-                        f"threshold: {self.config.export_price_threshold:.2f})"
-                    )
-                else:
-                    self.logger.info(
-                        f"Scheduling export enable from {slice_start} to {slice_end} "
-                        f"(no price data)"
-                    )
-
-                # Track export period
-                # Export periods are no longer tracked separately - handled by mode
-
-                # Check if this is a midnight start
-                if slice_start == "00:00":
-                    midnight_enable_scheduled = True
-
-                # Schedule export enable at start
-                task = self._schedule_action(slice_start, self._mode_manager.enable_export)
-                self._scheduled_tasks.append(task)
-
-                # Schedule export disable at end (normalize to EOD sentinel if needed)
-                disable_at = self._normalize_for_schedule(slice_end)
-                task = self._schedule_action(disable_at, self._mode_manager.disable_export)
-                self._scheduled_tasks.append(task)
-
-        # Check if we need a midnight disable (only if we didn't schedule a 00:00 enable)
-        if not midnight_enable_scheduled:
-            # Use constant for better readability
-            task = asyncio.create_task(
-                self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_export)
-            )
-            self._scheduled_tasks.append(task)
-            self.logger.info(f"Scheduled export disable at {MIDNIGHT_JITTER} for clean daily start")
 
     async def _schedule_at_time(self, time_str: str, coro_func: Any, *args: Any) -> None:
         """Schedule a coroutine to run at a specific time."""
