@@ -21,7 +21,7 @@ from utils.async_mqtt_client import AsyncMQTTClient
 from .growatt.models import (
     Period, PeriodType,
     EOD_HHMM, EOD_HHMMSS, EOD_DTTIME,
-    MIDNIGHT_JITTER, MIDNIGHT_DISABLE_JITTER,
+    MIDNIGHT_JITTER,
     is_24
 )
 from .growatt.price_analyzer import PriceAnalyzer
@@ -191,11 +191,6 @@ class GrowattController(BaseModule):
 
         # Mode states are now tracked in ModeManager
 
-        self._grid_first_slots: Dict[int, Dict[str, Any]] = {
-            1: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 100},
-            2: {"enabled": False, "start": "00:00", "stop": "00:00", "stop_soc": 20, "power_rate": 100}
-        }
-
         self._clock_drift_seconds: float = 0
 
         self._last_applied: Dict[str, Tuple[Any, ...]] = {}
@@ -286,7 +281,7 @@ class GrowattController(BaseModule):
         if self._optional_config.get("simulation_mode", False):
             return {
                 "battery_first": self._mode_manager.get_battery_first_slots() if hasattr(self, '_mode_manager') else {},
-                "grid_first": self._grid_first_slots
+                "grid_first": {}  # No longer tracking grid-first slots
             }
             
         state = {}
@@ -389,13 +384,13 @@ class GrowattController(BaseModule):
                     
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying grid-first state")
-                state["grid_first"] = None
+                state["grid_first"] = {}
             finally:
                 await self.mqtt_client.unsubscribe("energy/solar/result")
                 
         except Exception as e:
             self.logger.error(f"Error querying grid-first state: {e}")
-            state["grid_first"] = None
+            state["grid_first"] = {}
             
         return state
 
@@ -475,14 +470,8 @@ class GrowattController(BaseModule):
 
     async def _set_mode(self, mode: str, *args: Any) -> None:
         """Set the inverter mode (thin dispatcher to individual setters)."""
-        if mode == "battery_first":
-            await self._mode_manager.set_battery_first(*args)
-        elif mode == "grid_first":
-            await self._mode_manager.set_grid_first(*args)
-        elif mode == "load_first":
-            await self._mode_manager.set_load_first()
-        else:
-            self.logger.error(f"Unknown mode: {mode}")
+        # These direct calls are no longer used - decision engine handles modes
+        pass
 
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
@@ -1073,27 +1062,13 @@ class GrowattController(BaseModule):
         self._scheduled_tasks.clear()
         self._daily_schedule_task = None
 
-        # Reset to clean state on shutdown - same as startup state
+        # Reset to clean state on shutdown
         self.logger.info("🔄 Resetting inverter to safe shutdown state...")
         try:
-            # Set to load-first (safest mode)
-            await self._mode_manager.set_load_first()
-            await asyncio.sleep(0.5)
-
-            # Disable battery-first and grid-first (redundant but explicit)
-            await self._mode_manager.disable_battery_first()
-            await asyncio.sleep(0.5)
-            await self._mode_manager.disable_grid_first()
-            await asyncio.sleep(0.5)
-
-            # Disable AC charging
-            await self._mode_manager.disable_ac_charge()
-            await asyncio.sleep(0.5)
-
-            # Enable export (default safe state)
-            await self._mode_manager.enable_export()
-
-            self.logger.info("✅ Inverter shutdown state: load-first mode, export enabled, AC charging disabled")
+            # Set regular mode as safe default
+            self._scheduled_mode = "regular"
+            await self._determine_and_apply_mode()
+            self.logger.info("✅ Inverter shutdown state: regular mode applied")
         except Exception as e:
             self.logger.error(f"Error during shutdown reset: {e}", exc_info=True)
 
@@ -1107,33 +1082,16 @@ class GrowattController(BaseModule):
         """
         try:
             self.logger.info("🔄 Resetting inverter to default state...")
-
-            # Step 1: Set to load-first mode (safest default)
-            await self._mode_manager.set_load_first()
-            await asyncio.sleep(0.5)
-
-            # Step 2: Disable AC charging (will be enabled if needed by schedule)
-            await self._mode_manager.disable_ac_charge()
-            await asyncio.sleep(0.5)
-
-            # Step 3: Enable export (default state, will be disabled if needed)
-            await self._mode_manager.enable_export()
-            await asyncio.sleep(0.5)
-
-            # Step 4: Clear any battery-first or grid-first modes
-            # This is implicitly done by set_load_first, but we can be explicit
-            await self._mode_manager.disable_battery_first()
-            await asyncio.sleep(0.5)
-            await self._mode_manager.disable_grid_first()
-            await asyncio.sleep(0.5)
-
-            self.logger.info("✅ Inverter reset complete: load-first mode, export enabled, AC charging disabled")
+            # Apply regular mode as safe default
+            self._scheduled_mode = "regular"
+            await self._determine_and_apply_mode()
+            self.logger.info("✅ Inverter reset complete: regular mode applied")
 
         except Exception as e:
             self.logger.error(f"Failed to reset inverter state: {e}", exc_info=True)
             # Continue anyway - the scheduled mode will try to set the correct state
 
-    async def _on_home_status(self, topic: str, payload: Any) -> None:
+    async def _on_home_status(self, _topic: str, payload: Any) -> None:
         """Handle home status updates from UDP listener.
 
         Args:
@@ -1610,9 +1568,9 @@ class GrowattController(BaseModule):
                 )
                 # Schedule fallback mode
                 await self._schedule_fallback_mode()
-                # Apply safe state immediately (not just at midnight)
-                await self._mode_manager.set_load_first()
-                await self._mode_manager.disable_export()
+                # Apply safe state immediately
+                self._scheduled_mode = "regular_no_export"  # Safe mode without selling
+                await self._determine_and_apply_mode()
                 self.logger.info("Applied safe state immediately due to price generation failure")
                 return
 
@@ -1736,15 +1694,12 @@ class GrowattController(BaseModule):
 
     async def _schedule_fallback_mode(self) -> None:
         """Schedule fallback mode when price data is unavailable."""
-        # Schedule to disable battery-first at midnight with jitter
+        # Schedule regular mode as fallback
+        async def apply_fallback_mode():
+            self._scheduled_mode = "regular"
+            await self._determine_and_apply_mode()
         task = asyncio.create_task(
-            self._schedule_at_time(MIDNIGHT_JITTER, self._mode_manager.disable_battery_first)
-        )
-        self._scheduled_tasks.append(task)
-
-        # Schedule to disable export at midnight with jitter
-        task = asyncio.create_task(
-            self._schedule_at_time(MIDNIGHT_DISABLE_JITTER, self._mode_manager.disable_export)
+            self._schedule_at_time("00:00", apply_fallback_mode)
         )
         self._scheduled_tasks.append(task)
 
@@ -1827,18 +1782,14 @@ class GrowattController(BaseModule):
                     f"Scheduling load-first from 00:00 to {sunrise_str} (overnight consumption)"
                 )
                 self._scheduled_periods.append(
-                    Period("load_first", dt_time(0, 0), sunrise_time)
-                )
-                # Since no hours are below threshold, all prices are good - enable export
-                self._scheduled_periods.append(
-                    Period("export", dt_time(0, 0), sunrise_time)
+                    Period("regular", dt_time(0, 0), sunrise_time)  # Regular mode overnight
                 )
 
-                task = self._schedule_action("00:00", self._mode_manager.set_load_first)
-                self._scheduled_tasks.append(task)
-
-                # Enable export for overnight period (prices above threshold)
-                task = self._schedule_action(MIDNIGHT_JITTER, self._mode_manager.enable_export)
+                # Schedule regular mode at midnight
+                async def apply_overnight_mode():
+                    self._scheduled_mode = "regular"
+                    await self._determine_and_apply_mode()
+                task = self._schedule_action("00:00", apply_overnight_mode)
                 self._scheduled_tasks.append(task)
 
             # Schedule Grid-First from sunrise to end of day (sell solar + battery at 10% rate)
@@ -1847,21 +1798,15 @@ class GrowattController(BaseModule):
                 f"(sell solar + battery, stopSOC=20%, powerRate=10%)"
             )
             self._scheduled_periods.append(
-                Period("grid_first", sunrise_time, EOD_DTTIME,
+                Period("discharge_to_grid", sunrise_time, EOD_DTTIME,
                        params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate})
             )
-            self._scheduled_periods.append(
-                Period("export", sunrise_time, EOD_DTTIME)
-            )
 
-            task = self._schedule_action(
-                sunrise_str, self._emit_device_window,
-                self._mode_manager.set_grid_first, sunrise_str, EOD_HHMM, 20, 10
-            )
-            self._scheduled_tasks.append(task)
-
-            # Enable export after sunrise
-            task = self._schedule_action(self._bump_time(sunrise_str, 5), self._mode_manager.enable_export)
+            # Schedule discharge mode at sunrise
+            async def apply_discharge_mode():
+                self._scheduled_mode = "discharge_to_grid"
+                await self._determine_and_apply_mode()
+            task = self._schedule_action(sunrise_str, apply_discharge_mode)
             self._scheduled_tasks.append(task)
             return
 
@@ -1891,7 +1836,7 @@ class GrowattController(BaseModule):
                 f"Scheduling load-first from 00:00 to {sunrise_str} (overnight consumption)"
             )
             self._scheduled_periods.append(
-                Period("load_first", dt_time(0, 0), sunrise_time)
+                Period("regular", dt_time(0, 0), sunrise_time)  # Regular mode overnight
             )
 
             # Check if overnight prices are above threshold - if so, enable export
@@ -1904,13 +1849,14 @@ class GrowattController(BaseModule):
 
             if overnight_above_threshold:
                 self.logger.info("Overnight prices above threshold, enabling export")
-                self._scheduled_periods.append(
-                    Period("export", dt_time(0, 0), sunrise_time)
-                )
-                task = self._schedule_action(MIDNIGHT_JITTER, self._mode_manager.enable_export)
-                self._scheduled_tasks.append(task)
+                # Overnight prices above threshold - use regular mode with export
+                pass  # Export is inherent in regular mode
 
-            task = self._schedule_action("00:00", self._mode_manager.set_load_first)
+            # Schedule regular mode at midnight
+            async def apply_overnight_mode():
+                self._scheduled_mode = "regular"
+                await self._determine_and_apply_mode()
+            task = self._schedule_action("00:00", apply_overnight_mode)
             self._scheduled_tasks.append(task)
 
         # Schedule Grid-First from sunrise until first low price
@@ -1932,9 +1878,7 @@ class GrowattController(BaseModule):
                     params={"stop_soc": self.config.discharge_min_soc, "power_rate": self.config.discharge_power_rate}
                 )
             )
-            self._scheduled_periods.append(
-                Period("export", sunrise_time, self._parse_hhmm(grid_first_end))
-            )
+            # Export is handled by the sell_production mode itself
 
             # Set grid-first at sunrise with stopSOC=20% and powerRate=10%
             task = self._schedule_action(
@@ -1985,23 +1929,16 @@ class GrowattController(BaseModule):
                 f"Scheduling battery-first from {group_start} to {group_end} "
                 f"(store cheap solar, no AC charge)"
             )
+            # During low prices, use regular_no_export (store solar, don't sell)
             self._scheduled_periods.append(
-                Period("battery_first", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
+                Period("regular_no_export", self._parse_hhmm(group_start), self._parse_hhmm(group_end))
             )
 
-            # Switch to battery-first at start of low period
-            task = self._schedule_action(
-                group_start, self._emit_device_window,
-                self._mode_manager.set_battery_first, group_start, group_end
-            )
-            self._scheduled_tasks.append(task)
-
-            # Ensure AC charging is disabled (we only want solar charging)
-            task = self._schedule_action(self._bump_time(group_start, 5), self._mode_manager.disable_ac_charge)
-            self._scheduled_tasks.append(task)
-
-            # Disable export during low prices (no point selling below operator costs)
-            task = self._schedule_action(self._bump_time(group_start, 10), self._mode_manager.disable_export)
+            # Schedule mode switch at start of low price period
+            async def apply_low_price_mode():
+                self._scheduled_mode = "regular_no_export"
+                await self._determine_and_apply_mode()
+            task = self._schedule_action(group_start, apply_low_price_mode)
             self._scheduled_tasks.append(task)
 
             previous_end = group_end
@@ -2012,17 +1949,14 @@ class GrowattController(BaseModule):
                 f"Scheduling load-first from {last_low_end} to {EOD_HHMM} (use stored energy)"
             )
             self._scheduled_periods.append(
-                Period("load_first", self._parse_hhmm(last_low_end), EOD_DTTIME)
+                Period("regular", self._parse_hhmm(last_low_end), EOD_DTTIME)  # Regular for evening
             )
-            self._scheduled_periods.append(
-                Period("export", self._parse_hhmm(last_low_end), EOD_DTTIME)
-            )  # Enable export for excess
 
-            task = self._schedule_action(last_low_end, self._mode_manager.set_load_first)
-            self._scheduled_tasks.append(task)
-
-            # Enable export for evening (in case of excess energy)
-            task = self._schedule_action(self._bump_time(last_low_end, 5), self._mode_manager.enable_export)
+            # Schedule evening mode
+            async def apply_evening_mode():
+                self._scheduled_mode = "regular"
+                await self._determine_and_apply_mode()
+            task = self._schedule_action(last_low_end, apply_evening_mode)
             self._scheduled_tasks.append(task)
 
     async def _schedule_battery_control(
@@ -2211,11 +2145,12 @@ class GrowattController(BaseModule):
     async def _schedule_export_control(
         self, hourly_prices: Dict[Tuple[str, str], float], eur_czk_rate: float
     ) -> None:
-        """Schedule export enable/disable based on price thresholds."""
-        # Build AC charge windows for overlap checking
-        ac_windows: List[Tuple[dt_time, dt_time]] = [
-            (p.start, p.end) for p in self._scheduled_periods if p.kind == "ac_charge"
-        ]
+        """Schedule export enable/disable based on price thresholds.
+
+        DEPRECATED: Export control is now handled by the decision engine based on mode.
+        This method is kept for compatibility but does nothing.
+        """
+        pass
 
         def _segments(start: dt_time, end: dt_time) -> List[Tuple[dt_time, dt_time]]:
             """Split a possibly midnight-wrapping range into 1-2 non-wrapping segments."""
@@ -2397,9 +2332,7 @@ class GrowattController(BaseModule):
                     )
 
                 # Track export period
-                self._scheduled_periods.append(
-                    Period("export", slice_start_t, slice_end_t)
-                )
+                # Export periods are no longer tracked separately - handled by mode
 
                 # Check if this is a midnight start
                 if slice_start == "00:00":
