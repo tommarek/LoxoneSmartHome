@@ -64,7 +64,7 @@ async def test_controller_initialization(growatt_controller: GrowattController) 
     assert growatt_controller.name == "GrowattController"
     assert growatt_controller.config is not None
     assert growatt_controller._scheduled_tasks == []
-    assert growatt_controller._daily_schedule_task is None
+    assert growatt_controller._periodic_check_task is None
 
 
 @pytest.mark.asyncio
@@ -420,9 +420,9 @@ async def test_start_stop(
     """Test controller start and stop methods."""
     # Mock all the startup methods to prevent actual execution
     setattr(growatt_controller, "_sync_inverter_time", AsyncMock())
-    setattr(growatt_controller, "_reset_inverter_state", AsyncMock())
-    setattr(growatt_controller, "_schedule_daily_calculation", AsyncMock())
-    setattr(growatt_controller, "_apply_current_state", AsyncMock())
+    setattr(growatt_controller, "_fetch_prices", AsyncMock())
+    setattr(growatt_controller, "_evaluate_conditions", AsyncMock())
+    setattr(growatt_controller, "_periodic_evaluation_loop", AsyncMock())
 
     # Test start
     await growatt_controller.start()
@@ -431,9 +431,8 @@ async def test_start_stop(
 
     # Verify key startup methods were called
     growatt_controller._sync_inverter_time.assert_called_once()  # type: ignore[attr-defined]
-    growatt_controller._reset_inverter_state.assert_called_once()  # type: ignore[attr-defined]
-    growatt_controller._schedule_daily_calculation.assert_called_once()  # type: ignore[attr-defined]
-    growatt_controller._apply_current_state.assert_called_once()  # type: ignore[attr-defined]
+    growatt_controller._fetch_prices.assert_called_once()  # type: ignore[attr-defined]
+    growatt_controller._evaluate_conditions.assert_called()  # type: ignore[attr-defined]
 
     # Verify MQTT subscription
     mock_mqtt_client.subscribe.assert_called_once()

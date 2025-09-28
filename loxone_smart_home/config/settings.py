@@ -170,6 +170,27 @@ class GrowattConfig(BaseModel):
     battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
     individual_cheapest_hours: int = Field(default=6, ge=1, le=24)  # Individual cheap hours
 
+    # Decision engine price thresholds
+    cheap_price_threshold_eur: float = Field(default=80.0, gt=0)  # EUR/MWh - below this = cheap
+    # EUR/MWh - above this = export (~1 CZK/kWh)
+    export_enable_threshold_eur: float = Field(default=40.0, gt=0)
+    charge_efficiency: float = Field(default=0.87, gt=0, le=1)  # Battery round-trip efficiency
+    min_profit_margin: float = Field(default=1.2, ge=1)  # Minimum profit ratio for discharge
+
+    # Percentile-based price ranking thresholds
+    charge_percentile_threshold: float = Field(
+        default=25.0, ge=0, le=100,
+        description="Charge battery when price is in bottom X% of daily prices"
+    )
+    export_percentile_threshold: float = Field(
+        default=60.0, ge=0, le=100,
+        description="Enable export when price is in top X% of daily prices"
+    )
+    discharge_percentile_threshold: float = Field(
+        default=90.0, ge=0, le=100,
+        description="Discharge to grid when price is in top X% of daily prices"
+    )
+
     # MQTT topics for Growatt control
     battery_first_topic: str = "energy/solar/command/batteryfirst/set/timeslot"
     ac_charge_topic: str = "energy/solar/command/batteryfirst/set/acchargeenabled"

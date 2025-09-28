@@ -6,7 +6,7 @@ import zoneinfo
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import aiohttp
 from astral import LocationInfo
@@ -25,7 +25,9 @@ from .growatt.models import (
 )
 from .growatt.price_analyzer import PriceAnalyzer
 from .growatt.mode_manager import ModeManager
-from .growatt.decision_engine import GrowattDecisionEngine, DecisionContext, MODE_DEFINITIONS
+from .growatt.decision_engine import (
+    GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
+)
 
 
 class GrowattController(BaseModule):
@@ -160,12 +162,16 @@ class GrowattController(BaseModule):
         # Validate config and set defaults
         self._validate_config()
 
-        # Scheduled tasks
-        self._scheduled_tasks: List[asyncio.Task[None]] = []
-        self._daily_schedule_task: Optional[asyncio.Task[None]] = None
+        # Event-driven state
+        self._last_evaluation_hour: Optional[int] = None
+        self._last_evaluation_reason: Optional[str] = None
+        self._evaluation_lock = asyncio.Lock()
+        self._periodic_check_task: Optional[asyncio.Task[None]] = None
 
-        # Track scheduled periods for startup state sync
-        self._scheduled_periods: List[Period] = []
+        # Legacy compatibility - to be removed after full migration
+        self._scheduled_tasks: list[Any] = []  # Empty list for backward compatibility
+        self._scheduled_periods: list[Any] = []  # Empty list for backward compatibility
+        self._scheduled_mode: Optional[str] = None  # Legacy mode tracking
 
         # Local timezone (Prague/Czech Republic)
         self._local_tz = zoneinfo.ZoneInfo("Europe/Prague")
@@ -216,9 +222,12 @@ class GrowattController(BaseModule):
         self._home_status: Dict[str, Any] = {}
         self._high_loads_active: bool = False
         self._home_status_topic = "loxone/status"
-        self._scheduled_mode: Optional[PeriodType] = None  # Track what mode SHOULD be active
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
+        self._last_battery_soc: float = 50.0  # Track SOC changes
+        self._current_load: float = 0.0  # Current home load in kW
+        self._solar_power: float = 0.0  # Current solar generation in kW
+        self._last_price_fetch: Optional[datetime] = None  # Track price update time
 
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
@@ -1025,84 +1034,58 @@ class GrowattController(BaseModule):
 
     async def start(self) -> None:
         """Start the Growatt controller."""
-        self._running = True  # Set the flag so daily loop runs
+        self._running = True
 
         # Sync inverter time on startup
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
-
-        # Reset inverter to clean state on startup
-        self.logger.info("Resetting inverter to clean state...")
-        await self._reset_inverter_state()
 
         # Subscribe to home status for high load detection
         if self.mqtt_client:
             self.logger.info(f"Subscribing to home status topic: {self._home_status_topic}")
             await self.mqtt_client.subscribe(self._home_status_topic, self._on_home_status)
 
-        await self._schedule_daily_calculation()
-        self.logger.info("Growatt controller started")
+        # Fetch initial prices
+        await self._fetch_prices()
 
-        # Check and apply current state based on active time periods
-        # This happens after scheduling so we have the periods available
-        await self._apply_current_state()
+        # Start periodic evaluation loop
+        self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
+
+        # Perform initial evaluation
+        await self._evaluate_conditions("startup")
+
+        self.logger.info("Growatt controller started with event-driven evaluation")
 
     async def stop(self) -> None:
         """Stop the Growatt controller."""
-        self._running = False  # Clear the flag to stop daily loop
+        self._running = False  # Clear the flag to stop evaluation loop
 
-        # Cancel all scheduled tasks
-        tasks_to_cancel = []
-        for task in self._scheduled_tasks:
-            if task and not task.done():
-                task.cancel()
-                tasks_to_cancel.append(task)
-
-        if self._daily_schedule_task and not self._daily_schedule_task.done():
-            self._daily_schedule_task.cancel()
-            tasks_to_cancel.append(self._daily_schedule_task)
-
-        # Wait for all tasks to complete cancellation with timeout
-        if tasks_to_cancel:
+        # Cancel periodic check task
+        if self._periodic_check_task and not self._periodic_check_task.done():
+            self._periodic_check_task.cancel()
             try:
-                await asyncio.wait(tasks_to_cancel, timeout=1.0)
-            except asyncio.TimeoutError:
-                self.logger.warning("Some tasks did not cancel within timeout")
-            except Exception as e:
-                self.logger.debug(f"Task cancellation exception (expected): {e}")
+                await self._periodic_check_task
+            except asyncio.CancelledError:
+                pass
+            self._periodic_check_task = None
 
-        # Clear task lists
-        self._scheduled_tasks.clear()
-        self._daily_schedule_task = None
-
-        # Reset to clean state on shutdown
+        # Apply safe shutdown mode
         self.logger.info("🔄 Resetting inverter to safe shutdown state...")
         try:
-            # Set regular mode as safe default
-            self._scheduled_mode = "regular"
-            await self._determine_and_apply_mode()
+            await self._evaluate_conditions("shutdown")
             self.logger.info("✅ Inverter shutdown state: regular mode applied")
         except Exception as e:
             self.logger.error(f"Error during shutdown reset: {e}", exc_info=True)
 
         self.logger.info("Growatt controller stopped")
 
-    async def _reset_inverter_state(self) -> None:
-        """Reset inverter to a clean, known state on startup.
+    async def _determine_and_apply_mode(self) -> None:
+        """Legacy adapter - redirects to new evaluation system.
 
-        This ensures the inverter starts in a predictable state regardless of
-        what mode it was in when the service was last stopped.
+        This method exists for backward compatibility with code that still
+        calls the old method. It simply triggers a re-evaluation.
         """
-        try:
-            self.logger.info("🔄 Resetting inverter to default state...")
-            # Apply regular mode as safe default
-            self._scheduled_mode = "regular"
-            await self._determine_and_apply_mode()
-            self.logger.info("✅ Inverter reset complete: regular mode applied")
-
-        except Exception as e:
-            self.logger.error(f"Failed to reset inverter state: {e}", exc_info=True)
-            # Continue anyway - the scheduled mode will try to set the correct state
+        await self._evaluate_conditions("legacy_call")
 
     async def _on_home_status(self, _topic: str, payload: Any) -> None:
         """Handle home status updates from UDP listener.
@@ -1224,95 +1207,180 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
+    async def _fetch_prices(self) -> None:
+        """Fetch current energy prices and trigger evaluation."""
+        try:
+            # Determine target date
+            target_date = self._get_local_date_string(days_ahead=0)
+
+            # Fetch energy prices from DAM
+            hourly_prices = await self._price_analyzer.fetch_dam_energy_prices(date=target_date)
+
+            if not hourly_prices:
+                self.logger.warning("Failed to retrieve energy prices, using mock prices")
+                hourly_prices = self._price_analyzer.generate_mock_prices(target_date)
+
+            if hourly_prices:
+                # Store prices in cache
+                self._current_prices = hourly_prices
+                self._prices_date = target_date
+                self._prices_updated = datetime.now()
+
+                # Get exchange rate
+                self._eur_czk_rate = await self._get_eur_czk_rate()
+
+                # Log price table
+                await self._log_price_table(hourly_prices, target_date, self._eur_czk_rate or 25.0)
+
+                # Trigger re-evaluation with new prices
+                await self._on_price_update()
+            else:
+                self.logger.error("Failed to get any prices")
+
+        except Exception as e:
+            self.logger.error(f"Error fetching prices: {e}", exc_info=True)
+
+    async def _on_price_update(self) -> None:
+        """Handle new price data availability."""
+        await self._evaluate_conditions("price_update")
+
+    async def _on_load_threshold_crossed(self, high_loads: bool) -> None:
+        """Handle load threshold crossing.
+
+        Args:
+            high_loads: True if loads are now high, False if normal
+        """
+        if self._high_loads_active != high_loads:
+            self._high_loads_active = high_loads
+            reason = "high_load_detected" if high_loads else "load_normalized"
+            await self._evaluate_conditions(reason)
+
+    async def _on_manual_override_change(self) -> None:
+        """Handle manual override changes."""
+        await self._evaluate_conditions("manual_override")
+
     async def _apply_current_state(self) -> None:
-        """Apply the appropriate state based on current time and scheduled periods."""
-        now = self._get_local_now()
-        now_t = now.time()
-        self.logger.info(
-            f"Checking current state at {now.strftime('%H:%M')} for immediate application..."
-        )
+        """Apply the currently appropriate mode based on conditions.
 
-        # Check for manual override first
-        if self._manual_override_period:
-            override_status = self.get_manual_override_status()
-            if override_status.get("active"):
-                mode = self._manual_override_period.kind
-                self.logger.info(
-                    f"Manual override active: {mode} "
-                    f"(until {override_status.get('end_time', 'manual clear')})"
-                )
-
-                # Apply the manual override mode
-                self._scheduled_mode = mode
-                await self._determine_and_apply_mode()
-                return
-
-        if not self._scheduled_periods:
-            self.logger.info("No scheduled periods found yet, applying default mode")
-            self._scheduled_mode = "regular"
-            await self._determine_and_apply_mode()
-            return
-
-        # Find the active period at current time (should be only one with composite modes)
-        active_period: Optional[Period] = None
-        for period in self._scheduled_periods:
-            if period.contains_time(now_t):
-                active_period = period
-                self.logger.info(
-                    f"Currently in {period.kind} period "
-                    f"({period.start.strftime('%H:%M')}-{period.end.strftime('%H:%M')})"
-                )
-                break
-
-        if active_period:
-            # Apply the scheduled mode for the active period
-            self._scheduled_mode = active_period.kind
-            await self._determine_and_apply_mode()
-        else:
-            # No active period, apply default mode
-            self.logger.info("No active period found, applying default mode")
-            self._scheduled_mode = "regular"
-            await self._determine_and_apply_mode()
-
-        self.logger.info("Startup state synchronization complete")
+        This is now handled by the evaluation system.
+        """
+        await self._evaluate_conditions("state_sync")
 
     # Price analysis methods moved to PriceAnalyzer module
 
     # Mode management methods moved to ModeManager module
 
-    async def _determine_and_apply_mode(self) -> None:
-        """Use decision engine to determine and apply the appropriate mode."""
-        try:
-            # Build decision context
-            context = DecisionContext(
-                manual_override_active=bool(self._manual_override_period),
-                manual_override_mode=(
-                    self._manual_override_period.kind if self._manual_override_period else None
-                ),
-                high_loads_active=self._high_loads_active,
-                scheduled_mode=self._scheduled_mode,
-                battery_soc=self._battery_soc,
-                current_mode=self._current_mode
+    async def _evaluate_conditions(self, reason: str) -> None:
+        """Re-evaluate decision tree when conditions change.
+
+        Args:
+            reason: What triggered the re-evaluation
+        """
+        async with self._evaluation_lock:
+            try:
+                self._last_evaluation_reason = reason
+
+                # Build complete decision context with price data
+                context = await self._build_decision_context()
+
+                # Get decision from engine
+                new_mode = self._decision_engine.decide(context)
+
+                # Check if mode changed
+                if self._decision_engine.has_mode_changed(new_mode):
+                    # Get explanation for logging
+                    explanation = self._decision_engine.explain_decision()
+                    self.logger.info(
+                        f"📊 Mode change ({reason}): {self._current_mode} → {new_mode} - "
+                        f"Reason: {explanation['reason']} "
+                        f"(Priority: {explanation['priority']['name']})"
+                    )
+
+                    # Apply the new mode
+                    await self._apply_decided_mode(new_mode)
+                    self._current_mode = new_mode
+                else:
+                    self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
+
+            except Exception as e:
+                self.logger.error(f"Failed to evaluate conditions: {e}", exc_info=True)
+                # Don't change mode on error
+
+    async def _build_decision_context(self) -> DecisionContext:
+        """Build complete decision context with all current data.
+
+        Returns:
+            DecisionContext with current system state and price data
+        """
+        now = self._get_local_now()
+        current_hour = now.strftime("%H:00")
+        next_hour = (now.replace(minute=0) + timedelta(hours=1)).strftime("%H:00")
+        current_hour_key = (current_hour, next_hour)
+
+        # Get current price
+        current_price = self._current_prices.get(current_hour_key, 0.0)
+
+        # Calculate sunrise/sunset
+        sun_times = sun(self._location.observer, date=now.date())
+        sunrise = sun_times["sunrise"].time() if "sunrise" in sun_times else None
+        sunset = sun_times["sunset"].time() if "sunset" in sun_times else None
+
+        # Create price thresholds from config
+        price_thresholds = PriceThresholds(
+            cheap_threshold=self.config.cheap_price_threshold_eur,
+            export_threshold=self.config.export_enable_threshold_eur,  # EUR/MWh threshold
+            charge_efficiency=self.config.charge_efficiency,
+            min_profit_margin=self.config.min_profit_margin,
+            # Add percentile-based thresholds with defaults or from config
+            charge_percentile_threshold=getattr(
+                self.config, 'charge_percentile_threshold', 25.0
+            ),
+            export_percentile_threshold=getattr(
+                self.config, 'export_percentile_threshold', 60.0
+            ),
+            discharge_percentile_threshold=getattr(
+                self.config, 'discharge_percentile_threshold', 90.0
             )
+        )
 
-            # Get decision from engine
-            mode = self._decision_engine.decide(context)
-
-            # Get explanation for logging
-            explanation = self._decision_engine.explain_decision()
-            self.logger.info(
-                f"📊 Decision: Apply '{mode}' mode - "
-                f"Reason: {explanation['reason']} (Priority: {explanation['priority']['name']})"
+        # Calculate price ranking for current hour
+        price_ranking = None
+        if self._current_prices and current_hour_key in self._current_prices:
+            price_ranking = self._decision_engine.calculate_price_ranking(
+                current_hour_key, self._current_prices
             )
+            if price_ranking:
+                self.logger.debug(
+                    f"Price ranking: rank {price_ranking.current_rank}/"
+                    f"{price_ranking.total_hours} "
+                    f"(percentile {price_ranking.percentile:.1f}%, "
+                    f"{price_ranking.price_quadrant}), "
+                    f"spread {price_ranking.daily_spread:.2f} EUR/MWh"
+                )
 
-            # Apply the decided mode
-            await self._apply_decided_mode(mode)
-            self._current_mode = mode  # Track the applied mode
-
-        except Exception as e:
-            self.logger.error(f"Failed to determine and apply mode: {e}", exc_info=True)
-            # Fallback to safe default
-            await self._apply_decided_mode("regular")
+        return DecisionContext(
+            # Manual control
+            manual_override_active=bool(self._manual_override_period),
+            manual_override_mode=(
+                self._manual_override_period.kind if self._manual_override_period else None
+            ),
+            # System state
+            high_loads_active=self._high_loads_active,
+            battery_soc=self._battery_soc,
+            current_mode=self._current_mode,
+            current_load=self._current_load,
+            solar_power=self._solar_power,
+            # Time and pricing
+            current_time=now,
+            current_price=current_price,
+            hourly_prices=self._current_prices.copy(),
+            price_thresholds=price_thresholds,
+            price_ranking=price_ranking,  # Include price ranking
+            # Solar schedule
+            sunrise=sunrise,
+            sunset=sunset,
+            is_summer_mode=(await self._get_season_mode() == "summer")
+        )
 
     async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
         """Apply a mode based on its definition from MODE_DEFINITIONS.
@@ -1381,6 +1449,32 @@ class GrowattController(BaseModule):
             f"{mode_def.get('description', 'No description')} "
             f"({inverter_mode} @ {stop_soc}% SOC)"
         )
+
+    # Event-driven evaluation methods
+
+    async def _periodic_evaluation_loop(self) -> None:
+        """Periodically check for condition changes that need re-evaluation."""
+        while self._running:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+
+                now = self._get_local_now()
+
+                # Check for hour change (price changes)
+                current_hour = now.hour
+                if self._last_evaluation_hour != current_hour:
+                    self._last_evaluation_hour = current_hour
+                    await self._evaluate_conditions("hour_change")
+
+                # Check for battery SOC change (>5%)
+                if abs(self._battery_soc - self._last_battery_soc) >= 5:
+                    self._last_battery_soc = self._battery_soc
+                    await self._evaluate_conditions("battery_soc_change")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                self.logger.error(f"Error in periodic evaluation: {e}", exc_info=True)
 
     async def set_manual_override(
         self,
@@ -1470,8 +1564,7 @@ class GrowattController(BaseModule):
 
         # Apply the manual override mode immediately
         try:
-            self._scheduled_mode = mode
-            await self._determine_and_apply_mode()
+            await self._on_manual_override_change()
 
             # Log manual intervention
             end_str = end_time.strftime("%Y-%m-%d %H:%M") if end_time else "manual clear"
@@ -1508,7 +1601,7 @@ class GrowattController(BaseModule):
         if had_override:
             # Re-evaluate automatic schedule
             self.logger.info("🔄 Manual override cleared, re-evaluating automatic schedule")
-            await self._apply_current_state()
+            await self._evaluate_conditions("manual_override_cleared")
 
             return {
                 "success": True,
