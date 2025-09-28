@@ -13,7 +13,7 @@ Rate Limiting Strategy:
 
 import asyncio
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import aiohttp
 import pytz
@@ -145,7 +145,7 @@ class OTEPriceCollector(BaseModule):
             self.logger.warning(f"Error checking existing data: {e}, will load historical data")
             return True
 
-    async def _find_earliest_missing_date(self, start_date, end_date):
+    async def _find_earliest_missing_date(self, start_date: Any, end_date: Any) -> Any:
         """Find the earliest date that's missing data in the given range."""
         try:
             current_date = start_date
@@ -301,7 +301,7 @@ class OTEPriceCollector(BaseModule):
             return None
 
     def _parse_ote_response(
-        self, data: dict, date_str: str
+        self, data: Dict[str, Any], date_str: str
     ) -> Optional[Dict[Tuple[str, str], float]]:
         """Parse OTE API response data."""
         hourly_prices = {}

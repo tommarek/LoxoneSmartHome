@@ -1,6 +1,7 @@
 """Test the MQTT client module."""
 
 import asyncio
+from typing import AsyncGenerator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -24,7 +25,7 @@ class TestAsyncMQTTClient:
             return settings
 
     @pytest.fixture
-    async def mqtt_client(self, settings: Settings) -> AsyncMQTTClient:
+    async def mqtt_client(self, settings: Settings) -> AsyncGenerator[AsyncMQTTClient, None]:
         """Create MQTT client instance."""
         client = AsyncMQTTClient(settings)
         yield client

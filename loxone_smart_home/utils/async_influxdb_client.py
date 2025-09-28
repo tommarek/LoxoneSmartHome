@@ -6,7 +6,7 @@ from collections import deque
 from datetime import datetime
 from typing import Any, Deque, Dict, List, Optional
 
-from influxdb_client import Point, WritePrecision
+from influxdb_client import Point, WritePrecision  # type: ignore[attr-defined]
 from influxdb_client.client.influxdb_client_async import InfluxDBClientAsync
 
 from config.settings import Settings
@@ -79,7 +79,7 @@ class AsyncInfluxDBClient:
             async with self.pool_lock:
                 for client in self.client_pool:
                     try:
-                        await client.close()
+                        await client.close()  # type: ignore[no-untyped-call]
                     except Exception:
                         pass  # Ignore individual close errors
                 self.client_pool.clear()
@@ -122,20 +122,20 @@ class AsyncInfluxDBClient:
         timestamp: Optional[datetime] = None,
     ) -> None:
         """Queue a point for writing to InfluxDB."""
-        point = Point(measurement)
+        point = Point(measurement)  # type: ignore[no-untyped-call]
 
         # Add tags
         if tags:
             for key, value in tags.items():
-                point = point.tag(key, value)
+                point = point.tag(key, value)  # type: ignore[no-untyped-call]
 
         # Add fields
         for key, value in fields.items():
-            point = point.field(key, value)
+            point = point.field(key, value)  # type: ignore[no-untyped-call]
 
         # Add timestamp
         if timestamp:
-            point = point.time(timestamp, WritePrecision.NS)
+            point = point.time(timestamp, WritePrecision.NS)  # type: ignore[no-untyped-call]
 
         # Add to buffer
         async with self.buffer_lock:

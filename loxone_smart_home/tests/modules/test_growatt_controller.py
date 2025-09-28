@@ -54,7 +54,7 @@ def growatt_controller(
     """Create a GrowattController instance with mocked dependencies."""
     controller = GrowattController(mock_mqtt_client, mock_influxdb_client, mock_settings)
     # Mock the wait for result to prevent timeouts in tests
-    controller._wait_for_command_result = AsyncMock(return_value={"success": True})
+    setattr(controller, "_wait_for_command_result", AsyncMock(return_value={"success": True}))
     return controller
 
 
@@ -419,10 +419,10 @@ async def test_start_stop(
 ) -> None:
     """Test controller start and stop methods."""
     # Mock all the startup methods to prevent actual execution
-    growatt_controller._sync_inverter_time = AsyncMock()
-    growatt_controller._reset_inverter_state = AsyncMock()
-    growatt_controller._schedule_daily_calculation = AsyncMock()
-    growatt_controller._apply_current_state = AsyncMock()
+    setattr(growatt_controller, "_sync_inverter_time", AsyncMock())
+    setattr(growatt_controller, "_reset_inverter_state", AsyncMock())
+    setattr(growatt_controller, "_schedule_daily_calculation", AsyncMock())
+    setattr(growatt_controller, "_apply_current_state", AsyncMock())
 
     # Test start
     await growatt_controller.start()
@@ -430,10 +430,10 @@ async def test_start_stop(
     assert growatt_controller._running is True
 
     # Verify key startup methods were called
-    growatt_controller._sync_inverter_time.assert_called_once()
-    growatt_controller._reset_inverter_state.assert_called_once()
-    growatt_controller._schedule_daily_calculation.assert_called_once()
-    growatt_controller._apply_current_state.assert_called_once()
+    growatt_controller._sync_inverter_time.assert_called_once()  # type: ignore[attr-defined]
+    growatt_controller._reset_inverter_state.assert_called_once()  # type: ignore[attr-defined]
+    growatt_controller._schedule_daily_calculation.assert_called_once()  # type: ignore[attr-defined]
+    growatt_controller._apply_current_state.assert_called_once()  # type: ignore[attr-defined]
 
     # Verify MQTT subscription
     mock_mqtt_client.subscribe.assert_called_once()

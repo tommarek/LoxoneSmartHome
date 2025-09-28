@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 
 if TYPE_CHECKING:
-    from modules.growatt_controller import GrowattController
+    from ..growatt_controller import GrowattController
 
 
 class ModeManager:
@@ -40,21 +40,28 @@ class ModeManager:
 
     def _to_device_hhmm(self, s: str) -> str:
         """Convert time string to device format (HH:MM)."""
-        return self.controller._to_device_hhmm(s)
+        result = self.controller._to_device_hhmm(s)
+        assert isinstance(result, str)
+        return result
 
     def _ensure_future_start(
         self, start_hour: str, stop_hour: str, preserve_duration: bool = True
     ) -> tuple[str, str]:
         """Ensure start time is in future for inverter scheduling."""
-        return self.controller._ensure_future_start(start_hour, stop_hour, preserve_duration)
+        result = self.controller._ensure_future_start(start_hour, stop_hour, preserve_duration)
+        assert isinstance(result, tuple) and len(result) == 2
+        return result
 
     async def _wait_for_command_result(self, command_path: str) -> Optional[Dict[str, Any]]:
         """Wait for command result from inverter."""
-        return await self.controller._wait_for_command_result(command_path)
+        result = await self.controller._wait_for_command_result(command_path)
+        return result
 
     async def _query_inverter_state(self) -> Dict[str, Any]:
         """Query inverter state."""
-        return await self.controller._query_inverter_state()
+        result = await self.controller._query_inverter_state()
+        assert isinstance(result, dict)
+        return result
 
     async def ensure_exclusive(self, primary: str) -> None:
         """Ensure modes are mutually exclusive at the device level.

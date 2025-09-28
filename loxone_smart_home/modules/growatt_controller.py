@@ -31,6 +31,11 @@ from .growatt.decision_engine import GrowattDecisionEngine, DecisionContext, MOD
 class GrowattController(BaseModule):
     """Growatt controller that manages battery charging based on energy prices."""
 
+    # Class attributes for type checking
+    _manual_override_period: Optional[Period]
+    _manual_override_end_time: Optional[datetime]
+    _manual_override_source: str
+
     def _select_primary_mode(self, modes: set[PeriodType]) -> PeriodType:
         """Select primary mode from active modes.
 
@@ -38,10 +43,10 @@ class GrowattController(BaseModule):
         Manual overrides take precedence over everything else.
         """
         # Check for active manual override first
-        if self._manual_override_period:
+        if self._manual_override_period is not None:
             now = self._get_local_now()
             # Check if manual override is still valid
-            if self._manual_override_end_time:
+            if self._manual_override_end_time is not None:
                 if now < self._manual_override_end_time:
                     return self._manual_override_period.kind
                 else:
@@ -196,9 +201,9 @@ class GrowattController(BaseModule):
 
         self._schedule_func = self._schedule_at_time
 
-        self._manual_override_period: Optional[Period] = None
-        self._manual_override_end_time: Optional[datetime] = None
-        self._manual_override_source: str = ""
+        self._manual_override_period = None
+        self._manual_override_end_time = None
+        self._manual_override_source = ""
 
         self._last_command_results: Dict[str, Dict[str, Any]] = {}
 
@@ -336,13 +341,13 @@ class GrowattController(BaseModule):
 
             except asyncio.TimeoutError:
                 self.logger.warning("Timeout querying battery-first state")
-                state["battery_first"] = None
+                state["battery_first"] = {}
             finally:
                 await self.mqtt_client.unsubscribe("energy/solar/result")
 
         except Exception as e:
             self.logger.error(f"Error querying battery-first state: {e}")
-            state["battery_first"] = None
+            state["battery_first"] = {}
 
         # Query grid-first state
         try:
@@ -573,21 +578,21 @@ class GrowattController(BaseModule):
             }
 
             # Add mode-specific details for composite modes
-            period = slot["periods"][0] if slot["periods"] else None
+            first_period: Optional[Period] = slot["periods"][0] if slot["periods"] else None
 
             if slot["primary_mode"] == "discharge_to_grid":
                 entry["mode"] = "DISCHARGE-TO-GRID"
-                if period and period.params:
-                    stop_soc = period.params.get("stop_soc", 20)
-                    power_rate = period.params.get("power_rate", 100)
+                if first_period and first_period.params:
+                    stop_soc = first_period.params.get("stop_soc", 20)
+                    power_rate = first_period.params.get("power_rate", 100)
                     entry["details"].append(f"Discharge to {stop_soc}% SOC")
                     entry["details"].append(f"Power rate: {power_rate}%")
                 entry["details"].append("Export: ENABLED")
 
             elif slot["primary_mode"] == "charge_from_grid":
                 entry["mode"] = "CHARGE-FROM-GRID"
-                if period and period.params:
-                    stop_soc = period.params.get("stop_soc", self.config.max_soc)
+                if first_period and first_period.params:
+                    stop_soc = first_period.params.get("stop_soc", self.config.max_soc)
                     entry["details"].append(f"Charge to {stop_soc}% SOC")
                 entry["details"].append("AC Charging: ENABLED")
                 entry["details"].append("Export: ENABLED")  # Export now enabled during charging
@@ -1171,7 +1176,7 @@ class GrowattController(BaseModule):
         Returns:
             Dictionary with high load detection results
         """
-        result = {
+        result: Dict[str, Any] = {
             "active": False,
             "ev_charging": False,
             "ev_power": 0,
@@ -1326,9 +1331,13 @@ class GrowattController(BaseModule):
             mode_def = MODE_DEFINITIONS["regular"]
 
         # Determine actual SOC value
-        stop_soc = mode_def.get("stop_soc", 20)
-        if stop_soc == "configurable":
-            stop_soc = params.get("stop_soc", int(self.config.max_soc))
+        stop_soc_raw = mode_def.get("stop_soc", 20)
+        stop_soc: int = 20
+        if stop_soc_raw == "configurable":
+            soc_param = params.get("stop_soc", self.config.max_soc)
+            stop_soc = int(soc_param) if soc_param is not None else int(self.config.max_soc)
+        elif isinstance(stop_soc_raw, (int, float, str)):
+            stop_soc = int(stop_soc_raw)
 
         inverter_mode = mode_def.get("inverter_mode", "load_first")
 
@@ -1336,16 +1345,16 @@ class GrowattController(BaseModule):
         if inverter_mode == "load_first":
             await self._mode_manager.set_load_first(stop_soc=stop_soc)
         elif inverter_mode == "battery_first":
-            power_rate = params.get("power_rate", 100)
+            power_rate = int(params.get("power_rate", 100))
             await self._mode_manager.set_battery_first(
                 "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
             )
         elif inverter_mode == "grid_first":
-            power_rate = params.get(
+            power_rate = int(params.get(
                 "power_rate",
                 self.config.discharge_power_rate
                 if hasattr(self.config, 'discharge_power_rate') else 100
-            )
+            ))
             await self._mode_manager.set_grid_first(
                 "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
             )
@@ -1417,6 +1426,8 @@ class GrowattController(BaseModule):
             if not duration_value:
                 raise ValueError("Time value required for until_time duration")
             # Parse time string "HH:MM"
+            if isinstance(duration_value, int):
+                duration_value = str(duration_value)
             time_parts = duration_value.split(":")
             if len(time_parts) != 2:
                 raise ValueError(f"Invalid time format: {duration_value}")
@@ -1715,7 +1726,7 @@ class GrowattController(BaseModule):
     async def _schedule_fallback_mode(self) -> None:
         """Schedule fallback mode when price data is unavailable."""
         # Schedule regular mode as fallback
-        async def apply_fallback_mode():
+        async def apply_fallback_mode() -> None:
             self._scheduled_mode = "regular"
             await self._determine_and_apply_mode()
         task = asyncio.create_task(
@@ -1806,7 +1817,7 @@ class GrowattController(BaseModule):
                 )
 
                 # Schedule regular mode at midnight
-                async def apply_overnight_mode():
+                async def apply_overnight_mode() -> None:
                     self._scheduled_mode = "regular"
                     await self._determine_and_apply_mode()
                 task = self._schedule_action("00:00", apply_overnight_mode)
@@ -1827,7 +1838,7 @@ class GrowattController(BaseModule):
             )
 
             # Schedule discharge mode at sunrise
-            async def apply_discharge_mode():
+            async def apply_discharge_mode() -> None:
                 self._scheduled_mode = "discharge_to_grid"
                 await self._determine_and_apply_mode()
             task = self._schedule_action(sunrise_str, apply_discharge_mode)
@@ -1877,7 +1888,7 @@ class GrowattController(BaseModule):
                 pass  # Export is inherent in regular mode
 
             # Schedule regular mode at midnight
-            async def apply_overnight_mode():
+            async def apply_overnight_mode() -> None:
                 self._scheduled_mode = "regular"
                 await self._determine_and_apply_mode()
             task = self._schedule_action("00:00", apply_overnight_mode)
@@ -1892,7 +1903,7 @@ class GrowattController(BaseModule):
             grid_first_end = first_low_start
             self.logger.info(
                 f"Scheduling grid-first from {sunrise_str} to {grid_first_end} "
-                f"(sell morning solar, stopSOC=20%, powerRate=10%)"
+                f"(sell solar only - battery preserved at 100%, powerRate=10%)"
             )
             self._scheduled_periods.append(
                 Period(
@@ -1900,17 +1911,17 @@ class GrowattController(BaseModule):
                     sunrise_time,
                     self._parse_hhmm(grid_first_end),
                     params={
-                        "stop_soc": self.config.discharge_min_soc,
+                        "stop_soc": 100,  # Preserve battery, only sell solar production
                         "power_rate": self.config.discharge_power_rate
                     }
                 )
             )
             # Export is handled by the sell_production mode itself
 
-            # Set grid-first at sunrise with stopSOC=20% and powerRate=10%
+            # Set grid-first at sunrise with stopSOC=100% to preserve battery
             task = self._schedule_action(
                 sunrise_str, self._emit_device_window,
-                self._mode_manager.set_grid_first, sunrise_str, grid_first_end, 20, 10
+                self._mode_manager.set_grid_first, sunrise_str, grid_first_end, 100, 10
             )
             self._scheduled_tasks.append(task)
 
@@ -1963,7 +1974,7 @@ class GrowattController(BaseModule):
             )
 
             # Schedule mode switch at start of low price period
-            async def apply_low_price_mode():
+            async def apply_low_price_mode() -> None:
                 self._scheduled_mode = "regular_no_export"
                 await self._determine_and_apply_mode()
             task = self._schedule_action(group_start, apply_low_price_mode)
@@ -1981,7 +1992,7 @@ class GrowattController(BaseModule):
             )
 
             # Schedule evening mode
-            async def apply_evening_mode():
+            async def apply_evening_mode() -> None:
                 self._scheduled_mode = "regular"
                 await self._determine_and_apply_mode()
             task = self._schedule_action(last_low_end, apply_evening_mode)
@@ -2033,7 +2044,7 @@ class GrowattController(BaseModule):
                 )
                 # Create closure to apply mode at scheduled time
 
-                async def apply_charge_mode():
+                async def apply_charge_mode() -> None:
                     self._scheduled_mode = "charge_from_grid"
                     await self._determine_and_apply_mode()
                 task = self._schedule_action(start_time, apply_charge_mode)
@@ -2117,7 +2128,7 @@ class GrowattController(BaseModule):
                 )
                 # Create closure to apply mode at scheduled time
 
-                async def apply_discharge_mode():
+                async def apply_discharge_mode() -> None:
                     self._scheduled_mode = "discharge_to_grid"
                     await self._determine_and_apply_mode()
                 task = self._schedule_action(start_time, apply_discharge_mode)

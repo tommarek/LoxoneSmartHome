@@ -4,7 +4,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client import InfluxDBClient, Point, WritePrecision  # type: ignore[attr-defined]
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 from config.settings import Settings
@@ -48,20 +48,20 @@ class SharedInfluxDBClient:
             raise RuntimeError("InfluxDB client not connected")
 
         try:
-            point = Point(measurement)
+            point = Point(measurement)  # type: ignore[no-untyped-call]
 
             # Add tags
             if tags:
                 for key, value in tags.items():
-                    point = point.tag(key, value)
+                    point = point.tag(key, value)  # type: ignore[no-untyped-call]
 
             # Add fields
             for key, value in fields.items():
-                point = point.field(key, value)
+                point = point.field(key, value)  # type: ignore[no-untyped-call]
 
             # Add timestamp
             if timestamp:
-                point = point.time(timestamp, WritePrecision.NS)
+                point = point.time(timestamp, WritePrecision.NS)  # type: ignore[no-untyped-call]
 
             self.write_api.write(bucket=bucket, record=point)
             self.logger.debug(f"Wrote point to {bucket}/{measurement}")
@@ -97,5 +97,5 @@ class SharedInfluxDBClient:
     async def close(self) -> None:
         """Close the InfluxDB connection."""
         if self.client:
-            self.client.close()
+            self.client.close()  # type: ignore[no-untyped-call]
             self.logger.info("Closed InfluxDB connection")

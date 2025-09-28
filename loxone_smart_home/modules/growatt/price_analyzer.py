@@ -11,7 +11,7 @@ import aiohttp
 class PriceAnalyzer:
     """Handles energy price fetching and analysis for Growatt battery scheduling."""
 
-    def __init__(self, logger, local_tz, optional_config: Dict[str, Any]):
+    def __init__(self, logger: Any, local_tz: Any, optional_config: Dict[str, Any]) -> None:
         """Initialize PriceAnalyzer.
 
         Args:

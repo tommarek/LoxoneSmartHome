@@ -3,7 +3,7 @@
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from aiohttp import web
 
@@ -18,7 +18,7 @@ _telemetry_last_update: Optional[datetime] = None
 _telemetry_subscription_active = False
 
 # Global cache for command responses
-_command_responses: Dict[str, asyncio.Future] = {}
+_command_responses: Dict[str, asyncio.Future[Any]] = {}
 _result_subscription_active = False
 
 
@@ -125,7 +125,7 @@ async def _query_register_1044(controller: GrowattController) -> Optional[Dict[s
 
     try:
         # Create a future to wait for the response
-        future: asyncio.Future = asyncio.Future()
+        future: asyncio.Future[Any] = asyncio.Future()
         _command_responses["register/get/1044"] = future
 
         # Send the query for register 1044
@@ -136,7 +136,7 @@ async def _query_register_1044(controller: GrowattController) -> Optional[Dict[s
 
         # Wait for response with timeout
         response = await asyncio.wait_for(future, timeout=2.0)
-        return response
+        return cast(Dict[str, Any], response)
     except asyncio.TimeoutError:
         controller.logger.debug("Timeout querying register 1044")
         return {"error": "timeout", "register": 1044}
@@ -174,7 +174,7 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
 
     try:
         # Create a future to wait for the response
-        future: asyncio.Future = asyncio.Future()
+        future: asyncio.Future[Any] = asyncio.Future()
         _command_responses["register/set/1044"] = future
 
         # Log the mode change
@@ -191,6 +191,7 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
 
         # Wait for response with timeout
         response = await asyncio.wait_for(future, timeout=3.0)
+        response = cast(Dict[str, Any], response)
 
         # Log result
         if response.get("success"):
@@ -232,7 +233,7 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
     # Query battery-first status
     try:
         # Create a future to wait for the response
-        bf_future: asyncio.Future = asyncio.Future()
+        bf_future: asyncio.Future[Any] = asyncio.Future()
         _command_responses["batteryfirst/get"] = bf_future
 
         # Send the query with correct topic and empty JSON
@@ -255,7 +256,7 @@ async def _query_inverter_slots(controller: GrowattController) -> Dict[str, Any]
     # Query grid-first status
     try:
         # Create a future to wait for the response
-        gf_future: asyncio.Future = asyncio.Future()
+        gf_future: asyncio.Future[Any] = asyncio.Future()
         _command_responses["gridfirst/get"] = gf_future
 
         # Send the query with correct topic and empty JSON
@@ -345,10 +346,10 @@ async def get_status(request: web.Request) -> web.Response:
                 })
 
         # Determine primary mode
-        active_modes = {p["kind"] for p in active_periods}
+        active_modes = cast(Any, {p["kind"] for p in active_periods})
         primary_mode = (
             controller._select_primary_mode(active_modes)
-            if active_modes else "load_first"
+            if active_modes else "regular"
         )
 
         # Get inverter mode data from actual device
@@ -412,7 +413,7 @@ async def get_schedule(request: web.Request) -> web.Response:
 
     try:
         # Convert periods to JSON-serializable format
-        schedule = []
+        schedule: List[Dict[str, Any]] = []
         for period in controller._scheduled_periods:
             schedule.append({
                 "kind": period.kind,
@@ -422,14 +423,14 @@ async def get_schedule(request: web.Request) -> web.Response:
             })
 
         # Sort by start time
-        schedule.sort(key=lambda x: x["start"])
+        schedule.sort(key=lambda x: str(x["start"]))
 
         # Find currently active period
         now_t = controller._get_local_now().time()
         active = None
         for item in schedule:
-            start = datetime.strptime(item["start"], "%H:%M").time()
-            end = datetime.strptime(item["end"], "%H:%M").time()
+            start = datetime.strptime(str(item["start"]), "%H:%M").time()
+            end = datetime.strptime(str(item["end"]), "%H:%M").time()
 
             # Handle midnight wrap
             if start <= end:
@@ -480,15 +481,16 @@ async def get_prices(request: web.Request) -> web.Response:
 
         # Calculate statistics
         prices_list = list(controller._current_prices.values())
+        avg_price_eur: Optional[float] = None
+        min_price_eur: Optional[float] = None
+        max_price_eur: Optional[float] = None
         if prices_list:
             avg_price_eur = sum(prices_list) / len(prices_list)
             min_price_eur = min(prices_list)
             max_price_eur = max(prices_list)
-        else:
-            avg_price_eur = min_price_eur = max_price_eur = None
 
         # Convert to CZK/kWh (EUR/MWh * rate / 1000)
-        def to_czk_kwh(eur_mwh):
+        def to_czk_kwh(eur_mwh: Optional[float]) -> Optional[float]:
             if eur_mwh is None:
                 return None
             return round(eur_mwh * eur_czk_rate / 1000, 2)
@@ -562,7 +564,7 @@ async def set_mode(request: web.Request) -> web.Response:
 
         # Apply the composite mode
         params = data.get("params", {})
-        await controller._apply_composite_mode(mode, params)
+        await controller._apply_decided_mode(mode, params)
 
         return web.json_response({
             "success": True,
@@ -906,7 +908,10 @@ async def set_mode_via_register(request: web.Request) -> web.Response:
         else:
             return web.json_response({
                 "success": False,
-                "error": result.get("error", "Failed to set mode"),
+                "error": (
+                    result.get("error", "Failed to set mode")
+                    if result else "Failed to set mode"
+                ),
                 "response": result
             }, status=500)
 

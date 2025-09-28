@@ -151,7 +151,7 @@ class WeatherScraper(BaseModule):
         async with self._session.get(url, params=params) as resp:
             if resp.status != 200:
                 self.logger.error(f"OpenMeteo weather API returned status {resp.status}")
-                return []
+                return {}
             js = await resp.json()
 
         # Validate response structure
@@ -161,7 +161,7 @@ class WeatherScraper(BaseModule):
             )
             if "error" in js:
                 self.logger.error(f"API error: {js['error']}")
-            return []
+            return {}
 
         # Air quality data
         air_fields = "pm10,pm2_5,ozone,aerosol_optical_depth,uv_index"

@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import time as dt_time
+from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -58,19 +59,26 @@ async def controller(mock_mqtt_client, mock_influxdb_client, mock_settings):
     controller = GrowattController(mock_mqtt_client, mock_influxdb_client, mock_settings)
     # Set up price analyzer
     controller._price_analyzer = controller._price_analyzer
-    controller._local_tz = pytz.timezone("Europe/Prague")
+    setattr(controller, "_local_tz", pytz.timezone("Europe/Prague"))
 
     # Initialize required attributes
     controller._scheduled_periods = []
     controller._scheduled_tasks = []
 
     # Mock methods that would schedule actual tasks
-    controller._schedule_at_time = AsyncMock(return_value=asyncio.create_task(asyncio.sleep(0)))
-    controller._schedule_today = AsyncMock(return_value=asyncio.create_task(asyncio.sleep(0)))
-    controller._schedule_action = MagicMock(return_value=asyncio.create_task(asyncio.sleep(0)))
-    controller._schedule_end_of_day_cleanup = MagicMock()
-    controller._disable_export = AsyncMock()
-    controller._disable_battery_first = AsyncMock()
+    setattr(
+        controller, "_schedule_at_time",
+        AsyncMock(return_value=asyncio.create_task(asyncio.sleep(0)))
+    )
+    setattr(
+        controller, "_schedule_today",
+        AsyncMock(return_value=asyncio.create_task(asyncio.sleep(0)))
+    )
+    setattr(
+        controller, "_schedule_action",
+        MagicMock(return_value=asyncio.create_task(asyncio.sleep(0)))
+    )
+    setattr(controller, "_schedule_end_of_day_cleanup", MagicMock())
 
     yield controller
     # Cleanup
@@ -327,7 +335,7 @@ class TestScheduleIntegration:
     @pytest.mark.asyncio
     async def test_no_schedule_without_prices(self, controller):
         """Test graceful handling when no prices available."""
-        empty_prices = {}
+        empty_prices: Dict[Any, Any] = {}
 
         # Should handle empty prices gracefully
         await controller._schedule_winter_strategy(empty_prices, 24.29)

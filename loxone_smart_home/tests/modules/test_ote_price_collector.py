@@ -320,10 +320,8 @@ async def test_start_with_historical_load(
 ) -> None:
     """Test starting the collector with historical data load."""
     # Mock that we need historical load
-    ote_collector._needs_historical_load = AsyncMock(  # type: ignore[attr-defined]
-        return_value=True
-    )
-    ote_collector._load_historical_data = AsyncMock()  # type: ignore[attr-defined]
+    setattr(ote_collector, "_needs_historical_load", AsyncMock(return_value=True))
+    setattr(ote_collector, "_load_historical_data", AsyncMock())
 
     with patch("aiohttp.ClientSession") as mock_session_class:
         mock_session = AsyncMock()
@@ -335,7 +333,7 @@ async def test_start_with_historical_load(
         mock_session_class.assert_called_once()
 
         # Verify historical load was called
-        ote_collector._load_historical_data.assert_called_once()  # type: ignore[attr-defined]  # noqa: E501
+        ote_collector._load_historical_data.assert_called_once()  # type: ignore[attr-defined]    # noqa: E501
 
         # Verify daily update task was created
         assert ote_collector._daily_update_task is not None
@@ -348,10 +346,8 @@ async def test_start_without_historical_load(
 ) -> None:
     """Test starting the collector without historical data load."""
     # Mock that we don't need historical load
-    ote_collector._needs_historical_load = AsyncMock(  # type: ignore[attr-defined]
-        return_value=False
-    )
-    ote_collector._load_historical_data = AsyncMock()  # type: ignore[attr-defined]
+    setattr(ote_collector, "_needs_historical_load", AsyncMock(return_value=False))
+    setattr(ote_collector, "_load_historical_data", AsyncMock())
 
     with patch("aiohttp.ClientSession") as mock_session_class:
         mock_session = AsyncMock()
@@ -363,7 +359,7 @@ async def test_start_without_historical_load(
         mock_session_class.assert_called_once()
 
         # Verify historical load was NOT called
-        ote_collector._load_historical_data.assert_not_called()  # type: ignore[attr-defined]  # noqa: E501
+        ote_collector._load_historical_data.assert_not_called()  # type: ignore[attr-defined]    # noqa: E501
 
         # Verify daily update task was created
         assert ote_collector._daily_update_task is not None
@@ -406,10 +402,10 @@ async def test_update_today_and_tomorrow_before_2pm(
     prague_tz = pytz.timezone("Europe/Prague")
     mock_now = prague_tz.localize(datetime(2025, 6, 6, 13, 0))  # 1 PM
 
-    ote_collector._fetch_prices_for_date = AsyncMock(  # type: ignore[attr-defined]
+    setattr(ote_collector, "_fetch_prices_for_date", AsyncMock(
         return_value={("00:00", "01:00"): 50.0}
-    )
-    ote_collector._store_prices = AsyncMock()  # type: ignore[attr-defined]
+    ))
+    setattr(ote_collector, "_store_prices", AsyncMock())
 
     with patch("modules.ote_price_collector.datetime") as mock_datetime:
         mock_datetime.now.return_value = mock_now
@@ -434,10 +430,10 @@ async def test_update_today_and_tomorrow_after_2pm(
     prague_tz = pytz.timezone("Europe/Prague")
     mock_now = prague_tz.localize(datetime(2025, 6, 6, 15, 0))  # 3 PM
 
-    ote_collector._fetch_prices_for_date = AsyncMock(  # type: ignore[attr-defined]
+    setattr(ote_collector, "_fetch_prices_for_date", AsyncMock(
         return_value={("00:00", "01:00"): 50.0}
-    )
-    ote_collector._store_prices = AsyncMock()  # type: ignore[attr-defined]
+    ))
+    setattr(ote_collector, "_store_prices", AsyncMock())
 
     with patch("modules.ote_price_collector.datetime") as mock_datetime:
         mock_datetime.now.return_value = mock_now

@@ -24,7 +24,7 @@ class AsyncMQTTClient:
         self._running = False
 
         # Subscribers with thread-safe access
-        self.subscribers: Dict[str, Set[Callable]] = {}
+        self.subscribers: Dict[str, Set[Callable[..., Any]]] = {}
         self.subscribers_lock = asyncio.Lock()
 
         # Publish queue for reliability
@@ -195,7 +195,9 @@ class AsyncMQTTClient:
 
             self.subscribers[topic].add(callback)
 
-    async def unsubscribe(self, topic: str, callback: Optional[Callable] = None) -> None:
+    async def unsubscribe(
+        self, topic: str, callback: Optional[Callable[[str, Any], Any]] = None
+    ) -> None:
         """Unsubscribe from a topic."""
         async with self.subscribers_lock:
             if topic in self.subscribers:
@@ -276,7 +278,9 @@ class AsyncMQTTClient:
                 if isinstance(result, Exception):
                     self.logger.error(f"Error in callback {callbacks[i]} for {topic}: {result}")
 
-    async def _execute_callback(self, callback: Callable, topic: str, payload: str) -> None:
+    async def _execute_callback(
+        self, callback: Callable[[str, Any], Any], topic: str, payload: str
+    ) -> None:
         """Execute a callback safely."""
         try:
             if asyncio.iscoroutinefunction(callback):

@@ -3,7 +3,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, create_autospec
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "loxone_smart_home"))
 
@@ -80,9 +80,17 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.mock_controller._sync_inverter_time = AsyncMock(
             return_value=True
         )
-        self.mock_controller._set_battery_first = AsyncMock()
-        self.mock_controller._set_grid_first = AsyncMock()
-        self.mock_controller._set_load_first = AsyncMock()
+        self.mock_controller._apply_decided_mode = AsyncMock()
+        self.mock_controller.get_manual_override_status = MagicMock(
+            return_value={"active": False}
+        )
+        self.mock_controller.set_manual_override = AsyncMock(
+            return_value={"success": True, "mode": "test"}
+        )
+        self.mock_controller.clear_manual_override = AsyncMock(
+            return_value={"success": True}
+        )
+        self.mock_controller.logger = MagicMock()
 
         # Mock config
         self.mock_controller.config = MagicMock()
@@ -175,11 +183,9 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertEqual(data["max_soc"], 90)
 
     async def test_set_mode_battery_first(self) -> None:
-        """Test POST /api/growatt/mode for battery_first."""
+        """Test POST /api/growatt/mode for charge_from_grid."""
         payload = {
-            "mode": "battery_first",
-            "start": "08:00",
-            "stop": "10:00",
+            "mode": "charge_from_grid",
             "params": {
                 "stop_soc": 85,
                 "power_rate": 95
@@ -197,21 +203,18 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertIn("success", data)
         self.assertIn("mode", data)
         self.assertTrue(data["success"])
-        self.assertEqual(data["mode"], "battery_first")
+        self.assertEqual(data["mode"], "charge_from_grid")
 
         # Verify controller method was called
-        self.mock_controller._set_battery_first.assert_called_once_with(
-            "08:00", "10:00",
-            stop_soc=85,
-            power_rate=95
+        self.mock_controller._apply_decided_mode.assert_called_once_with(
+            "charge_from_grid",
+            {"stop_soc": 85, "power_rate": 95}
         )
 
     async def test_set_mode_grid_first(self) -> None:
-        """Test POST /api/growatt/mode for grid_first."""
+        """Test POST /api/growatt/mode for discharge_to_grid."""
         payload = {
-            "mode": "grid_first",
-            "start": "17:00",
-            "stop": "20:00",
+            "mode": "discharge_to_grid",
             "params": {
                 "stop_soc": 25,
                 "power_rate": 15
@@ -227,18 +230,17 @@ class TestGrowattAPI(AioHTTPTestCase):
 
         data = await resp.json()
         self.assertTrue(data["success"])
-        self.assertEqual(data["mode"], "grid_first")
+        self.assertEqual(data["mode"], "discharge_to_grid")
 
         # Verify controller method was called
-        self.mock_controller._set_grid_first.assert_called_once_with(
-            "17:00", "20:00",
-            stop_soc=25,
-            power_rate=15
+        self.mock_controller._apply_decided_mode.assert_called_once_with(
+            "discharge_to_grid",
+            {"stop_soc": 25, "power_rate": 15}
         )
 
     async def test_set_mode_load_first(self) -> None:
-        """Test POST /api/growatt/mode for load_first."""
-        payload = {"mode": "load_first"}
+        """Test POST /api/growatt/mode for regular mode."""
+        payload = {"mode": "regular"}
 
         resp = await self.client.request(
             "POST",
@@ -249,10 +251,13 @@ class TestGrowattAPI(AioHTTPTestCase):
 
         data = await resp.json()
         self.assertTrue(data["success"])
-        self.assertEqual(data["mode"], "load_first")
+        self.assertEqual(data["mode"], "regular")
 
         # Verify controller method was called
-        self.mock_controller._set_load_first.assert_called_once()
+        self.mock_controller._apply_decided_mode.assert_called_once_with(
+            "regular",
+            {}
+        )
 
     async def test_set_mode_invalid(self) -> None:
         """Test POST /api/growatt/mode with invalid mode."""
@@ -267,7 +272,7 @@ class TestGrowattAPI(AioHTTPTestCase):
 
         data = await resp.json()
         self.assertIn("error", data)
-        self.assertEqual(data["error"], "Invalid mode")
+        self.assertIn("Invalid mode", data["error"])
 
     async def test_sync_time(self) -> None:
         """Test POST /api/growatt/sync-time endpoint."""
@@ -332,15 +337,23 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.assertFalse(data["success"])
         self.assertEqual(data["message"], "Could not read inverter time")
 
+    @patch('modules.growatt.api._query_inverter_slots', new_callable=AsyncMock)
     @patch('modules.growatt.api._telemetry_cache')
     async def test_get_status_with_inverter_data(
         self,
-        mock_cache: MagicMock
+        mock_cache: MagicMock,
+        mock_query_slots: AsyncMock
     ) -> None:
         """Test GET /api/growatt/status with cached telemetry data."""
         # Mock telemetry cache with data
         mock_cache.__bool__.return_value = True
         mock_cache.get.return_value = 50  # ActivePowerRate
+
+        # Mock query inverter slots
+        mock_query_slots.return_value = {
+            "battery_first_raw": {"enabled": False},
+            "grid_first_raw": {"enabled": False}
+        }
 
         resp = await self.client.request("GET", "/api/growatt/status")
         self.assertEqual(resp.status, 200)
@@ -351,12 +364,9 @@ class TestGrowattAPI(AioHTTPTestCase):
         # Check we have active_power_rate from telemetry cache
         self.assertIn("active_power_rate", inverter)
         self.assertEqual(inverter["active_power_rate"], 50)
-        # Check we have mode status inferred from periods
-        self.assertIn("battery_first_status", inverter)
-        self.assertIn("grid_first_status", inverter)
-        # Since no periods are active, both should be disabled
-        self.assertFalse(inverter["battery_first_status"]["enabled"])
-        self.assertFalse(inverter["grid_first_status"]["enabled"])
+        # Check we have mode data
+        self.assertIn("battery_first_data", inverter)
+        self.assertIn("grid_first_data", inverter)
 
 
 if __name__ == "__main__":
