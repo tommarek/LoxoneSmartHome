@@ -792,8 +792,8 @@ class GrowattController(BaseModule):
             #     - Command reaches inverter at ~19:36:45 inverter time
             #     - Inverter needs to wait ~1 minute until its 19:38 → mode activates!
 
-            # Base buffer: 1 minute for command transmission + processing
-            buffer_minutes = 1
+            # Base buffer: 2 minutes for command transmission + processing
+            buffer_minutes = 2
 
             # Add extra time if inverter is AHEAD (negative drift)
             # If inverter is ahead, we need MORE buffer time
