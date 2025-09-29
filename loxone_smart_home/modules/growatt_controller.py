@@ -701,9 +701,10 @@ class GrowattController(BaseModule):
 
             if abs(drift) > 30:  # More than 30 seconds drift
                 self.logger.warning(
-                    f"Inverter clock drift detected: {drift:.0f} seconds. "
-                    f"Server: {server_time.strftime('%Y-%m-%d %H:%M:%S')}, "
-                    f"Inverter: {inverter_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                    f"⏰ Clock skew detected: {drift:.1f}s "
+                    f"({'inverter behind' if drift > 0 else 'inverter ahead'}) - "
+                    f"Server: {server_time.strftime('%H:%M:%S')}, "
+                    f"Inverter: {inverter_time.strftime('%H:%M:%S')}"
                 )
 
                 # Optionally update inverter time
@@ -716,7 +717,10 @@ class GrowattController(BaseModule):
                     self._clock_drift_seconds = 0
                     return True
             else:
-                self.logger.debug(f"Inverter time is in sync (drift: {drift:.0f}s)")
+                self.logger.info(
+                    f"⏰ Clock synchronized: {drift:.1f}s skew "
+                    f"({'inverter behind' if drift > 0 else 'inverter ahead' if drift < 0 else 'perfect sync'})"
+                )
 
             return True
 
@@ -812,11 +816,15 @@ class GrowattController(BaseModule):
             # Keep the original stop time (should be 23:59 for all-day modes)
             adjusted_stop_dt = stop_dt
 
+            skew_desc = (
+                f"{abs(self._clock_drift_seconds):.1f}s {'behind' if self._clock_drift_seconds > 0 else 'ahead'}"
+                if self._clock_drift_seconds != 0
+                else "in sync"
+            )
             self.logger.info(
-                f"⏰ Immediate activation: start={_fmt(adjusted_start_dt)} "
-                f"(server_now={now.strftime('%H:%M:%S')}, buffer={total_buffer}min, "
-                f"drift={self._clock_drift_seconds:.1f}s) - "
-                f"Inverter will activate in ~{total_buffer} min"
+                f"⏰ Immediate activation scheduled: start={_fmt(adjusted_start_dt)} "
+                f"(now={now.strftime('%H:%M:%S')}, buffer={total_buffer}min) - "
+                f"Mode activates in ~{total_buffer} min | Clock skew: {skew_desc}"
             )
             return _fmt(adjusted_start_dt), _fmt(adjusted_stop_dt)
 

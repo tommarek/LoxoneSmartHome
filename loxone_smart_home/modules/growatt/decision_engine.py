@@ -527,7 +527,7 @@ class GrowattDecisionEngine:
                 )
         else:
             # No charge price history, just check if above minimum
-            self.logger.info(
+            self.logger.debug(
                 f"Discharge allowed: {current_price_czk:.2f} CZK/kWh > "
                 f"{context.price_thresholds.discharge_price_min:.2f} CZK/kWh minimum"
             )
