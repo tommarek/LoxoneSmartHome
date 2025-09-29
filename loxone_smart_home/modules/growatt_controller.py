@@ -731,11 +731,20 @@ class GrowattController(BaseModule):
         stop_str: str,
         min_future_minutes: int = 1,
         preserve_duration: bool = False,
+        immediate_activation: bool = False,
     ) -> Tuple[str, str]:
-        """Ensure start time is at least min_future_minutes in the future.
+        """Ensure start time is appropriate for inverter scheduling.
 
-        If preserve_duration=True, keep the original slot duration when bumping start.
-        Returns adjusted (start, stop) in HH:MM format.
+        Args:
+            start_str: Start time string (HH:MM or HH:MM:SS)
+            stop_str: Stop time string (HH:MM or HH:MM:SS)
+            min_future_minutes: Minutes in future for normal scheduling (default 1)
+            preserve_duration: Keep original slot duration when bumping start
+            immediate_activation: If True, set start time in PAST for immediate activation
+                                 (inverter only triggers modes when clock crosses start time)
+
+        Returns:
+            Adjusted (start, stop) tuple in HH:MM format
         """
         now = self._get_local_now()
 
@@ -759,6 +768,59 @@ class GrowattController(BaseModule):
             stop_dt += timedelta(days=1)
         duration = stop_dt - start_dt
 
+        # Format helper
+        def _fmt(dt: datetime) -> str:
+            t = dt.time()
+            return t.strftime("%H:%M")
+
+        if immediate_activation:
+            # For immediate activation, inverter needs to SEE a future time on its clock
+            # so it can cross that time and trigger the mode.
+            #
+            # Key insight: We must account for clock skew between server and inverter
+            # _clock_drift_seconds = server_time - inverter_time
+            #   - Positive: inverter is BEHIND server (inverter time < server time)
+            #   - Negative: inverter is AHEAD of server (inverter time > server time)
+            #
+            # Example with inverter AHEAD by 45 seconds:
+            #   Server: 19:36:00, Inverter: 19:36:45, drift = -45s
+            #   If we set start to 19:38 server time:
+            #     - Command reaches inverter at ~19:36:45 inverter time
+            #     - Inverter needs to wait ~1 minute until its 19:38 → mode activates!
+
+            # Base buffer: 1 minute for command transmission + processing
+            buffer_minutes = 1
+
+            # Add extra time if inverter is AHEAD (negative drift)
+            # If inverter is ahead, we need MORE buffer time
+            # Example: inverter 45s ahead → add 1 minute extra
+            if self._clock_drift_seconds < 0:
+                # Inverter is ahead - add extra buffer
+                drift_adjustment_minutes = int(abs(self._clock_drift_seconds) / 60) + 1
+            else:
+                # Inverter is behind or in sync - may need slightly less time
+                # but keep at least 1 minute for safety
+                drift_adjustment_minutes = max(1, int(self._clock_drift_seconds / 60))
+
+            total_buffer = buffer_minutes + drift_adjustment_minutes
+
+            # Set start time in the FUTURE (relative to server)
+            adjusted_start_dt = now.replace(microsecond=0, second=0) + timedelta(
+                minutes=total_buffer
+            )
+
+            # Keep the original stop time (should be 23:59 for all-day modes)
+            adjusted_stop_dt = stop_dt
+
+            self.logger.info(
+                f"⏰ Immediate activation: start={_fmt(adjusted_start_dt)} "
+                f"(server_now={now.strftime('%H:%M:%S')}, buffer={total_buffer}min, "
+                f"drift={self._clock_drift_seconds:.1f}s) - "
+                f"Inverter will activate in ~{total_buffer} min"
+            )
+            return _fmt(adjusted_start_dt), _fmt(adjusted_stop_dt)
+
+        # Normal future scheduling logic (existing behavior)
         # Round up to the next whole minute to avoid edge cases
         min_start = now.replace(microsecond=0, second=0) + timedelta(minutes=min_future_minutes)
         if start_dt <= min_start:
@@ -767,11 +829,6 @@ class GrowattController(BaseModule):
                 adjusted_stop_dt = adjusted_start_dt + duration
             else:
                 adjusted_stop_dt = stop_dt  # keep original stop
-
-            # Normalize back into today's clock (mod 24h)
-            def _fmt(dt: datetime) -> str:
-                t = dt.time()
-                return t.strftime("%H:%M")
 
             msg = (
                 f"Adjusting start time from {start_str} to {_fmt(adjusted_start_dt)} "
@@ -1301,6 +1358,13 @@ class GrowattController(BaseModule):
 
         if mode_changed:
             self._commands_sent_count += 1
+
+            # Detect if this is for immediate activation (all-day time window)
+            # Time window of 00:00-23:59 indicates mode should be active NOW
+            immediate_activation = (
+                new_state.time_start == "00:00" and new_state.time_stop == "23:59"
+            )
+
             if new_state.inverter_mode == "load_first":
                 await self._mode_manager.set_load_first(stop_soc=new_state.stop_soc)
             elif new_state.inverter_mode == "battery_first":
@@ -1308,14 +1372,16 @@ class GrowattController(BaseModule):
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
-                    power_rate=new_state.power_rate
+                    power_rate=new_state.power_rate,
+                    immediate_activation=immediate_activation
                 )
             elif new_state.inverter_mode == "grid_first":
                 await self._mode_manager.set_grid_first(
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
-                    power_rate=new_state.power_rate
+                    power_rate=new_state.power_rate,
+                    immediate_activation=immediate_activation
                 )
 
             await asyncio.sleep(0.5)

@@ -45,10 +45,16 @@ class ModeManager:
         return result
 
     def _ensure_future_start(
-        self, start_hour: str, stop_hour: str, preserve_duration: bool = True
+        self,
+        start_hour: str,
+        stop_hour: str,
+        preserve_duration: bool = True,
+        immediate_activation: bool = False
     ) -> tuple[str, str]:
         """Ensure start time is in future for inverter scheduling."""
-        result = self.controller._ensure_future_start(start_hour, stop_hour, preserve_duration)
+        result = self.controller._ensure_future_start(
+            start_hour, stop_hour, preserve_duration, immediate_activation=immediate_activation
+        )
         assert isinstance(result, tuple) and len(result) == 2
         return result
 
@@ -185,7 +191,8 @@ class ModeManager:
 
     async def set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: Optional[int] = None,
-        power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False
+        power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False,
+        immediate_activation: bool = False
     ) -> None:
         """Set battery-first mode for specified time window.
 
@@ -193,6 +200,7 @@ class ModeManager:
         stop_soc: Battery level to stop charging at (default from config.max_soc)
         power_rate: Charge rate in % (default 100%)
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
+        immediate_activation: If True, set start time in past for immediate activation
         """
         if stop_soc is None:
             stop_soc = int(self.config.max_soc)
@@ -200,7 +208,9 @@ class ModeManager:
             adjusted_start, adjusted_stop = start_hour, stop_hour
         else:
             adjusted_start, adjusted_stop = self._ensure_future_start(
-                start_hour, stop_hour, preserve_duration=preserve_duration
+                start_hour, stop_hour,
+                preserve_duration=preserve_duration,
+                immediate_activation=immediate_activation
             )
 
         if adjusted_start == adjusted_stop:
@@ -454,7 +464,8 @@ class ModeManager:
 
     async def set_grid_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,
-        *, preserve_duration: bool = True, pre_scheduled: bool = False
+        *, preserve_duration: bool = True, pre_scheduled: bool = False,
+        immediate_activation: bool = False
     ) -> None:
         """Set grid-first mode for specified time window.
 
@@ -462,12 +473,15 @@ class ModeManager:
         stop_soc: Battery level to stop discharging at (default 20%)
         power_rate: Discharge rate in % (default 100%)
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
+        immediate_activation: If True, set start time in past for immediate activation
         """
         if pre_scheduled:
             adjusted_start, adjusted_stop = start_hour, stop_hour
         else:
             adjusted_start, adjusted_stop = self._ensure_future_start(
-                start_hour, stop_hour, preserve_duration=preserve_duration
+                start_hour, stop_hour,
+                preserve_duration=preserve_duration,
+                immediate_activation=immediate_activation
             )
 
         if adjusted_start == adjusted_stop:
