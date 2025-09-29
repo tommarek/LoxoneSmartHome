@@ -1228,7 +1228,7 @@ class GrowattController(BaseModule):
             charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
             export_price_min=getattr(self.config, 'export_price_min', 1.0),
             discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
-            discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 1.5),
+            discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
             battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85)
         )
 

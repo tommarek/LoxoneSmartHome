@@ -686,7 +686,7 @@ async def get_config(request: web.Request) -> web.Response:
             "charge_price_max": getattr(controller.config, "charge_price_max", 1.5),
             "export_price_min": getattr(controller.config, "export_price_min", 1.0),
             "discharge_price_min": getattr(controller.config, "discharge_price_min", 3.0),
-            "discharge_profit_margin": getattr(controller.config, "discharge_profit_margin", 1.5),
+            "discharge_profit_margin": getattr(controller.config, "discharge_profit_margin", 4.0),
             "battery_charge_hours": (
                 controller.config.battery_charge_hours
             ),
