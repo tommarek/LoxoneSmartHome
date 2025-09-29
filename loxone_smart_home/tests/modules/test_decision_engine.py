@@ -371,7 +371,7 @@ def test_price_based_discharge_decision(
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # 3.75 CZK/kWh > 2.0 threshold AND 3.75 > 0.75*3 = 2.25, so should discharge
+    # 3.75 CZK/kWh > max(2.0 min, 0.75*1.2 margin) = max(2.0, 0.9) = 2.0, so should discharge
     assert decision == "discharge_to_grid"
     assert "25% power" in explanation["reason"].lower()
 
@@ -1020,7 +1020,7 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     }
 
     # Test 1: High price with sufficient spread - should discharge
-    # 3.0 CZK/kWh > 2.0 threshold AND 3.0 > 0.8 * 3 = 2.4
+    # 3.0 CZK/kWh > max(2.0 min, 0.8*3.0 margin) = max(2.0, 2.4) = 2.4 ✓
     price_ranking = PriceRankingData(
         current_rank=5,
         total_hours=6,
@@ -1048,7 +1048,7 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
             discharge_price_min=2.0,
-            discharge_profit_margin=1.5,
+            discharge_profit_margin=3.0,  # Changed from 1.5 to match test intent
             battery_efficiency=0.85
         ),
         price_ranking=price_ranking
@@ -1057,12 +1057,12 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should discharge because 3.0 > 2.0 threshold AND 3.0 > 0.8*3 = 2.4
+    # Should discharge: 3.0 >= max(2.0, 0.8*3.0) = 2.4 ✓
     assert decision == "discharge_to_grid"
     assert "25% power" in explanation["reason"].lower()
 
     # Test 2: Price below spread requirement - should NOT discharge
-    # 2.0 CZK/kWh >= 2.0 threshold BUT 2.0 < 0.8 * 3 = 2.4
+    # 2.0 CZK/kWh < max(2.0 min, 0.8*3.0 margin) = max(2.0, 2.4) = 2.4 ✗
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
@@ -1074,7 +1074,7 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
             discharge_price_min=2.0,
-            discharge_profit_margin=1.5,
+            discharge_profit_margin=3.0,  # Changed from 1.5 to match test intent
             battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
@@ -1095,11 +1095,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     )
 
     decision = decision_engine.decide(context)
-    # Should NOT discharge because 2.0 < 2.4 required spread
+    # Should NOT discharge: 2.0 < 2.4 required ✗
     assert decision == "regular"  # Just export, no discharge
 
     # Test 3: Price below absolute threshold - should NOT discharge
-    # 1.0 CZK/kWh < 2.0 threshold
+    # 1.0 CZK/kWh < max(2.0 min, 0.8*3.0 margin) = max(2.0, 2.4) = 2.4 ✗
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
@@ -1111,7 +1111,7 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
             discharge_price_min=2.0,
-            discharge_profit_margin=1.5,
+            discharge_profit_margin=3.0,  # Changed from 1.5 for consistency
             battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
