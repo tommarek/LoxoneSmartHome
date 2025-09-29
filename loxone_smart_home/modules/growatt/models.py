@@ -6,7 +6,7 @@ from datetime import time as dt_time
 from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 PeriodType = Literal[
-    "regular", "sell_production", "regular_no_export", "charge_from_grid", "discharge_to_grid"
+    "regular", "sell_production", "charge_from_grid", "discharge_to_grid"
 ]
 
 MODE_PRECEDENCE: Tuple[str, ...] = ("battery_first", "grid_first", "load_first")

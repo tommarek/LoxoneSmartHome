@@ -629,12 +629,19 @@ class ModeManager:
 
         stop_soc = max(5, min(100, stop_soc))
 
+        # Check if already in this state
+        sig = ("load_first", stop_soc)
+        if self._last_applied.get("load_first") == sig:
+            self.logger.debug(f"Load-first already at stopSOC={stop_soc}%, skipping")
+            return
+
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🏠 [SIMULATE] LOAD-FIRST MODE SET with stopSOC={stop_soc}% "
                 f"(simulated at {current_time})"
             )
+            self._last_applied["load_first"] = sig
             return
 
         # Load-first is achieved by disabling both battery-first and grid-first
@@ -665,6 +672,9 @@ class ModeManager:
         self.logger.info(
             f"🏠 LOAD-FIRST MODE SET with stopSOC={stop_soc}% at {current_time}"
         )
+
+        # Mark as successfully applied
+        self._last_applied["load_first"] = sig
 
     def get_ac_charge_enabled(self) -> bool:
         """Get current AC charge enabled state."""

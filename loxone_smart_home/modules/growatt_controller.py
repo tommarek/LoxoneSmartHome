@@ -28,6 +28,7 @@ from .growatt.mode_manager import ModeManager
 from .growatt.decision_engine import (
     GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
 )
+from .growatt.inverter_state import InverterState
 
 
 class GrowattController(BaseModule):
@@ -38,6 +39,13 @@ class GrowattController(BaseModule):
     _manual_override_end_time: Optional[datetime]
     _manual_override_source: str
     _optional_config: Dict[str, Any]
+
+    # State tracking for preventing redundant commands
+    _current_inverter_state: Optional[InverterState] = None
+    _last_commanded_state: Optional[InverterState] = None
+    _state_history: list[InverterState]
+    _commands_sent_count: int = 0
+    _commands_skipped_count: int = 0
 
     def _select_primary_mode(self, modes: set[PeriodType]) -> PeriodType:
         """Select primary mode from active modes.
@@ -168,6 +176,13 @@ class GrowattController(BaseModule):
         self._last_evaluation_reason: Optional[str] = None
         self._evaluation_lock = asyncio.Lock()
         self._periodic_check_task: Optional[asyncio.Task[None]] = None
+
+        # Initialize state tracking
+        self._current_inverter_state = None
+        self._last_commanded_state = None
+        self._state_history = []
+        self._commands_sent_count = 0
+        self._commands_skipped_count = 0
 
         # Legacy compatibility - to be removed after full migration
         self._scheduled_tasks: list[Any] = []  # Empty list for backward compatibility
@@ -617,10 +632,7 @@ class GrowattController(BaseModule):
                 entry["details"].append("Normal operation")
                 entry["details"].append("Export: ENABLED")
 
-            elif slot["primary_mode"] == "regular_no_export":
-                entry["mode"] = "REGULAR-NO-EXPORT"
-                entry["details"].append("Normal operation")
-                entry["details"].append("Export: DISABLED")
+            # regular_no_export mode removed - export is always price-based
 
             schedule_entries.append(entry)
 
@@ -1388,12 +1400,17 @@ class GrowattController(BaseModule):
             is_summer_mode=(await self._get_season_mode() == "summer")
         )
 
-    async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
-        """Apply a mode based on its definition from MODE_DEFINITIONS.
+    async def _build_desired_state(
+        self, mode: str, params: Optional[Dict[str, Any]] = None
+    ) -> InverterState:
+        """Build the complete desired inverter state.
 
         Args:
             mode: Mode name from decision engine
             params: Optional parameters for configurable modes
+
+        Returns:
+            Complete InverterState representing desired configuration
         """
         params = params or {}
 
@@ -1413,48 +1430,137 @@ class GrowattController(BaseModule):
         elif isinstance(stop_soc_raw, (int, float, str)):
             stop_soc = int(stop_soc_raw)
 
-        inverter_mode = mode_def.get("inverter_mode", "load_first")
+        # Determine power rate
+        default_rate = 100
+        if hasattr(self.config, 'discharge_power_rate'):
+            default_rate = self.config.discharge_power_rate
+        power_rate = int(params.get("power_rate", default_rate))
 
-        # Apply the inverter mode with appropriate SOC
-        if inverter_mode == "load_first":
-            await self._mode_manager.set_load_first(stop_soc=stop_soc)
-        elif inverter_mode == "battery_first":
-            power_rate = int(params.get("power_rate", 100))
-            await self._mode_manager.set_battery_first(
-                "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
+        # Map mode to inverter mode
+        inverter_mode = str(mode_def.get("inverter_mode", "load_first"))
+
+        # Determine export based on price
+        export_enabled = True  # Default
+        try:
+            context = await self._build_decision_context()
+            if context.price_thresholds and context.current_price > 0:
+                current_price_czk = context.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
+                export_threshold_czk = context.price_thresholds.export_threshold * 25 / 1000
+                export_enabled = current_price_czk >= export_threshold_czk
+        except Exception as e:
+            self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
+
+        # AC charge from mode definition
+        ac_charge_enabled = bool(mode_def.get("ac_charge", False))
+
+        return InverterState(
+            inverter_mode=inverter_mode,
+            stop_soc=stop_soc,
+            power_rate=power_rate,
+            time_start="00:00",
+            time_stop="23:59",
+            ac_charge_enabled=ac_charge_enabled,
+            export_enabled=export_enabled,
+            timestamp=self._get_local_now(),
+            source="evaluation"
+        )
+
+    async def _apply_state_changes(
+        self,
+        old_state: Optional[InverterState],
+        new_state: InverterState
+    ) -> None:
+        """Apply only the changes between old and new state.
+
+        Args:
+            old_state: Previous state (None for initial)
+            new_state: Desired new state
+        """
+        # Mode change (inverter_mode, stop_soc, power_rate, time window)
+        mode_changed = (
+            not old_state or
+            old_state.inverter_mode != new_state.inverter_mode or
+            old_state.stop_soc != new_state.stop_soc or
+            old_state.power_rate != new_state.power_rate or
+            old_state.time_start != new_state.time_start or
+            old_state.time_stop != new_state.time_stop
+        )
+
+        if mode_changed:
+            self._commands_sent_count += 1
+            if new_state.inverter_mode == "load_first":
+                await self._mode_manager.set_load_first(stop_soc=new_state.stop_soc)
+            elif new_state.inverter_mode == "battery_first":
+                await self._mode_manager.set_battery_first(
+                    new_state.time_start,
+                    new_state.time_stop,
+                    stop_soc=new_state.stop_soc,
+                    power_rate=new_state.power_rate
+                )
+            elif new_state.inverter_mode == "grid_first":
+                await self._mode_manager.set_grid_first(
+                    new_state.time_start,
+                    new_state.time_stop,
+                    stop_soc=new_state.stop_soc,
+                    power_rate=new_state.power_rate
+                )
+
+            await asyncio.sleep(0.5)
+
+        # Export change
+        if not old_state or old_state.export_enabled != new_state.export_enabled:
+            self._commands_sent_count += 1
+            if new_state.export_enabled:
+                await self._mode_manager.enable_export()
+                self.logger.info("Export ENABLED (price-based)")
+            else:
+                await self._mode_manager.disable_export()
+                self.logger.info("Export DISABLED (price-based)")
+
+        # AC charge change
+        if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:
+            self._commands_sent_count += 1
+            await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled)
+
+    async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
+        """Apply a mode based on its definition from MODE_DEFINITIONS.
+
+        Args:
+            mode: Mode name from decision engine
+            params: Optional parameters for configurable modes
+        """
+        # Build desired state from mode and current conditions
+        desired_state = await self._build_desired_state(mode, params)
+
+        # Check if anything actually changed
+        if self._current_inverter_state and desired_state == self._current_inverter_state:
+            self._commands_skipped_count += 1
+            self.logger.debug(
+                f"State unchanged after evaluation: {desired_state.summary()} "
+                f"(skipped: {self._commands_skipped_count}, sent: {self._commands_sent_count})"
             )
-        elif inverter_mode == "grid_first":
-            power_rate = int(params.get(
-                "power_rate",
-                self.config.discharge_power_rate
-                if hasattr(self.config, 'discharge_power_rate') else 100
-            ))
-            await self._mode_manager.set_grid_first(
-                "00:00", "23:59", stop_soc=stop_soc, power_rate=power_rate
-            )
+            return
 
-        await asyncio.sleep(0.5)
-
-        # Set export state
-        if mode_def.get("export", True):
-            await self._mode_manager.enable_export()
+        # Identify what changed
+        if self._current_inverter_state:
+            changes = desired_state.significant_changes(self._current_inverter_state)
+            self.logger.info(f"📝 Applying changes: {', '.join(changes)}")
         else:
-            await self._mode_manager.disable_export()
+            self.logger.info(f"📝 Applying initial state: {mode}")
 
-        # Set AC charging state
-        if mode_def.get("ac_charge", False):
-            await self._mode_manager.enable_ac_charge()
-        else:
-            await self._mode_manager.disable_ac_charge()
+        # Apply ONLY the changes needed
+        await self._apply_state_changes(self._current_inverter_state, desired_state)
+
+        # Update tracking
+        self._current_inverter_state = desired_state
+        self._state_history.append(desired_state)
+        if len(self._state_history) > 10:
+            self._state_history.pop(0)
 
         # Track if we're in high load protected mode
         self._high_load_protected_mode_active = (mode == "high_load_protected")
 
-        self.logger.info(
-            f"✅ Applied mode: {mode.upper()} - "
-            f"{mode_def.get('description', 'No description')} "
-            f"({inverter_mode} @ {stop_soc}% SOC)"
-        )
+        self.logger.info(f"✅ State applied: {desired_state.summary()}")
 
     # Event-driven evaluation methods
 
@@ -1504,7 +1610,7 @@ class GrowattController(BaseModule):
         """
         # Validate mode
         valid_modes = [
-            "regular", "sell_production", "regular_no_export",
+            "regular", "sell_production",
             "charge_from_grid", "discharge_to_grid"
         ]
         if mode not in valid_modes:
@@ -1699,7 +1805,7 @@ class GrowattController(BaseModule):
                 # Schedule fallback mode
                 await self._schedule_fallback_mode()
                 # Apply safe state immediately
-                self._scheduled_mode = "regular_no_export"  # Safe mode without selling
+                self._scheduled_mode = "regular"  # Safe mode without selling
                 await self._determine_and_apply_mode()
                 self.logger.info("Applied safe state immediately due to price generation failure")
                 return
@@ -2063,10 +2169,10 @@ class GrowattController(BaseModule):
                 f"Scheduling battery-first from {group_start} to {group_end} "
                 f"(store cheap solar, no AC charge)"
             )
-            # During low prices, use regular_no_export (store solar, don't sell)
+            # During low prices, use regular mode (export controlled by price)
             self._scheduled_periods.append(
                 Period(
-                    "regular_no_export",
+                    "regular",
                     self._parse_hhmm(group_start),
                     self._parse_hhmm(group_end)
                 )
@@ -2074,7 +2180,7 @@ class GrowattController(BaseModule):
 
             # Schedule mode switch at start of low price period
             async def apply_low_price_mode() -> None:
-                self._scheduled_mode = "regular_no_export"
+                self._scheduled_mode = "regular"
                 await self._determine_and_apply_mode()
             task = self._schedule_action(group_start, apply_low_price_mode)
             self._scheduled_tasks.append(task)
@@ -2233,7 +2339,7 @@ class GrowattController(BaseModule):
                 task = self._schedule_action(start_time, apply_discharge_mode)
                 self._scheduled_tasks.append(task)
 
-        # Fill gaps with regular or regular_no_export based on price
+        # Fill gaps with regular mode (export is always price-based)
         # Calculate threshold for export control
         threshold_eur_mwh = self.config.export_price_threshold * 1000 / eur_czk_rate
 
@@ -2287,7 +2393,7 @@ class GrowattController(BaseModule):
             for group_start, group_end in no_export_groups:
                 self._scheduled_periods.append(
                     Period(
-                        "regular_no_export",
+                        "regular",
                         self._parse_hhmm(group_start),
                         self._parse_hhmm(group_end)
                     )
@@ -2313,7 +2419,7 @@ class GrowattController(BaseModule):
 
         DEPRECATED: Export control is now handled by composite modes in the decision engine.
         - "regular" and "sell_production" modes have export enabled
-        - "regular_no_export" mode has export disabled
+        - Export is now always controlled by price threshold
         - "charge_from_grid" and "discharge_to_grid" control export as needed
 
         This method is kept as a no-op for backward compatibility.

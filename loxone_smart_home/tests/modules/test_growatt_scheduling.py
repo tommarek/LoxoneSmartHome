@@ -275,7 +275,7 @@ class TestExportControl:
 
         # The test creates gaps that should be filled with regular/no-export periods
         # With threshold of 1.0 CZK/kWh = ~41 EUR/MWh, prices of 30-35 EUR/MWh should disable export
-        # However, if charging happens during those hours, they won't get regular_no_export periods
+        # However, if charging happens during those hours, export will be controlled by price
 
         # Check that we have some scheduling happening
         assert len(controller._scheduled_periods) > 0, "Should have some scheduled periods"
@@ -284,7 +284,7 @@ class TestExportControl:
         for period in controller._scheduled_periods:
             # Just verify the structure is correct
             assert period.kind in [
-                "charge_from_grid", "discharge_to_grid", "regular", "regular_no_export"
+                "charge_from_grid", "discharge_to_grid", "regular"
             ]
 
 

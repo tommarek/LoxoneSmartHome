@@ -534,7 +534,7 @@ async def set_mode(request: web.Request) -> web.Response:
 
     Expected JSON payload:
     {
-        "mode": "regular" | "sell_production" | "regular_no_export" |
+        "mode": "regular" | "sell_production" |
                 "charge_from_grid" | "discharge_to_grid",
         "params": {
             "stop_soc": 90,     // optional - for charge_from_grid or discharge_to_grid
@@ -553,7 +553,7 @@ async def set_mode(request: web.Request) -> web.Response:
         mode = data.get("mode")
 
         valid_modes = [
-            "regular", "sell_production", "regular_no_export",
+            "regular", "sell_production",
             "charge_from_grid", "discharge_to_grid"
         ]
         if mode not in valid_modes:
@@ -582,7 +582,7 @@ async def manual_mode_set(request: web.Request) -> web.Response:
 
     Expected JSON payload:
     {
-        "mode": "regular" | "sell_production" | "regular_no_export" |
+        "mode": "regular" | "sell_production" |
                 "charge_from_grid" | "discharge_to_grid",
         "duration": {
             "type": "immediate" | "end_of_day" | "duration_hours" | "until_time",

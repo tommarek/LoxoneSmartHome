@@ -132,40 +132,30 @@ class DecisionNode:
 
 
 # Mode definitions - what each mode means in terms of inverter settings
+# NOTE: Export control is ALWAYS price-based, not mode-dependent
 MODE_DEFINITIONS = {
     "regular": {
-        "description": "Normal operation - load first with export",
+        "description": "Normal operation - load first",
         "inverter_mode": "load_first",
         "stop_soc": 20,  # Default minimum SOC
-        "export": True,
-        "ac_charge": False
-    },
-    "regular_no_export": {
-        "description": "Normal operation without export",
-        "inverter_mode": "load_first",
-        "stop_soc": 20,
-        "export": False,
         "ac_charge": False
     },
     "high_load_protected": {
         "description": "High load protection - prevent battery discharge",
         "inverter_mode": "load_first",
         "stop_soc": 100,  # Prevent any discharge
-        "export": True,   # Allow solar export if available
         "ac_charge": False
     },
     "charge_from_grid": {
         "description": "Charging battery from grid to 100%",
         "inverter_mode": "battery_first",
         "stop_soc": 100,  # Charge to full
-        "export": False,  # Don't export while charging
         "ac_charge": True
     },
     "battery_first_ac_charge": {
         "description": "Battery-first with AC charging (high load + cheap price)",
         "inverter_mode": "battery_first",
         "stop_soc": 100,  # Charge to full and prevent discharge
-        "export": False,  # Don't export while charging
         "ac_charge": True,
         "high_load_compatible": True  # Can run with high loads
     },
@@ -173,14 +163,12 @@ MODE_DEFINITIONS = {
         "description": "Discharging battery to grid",
         "inverter_mode": "grid_first",
         "stop_soc": "configurable",  # From parameters
-        "export": True,
         "ac_charge": False
     },
     "sell_production": {
         "description": "Sell only solar production",
         "inverter_mode": "grid_first",
         "stop_soc": 100,  # Don't discharge battery
-        "export": True,
         "ac_charge": False
     }
 }
@@ -257,20 +245,24 @@ class GrowattDecisionEngine:
                 )
             ),
 
-            # Priority 4: Export Control Based on Price Threshold
+            # Priority 4: Check for battery discharge opportunity
             DecisionNode(
-                name="Price-Based Export Control",
+                name="Battery Discharge Control",
                 priority=Priority.SCHEDULED_MODE,
-                condition=lambda ctx: self._should_control_export(ctx),
-                action=lambda ctx: self._get_export_mode(ctx),
-                explanation=lambda ctx: self._get_export_explanation(ctx)
+                condition=lambda ctx: self._should_discharge_battery(ctx),
+                action="discharge_to_grid",
+                explanation=lambda ctx: (
+                    f"Battery discharge profitable: "
+                    f"{ctx.current_price:.1f} EUR/MWh meets spread requirement, "
+                    f"discharging at 25% power"
+                )
             ),
 
             # Priority 5: Default Mode - No special conditions
             DecisionNode(
                 name="Default Mode",
                 priority=Priority.DEFAULT_MODE,
-                condition=lambda ctx: True,  # Always matches as fallback
+                condition=lambda _: True,  # Always matches as fallback
                 action="regular",
                 explanation="No special conditions - regular operation"
             )
@@ -482,84 +474,6 @@ class GrowattDecisionEngine:
                 return True
 
         return False
-
-    def _should_control_export(self, context: DecisionContext) -> bool:
-        """Determine if export control should be applied based on price.
-
-        Args:
-            context: Current decision context
-
-        Returns:
-            True if export control should be applied
-        """
-        # Only control export if we have price data
-        return context.price_thresholds is not None and context.current_price > 0
-
-    def _get_export_mode(self, context: DecisionContext) -> str:
-        """Get the appropriate export mode based on price ranking.
-
-        Args:
-            context: Current decision context
-
-        Returns:
-            Mode string for export control
-        """
-        if not context.price_thresholds:
-            return "regular"  # Default with export
-
-        # Check if we should discharge for profit
-        if self._should_discharge_battery(context):
-            return "discharge_to_grid"
-
-        # Export control policy: Absolute threshold is the primary decision factor
-        # The 1 CZK/kWh threshold ensures we don't export when electricity is too cheap
-
-        # Check absolute threshold - this is the primary decision factor
-        if context.current_price >= context.price_thresholds.export_threshold:
-            return "regular"  # Above threshold - enable export
-        else:
-            return "regular_no_export"  # Below threshold - disable export
-
-    def _get_export_explanation(self, context: DecisionContext) -> str:
-        """Get explanation for export control decision.
-
-        Args:
-            context: Current decision context
-
-        Returns:
-            Explanation string
-        """
-        if not context.price_thresholds:
-            return "No price data - default mode with export"
-
-        mode = self._get_export_mode(context)
-        price_czk = context.current_price * 25 / 1000  # Convert EUR/MWh to CZK/kWh
-        threshold_czk = context.price_thresholds.export_threshold * 25 / 1000
-
-        # Include ranking information if available (for context only, not decision)
-        rank_info = ""
-        if context.price_ranking:
-            rank_info = (
-                f" (rank {context.price_ranking.current_rank}/{context.price_ranking.total_hours}, "
-                f"percentile {context.price_ranking.percentile:.1f}%, "
-                f"{context.price_ranking.price_quadrant})"
-            )
-
-        if mode == "discharge_to_grid":
-            # Include spread information for discharge
-            if context.price_ranking:
-                daily_min_czk = context.price_ranking.daily_min * 25 / 1000
-                multiplier = context.price_thresholds.discharge_price_multiplier
-                return (f"Price {price_czk:.2f} CZK/kWh{rank_info} - discharging at 25% "
-                        f"(>{daily_min_czk:.2f} * {multiplier}x)")
-            else:
-                return f"Price {price_czk:.2f} CZK/kWh{rank_info} - profitable battery discharge"
-        elif mode == "regular":
-            return (f"Price {price_czk:.2f} CZK/kWh{rank_info} >= "
-                    f"{threshold_czk:.2f} CZK/kWh threshold - export enabled")
-        else:
-            return (f"Price {price_czk:.2f} CZK/kWh{rank_info} < "
-                    f"{threshold_czk:.2f} CZK/kWh threshold - export disabled")
 
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on price spread.

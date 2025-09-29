@@ -49,14 +49,14 @@ def test_manual_override_highest_priority(
     """Test that manual override has the highest priority."""
     # Set all conditions to trigger
     base_context.manual_override_active = True
-    base_context.manual_override_mode = "regular_no_export"
+    base_context.manual_override_mode = "regular"
     base_context.high_loads_active = True
     base_context.scheduled_mode = "charge_from_grid"
 
     decision = decision_engine.decide(base_context)
     explanation = decision_engine.explain_decision()
 
-    assert decision == "regular_no_export"
+    assert decision == "regular"  # Export is now always price-based
     assert explanation["priority"]["level"] == Priority.MANUAL_OVERRIDE
     assert "manual override" in explanation["reason"].lower()
 
@@ -151,8 +151,8 @@ def test_mode_transitions(
 
     # Manual override takes precedence over everything
     base_context.manual_override_active = True
-    base_context.manual_override_mode = "regular_no_export"
-    assert decision_engine.decide(base_context) == "regular_no_export"
+    base_context.manual_override_mode = "regular"
+    assert decision_engine.decide(base_context) == "regular"
 
     # Clear manual override, should go back to battery_first_ac_charge (high load + charging)
     base_context.manual_override_active = False
@@ -172,7 +172,7 @@ def test_mode_definitions_complete() -> None:
     """Test that all required mode definitions exist."""
     required_modes = [
         "regular",
-        "regular_no_export",
+        "regular",
         "high_load_protected",
         "charge_from_grid",
         "battery_first_ac_charge",
@@ -186,7 +186,7 @@ def test_mode_definitions_complete() -> None:
         assert "description" in mode_def
         assert "inverter_mode" in mode_def
         assert "stop_soc" in mode_def or mode_def.get("stop_soc") == "configurable"
-        assert "export" in mode_def
+        # Export is now always handled separately based on price
         assert "ac_charge" in mode_def
 
 
@@ -280,7 +280,7 @@ def test_all_composite_modes_supported(
     composite_modes = [
         "regular",
         "sell_production",
-        "regular_no_export",
+        "regular",
         "charge_from_grid",
         "discharge_to_grid"
     ]
@@ -372,7 +372,7 @@ def test_price_based_discharge_decision(
 
     # 3.75 CZK/kWh > 2.0 threshold AND 3.75 > 0.75*3 = 2.25, so should discharge
     assert decision == "discharge_to_grid"
-    assert "discharging at 25%" in explanation["reason"].lower()
+    assert "25% power" in explanation["reason"].lower()
 
 
 def test_low_battery_prevents_discharge(
@@ -452,9 +452,9 @@ def test_export_enabled_above_threshold(
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should enable export when price > threshold
-    assert decision == "regular"  # Regular mode with export enabled
-    assert "export enabled" in explanation["reason"].lower()
+    # Should choose regular mode (export is handled separately)
+    assert decision == "regular"  # Regular mode (export handled separately)
+    # Export control is handled separately, not in mode decision
 
 
 def test_low_price_export_disabled(
@@ -478,9 +478,9 @@ def test_low_price_export_disabled(
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should disable export when price < threshold
-    assert decision == "regular_no_export"
-    assert "export disabled" in explanation["reason"].lower()
+    # Should choose regular mode (export is handled separately)
+    assert decision == "regular"  # Export is now always price-based
+    # Export control is handled separately, not in mode decision
 
 
 def test_price_validation_invalid_data(
@@ -802,9 +802,9 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should NOT export because price (30) < threshold (40)
-    assert decision == "regular_no_export"
-    assert "export disabled" in explanation["reason"].lower()
+    # Should choose regular mode (export is handled separately)
+    assert decision == "regular"  # Export is now always price-based
+    # Export control is handled separately, not in mode decision
 
     # Test 2: Price above absolute threshold - should export
     context.current_price = 60.0
@@ -813,9 +813,9 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should export because price (60) >= threshold (40)
+    # Should choose regular mode (export is handled separately)
     assert decision == "regular"
-    assert "export enabled" in explanation["reason"].lower()
+    # Export control is handled separately, not in mode decision
 
 
 def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
@@ -906,7 +906,7 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
     decision = decision_engine.decide(context)
     # Should NOT charge because rank 3 > 2 cheapest hours (winter logic takes precedence)
     # Export should be disabled because price (35) < threshold (40)
-    assert decision == "regular_no_export"
+    assert decision == "regular"  # Export is now always price-based
 
     # Test 3: Summer mode - should NEVER charge from AC
     # Test with cheapest hour to ensure no charging happens
@@ -946,7 +946,7 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
     decision = decision_engine.decide(context)
     # Should NOT charge in summer mode, even during cheapest hour
     # Export should be disabled because price (20) < threshold (40)
-    assert decision == "regular_no_export"
+    assert decision == "regular"  # Export is now always price-based
 
     # Test 4: Summer mode with moderately expensive hour - still no charging
     context = DecisionContext(
@@ -1041,7 +1041,7 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
 
     # Should discharge because 3.0 > 2.0 threshold AND 3.0 > 0.8*3 = 2.4
     assert decision == "discharge_to_grid"
-    assert "discharging at 25%" in explanation["reason"].lower()
+    assert "25% power" in explanation["reason"].lower()
 
     # Test 2: Price below spread requirement - should NOT discharge
     # 2.0 CZK/kWh >= 2.0 threshold BUT 2.0 < 0.8 * 3 = 2.4
