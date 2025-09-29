@@ -1231,8 +1231,16 @@ class GrowattController(BaseModule):
         stop_soc_raw = mode_def.get("stop_soc", 20)
         stop_soc: int = 20
         if stop_soc_raw == "configurable":
-            soc_param = params.get("stop_soc", self.config.max_soc)
-            stop_soc = int(soc_param) if soc_param is not None else int(self.config.max_soc)
+            # Use appropriate default based on mode type
+            if mode == "discharge_to_grid":
+                default_soc = self.config.discharge_min_soc  # Use 20% for discharge
+            elif mode == "charge_from_grid":
+                default_soc = self.config.max_soc  # Use 100% for charging
+            else:
+                default_soc = self.config.max_soc  # Default to max for other modes
+
+            soc_param = params.get("stop_soc", default_soc)
+            stop_soc = int(soc_param) if soc_param is not None else int(default_soc)
         elif isinstance(stop_soc_raw, (int, float, str)):
             stop_soc = int(stop_soc_raw)
 
