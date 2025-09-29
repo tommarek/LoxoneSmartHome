@@ -24,7 +24,7 @@ class Priority(IntEnum):
 
 @dataclass
 class PriceThresholds:
-    """Price thresholds for decision making."""
+    """Price thresholds for decision making (mixed EUR/MWh and CZK/kWh)."""
     cheap_threshold: float  # Below this = cheap hour for charging (EUR/MWh)
     export_threshold: float  # Above this = enable export (EUR/MWh, ~40 for 1 CZK/kWh)
     charge_efficiency: float = 0.87  # Battery round-trip efficiency
@@ -32,8 +32,11 @@ class PriceThresholds:
     target_soc: float = 100.0  # Target SOC when charging from grid
     # Percentile-based thresholds
     charge_percentile_threshold: float = 25.0  # Charge when in bottom 25%
-    export_percentile_threshold: float = 60.0  # Export when in top 40%
-    discharge_percentile_threshold: float = 90.0  # Discharge when in top 10%
+    # Winter mode settings
+    winter_cheapest_hours: int = 2  # Number of cheapest hours to charge in winter
+    # Smart discharge control (CZK/kWh units)
+    discharge_min_price_czk: float = 2.0  # Minimum price for discharge (CZK/kWh)
+    discharge_price_multiplier: float = 3.0  # Price must be Nx daily minimum
 
 
 @dataclass
@@ -80,14 +83,17 @@ class DecisionContext:
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        # Check if current hour is cheap for charging based on ranking or absolute threshold
-        if self.price_ranking and self.price_thresholds:
-            # Use percentile-based decision if ranking available
+        # Summer mode: NO AC charging at all
+        if self.is_summer_mode:
+            self.is_battery_charging_scheduled = False
+        # Winter mode: charge only during N cheapest hours
+        elif self.price_ranking and self.price_thresholds:
+            winter_hours = self.price_thresholds.winter_cheapest_hours
             self.is_battery_charging_scheduled = (
-                self.price_ranking.percentile <= self.price_thresholds.charge_percentile_threshold
+                self.price_ranking.current_rank <= winter_hours
             )
         elif self.price_thresholds and self.current_price > 0:
-            # Fall back to absolute threshold
+            # Fall back to absolute threshold (winter only)
             self.is_battery_charging_scheduled = (
                 self.current_price < self.price_thresholds.cheap_threshold
             )
@@ -440,20 +446,21 @@ class GrowattDecisionEngine:
         if context.battery_soc >= 100:
             return False
 
-        # Prefer percentile-based decision if ranking available
+        # Summer mode: NEVER charge from AC
+        if context.is_summer_mode:
+            self.logger.debug("Summer mode: AC charging disabled")
+            return False
+
+        # Winter mode: charge only during the N cheapest hours
         if context.price_ranking and context.price_thresholds:
-            should_charge = (
-                context.price_ranking.percentile <=
-                context.price_thresholds.charge_percentile_threshold
-            )
+            winter_hours = context.price_thresholds.winter_cheapest_hours
+            should_charge = context.price_ranking.current_rank <= winter_hours
 
             if should_charge:
                 self.logger.debug(
-                    f"Battery charging recommended: percentile "
-                    f"{context.price_ranking.percentile:.1f}% "
-                    f"<= threshold {context.price_thresholds.charge_percentile_threshold}% "
-                    f"(rank {context.price_ranking.current_rank}/"
-                    f"{context.price_ranking.total_hours})"
+                    f"Winter charging: current rank {context.price_ranking.current_rank} "
+                    f"<= {winter_hours} cheapest hours "
+                    f"(price: {context.current_price:.1f} EUR/MWh)"
                 )
             return should_charge
 
@@ -504,19 +511,14 @@ class GrowattDecisionEngine:
         if self._should_discharge_battery(context):
             return "discharge_to_grid"
 
-        # Prefer percentile-based decision if ranking available
-        if context.price_ranking:
-            export_thresh = context.price_thresholds.export_percentile_threshold
-            if context.price_ranking.percentile >= export_thresh:
-                return "regular"  # Export enabled for expensive hours
-            else:
-                return "regular_no_export"  # Export disabled for cheap hours
+        # Export control policy: Absolute threshold is the primary decision factor
+        # The 1 CZK/kWh threshold ensures we don't export when electricity is too cheap
 
-        # Fall back to absolute threshold
+        # Check absolute threshold - this is the primary decision factor
         if context.current_price >= context.price_thresholds.export_threshold:
-            return "regular"  # Regular mode with export enabled
+            return "regular"  # Above threshold - enable export
         else:
-            return "regular_no_export"  # Regular mode with export disabled
+            return "regular_no_export"  # Below threshold - disable export
 
     def _get_export_explanation(self, context: DecisionContext) -> str:
         """Get explanation for export control decision.
@@ -532,8 +534,10 @@ class GrowattDecisionEngine:
 
         mode = self._get_export_mode(context)
         price_czk = context.current_price * 25 / 1000  # Convert EUR/MWh to CZK/kWh
+        threshold_czk = context.price_thresholds.export_threshold * 25 / 1000
 
-        # Include ranking information if available
+        # Include ranking information if available (for context only, not decision)
+        rank_info = ""
         if context.price_ranking:
             rank_info = (
                 f" (rank {context.price_ranking.current_rank}/{context.price_ranking.total_hours}, "
@@ -541,33 +545,40 @@ class GrowattDecisionEngine:
                 f"{context.price_ranking.price_quadrant})"
             )
 
-            if mode == "discharge_to_grid":
-                return f"Price {price_czk:.2f} CZK/kWh{rank_info} - profitable battery discharge"
-            elif mode == "regular":
-                return f"Price {price_czk:.2f} CZK/kWh{rank_info} - export enabled (expensive hour)"
-            else:
-                return f"Price {price_czk:.2f} CZK/kWh{rank_info} - export disabled (cheap hour)"
-
-        # Fall back to absolute threshold explanation
-        threshold_czk = context.price_thresholds.export_threshold * 25 / 1000
         if mode == "discharge_to_grid":
-            return f"Price {price_czk:.2f} CZK/kWh - profitable battery discharge"
+            # Include spread information for discharge
+            if context.price_ranking:
+                daily_min_czk = context.price_ranking.daily_min * 25 / 1000
+                multiplier = context.price_thresholds.discharge_price_multiplier
+                return (f"Price {price_czk:.2f} CZK/kWh{rank_info} - discharging at 25% "
+                        f"(>{daily_min_czk:.2f} * {multiplier}x)")
+            else:
+                return f"Price {price_czk:.2f} CZK/kWh{rank_info} - profitable battery discharge"
         elif mode == "regular":
-            return f"Price {price_czk:.2f} CZK/kWh > {threshold_czk:.2f} - export enabled"
+            return (f"Price {price_czk:.2f} CZK/kWh{rank_info} >= "
+                    f"{threshold_czk:.2f} CZK/kWh threshold - export enabled")
         else:
-            return f"Price {price_czk:.2f} CZK/kWh < {threshold_czk:.2f} - export disabled"
+            return (f"Price {price_czk:.2f} CZK/kWh{rank_info} < "
+                    f"{threshold_czk:.2f} CZK/kWh threshold - export disabled")
 
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
-        """Determine if battery should discharge based on price ranking and profit margin.
+        """Determine if battery should discharge based on price spread.
+
+        Discharge only when:
+        1. Battery SOC > 20%
+        2. No high loads active
+        3. Price > absolute minimum threshold (CZK/kWh)
+        4. Price > daily_min * multiplier
+        5. Discharge is profitable based on charge cost
 
         Args:
             context: Current decision context
 
         Returns:
-            True if battery should discharge to grid
+            True if battery should discharge to grid at 25% rate
         """
         # Don't discharge if battery is too low
-        if context.battery_soc <= 20:  # Lower threshold for more aggressive discharge
+        if context.battery_soc <= 20:
             return False
 
         # Don't discharge during high loads
@@ -578,24 +589,36 @@ class GrowattDecisionEngine:
         if not context.price_thresholds or context.current_price <= 0:
             return False
 
-        # Prefer percentile-based decision if ranking available
+        # Convert current price to CZK/kWh (EUR/MWh * 25 / 1000)
+        current_price_czk = context.current_price * 25 / 1000
+
+        # Check absolute minimum threshold
+        if current_price_czk < context.price_thresholds.discharge_min_price_czk:
+            self.logger.debug(
+                f"No discharge: price {current_price_czk:.2f} CZK/kWh < "
+                f"min threshold {context.price_thresholds.discharge_min_price_czk:.2f}"
+            )
+            return False
+
+        # Check price spread vs daily minimum
         if context.price_ranking:
-            # Only discharge during top percentile hours
-            discharge_thresh = context.price_thresholds.discharge_percentile_threshold
-            if context.price_ranking.percentile < discharge_thresh:
+            daily_min_czk = context.price_ranking.daily_min * 25 / 1000
+            required_price_czk = daily_min_czk * context.price_thresholds.discharge_price_multiplier
+
+            if current_price_czk < required_price_czk:
+                self.logger.debug(
+                    f"No discharge: price {current_price_czk:.2f} CZK/kWh < "
+                    f"required {required_price_czk:.2f} ({daily_min_czk:.2f} * "
+                    f"{context.price_thresholds.discharge_price_multiplier}x)"
+                )
                 return False
 
-            self.logger.debug(
-                f"Price in top {100 - context.price_ranking.percentile:.1f}% "
-                f"(rank {context.price_ranking.current_rank}/"
-                f"{context.price_ranking.total_hours}), "
-                f"checking profitability for discharge"
+            self.logger.info(
+                f"Discharge conditions met: {current_price_czk:.2f} CZK/kWh "
+                f"(>{context.price_thresholds.discharge_min_price_czk:.2f} min, "
+                f">{required_price_czk:.2f} = {daily_min_czk:.2f} * "
+                f"{context.price_thresholds.discharge_price_multiplier}x)"
             )
-        else:
-            # Fall back to absolute threshold
-            discharge_threshold = context.price_thresholds.export_threshold * 3
-            if context.current_price < discharge_threshold:
-                return False
 
         # Calculate if discharge would be profitable
         avg_charge_price = self._get_average_charge_price(context)
@@ -605,11 +628,19 @@ class GrowattDecisionEngine:
             profit_ratio = context.current_price / effective_cost
 
             if profit_ratio >= context.price_thresholds.min_profit_margin:
-                self.logger.debug(
-                    f"Discharge profitable: current price {context.current_price:.2f} / "
-                    f"effective cost {effective_cost:.2f} = {profit_ratio:.2f}x profit"
+                avg_charge_czk = avg_charge_price * 25 / 1000
+                effective_czk = effective_cost * 25 / 1000
+                self.logger.info(
+                    f"Discharge profitable: {current_price_czk:.2f} CZK/kWh / "
+                    f"{effective_czk:.2f} CZK/kWh = {profit_ratio:.2f}x profit "
+                    f"(charge cost: {avg_charge_czk:.2f}, efficiency: {efficiency:.0%})"
                 )
                 return True
+            else:
+                self.logger.debug(
+                    f"Discharge not profitable: profit ratio {profit_ratio:.2f}x < "
+                    f"required {context.price_thresholds.min_profit_margin}x"
+                )
 
         return False
 

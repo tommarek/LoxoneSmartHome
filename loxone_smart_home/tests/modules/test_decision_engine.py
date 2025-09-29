@@ -326,7 +326,12 @@ def test_price_based_charging_decision(
 def test_price_based_discharge_decision(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """Test that very high prices trigger battery discharge."""
+    """Test that very high prices with sufficient spread trigger battery discharge."""
+    hourly_prices = {
+        ("03:00", "04:00"): 30.0,  # Cheap charge price (0.75 CZK/kWh)
+        ("18:00", "19:00"): 150.0,  # Current high price (3.75 CZK/kWh)
+    }
+
     context = DecisionContext(
         manual_override_active=False,
         manual_override_mode=None,
@@ -334,25 +339,40 @@ def test_price_based_discharge_decision(
         battery_soc=80.0,  # Good SOC for discharge
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 18, 0),  # 6 PM peak
-        current_price=150.0,  # High price (3.75x export threshold)
-        hourly_prices={
-            ("03:00", "04:00"): 30.0,  # Cheap charge price
-            ("18:00", "19:00"): 150.0,  # Current high price
-        },
+        current_price=150.0,  # 3.75 CZK/kWh
+        hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
             cheap_threshold=80.0,
-            export_threshold=40.0,  # Export at 40, discharge at 120+ (3x)
+            export_threshold=40.0,
             charge_efficiency=0.87,
-            min_profit_margin=1.2
-        )
+            min_profit_margin=1.2,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=2,
+            total_hours=2,
+            percentile=100.0,
+            hours_cheaper_count=1,
+            hours_more_expensive_count=0,
+            daily_min=30.0,  # 0.75 CZK/kWh
+            daily_max=150.0,
+            daily_avg=90.0,
+            daily_median=90.0,
+            daily_spread=120.0,
+            price_quadrant="Most Expensive",
+            is_relatively_cheap=False,
+            is_relatively_expensive=True
+        ),
+        is_summer_mode=True  # Set to summer to prevent charging
     )
 
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # 150 is > 120 (3x40), so should discharge
+    # 3.75 CZK/kWh > 2.0 threshold AND 3.75 > 0.75*3 = 2.25, so should discharge
     assert decision == "discharge_to_grid"
-    assert "discharge" in explanation["reason"].lower() or "profit" in explanation["reason"].lower()
+    assert "discharging at 25%" in explanation["reason"].lower()
 
 
 def test_low_battery_prevents_discharge(
@@ -370,7 +390,9 @@ def test_low_battery_prevents_discharge(
         hourly_prices={("18:00", "19:00"): 150.0},
         price_thresholds=PriceThresholds(
             cheap_threshold=80.0,
-            export_threshold=120.0
+            export_threshold=40.0,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
         )
     )
 
@@ -735,44 +757,44 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
 
 
 def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine) -> None:
-    """Test that export decisions use percentile ranking when available."""
+    """Test that export decisions use absolute threshold only (percentile info is for context)."""
     hourly_prices = {
-        ("00:00", "01:00"): 40.0,
-        ("01:00", "02:00"): 50.0,
-        ("02:00", "03:00"): 60.0,  # 75th percentile - should export
-        ("03:00", "04:00"): 80.0,
+        ("00:00", "01:00"): 30.0,  # Below threshold
+        ("01:00", "02:00"): 40.0,  # At threshold
+        ("02:00", "03:00"): 60.0,  # Above threshold
+        ("03:00", "04:00"): 80.0,  # Well above threshold
     }
 
-    # Create ranking for moderately expensive hour (not expensive enough for discharge)
+    # Test 1: Price below absolute threshold - should NOT export
     price_ranking = PriceRankingData(
-        current_rank=3,
+        current_rank=4,
         total_hours=4,
-        percentile=66.7,  # Above export threshold but below discharge
-        hours_cheaper_count=2,
-        hours_more_expensive_count=1,
-        daily_min=40.0,
+        percentile=0.0,  # Cheapest hour
+        hours_cheaper_count=3,
+        hours_more_expensive_count=0,
+        daily_min=30.0,
         daily_max=80.0,
-        daily_avg=57.5,
-        daily_median=55.0,
-        daily_spread=40.0,
-        price_quadrant="Expensive",
-        is_relatively_cheap=False,
-        is_relatively_expensive=True
+        daily_avg=52.5,
+        daily_median=50.0,
+        daily_spread=50.0,
+        price_quadrant="Cheap",
+        is_relatively_cheap=True,
+        is_relatively_expensive=False
     )
 
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
-        battery_soc=100.0,  # Full battery to avoid charging
-        current_time=datetime(2024, 1, 1, 2, 30),
-        current_price=60.0,  # Testing 02:00-03:00 hour
+        battery_soc=100.0,  # Full battery to prevent charging decision
+        current_time=datetime(2024, 1, 1, 0, 30),
+        current_price=30.0,  # Below threshold
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=70.0,
-            export_threshold=90.0,  # Would not export with absolute threshold
-            export_percentile_threshold=60.0,  # Should export with percentile
+            cheap_threshold=20.0,  # Set lower to avoid charge decision
+            export_threshold=40.0,  # 40 EUR/MWh = 1 CZK/kWh
             charge_percentile_threshold=25.0,
-            discharge_percentile_threshold=95.0  # Set high to avoid discharge
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
         ),
         price_ranking=price_ranking
     )
@@ -780,6 +802,363 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # Should export because percentile (100%) >= threshold (60%)
+    # Should NOT export because price (30) < threshold (40)
+    assert decision == "regular_no_export"
+    assert "export disabled" in explanation["reason"].lower()
+
+    # Test 2: Price above absolute threshold - should export
+    context.current_price = 60.0
+    context.current_time = datetime(2024, 1, 1, 2, 30)
+
+    decision = decision_engine.decide(context)
+    explanation = decision_engine.explain_decision()
+
+    # Should export because price (60) >= threshold (40)
     assert decision == "regular"
-    assert "expensive hour" in explanation["reason"].lower()
+    assert "export enabled" in explanation["reason"].lower()
+
+
+def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
+    """Test that winter mode only charges during 2 cheapest hours."""
+    hourly_prices = {
+        ("00:00", "01:00"): 20.0,  # Rank 1 - cheapest
+        ("01:00", "02:00"): 25.0,  # Rank 2 - second cheapest
+        ("02:00", "03:00"): 35.0,  # Rank 3
+        ("03:00", "04:00"): 40.0,  # Rank 4
+        ("04:00", "05:00"): 50.0,  # Rank 5 - most expensive
+    }
+
+    # Test 1: Winter mode, rank 1 (cheapest hour) - should charge
+    price_ranking = PriceRankingData(
+        current_rank=1,
+        total_hours=5,
+        percentile=0.0,
+        hours_cheaper_count=0,
+        hours_more_expensive_count=4,
+        daily_min=20.0,
+        daily_max=50.0,
+        daily_avg=34.0,
+        daily_median=35.0,
+        daily_spread=30.0,
+        price_quadrant="Cheapest",
+        is_relatively_cheap=True,
+        is_relatively_expensive=False
+    )
+
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,  # Not full
+        current_time=datetime(2024, 1, 1, 0, 30),
+        current_price=20.0,
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=30.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=40.0,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0,
+            winter_cheapest_hours=2  # Charge only during 2 cheapest hours
+        ),
+        price_ranking=price_ranking,
+        is_summer_mode=False  # Winter mode
+    )
+
+    decision = decision_engine.decide(context)
+    # Should charge because rank 1 <= 2 cheapest hours
+    assert decision == "charge_from_grid"
+
+    # Test 2: Winter mode, rank 3 - should NOT charge
+    # Need to create a new context to trigger __post_init__ with the new values
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 2, 30),
+        current_price=35.0,
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=30.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=40.0,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0,
+            winter_cheapest_hours=2
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=3,
+            total_hours=5,
+            percentile=50.0,
+            hours_cheaper_count=2,
+            hours_more_expensive_count=2,
+            daily_min=20.0,
+            daily_max=50.0,
+            daily_avg=34.0,
+            daily_median=35.0,
+            daily_spread=30.0,
+            price_quadrant="Cheap",
+            is_relatively_cheap=True,
+            is_relatively_expensive=False
+        ),
+        is_summer_mode=False
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT charge because rank 3 > 2 cheapest hours (winter logic takes precedence)
+    # Export should be disabled because price (35) < threshold (40)
+    assert decision == "regular_no_export"
+
+    # Test 3: Summer mode - should NEVER charge from AC
+    # Test with cheapest hour to ensure no charging happens
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 0, 30),
+        current_price=20.0,  # Cheapest price
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=30.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=100.0,  # Even with 100% threshold
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0,
+            winter_cheapest_hours=2
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=1,  # Cheapest hour
+            total_hours=5,
+            percentile=0.0,  # Lowest percentile
+            hours_cheaper_count=0,
+            hours_more_expensive_count=4,
+            daily_min=20.0,
+            daily_max=50.0,
+            daily_avg=34.0,
+            daily_median=35.0,
+            daily_spread=30.0,
+            price_quadrant="Cheapest",
+            is_relatively_cheap=True,
+            is_relatively_expensive=False
+        ),
+        is_summer_mode=True  # Summer mode
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT charge in summer mode, even during cheapest hour
+    # Export should be disabled because price (20) < threshold (40)
+    assert decision == "regular_no_export"
+
+    # Test 4: Summer mode with moderately expensive hour - still no charging
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 3, 30),
+        current_price=40.0,  # At threshold
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=30.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=40.0,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0,
+            winter_cheapest_hours=2
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=4,
+            total_hours=5,
+            percentile=75.0,  # Below discharge threshold
+            hours_cheaper_count=3,
+            hours_more_expensive_count=1,
+            daily_min=20.0,
+            daily_max=50.0,
+            daily_avg=34.0,
+            daily_median=35.0,
+            daily_spread=30.0,
+            price_quadrant="Expensive",
+            is_relatively_cheap=False,
+            is_relatively_expensive=True
+        ),
+        is_summer_mode=True  # Summer mode
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT charge in summer mode, regardless of price
+    # Export should be enabled because price (40) >= threshold (40)
+    assert decision == "regular"
+
+
+def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) -> None:
+    """Test smart discharge based on price spread relative to daily minimum."""
+    # Create a day with significant price variation
+    hourly_prices = {
+        ("00:00", "01:00"): 32.0,  # 0.8 CZK/kWh
+        ("01:00", "02:00"): 36.0,  # 0.9 CZK/kWh
+        ("02:00", "03:00"): 40.0,  # 1.0 CZK/kWh
+        ("06:00", "07:00"): 80.0,  # 2.0 CZK/kWh
+        ("07:00", "08:00"): 120.0,  # 3.0 CZK/kWh - should discharge
+        ("08:00", "09:00"): 140.0,  # 3.5 CZK/kWh - should discharge
+    }
+
+    # Test 1: High price with sufficient spread - should discharge
+    # 3.0 CZK/kWh > 2.0 threshold AND 3.0 > 0.8 * 3 = 2.4
+    price_ranking = PriceRankingData(
+        current_rank=5,
+        total_hours=6,
+        percentile=83.3,
+        hours_cheaper_count=4,
+        hours_more_expensive_count=1,
+        daily_min=32.0,  # 0.8 CZK/kWh
+        daily_max=140.0,
+        daily_avg=73.0,
+        daily_median=60.0,
+        daily_spread=108.0,
+        price_quadrant="Most Expensive",
+        is_relatively_cheap=False,
+        is_relatively_expensive=True
+    )
+
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 7, 30),
+        current_price=120.0,  # 3.0 CZK/kWh
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=80.0,  # 2.0 CZK/kWh
+            export_threshold=40.0,  # 1.0 CZK/kWh
+            charge_percentile_threshold=25.0,
+            winter_cheapest_hours=2,
+            discharge_min_price_czk=2.0,  # Minimum 2.0 CZK/kWh
+            discharge_price_multiplier=3.0  # Must be 3x daily min
+        ),
+        price_ranking=price_ranking
+    )
+
+    decision = decision_engine.decide(context)
+    explanation = decision_engine.explain_decision()
+
+    # Should discharge because 3.0 > 2.0 threshold AND 3.0 > 0.8*3 = 2.4
+    assert decision == "discharge_to_grid"
+    assert "discharging at 25%" in explanation["reason"].lower()
+
+    # Test 2: Price below spread requirement - should NOT discharge
+    # 2.0 CZK/kWh >= 2.0 threshold BUT 2.0 < 0.8 * 3 = 2.4
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 6, 30),
+        current_price=80.0,  # 2.0 CZK/kWh
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=80.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=25.0,
+            winter_cheapest_hours=2,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=4,
+            total_hours=6,
+            percentile=66.7,
+            hours_cheaper_count=3,
+            hours_more_expensive_count=2,
+            daily_min=32.0,  # 0.8 CZK/kWh
+            daily_max=140.0,
+            daily_avg=73.0,
+            daily_median=60.0,
+            daily_spread=108.0,
+            price_quadrant="Expensive",
+            is_relatively_cheap=False,
+            is_relatively_expensive=True
+        )
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT discharge because 2.0 < 2.4 required spread
+    assert decision == "regular"  # Just export, no discharge
+
+    # Test 3: Price below absolute threshold - should NOT discharge
+    # 1.0 CZK/kWh < 2.0 threshold
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 2, 30),
+        current_price=40.0,  # 1.0 CZK/kWh
+        hourly_prices=hourly_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=80.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=25.0,
+            winter_cheapest_hours=2,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=3,
+            total_hours=6,
+            percentile=50.0,
+            hours_cheaper_count=2,
+            hours_more_expensive_count=3,
+            daily_min=32.0,
+            daily_max=140.0,
+            daily_avg=73.0,
+            daily_median=60.0,
+            daily_spread=108.0,
+            price_quadrant="Cheap",
+            is_relatively_cheap=True,
+            is_relatively_expensive=False
+        )
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT discharge because 1.0 < 2.0 min threshold
+    assert decision == "regular"  # Just export at 1.0 CZK/kWh
+
+    # Test 4: Flat price day - should NOT discharge even at high prices
+    flat_prices = {
+        ("00:00", "01:00"): 76.0,  # 1.9 CZK/kWh
+        ("01:00", "02:00"): 80.0,  # 2.0 CZK/kWh
+        ("02:00", "03:00"): 84.0,  # 2.1 CZK/kWh
+        ("03:00", "04:00"): 88.0,  # 2.2 CZK/kWh
+    }
+
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 3, 30),
+        current_price=88.0,  # 2.2 CZK/kWh
+        hourly_prices=flat_prices,
+        price_thresholds=PriceThresholds(
+            cheap_threshold=80.0,
+            export_threshold=40.0,
+            charge_percentile_threshold=25.0,
+            winter_cheapest_hours=2,
+            discharge_min_price_czk=2.0,
+            discharge_price_multiplier=3.0
+        ),
+        price_ranking=PriceRankingData(
+            current_rank=4,
+            total_hours=4,
+            percentile=100.0,
+            hours_cheaper_count=3,
+            hours_more_expensive_count=0,
+            daily_min=76.0,  # 1.9 CZK/kWh
+            daily_max=88.0,
+            daily_avg=82.0,
+            daily_median=82.0,
+            daily_spread=12.0,
+            price_quadrant="Most Expensive",
+            is_relatively_cheap=False,
+            is_relatively_expensive=True
+        )
+    )
+
+    decision = decision_engine.decide(context)
+    # Should NOT discharge: 2.2 >= 2.0 threshold BUT 2.2 < 1.9*3 = 5.7
+    assert decision == "regular"  # No discharge on flat days

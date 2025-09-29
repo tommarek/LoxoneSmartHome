@@ -165,6 +165,16 @@ class GrowattConfig(BaseModel):
         default=25, ge=10, le=100
     )  # Discharge power rate % (25% = gentle)
 
+    # Smart discharge control (CZK/kWh units)
+    discharge_min_price_czk: float = Field(
+        default=2.0, gt=0,
+        description="Minimum price in CZK/kWh to consider battery discharge"
+    )
+    discharge_price_multiplier: float = Field(
+        default=3.0, ge=1.5,
+        description="Price must be this many times higher than daily minimum"
+    )
+
     # Price thresholds and control parameters
     export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
     battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
