@@ -24,19 +24,13 @@ class Priority(IntEnum):
 
 @dataclass
 class PriceThresholds:
-    """Price thresholds for decision making (mixed EUR/MWh and CZK/kWh)."""
-    cheap_threshold: float  # Below this = cheap hour for charging (EUR/MWh)
-    export_threshold: float  # Above this = enable export (EUR/MWh, ~40 for 1 CZK/kWh)
-    charge_efficiency: float = 0.87  # Battery round-trip efficiency
-    min_profit_margin: float = 1.2  # Minimum profit ratio for discharge
+    """Simple price thresholds for decision making (all in CZK/kWh)."""
+    charge_price_max: float  # Charge when price below this
+    export_price_min: float  # Export solar when price above this
+    discharge_price_min: float  # Discharge battery when price above this
+    discharge_profit_margin: float  # Required profit margin (e.g., 1.5 = 50% profit)
+    battery_efficiency: float  # Battery round-trip efficiency
     target_soc: float = 100.0  # Target SOC when charging from grid
-    # Percentile-based thresholds
-    charge_percentile_threshold: float = 25.0  # Charge when in bottom 25%
-    # Winter mode settings
-    winter_cheapest_hours: int = 2  # Number of cheapest hours to charge in winter
-    # Smart discharge control (CZK/kWh units)
-    discharge_min_price_czk: float = 2.0  # Minimum price for discharge (CZK/kWh)
-    discharge_price_multiplier: float = 3.0  # Price must be Nx daily minimum
 
 
 @dataclass
@@ -86,16 +80,18 @@ class DecisionContext:
         # Summer mode: NO AC charging at all
         if self.is_summer_mode:
             self.is_battery_charging_scheduled = False
-        # Winter mode: charge only during N cheapest hours
-        elif self.price_ranking and self.price_thresholds:
-            winter_hours = self.price_thresholds.winter_cheapest_hours
+        # Winter mode: charge during cheapest hours (ranking)
+        elif self.price_ranking:
+            # Default to charging during 2 cheapest hours in winter
             self.is_battery_charging_scheduled = (
-                self.price_ranking.current_rank <= winter_hours
+                self.price_ranking.current_rank <= 2  # Top 2 cheapest hours
             )
         elif self.price_thresholds and self.current_price > 0:
             # Fall back to absolute threshold (winter only)
+            # Convert EUR/MWh to CZK/kWh for comparison (EUR * 25 / 1000)
+            price_czk_kwh = self.current_price * 25 / 1000
             self.is_battery_charging_scheduled = (
-                self.current_price < self.price_thresholds.cheap_threshold
+                price_czk_kwh < self.price_thresholds.charge_price_max
             )
         # Legacy: Check if the scheduled mode is battery charging
         elif self.scheduled_mode == "charge_from_grid":
@@ -443,53 +439,40 @@ class GrowattDecisionEngine:
             self.logger.debug("Summer mode: AC charging disabled")
             return False
 
-        # Winter mode: charge only during the N cheapest hours
-        if context.price_ranking and context.price_thresholds:
-            winter_hours = context.price_thresholds.winter_cheapest_hours
-            should_charge = context.price_ranking.current_rank <= winter_hours
+        # Check if current price is below charge threshold
+        if context.price_thresholds and context.current_price > 0:
+            # Convert current price from EUR/MWh to CZK/kWh
+            current_price_czk = context.current_price * 25 / 1000
+            should_charge = current_price_czk < context.price_thresholds.charge_price_max
 
             if should_charge:
                 self.logger.debug(
-                    f"Winter charging: current rank {context.price_ranking.current_rank} "
-                    f"<= {winter_hours} cheapest hours "
-                    f"(price: {context.current_price:.1f} EUR/MWh)"
+                    f"Charging: price {current_price_czk:.2f} CZK/kWh "
+                    f"< {context.price_thresholds.charge_price_max:.2f} CZK/kWh threshold"
+                )
+            else:
+                self.logger.debug(
+                    f"No charge: price {current_price_czk:.2f} CZK/kWh "
+                    f"> {context.price_thresholds.charge_price_max:.2f} CZK/kWh threshold"
                 )
             return should_charge
-
-        # Fall back to absolute threshold if no ranking available
-        if not context.price_thresholds or context.current_price <= 0:
-            return False
-
-        # Check if current hour is in consecutive cheap hours
-        cheap_hours = self._find_consecutive_cheap_hours(context)
-        current_hour = context.current_time.strftime("%H:00")
-
-        for start, end, _ in cheap_hours:
-            if self._is_hour_in_range(current_hour, start, end):
-                self.logger.debug(
-                    f"Current hour {current_hour} is in cheap range {start}-{end}, "
-                    f"price {context.current_price:.2f} < threshold "
-                    f"{context.price_thresholds.cheap_threshold:.2f}"
-                )
-                return True
 
         return False
 
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
-        """Determine if battery should discharge based on price spread.
+        """Determine if battery should discharge based on simple price thresholds.
 
         Discharge only when:
-        1. Battery SOC > 20%
+        1. Battery SOC > discharge_min_soc
         2. No high loads active
-        3. Price > absolute minimum threshold (CZK/kWh)
-        4. Price > daily_min * multiplier
-        5. Discharge is profitable based on charge cost
+        3. Price > discharge minimum threshold
+        4. Discharge is profitable based on charge cost
 
         Args:
             context: Current decision context
 
         Returns:
-            True if battery should discharge to grid at 25% rate
+            True if battery should discharge to grid
         """
         # Don't discharge if battery is too low
         if context.battery_soc <= 20:
@@ -507,54 +490,48 @@ class GrowattDecisionEngine:
         current_price_czk = context.current_price * 25 / 1000
 
         # Check absolute minimum threshold
-        if current_price_czk < context.price_thresholds.discharge_min_price_czk:
+        if current_price_czk < context.price_thresholds.discharge_price_min:
             self.logger.debug(
                 f"No discharge: price {current_price_czk:.2f} CZK/kWh < "
-                f"min threshold {context.price_thresholds.discharge_min_price_czk:.2f}"
+                f"min threshold {context.price_thresholds.discharge_price_min:.2f}"
             )
             return False
-
-        # Check price spread vs daily minimum
-        if context.price_ranking:
-            daily_min_czk = context.price_ranking.daily_min * 25 / 1000
-            required_price_czk = daily_min_czk * context.price_thresholds.discharge_price_multiplier
-
-            if current_price_czk < required_price_czk:
-                self.logger.debug(
-                    f"No discharge: price {current_price_czk:.2f} CZK/kWh < "
-                    f"required {required_price_czk:.2f} ({daily_min_czk:.2f} * "
-                    f"{context.price_thresholds.discharge_price_multiplier}x)"
-                )
-                return False
-
-            self.logger.info(
-                f"Discharge conditions met: {current_price_czk:.2f} CZK/kWh "
-                f"(>{context.price_thresholds.discharge_min_price_czk:.2f} min, "
-                f">{required_price_czk:.2f} = {daily_min_czk:.2f} * "
-                f"{context.price_thresholds.discharge_price_multiplier}x)"
-            )
 
         # Calculate if discharge would be profitable
         avg_charge_price = self._get_average_charge_price(context)
         if avg_charge_price > 0:
-            efficiency = context.price_thresholds.charge_efficiency
-            effective_cost = avg_charge_price / efficiency
-            profit_ratio = context.current_price / effective_cost
+            # Convert to CZK/kWh
+            avg_charge_czk = avg_charge_price * 25 / 1000
 
-            if profit_ratio >= context.price_thresholds.min_profit_margin:
-                avg_charge_czk = avg_charge_price * 25 / 1000
-                effective_czk = effective_cost * 25 / 1000
+            # Calculate required price for profitability
+            required_price_czk = (avg_charge_czk *
+                                  context.price_thresholds.discharge_profit_margin /
+                                  context.price_thresholds.battery_efficiency)
+
+            if current_price_czk >= required_price_czk:
+                profit_ratio = (current_price_czk *
+                                context.price_thresholds.battery_efficiency /
+                                avg_charge_czk)
                 self.logger.info(
-                    f"Discharge profitable: {current_price_czk:.2f} CZK/kWh / "
-                    f"{effective_czk:.2f} CZK/kWh = {profit_ratio:.2f}x profit "
-                    f"(charge cost: {avg_charge_czk:.2f}, efficiency: {efficiency:.0%})"
+                    f"Discharge profitable: {current_price_czk:.2f} CZK/kWh gives "
+                    f"{profit_ratio:.1f}x return on {avg_charge_czk:.2f} CZK/kWh charge cost "
+                    f"(required: {context.price_thresholds.discharge_profit_margin:.1f}x, "
+                    f"efficiency: {context.price_thresholds.battery_efficiency:.0%})"
                 )
                 return True
             else:
                 self.logger.debug(
-                    f"Discharge not profitable: profit ratio {profit_ratio:.2f}x < "
-                    f"required {context.price_thresholds.min_profit_margin}x"
+                    f"Discharge not profitable: {current_price_czk:.2f} CZK/kWh < "
+                    f"required {required_price_czk:.2f} CZK/kWh for "
+                    f"{context.price_thresholds.discharge_profit_margin:.1f}x margin"
                 )
+        else:
+            # No charge price history, just check if above minimum
+            self.logger.info(
+                f"Discharge allowed: {current_price_czk:.2f} CZK/kWh > "
+                f"{context.price_thresholds.discharge_price_min:.2f} CZK/kWh minimum"
+            )
+            return True
 
         return False
 
@@ -585,7 +562,9 @@ class GrowattDecisionEngine:
             start_key = sorted_hours[i]
             price = context.hourly_prices[start_key]
 
-            if price < context.price_thresholds.cheap_threshold:
+            # Convert EUR/MWh to CZK/kWh for comparison
+            price_czk_kwh = price * 25 / 1000
+            if price_czk_kwh < context.price_thresholds.charge_price_max:
                 # Start of cheap period
                 period_start = start_key[0]
                 period_prices = [price]
@@ -596,7 +575,9 @@ class GrowattDecisionEngine:
                     next_key = sorted_hours[j]
                     next_price = context.hourly_prices[next_key]
 
-                    if next_price < context.price_thresholds.cheap_threshold:
+                    # Convert EUR/MWh to CZK/kWh for comparison
+                    next_price_czk_kwh = next_price * 25 / 1000
+                    if next_price_czk_kwh < context.price_thresholds.charge_price_max:
                         period_prices.append(next_price)
                         j += 1
                     else:
@@ -612,19 +593,27 @@ class GrowattDecisionEngine:
         return cheap_periods
 
     def _get_average_charge_price(self, context: DecisionContext) -> float:
-        """Get average price during recent charging hours.
+        """Get average price during hours below charge threshold.
 
         Args:
             context: Current decision context
 
         Returns:
-            Average charge price or 0 if not available
+            Average charge price in EUR/MWh or 0 if not available
         """
-        # For now, use the average of cheap hours as proxy
-        cheap_hours = self._find_consecutive_cheap_hours(context)
-        if cheap_hours:
-            total = sum(avg_price for _, _, avg_price in cheap_hours)
-            return total / len(cheap_hours)
+        if not context.hourly_prices or not context.price_thresholds:
+            return 0.0
+
+        # Find hours below charge threshold
+        # CZK/kWh to EUR/MWh
+        charge_threshold_eur = context.price_thresholds.charge_price_max * 1000 / 25
+        cheap_prices = [
+            price for price in context.hourly_prices.values()
+            if price <= charge_threshold_eur
+        ]
+
+        if cheap_prices:
+            return sum(cheap_prices) / len(cheap_prices)
         return 0.0
 
     def _is_hour_in_range(self, hour: str, start: str, end: str) -> bool:

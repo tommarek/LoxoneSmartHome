@@ -279,7 +279,7 @@ class OTEPriceCollector(BaseModule):
         }
 
         try:
-            async with self._session.get(url, headers=headers, timeout=30) as response:
+            async with self._session.get(url, headers=headers) as response:
                 if response.status == 429:  # Rate limited
                     self.logger.warning(f"Rate limited for {date_str}, will retry with backoff")
                     return None

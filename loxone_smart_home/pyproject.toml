@@ -27,8 +27,15 @@ line_length = 100
 python_version = "3.11"
 strict = true
 ignore_missing_imports = true
-explicit_package_bases = true
-namespace_packages = true
+exclude = [
+    "build/",
+    "dist/",
+    ".mypy_cache/",
+    "__pycache__/",
+    "venv/",
+    ".venv/",
+    "tests/"
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

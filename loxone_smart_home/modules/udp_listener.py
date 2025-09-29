@@ -138,7 +138,7 @@ class UDPListener(BaseModule):
             message = data.decode("utf-8").strip()
 
             # Parse the data structure:
-            # timestamp;measurement_name;value;room_name[optional];measurement_type[optional];tag1[optional];tag2[optional]
+            # Parse the data structure:
             parts = message.split(self.settings.udp_listener.delimiter)
 
             if len(parts) < 3:

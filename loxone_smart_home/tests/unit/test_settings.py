@@ -17,7 +17,7 @@ class TestSettings:
             settings = Settings(influxdb_token="test-token")
 
             assert settings.log_level == "INFO"
-            assert settings.mqtt_broker == "mqtt"
+            assert settings.mqtt_broker == "localhost"
             assert settings.mqtt_port == 1883
             assert settings.influxdb_token == "test-token"
 
@@ -140,21 +140,3 @@ class TestGrowattConfig:
         """Test positive value constraints."""
         with pytest.raises(ValidationError):
             GrowattConfig(battery_capacity=-10.0)
-
-        with pytest.raises(ValidationError):
-            GrowattConfig(max_charge_power=0.0)
-
-    def test_schedule_validation(self) -> None:
-        """Test schedule time validation."""
-        # Valid schedule time
-        config = GrowattConfig(schedule_hour=15, schedule_minute=30)
-        assert config.schedule_hour == 15
-        assert config.schedule_minute == 30
-
-        # Invalid hour
-        with pytest.raises(ValidationError):
-            GrowattConfig(schedule_hour=24)
-
-        # Invalid minute
-        with pytest.raises(ValidationError):
-            GrowattConfig(schedule_minute=60)

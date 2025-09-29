@@ -153,53 +153,40 @@ class GrowattConfig(BaseModel):
 
     # Control parameters
     battery_capacity: float = Field(default=10.0, gt=0)  # kWh
-    max_charge_power: float = Field(default=3.0, gt=0)  # kW
     min_soc: float = Field(default=20.0, ge=0, le=100)  # %
     max_soc: float = Field(default=100.0, ge=0, le=100)  # %
     discharge_min_soc: float = Field(default=20.0, ge=0, le=100)  # % - Stop discharge at this SOC
 
-    # Battery economics
-    battery_efficiency: float = Field(default=0.85, gt=0, le=1)  # Round-trip efficiency (85%)
-    discharge_profit_margin: float = Field(default=3.0, ge=1)  # Minimum profit margin (200% = 3x)
+    # Battery parameters
+    battery_efficiency: float = Field(
+        default=0.85, gt=0, le=1,
+        description="Battery round-trip efficiency (15% loss)"
+    )
     discharge_power_rate: int = Field(
-        default=25, ge=10, le=100
-    )  # Discharge power rate % (25% = gentle)
-
-    # Smart discharge control (CZK/kWh units)
-    discharge_min_price_czk: float = Field(
-        default=2.0, gt=0,
-        description="Minimum price in CZK/kWh to consider battery discharge"
-    )
-    discharge_price_multiplier: float = Field(
-        default=3.0, ge=1.5,
-        description="Price must be this many times higher than daily minimum"
+        default=25, ge=10, le=100,
+        description="Discharge power rate % (25% = gentle)"
     )
 
-    # Price thresholds and control parameters
-    export_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh
+    # Simple price thresholds (all in CZK/kWh for consistency)
+    charge_price_max: float = Field(
+        default=1.5, gt=0,
+        description="Charge battery when price below this (CZK/kWh)"
+    )
+    export_price_min: float = Field(
+        default=1.0, gt=0,
+        description="Export solar production when price above this (CZK/kWh)"
+    )
+    discharge_price_min: float = Field(
+        default=3.0, gt=0,
+        description="Discharge battery to grid when price above this (CZK/kWh)"
+    )
+    discharge_profit_margin: float = Field(
+        default=1.5, ge=1.0,
+        description="Required profit margin over charge cost (1.5 = 50% profit)"
+    )
+
+    # Scheduling
     battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
-    individual_cheapest_hours: int = Field(default=6, ge=1, le=24)  # Individual cheap hours
-
-    # Decision engine price thresholds
-    cheap_price_threshold_eur: float = Field(default=80.0, gt=0)  # EUR/MWh - below this = cheap
-    # EUR/MWh - above this = export (~1 CZK/kWh)
-    export_enable_threshold_eur: float = Field(default=40.0, gt=0)
-    charge_efficiency: float = Field(default=0.87, gt=0, le=1)  # Battery round-trip efficiency
-    min_profit_margin: float = Field(default=1.2, ge=1)  # Minimum profit ratio for discharge
-
-    # Percentile-based price ranking thresholds
-    charge_percentile_threshold: float = Field(
-        default=25.0, ge=0, le=100,
-        description="Charge battery when price is in bottom X% of daily prices"
-    )
-    export_percentile_threshold: float = Field(
-        default=60.0, ge=0, le=100,
-        description="Enable export when price is in top X% of daily prices"
-    )
-    discharge_percentile_threshold: float = Field(
-        default=90.0, ge=0, le=100,
-        description="Discharge to grid when price is in top X% of daily prices"
-    )
 
     # Command control parameters
     command_delay: float = Field(
@@ -233,13 +220,8 @@ class GrowattConfig(BaseModel):
     # Load-first mode topics
     load_first_stopsoc_topic: str = "energy/solar/command/loadfirst/set/stopsoc"
 
-    # Scheduling
-    schedule_hour: int = Field(default=23, ge=0, le=23)  # Daily calculation hour
-    schedule_minute: int = Field(default=59, ge=0, le=59)  # Daily calculation minute
-
     # Season detection parameters
     summer_temp_threshold: float = Field(default=15.0, ge=-20, le=40)  # °C
-    summer_price_threshold: float = Field(default=1.0, gt=0)  # CZK/kWh (below operator costs)
     temperature_avg_days: int = Field(default=3, ge=1, le=7)  # Days for temperature average
 
     # Currency conversion
@@ -247,9 +229,6 @@ class GrowattConfig(BaseModel):
 
     # Simulation mode
     simulation_mode: bool = False
-
-    # Device IDs
-    device_serial: Optional[str] = None
 
     # Retry settings
     max_retries: int = Field(default=3, ge=1)
@@ -299,7 +278,7 @@ class Settings(BaseSettings):
     udp_listener_host: str = "0.0.0.0"
     udp_listener_port: int = Field(default=2000, ge=1, le=65535)
 
-    loxone_host: str = Field(default="192.168.101.34", alias="LOXONE_HOST")
+    loxone_host: str = Field(default="192.168.0.200", alias="LOXONE_HOST")
     loxone_udp_port: int = Field(default=4000, ge=1, le=65535, alias="LOXONE_PORT")
     mqtt_topics: Optional[str] = Field(default=None, alias="MQTT_TOPICS")
 
@@ -308,7 +287,6 @@ class Settings(BaseSettings):
     openweathermap_api_key: Optional[str] = None
     weather_service: str = Field(default="openmeteo", alias="USE_SERVICE")
 
-    growatt_device_serial: Optional[str] = None
     growatt_simulation_mode: bool = False
 
     # OTE Price Collector settings (optional overrides)
@@ -385,7 +363,6 @@ class Settings(BaseSettings):
     def growatt(self) -> GrowattConfig:
         """Get Growatt configuration."""
         return GrowattConfig(
-            device_serial=self.growatt_device_serial,
             simulation_mode=self.growatt_simulation_mode,
         )
 

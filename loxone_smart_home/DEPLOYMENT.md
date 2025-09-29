@@ -95,8 +95,7 @@ Enable/disable individual modules via environment variables:
 #### Growatt Controller
 - `GROWATT_SIMULATION_MODE` - Test without sending commands
 - `GROWATT_EXPORT_PRICE_THRESHOLD` - Price to enable export (CZK/kWh)
-- `GROWATT_BATTERY_CHARGE_HOURS` - Consecutive hours for AC charging
-- `GROWATT_INDIVIDUAL_CHEAPEST_HOURS` - Individual cheap hours to use
+- `GROWATT_BATTERY_CHARGE_HOURS` - Consecutive hours for AC charging at cheapest rates
 
 ## Migration from Old Services
 

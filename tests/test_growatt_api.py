@@ -95,14 +95,11 @@ class TestGrowattAPI(AioHTTPTestCase):
         # Mock config
         self.mock_controller.config = MagicMock()
         self.mock_controller.config.battery_capacity = 10.0
-        self.mock_controller.config.max_charge_power = 3.0
         self.mock_controller.config.min_soc = 20
         self.mock_controller.config.max_soc = 90
-        self.mock_controller.config.export_price_threshold = 1.0
+        self.mock_controller.config.export_price_min = 1.0
         self.mock_controller.config.battery_charge_hours = 2
-        self.mock_controller.config.individual_cheapest_hours = 6
         self.mock_controller.config.summer_price_threshold = 1.0
-        self.mock_controller.config.device_serial = "ABC123"
         self.mock_controller.config.schedule_hour = 23
         self.mock_controller.config.schedule_minute = 59
 

@@ -3,15 +3,15 @@
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, Optional, cast
 
 from aiohttp import web
 
 from modules.growatt_controller import GrowattController
 
 # Define AppKey for proper aiohttp usage
-GROWATT_CONTROLLER_KEY = web.AppKey("growatt_controller", GrowattController)
-
+GROWATT_CONTROLLER_KEY: web.AppKey[GrowattController] = web.AppKey(
+    "growatt_controller", GrowattController)
 # Global cache for telemetry data
 _telemetry_cache: Dict[str, Any] = {}
 _telemetry_last_update: Optional[datetime] = None
@@ -204,7 +204,7 @@ async def _set_register_1044(controller: GrowattController, value: int) -> Optio
             )
             controller.logger.error(f"📋 Full response: {json.dumps(response, indent=2)}")
 
-        return response
+        return cast(Optional[Dict[str, Any]], response)
     except asyncio.TimeoutError:
         controller.logger.error("Timeout setting register 1044")
         return {"error": "timeout", "register": 1044, "value": value}
@@ -332,25 +332,9 @@ async def get_status(request: web.Request) -> web.Response:
     try:
         # Get current state
         now = controller._get_local_now()
-        now_t = now.time()
 
-        # Find active periods
-        active_periods = []
-        for period in controller._scheduled_periods:
-            if period.contains_time(now_t):
-                active_periods.append({
-                    "kind": period.kind,
-                    "start": period.start.strftime("%H:%M"),
-                    "end": period.end.strftime("%H:%M"),
-                    "params": period.params
-                })
-
-        # Determine primary mode
-        active_modes = cast(Any, {p["kind"] for p in active_periods})
-        primary_mode = (
-            controller._select_primary_mode(active_modes)
-            if active_modes else "regular"
-        )
+        # Since scheduling is removed, we just use the current mode
+        primary_mode = controller._current_mode or "regular"
 
         # Get inverter mode data from actual device
         inverter_data = {}
@@ -375,7 +359,6 @@ async def get_status(request: web.Request) -> web.Response:
         status = {
             "running": controller._running,
             "current_mode": primary_mode,
-            "active_periods": active_periods,
             "season_mode": controller._season_mode,
             "season_mode_updated": (
                 controller._season_mode_updated.isoformat()
@@ -400,10 +383,10 @@ async def get_status(request: web.Request) -> web.Response:
 
 
 async def get_schedule(request: web.Request) -> web.Response:
-    """Get current schedule.
+    """Get current schedule (deprecated - scheduling system removed).
 
     Returns:
-        JSON with scheduled periods and their parameters.
+        JSON indicating scheduling is no longer used.
     """
     controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
     if not controller:
@@ -411,45 +394,13 @@ async def get_schedule(request: web.Request) -> web.Response:
             {"error": "Controller not initialized"}, status=503
         )
 
-    try:
-        # Convert periods to JSON-serializable format
-        schedule: List[Dict[str, Any]] = []
-        for period in controller._scheduled_periods:
-            schedule.append({
-                "kind": period.kind,
-                "start": period.start.strftime("%H:%M"),
-                "end": period.end.strftime("%H:%M"),
-                "params": period.params or {}
-            })
-
-        # Sort by start time
-        schedule.sort(key=lambda x: str(x["start"]))
-
-        # Find currently active period
-        now_t = controller._get_local_now().time()
-        active = None
-        for item in schedule:
-            start = datetime.strptime(str(item["start"]), "%H:%M").time()
-            end = datetime.strptime(str(item["end"]), "%H:%M").time()
-
-            # Handle midnight wrap
-            if start <= end:
-                if start <= now_t <= end:
-                    active = item
-                    break
-            else:
-                if now_t >= start or now_t <= end:
-                    active = item
-                    break
-
-        return web.json_response({
-            "schedule": schedule,
-            "active_now": active,
-            "total_periods": len(schedule)
-        })
-
-    except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
+    # Scheduling system has been removed in favor of real-time evaluation
+    return web.json_response({
+        "message": "Scheduling system deprecated - using real-time evaluation",
+        "schedule": [],
+        "active_now": None,
+        "total_periods": 0
+    })
 
 
 async def get_prices(request: web.Request) -> web.Response:
@@ -510,7 +461,7 @@ async def get_prices(request: web.Request) -> web.Response:
             "average_today_czk_kwh": to_czk_kwh(avg_price_eur),
             "min_price_czk_kwh": to_czk_kwh(min_price_eur),
             "max_price_czk_kwh": to_czk_kwh(max_price_eur),
-            "export_threshold_czk_kwh": controller.config.export_price_threshold,
+            "export_threshold_czk_kwh": controller.config.export_price_min,
             "eur_czk_rate": eur_czk_rate,
             "eur_czk_rate_updated": (
                 controller._eur_czk_rate_updated.isoformat()
@@ -727,26 +678,21 @@ async def get_config(request: web.Request) -> web.Response:
             "battery_capacity": getattr(
                 controller.config, "battery_capacity", None
             ),
-            "max_charge_power": getattr(
-                controller.config, "max_charge_power", None
-            ),
             "min_soc": getattr(controller.config, "min_soc", None),
             "max_soc": getattr(controller.config, "max_soc", None),
-            "export_price_threshold": (
-                controller.config.export_price_threshold
-            ),
+            "discharge_min_soc": getattr(controller.config, "discharge_min_soc", None),
+            "battery_efficiency": getattr(controller.config, "battery_efficiency", 0.85),
+            "discharge_power_rate": getattr(controller.config, "discharge_power_rate", 25),
+            "charge_price_max": getattr(controller.config, "charge_price_max", 1.5),
+            "export_price_min": getattr(controller.config, "export_price_min", 1.0),
+            "discharge_price_min": getattr(controller.config, "discharge_price_min", 3.0),
+            "discharge_profit_margin": getattr(controller.config, "discharge_profit_margin", 1.5),
             "battery_charge_hours": (
                 controller.config.battery_charge_hours
-            ),
-            "individual_cheapest_hours": (
-                controller.config.individual_cheapest_hours
             ),
             "summer_temp_threshold": controller._optional_config.get(
                 "summer_temp_threshold", 15.0
             ) if hasattr(controller, '_optional_config') else 15.0,
-            "summer_price_threshold": (
-                controller.config.summer_price_threshold
-            ),
             "temperature_avg_days": controller._optional_config.get(
                 "temperature_avg_days", 3
             ) if hasattr(controller, '_optional_config') else 3,
@@ -755,10 +701,7 @@ async def get_config(request: web.Request) -> web.Response:
             ) if hasattr(controller, '_optional_config') else 25.0,
             "simulation_mode": controller._optional_config.get(
                 "simulation_mode", False
-            ) if hasattr(controller, '_optional_config') else False,
-            "device_serial": controller.config.device_serial,
-            "schedule_hour": controller.config.schedule_hour,
-            "schedule_minute": controller.config.schedule_minute
+            ) if hasattr(controller, '_optional_config') else False
         }
 
         return web.json_response(config)

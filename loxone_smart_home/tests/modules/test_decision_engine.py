@@ -310,9 +310,11 @@ def test_price_based_charging_decision(
             ("05:00", "06:00"): 70.0,
         },
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=120.0,
-            charge_efficiency=0.87
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=3.0,  # 120.0 EUR/MWh
+            discharge_price_min=6.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.87
         )
     )
 
@@ -342,12 +344,11 @@ def test_price_based_discharge_decision(
         current_price=150.0,  # 3.75 CZK/kWh
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0,
-            charge_efficiency=0.87,
-            min_profit_margin=1.2,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.2,
+            battery_efficiency=0.87
         ),
         price_ranking=PriceRankingData(
             current_rank=2,
@@ -389,10 +390,11 @@ def test_low_battery_prevents_discharge(
         current_price=150.0,  # High price
         hourly_prices={("18:00", "19:00"): 150.0},
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
@@ -415,8 +417,11 @@ def test_full_battery_prevents_charging(
         current_price=50.0,  # Very cheap
         hourly_prices={("03:00", "04:00"): 50.0},
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            discharge_price_min=3.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
@@ -444,13 +449,16 @@ def test_export_enabled_above_threshold(
         is_summer_mode=True,
         current_price=50.0,  # Above export threshold but below cheap threshold
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0  # Export above 40 EUR/MWh
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            discharge_price_min=3.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
     decision = decision_engine.decide(context)
-    explanation = decision_engine.explain_decision()
+    decision_engine.explain_decision()
 
     # Should choose regular mode (export is handled separately)
     assert decision == "regular"  # Regular mode (export handled separately)
@@ -470,13 +478,16 @@ def test_low_price_export_disabled(
         current_time=datetime(2024, 1, 1, 12, 0),
         current_price=30.0,  # Below export threshold
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0  # Export above 40 EUR/MWh
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            discharge_price_min=3.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
     decision = decision_engine.decide(context)
-    explanation = decision_engine.explain_decision()
+    decision_engine.explain_decision()
 
     # Should choose regular mode (export is handled separately)
     assert decision == "regular"  # Export is now always price-based
@@ -495,8 +506,11 @@ def test_price_validation_invalid_data(
         current_price=-50.0,  # Invalid negative price
         hourly_prices={("03:00", "04:00"): -50.0},
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=120.0
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            discharge_price_min=3.5,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
@@ -523,8 +537,11 @@ def test_time_range_overnight(
             ("03:00", "04:00"): 60.0,
         },
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=120.0
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            discharge_price_min=3.5,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
@@ -548,10 +565,11 @@ def test_profit_margin_calculation(
             ("18:00", "19:00"): 125.0,  # Current price
         },
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=120.0,
-            charge_efficiency=0.87,
-            min_profit_margin=1.5  # High margin requirement
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            discharge_price_min=3.5,
+            discharge_profit_margin=1.5,  # High margin requirement
+            battery_efficiency=0.87
         )
     )
 
@@ -592,8 +610,11 @@ def test_consecutive_cheap_hours_grouping(
             ("06:00", "07:00"): 60.0,  # New cheap period
         },
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=120.0
+            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
+            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            discharge_price_min=3.5,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         )
     )
 
@@ -744,9 +765,11 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
         current_price=40.0,
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=50.0,  # Would not charge with absolute threshold
-            export_threshold=40.0,
-            charge_percentile_threshold=25.0  # Should charge with percentile
+            charge_price_max=1.2,  # 50.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=price_ranking
     )
@@ -790,17 +813,17 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
         current_price=30.0,  # Below threshold
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=20.0,  # Set lower to avoid charge decision
-            export_threshold=40.0,  # 40 EUR/MWh = 1 CZK/kWh
-            charge_percentile_threshold=25.0,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=0.5,  # 20.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=price_ranking
     )
 
     decision = decision_engine.decide(context)
-    explanation = decision_engine.explain_decision()
+    decision_engine.explain_decision()
 
     # Should choose regular mode (export is handled separately)
     assert decision == "regular"  # Export is now always price-based
@@ -811,7 +834,7 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
     context.current_time = datetime(2024, 1, 1, 2, 30)
 
     decision = decision_engine.decide(context)
-    explanation = decision_engine.explain_decision()
+    decision_engine.explain_decision()
 
     # Should choose regular mode (export is handled separately)
     assert decision == "regular"
@@ -853,12 +876,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         current_price=20.0,
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=30.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=40.0,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0,
-            winter_cheapest_hours=2  # Charge only during 2 cheapest hours
+            charge_price_max=0.8,  # 30.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=price_ranking,
         is_summer_mode=False  # Winter mode
@@ -878,12 +900,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         current_price=35.0,
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=30.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=40.0,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0,
-            winter_cheapest_hours=2
+            charge_price_max=0.8,  # 30.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=3,
@@ -918,12 +939,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         current_price=20.0,  # Cheapest price
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=30.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=100.0,  # Even with 100% threshold
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0,
-            winter_cheapest_hours=2
+            charge_price_max=0.8,  # 30.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=1,  # Cheapest hour
@@ -957,12 +977,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         current_price=40.0,  # At threshold
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=30.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=40.0,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0,
-            winter_cheapest_hours=2
+            charge_price_max=0.8,  # 30.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
@@ -1026,12 +1045,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         current_price=120.0,  # 3.0 CZK/kWh
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,  # 2.0 CZK/kWh
-            export_threshold=40.0,  # 1.0 CZK/kWh
-            charge_percentile_threshold=25.0,
-            winter_cheapest_hours=2,
-            discharge_min_price_czk=2.0,  # Minimum 2.0 CZK/kWh
-            discharge_price_multiplier=3.0  # Must be 3x daily min
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=price_ranking
     )
@@ -1053,12 +1071,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         current_price=80.0,  # 2.0 CZK/kWh
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=25.0,
-            winter_cheapest_hours=2,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
@@ -1091,12 +1108,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         current_price=40.0,  # 1.0 CZK/kWh
         hourly_prices=hourly_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=25.0,
-            winter_cheapest_hours=2,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=3,
@@ -1116,8 +1132,8 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     )
 
     decision = decision_engine.decide(context)
-    # Should NOT discharge because 1.0 < 2.0 min threshold
-    assert decision == "regular"  # Just export at 1.0 CZK/kWh
+    # Should charge because 1.0 < 2.0 charge threshold
+    assert decision == "charge_from_grid"  # Charge at low price
 
     # Test 4: Flat price day - should NOT discharge even at high prices
     flat_prices = {
@@ -1135,12 +1151,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         current_price=88.0,  # 2.2 CZK/kWh
         hourly_prices=flat_prices,
         price_thresholds=PriceThresholds(
-            cheap_threshold=80.0,
-            export_threshold=40.0,
-            charge_percentile_threshold=25.0,
-            winter_cheapest_hours=2,
-            discharge_min_price_czk=2.0,
-            discharge_price_multiplier=3.0
+            charge_price_max=2.0,  # 80.0 EUR/MWh
+            export_price_min=1.0,  # 40.0 EUR/MWh
+            discharge_price_min=2.0,
+            discharge_profit_margin=1.5,
+            battery_efficiency=0.85
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
