@@ -25,7 +25,7 @@ class ModeManager:
         self.logger = controller.logger
         self.mqtt_client = controller.mqtt_client
         self.config = controller.config
-        self._optional_config = controller._optional_config
+        self._optional_config: Dict[str, Any] = controller._optional_config
         self._local_tz = controller._local_tz
         self._last_applied = controller._last_applied
 
@@ -63,6 +63,88 @@ class ModeManager:
         assert isinstance(result, dict)
         return result
 
+    async def _execute_command_with_retry(
+        self,
+        topic: str,
+        payload: Dict[str, Any],
+        command_type: str,
+        command_description: str
+    ) -> tuple[bool, Optional[Dict[str, Any]]]:
+        """Execute MQTT command with retry logic on failure.
+
+        Args:
+            topic: MQTT topic to publish to
+            payload: Command payload to send
+            command_type: Type of command for result matching (e.g., "batteryfirst/set/timeslot")
+            command_description: Human-readable description for logging
+
+        Returns:
+            Tuple of (success, result_data)
+        """
+        if self._optional_config.get("simulation_mode", False):
+            self.logger.info(f"[SIMULATE] {command_description}")
+            return (True, {"success": True, "message": "Simulated"})
+
+        assert self.mqtt_client is not None
+        retry_count = self.config.command_retry_count
+        retry_delay = self.config.command_retry_delay
+
+        for attempt in range(1, retry_count + 1):
+            # Log the attempt
+            if attempt > 1:
+                self.logger.info(
+                    f"🔄 Retry attempt {attempt}/{retry_count} for {command_description}"
+                )
+            else:
+                self.logger.info(
+                    f"📤 Sending {command_description}: topic={topic}, "
+                    f"payload={json.dumps(payload)}"
+                )
+
+            # Send the command
+            await self.mqtt_client.publish(topic, json.dumps(payload))
+
+            # Wait for result with configured timeout
+            result = await self.controller._wait_for_command_result(
+                command_type, timeout=self.config.command_timeout
+            )
+
+            if result and result.get("success", False):
+                # Success!
+                if attempt > 1:
+                    self.logger.info(
+                        f"✅ {command_description} succeeded on attempt {attempt}"
+                    )
+                return (True, result)
+
+            # Command failed
+            error_msg = result.get("message", "Unknown error") if result else "Timeout"
+
+            if attempt < retry_count:
+                # Will retry
+                self.logger.warning(
+                    f"⚠️ {command_description} failed "
+                    f"(attempt {attempt}/{retry_count}): {error_msg}"
+                )
+                if result:
+                    self.logger.debug(f"Failed response: {json.dumps(result, indent=2)}")
+
+                # Wait before retry with exponential backoff
+                wait_time = retry_delay * (2 ** (attempt - 1))
+                self.logger.debug(f"Waiting {wait_time:.1f}s before retry...")
+                await asyncio.sleep(wait_time)
+            else:
+                # Final failure
+                self.logger.error(
+                    f"❌ {command_description} FAILED after {retry_count} attempts: {error_msg}"
+                )
+                if result:
+                    self.logger.error(f"📋 Final error response: {json.dumps(result, indent=2)}")
+                return (False, result)
+
+        # Should never reach here, but just in case
+        return (False, None)
+
     async def ensure_exclusive(self, primary: str) -> None:
         """Ensure modes are mutually exclusive at the device level.
 
@@ -71,9 +153,9 @@ class ModeManager:
         self.logger.info(f"🔄 Ensuring exclusive mode for {primary}, resetting other modes...")
 
         await self.disable_battery_first()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(self.config.command_delay)
         await self.disable_grid_first()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(self.config.command_delay)
 
         self.logger.debug(f"Reset to load-first mode before applying {primary}")
 
@@ -156,15 +238,31 @@ class ModeManager:
             stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
             stopsoc_payload = {"value": stop_soc}
             self.logger.debug(f"Setting battery-first stopSOC to {stop_soc}%")
-            await self.mqtt_client.publish(stopsoc_topic, json.dumps(stopsoc_payload))
-            await asyncio.sleep(0.5)
+            success, _ = await self._execute_command_with_retry(
+                stopsoc_topic,
+                stopsoc_payload,
+                "batteryfirst/set/stopsoc",
+                f"battery-first stopSOC set to {stop_soc}%"
+            )
+            if not success:
+                self.logger.error("Failed to set battery-first stopSOC, aborting mode change")
+                return
+            await asyncio.sleep(self.config.command_delay)
 
         if power_rate != 100:
             powerrate_topic = "energy/solar/command/batteryfirst/set/powerrate"
             powerrate_payload = {"value": power_rate}
             self.logger.debug(f"Setting battery-first powerRate to {power_rate}%")
-            await self.mqtt_client.publish(powerrate_topic, json.dumps(powerrate_payload))
-            await asyncio.sleep(0.5)
+            success, _ = await self._execute_command_with_retry(
+                powerrate_topic,
+                powerrate_payload,
+                "batteryfirst/set/powerrate",
+                f"battery-first powerRate set to {power_rate}%"
+            )
+            if not success:
+                self.logger.error("Failed to set battery-first powerRate, aborting mode change")
+                return
+            await asyncio.sleep(self.config.command_delay)
 
         # Use slot 1
         start_dev = self._to_device_hhmm(adjusted_start)
@@ -178,19 +276,17 @@ class ModeManager:
         )
 
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
-        self.logger.info(
-            f"📤 Sending battery-first SET command: topic={self.config.battery_first_topic}, "
-            f"payload={json.dumps(payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.battery_first_topic,
+            payload,
+            "batteryfirst/set/timeslot",
+            f"battery-first mode set for {adjusted_start}-{adjusted_stop}"
         )
-        await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-
-        result = await self._wait_for_command_result("batteryfirst/set/timeslot")
-        if result and not result.get("success", False):
+        if not success:
             self.logger.error(
-                f"⚠️ Battery-first command FAILED! "
-                f"Message: {result.get('message', 'Unknown error')}"
+                "⚠️ Battery-first mode NOT activated. Inverter may still be in previous mode. "
+                "Check inverter display or query current state."
             )
-            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
             return
 
         self._battery_first_slots[1] = {
@@ -210,7 +306,7 @@ class ModeManager:
         )
         self._last_applied["battery_first"] = sig
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(self.config.command_delay)
         state = await self._query_inverter_state()
         self.logger.info("📋 Inverter state after battery-first command:")
         if state.get("battery_first"):
@@ -232,18 +328,16 @@ class ModeManager:
 
         payload = {"value": 1 if enabled else 0}
         assert self.mqtt_client is not None
-        self.logger.info(
-            f"📤 Sending AC charge command: topic={self.config.ac_charge_topic}, "
-            f"payload={json.dumps(payload)}"
+        state_text = "ENABLED" if enabled else "DISABLED"
+        success, _ = await self._execute_command_with_retry(
+            self.config.ac_charge_topic,
+            payload,
+            "batteryfirst/set/acchargeenabled",
+            f"AC charge {state_text}"
         )
-        await self.mqtt_client.publish(self.config.ac_charge_topic, json.dumps(payload))
-
-        result = await self._wait_for_command_result("batteryfirst/set/acchargeenabled")
-        if result and not result.get("success", False):
-            self.logger.error(
-                f"⚠️ AC charge command failed! Message: {result.get('message', 'Unknown error')}"
-            )
-            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+        if not success:
+            self.logger.error(f"Failed to set AC charge to {state_text}")
+            # Continue anyway, not critical
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         state = "ENABLED" if enabled else "DISABLED"
@@ -276,19 +370,15 @@ class ModeManager:
             "🔍 DEBUG disable battery-first payload: start='00:00', stop='00:00', "
             "enabled=False, slot=1"
         )
-        self.logger.info(
-            f"📤 Disabling battery-first: topic={self.config.battery_first_topic}, "
-            f"payload={json.dumps(payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.battery_first_topic,
+            payload,
+            "batteryfirst/set/timeslot",
+            "disable battery-first mode"
         )
-        await self.mqtt_client.publish(self.config.battery_first_topic, json.dumps(payload))
-
-        result = await self._wait_for_command_result("batteryfirst/set/timeslot")
-        if result and not result.get("success", False):
-            self.logger.error(
-                f"⚠️ Failed to disable battery-first! "
-                f"Message: {result.get('message', 'Unknown error')}"
-            )
-            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+        if not success:
+            self.logger.error("Failed to disable battery-first mode")
+            # Continue anyway to update state
 
         self._battery_first_slots[1] = {
             "enabled": False,
@@ -325,35 +415,29 @@ class ModeManager:
 
         if enabled:
             topic = self.config.export_enable_topic
-            self.logger.info(
-                f"📤 Sending export enable: topic={topic}, payload={json.dumps(payload)}"
+            success, _ = await self._execute_command_with_retry(
+                topic,
+                payload,
+                "export/enable",
+                "export enable"
             )
-            await self.mqtt_client.publish(topic, json.dumps(payload))
-
-            # Wait for result
-            result = await self._wait_for_command_result("export/enable")
-            if result and not result.get("success", False):
-                self.logger.error(
-                    f"⚠️ Export enable failed! Message: {result.get('message', 'Unknown error')}"
-                )
-                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+            if not success:
+                self.logger.error("Failed to enable export")
+                # Continue anyway to update state
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {topic}")
         else:
             topic = self.config.export_disable_topic
-            self.logger.info(
-                f"📤 Sending export disable: topic={topic}, payload={json.dumps(payload)}"
+            success, _ = await self._execute_command_with_retry(
+                topic,
+                payload,
+                "export/disable",
+                "export disable"
             )
-            await self.mqtt_client.publish(topic, json.dumps(payload))
-
-            # Wait for result
-            result = await self._wait_for_command_result("export/disable")
-            if result and not result.get("success", False):
-                self.logger.error(
-                    f"⚠️ Export disable failed! Message: {result.get('message', 'Unknown error')}"
-                )
-                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+            if not success:
+                self.logger.error("Failed to disable export")
+                # Continue anyway to update state
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {topic}")
@@ -424,31 +508,35 @@ class ModeManager:
         self.logger.debug(f"Setting grid-first stopSOC to {stop_soc}%")
         # DEBUG
         self.logger.warning(f"🔍 DEBUG grid-first stopSOC payload: value={stop_soc}")
-        self.logger.info(
-            f"📤 Sending grid-first stopSOC: topic={self.config.grid_first_stopsoc_topic}, "
-            f"payload={json.dumps(stopsoc_payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.grid_first_stopsoc_topic,
+            stopsoc_payload,
+            "gridfirst/set/stopsoc",
+            f"grid-first stopSOC set to {stop_soc}%"
         )
-        await self.mqtt_client.publish(
-            self.config.grid_first_stopsoc_topic, json.dumps(stopsoc_payload)
-        )
+        if not success:
+            self.logger.error("Failed to set grid-first stopSOC, aborting mode change")
+            return
 
-        # Small delay between commands
-        await asyncio.sleep(0.5)
+        # Delay between commands
+        await asyncio.sleep(self.config.command_delay)
 
         powerrate_payload = {"value": power_rate}
         self.logger.debug(f"Setting grid-first powerRate to {power_rate}%")
         # DEBUG
         self.logger.warning(f"🔍 DEBUG grid-first powerRate payload: value={power_rate}")
-        self.logger.info(
-            f"📤 Sending grid-first powerRate: topic={self.config.grid_first_powerrate_topic}, "
-            f"payload={json.dumps(powerrate_payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.grid_first_powerrate_topic,
+            powerrate_payload,
+            "gridfirst/set/powerrate",
+            f"grid-first powerRate set to {power_rate}%"
         )
-        await self.mqtt_client.publish(
-            self.config.grid_first_powerrate_topic, json.dumps(powerrate_payload)
-        )
+        if not success:
+            self.logger.error("Failed to set grid-first powerRate, aborting mode change")
+            return
 
-        # Small delay before enabling the mode
-        await asyncio.sleep(0.5)
+        # Delay before enabling the mode
+        await asyncio.sleep(self.config.command_delay)
 
         # Finally set the time slot to enable the mode
         # IMPORTANT: Both battery-first and grid-first MUST use slot 1!
@@ -469,19 +557,13 @@ class ModeManager:
         )
 
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
-        self.logger.info(
-            f"📤 Sending grid-first SET command: topic={self.config.grid_first_topic}, "
-            f"payload={json.dumps(timeslot_payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.grid_first_topic,
+            timeslot_payload,
+            "gridfirst/set/timeslot",
+            f"grid-first mode set for {adjusted_start}-{adjusted_stop}"
         )
-        await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(timeslot_payload))
-
-        result = await self._wait_for_command_result("gridfirst/set/timeslot")
-        if result and not result.get("success", False):
-            self.logger.error(
-                f"❌ Grid-first command FAILED! "
-                f"Message: {result.get('message', 'Unknown error')}"
-            )
-            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+        if not success:
             self.logger.error(
                 "⚠️ Grid-first mode NOT activated. Inverter may still be in previous mode. "
                 "Check inverter display or query current state."
@@ -498,7 +580,7 @@ class ModeManager:
         )
         self._last_applied["grid_first"] = sig
 
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(self.config.command_delay)
         state = await self._query_inverter_state()
         self.logger.info("📋 Inverter state after grid-first command:")
         if state.get("battery_first"):
@@ -520,19 +602,15 @@ class ModeManager:
             "🔍 DEBUG disable grid-first payload: start='00:00', stop='00:00', "
             "enabled=False, slot=1"
         )
-        self.logger.info(
-            f"📤 Disabling grid-first: topic={self.config.grid_first_topic}, "
-            f"payload={json.dumps(payload)}"
+        success, _ = await self._execute_command_with_retry(
+            self.config.grid_first_topic,
+            payload,
+            "gridfirst/set/timeslot",
+            "disable grid-first mode"
         )
-        await self.mqtt_client.publish(self.config.grid_first_topic, json.dumps(payload))
-
-        result = await self._wait_for_command_result("gridfirst/set/timeslot")
-        if result and not result.get("success", False):
-            self.logger.error(
-                f"⚠️ Failed to disable grid-first! "
-                f"Message: {result.get('message', 'Unknown error')}"
-            )
-            self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+        if not success:
+            self.logger.error("Failed to disable grid-first mode")
+            # Continue anyway to update state
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -564,30 +642,24 @@ class ModeManager:
 
         # Disable battery-first and grid-first to achieve load-first
         await self.disable_battery_first()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(self.config.command_delay)
         await self.disable_grid_first()
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(self.config.command_delay)
 
         # Set the stop SOC for load-first mode
         if hasattr(self.config, 'load_first_stopsoc_topic'):
             stopsoc_payload = {"value": stop_soc}
             self.logger.debug(f"Setting load-first stopSOC to {stop_soc}%")
-            self.logger.info(
-                f"📤 Sending load-first stopSOC: topic={self.config.load_first_stopsoc_topic}, "
-                f"payload={json.dumps(stopsoc_payload)}"
-            )
             assert self.mqtt_client is not None
-            await self.mqtt_client.publish(
-                self.config.load_first_stopsoc_topic, json.dumps(stopsoc_payload)
+            success, _ = await self._execute_command_with_retry(
+                self.config.load_first_stopsoc_topic,
+                stopsoc_payload,
+                "loadfirst/set/stopsoc",
+                f"load-first stopSOC set to {stop_soc}%"
             )
-
-            result = await self._wait_for_command_result("loadfirst/set/stopsoc")
-            if result and not result.get("success", False):
-                self.logger.error(
-                    f"⚠️ Load-first stopSOC command failed! "
-                    f"Message: {result.get('message', 'Unknown error')}"
-                )
-                self.logger.error(f"📋 Full response: {json.dumps(result, indent=2)}")
+            if not success:
+                self.logger.error("Failed to set load-first stopSOC")
+                # Continue anyway, not critical
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(

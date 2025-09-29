@@ -201,6 +201,24 @@ class GrowattConfig(BaseModel):
         description="Discharge to grid when price is in top X% of daily prices"
     )
 
+    # Command control parameters
+    command_delay: float = Field(
+        default=1.0, ge=0.1, le=10.0,
+        description="Delay between inverter commands in seconds"
+    )
+    command_retry_count: int = Field(
+        default=3, ge=1, le=10,
+        description="Maximum number of retry attempts for failed commands"
+    )
+    command_retry_delay: float = Field(
+        default=2.0, ge=0.5, le=30.0,
+        description="Initial delay between command retries in seconds (exponential backoff)"
+    )
+    command_timeout: float = Field(
+        default=5.0, ge=1.0, le=30.0,
+        description="Timeout for waiting for command results in seconds"
+    )
+
     # MQTT topics for Growatt control
     battery_first_topic: str = "energy/solar/command/batteryfirst/set/timeslot"
     ac_charge_topic: str = "energy/solar/command/batteryfirst/set/acchargeenabled"

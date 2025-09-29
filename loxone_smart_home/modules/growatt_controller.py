@@ -37,6 +37,7 @@ class GrowattController(BaseModule):
     _manual_override_period: Optional[Period]
     _manual_override_end_time: Optional[datetime]
     _manual_override_source: str
+    _optional_config: Dict[str, Any]
 
     def _select_primary_mode(self, modes: set[PeriodType]) -> PeriodType:
         """Select primary mode from active modes.
@@ -1335,11 +1336,16 @@ class GrowattController(BaseModule):
             charge_percentile_threshold=getattr(
                 self.config, 'charge_percentile_threshold', 25.0
             ),
-            export_percentile_threshold=getattr(
-                self.config, 'export_percentile_threshold', 60.0
+            # Winter mode settings
+            winter_cheapest_hours=getattr(
+                self.config, 'battery_charge_hours', 2
             ),
-            discharge_percentile_threshold=getattr(
-                self.config, 'discharge_percentile_threshold', 90.0
+            # Smart discharge control
+            discharge_min_price_czk=getattr(
+                self.config, 'discharge_min_price_czk', 2.0
+            ),
+            discharge_price_multiplier=getattr(
+                self.config, 'discharge_price_multiplier', 3.0
             )
         )
 
