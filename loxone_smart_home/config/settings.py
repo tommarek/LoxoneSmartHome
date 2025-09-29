@@ -143,8 +143,16 @@ class OTEConfig(BaseModel):
     eur_czk_rate: float = Field(default=25.0, gt=0)
 
 
-class GrowattConfig(BaseModel):
+class GrowattConfig(BaseSettings):
     """Growatt controller configuration."""
+
+    model_config = SettingsConfigDict(
+        env_prefix="GROWATT_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+        extra="ignore",
+    )
 
     # API endpoints
     ote_dam_url: str = (
@@ -181,8 +189,8 @@ class GrowattConfig(BaseModel):
         description="Discharge battery to grid when price above this (CZK/kWh)"
     )
     discharge_profit_margin: float = Field(
-        default=1.5, ge=1.0,
-        description="Required profit margin over charge cost (1.5 = 50% profit)"
+        default=4.0, ge=1.0,
+        description="Required multiplier over cheapest hour (4.0 = sell at 4× cheapest price)"
     )
 
     # Scheduling
@@ -287,8 +295,6 @@ class Settings(BaseSettings):
     openweathermap_api_key: Optional[str] = None
     weather_service: str = Field(default="openmeteo", alias="USE_SERVICE")
 
-    growatt_simulation_mode: bool = False
-
     # OTE Price Collector settings (optional overrides)
     ote_request_delay: Optional[float] = Field(default=None, ge=0.1)
     ote_error_delay: Optional[float] = Field(default=None, ge=1.0)
@@ -362,9 +368,8 @@ class Settings(BaseSettings):
     @property
     def growatt(self) -> GrowattConfig:
         """Get Growatt configuration."""
-        return GrowattConfig(
-            simulation_mode=self.growatt_simulation_mode,
-        )
+        # GrowattConfig will load from GROWATT_* environment variables automatically
+        return GrowattConfig()
 
     @property
     def ote(self) -> OTEConfig:
