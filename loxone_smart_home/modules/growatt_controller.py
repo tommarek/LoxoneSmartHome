@@ -1587,8 +1587,8 @@ class GrowattController(BaseModule):
                                    Set to False for immediate apply to avoid spillover.
             pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         """
-        st = self._parse_hhmm(start_hhmm)
-        en = self._parse_hhmm(stop_hhmm)
+        st = self._parse_time_any(start_hhmm)
+        en = self._parse_time_any(stop_hhmm)
         if st <= en:
             # If we're aiming at the EOD barrier, never preserve duration on bumps.
             # Otherwise, allow the caller to choose.

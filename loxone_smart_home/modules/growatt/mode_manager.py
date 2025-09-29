@@ -580,13 +580,25 @@ class ModeManager:
         )
         self._last_applied["grid_first"] = sig
 
-        await asyncio.sleep(self.config.command_delay)
-        state = await self._query_inverter_state()
-        self.logger.info("📋 Inverter state after grid-first command:")
-        if state.get("battery_first"):
-            self.logger.info(f"   Battery-first: {state['battery_first']}")
-        if state.get("grid_first"):
-            self.logger.info(f"   Grid-first: {state['grid_first']}")
+        # Give the inverter more time to process grid-first mode changes
+        # as some firmware versions need extra time to update their state
+        await asyncio.sleep(max(self.config.command_delay * 2, 2.0))
+
+        # Query state but don't fail if the query doesn't work immediately
+        # The command has already succeeded, the query is just for logging
+        try:
+            state = await self._query_inverter_state()
+            self.logger.info("📋 Inverter state after grid-first command:")
+            if state.get("battery_first"):
+                self.logger.info(f"   Battery-first: {state['battery_first']}")
+            if state.get("grid_first"):
+                self.logger.info(f"   Grid-first: {state['grid_first']}")
+        except Exception as e:
+            self.logger.debug(f"Could not query state after grid-first command: {e}")
+            self.logger.info(
+                "Note: Grid-first command succeeded, but state query failed. "
+                "This is normal for some firmware versions."
+            )
 
     async def disable_grid_first(self) -> None:
         """Disable grid-first mode."""
