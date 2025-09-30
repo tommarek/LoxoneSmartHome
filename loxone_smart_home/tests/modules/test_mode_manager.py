@@ -69,13 +69,10 @@ async def test_command_retry_on_failure(mode_manager, mock_controller):
     # Verify wait_for_command_result was called 3 times
     assert mock_controller._wait_for_command_result.call_count == 3
 
-    # Verify logger was called for retry attempts
+    # Verify logger was called for successful retries (new quiet logging)
+    # Note: succeeds on 3rd attempt = 2 retries
     assert any(
-        "Retry attempt 2/3" in str(call)
-        for call in mode_manager.logger.info.call_args_list
-    )
-    assert any(
-        "Retry attempt 3/3" in str(call)
+        "succeeded (2 retries)" in str(call)
         for call in mode_manager.logger.info.call_args_list
     )
 
@@ -104,9 +101,9 @@ async def test_command_retry_max_attempts(mode_manager, mock_controller):
     # Verify MQTT was called 3 times (max retry count)
     assert mock_controller.mqtt_client.publish.call_count == 3
 
-    # Verify error was logged
+    # Verify error was logged (new format)
     assert any(
-        "FAILED after 3 attempts" in str(call)
+        "failed after 3 attempts" in str(call)
         for call in mode_manager.logger.error.call_args_list
     )
 
@@ -131,10 +128,10 @@ async def test_command_retry_with_timeout(mode_manager, mock_controller):
     # Verify success after timeout retry
     assert success is True
 
-    # Verify warning was logged for timeout
+    # Verify timeout was logged to debug (new quiet logging)
     assert any(
         "Timeout" in str(call)
-        for call in mode_manager.logger.warning.call_args_list
+        for call in mode_manager.logger.debug.call_args_list
     )
 
 
@@ -159,13 +156,13 @@ async def test_command_exponential_backoff(mode_manager, mock_controller):
 
         assert success is True
 
-        # Verify exponential backoff delays
+        # Verify exponential backoff delays (1.5x multiplier)
         sleep_calls = [call.args[0] for call in mock_sleep.call_args_list]
-        # First retry: 0.5 * 2^0 = 0.5
-        # Second retry: 0.5 * 2^1 = 1.0
+        # First retry: 0.5 * 1.5^0 = 0.5
+        # Second retry: 0.5 * 1.5^1 = 0.75
         assert len(sleep_calls) >= 2
         assert abs(sleep_calls[-2] - 0.5) < 0.01  # First retry delay
-        assert abs(sleep_calls[-1] - 1.0) < 0.01  # Second retry delay (exponential)
+        assert abs(sleep_calls[-1] - 0.75) < 0.01  # Second retry delay (1.5x exponential)
 
 
 @pytest.mark.asyncio

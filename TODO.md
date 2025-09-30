@@ -1,107 +1,61 @@
-# TODO - Loxone Smart Home
+# TODO - LoxoneSmartHome
 
-## ✅ Completed Tasks
+## Smart Battery Optimization - Remaining Tasks
 
-### Async Operation & Resource Management (COMPLETED)
-- [x] Improve async operation and shared resource handling
-  - [x] Ensure thread-safe access to shared MQTT client
-  - [x] Implement connection pooling for InfluxDB client
-  - [x] Add proper async locks for critical sections
-  - [x] Handle concurrent writes from multiple modules (UDP, Weather, Growatt)
-  - [x] Implement retry logic with exponential backoff
-  - [x] Add connection health monitoring
-  
-- [x] Database write optimization
-  - [x] Implement write buffer with batch processing
-  - [x] Configure optimal batch sizes for performance
-  - [x] Add write queue with priority handling
-  - [x] Monitor and log write performance metrics
-  - [x] Handle backpressure when database is slow
+### Performance Monitoring
+- [ ] Add metrics collection for battery cycling patterns
+- [ ] Track actual vs predicted profit from discharge operations
+- [ ] Monitor command success rate after retry improvements
+- [ ] Analyze clock drift patterns over time
 
-### Logging Improvements (COMPLETED)
-- [x] Show timestamps in local timezone (Europe/Prague) instead of UTC
-  - [x] Update all logger formatters to use local timezone
-  - [x] Make timezone configurable via settings
-  - [x] Ensure consistency across all modules
-  
-- [x] Define service names for better log identification
-  - [x] Add service prefix to all log messages (e.g., [UDP], [MQTT], [WEATHER], [GROWATT])
-  - [x] Use consistent service naming convention
-  - [x] Make it easy to filter logs by service
+### Future Enhancements
 
-### Code Quality (COMPLETED)
-- [x] Fix all linting issues (line length violations and whitespace)
-- [x] Fix async operation logging errors during test cleanup
-- [x] Ensure all tests pass (76/76)
+#### Advanced Battery Management
+- [ ] Implement weather-based charging predictions (solar forecast integration)
+- [ ] Add machine learning for consumption pattern prediction
+- [ ] Dynamic profit margin adjustment based on historical success
+- [ ] Multi-day optimization for extreme price events
 
-## 📋 Remaining Tasks
+#### System Resilience
+- [ ] Add health check endpoint for monitoring
+- [ ] Implement circuit breaker pattern for failing commands
+- [ ] Add persistent state storage for recovery after restarts
+- [ ] Create backup configuration profiles
 
-### Loxone Control Integration
-- [ ] Implement ability to control charging/discharging/export from Loxone
-  - [ ] Design MQTT topic structure for Loxone commands
-  - [ ] Add MQTT subscribers for incoming control commands
-  - [ ] Implement override logic for automated scheduling
-  - [ ] Add manual mode vs automatic mode switching
-  - [ ] Handle conflicts between manual commands and price-based automation
-  - [ ] Add status feedback to Loxone (current mode, battery state, etc.)
-  - [ ] Create configuration for control topics and override behavior
-  - [ ] Add comprehensive testing for control logic
-  - [ ] Update documentation with control API
+#### User Experience
+- [ ] Add Grafana dashboard templates for battery optimization metrics
+- [ ] Create mobile-friendly control interface
+- [ ] Implement notification system for exceptional events (high profit opportunities)
+- [ ] Add simulation mode UI for testing strategies
 
-## 🚀 Implementation Summary
+### Code Quality Improvements
+- [ ] Increase test coverage to >90%
+- [ ] Add integration tests for complete charge/discharge cycles
+- [ ] Performance profiling of decision engine
+- [ ] Documentation of optimization strategies
 
-### New Async Clients Created
-- **AsyncInfluxDBClient** - Thread-safe InfluxDB client with:
-  - Connection pooling (5-connection pool)
-  - Batch processing (5000 points, 1s flush interval)
-  - Retry logic with exponential backoff
-  - Performance metrics tracking
-  - Background connection monitoring
+### Configuration Enhancements
+- [ ] Add per-season configuration profiles
+- [ ] Support multiple battery systems
+- [ ] Time-of-use tariff configuration wizard
+- [ ] Export configuration validation tool
 
-- **AsyncMQTTClient** - Thread-safe MQTT client with:
-  - Publish queue for reliability
-  - Automatic reconnection with retry logic
-  - Thread-safe subscriber management
-  - Concurrent callback execution
-  - Connection health monitoring
+## Completed in Current Branch 
+- Fixed linting issues in decision_engine.py
+- Cleaned up configuration duplicates
+- Enhanced MQTT retry mechanism (10 retries, 10s timeout)
+- Reduced retry logging verbosity
+- Added configurable clock drift buffer
+- Implemented transaction-like command execution with rollback
+- Fixed mypy module path conflicts
+- Adjusted discharge parameters for realistic operation
+- Fixed type errors in GrowattController API (state tracking)
+- Fixed type errors in weather_scraper (params type hints)
+- Updated all mode_manager tests for new retry behavior
+- Fixed retry count logging (shows actual retries, not attempts)
 
-### Enhanced Logging System
-- **TimezoneAwareFormatter** - Custom log formatter with:
-  - Local timezone support (Europe/Prague)
-  - Service-specific prefixes ([UDP], [MQTT], [WEATHER], [GROWATT])
-  - Configurable timezone via settings
-  - Consistent formatting across all modules
-
-### Test Coverage
-- All 76 tests passing
-- Fixed mock specifications for new async clients
-- Added proper cleanup for async resources
-- Comprehensive test coverage maintained
-
-## Implementation Notes
-
-### Command Structure (Proposed)
-- `loxone/growatt/charge/enable` - Manual charge enable/disable
-- `loxone/growatt/discharge/enable` - Manual discharge control  
-- `loxone/growatt/export/enable` - Manual export control
-- `loxone/growatt/mode` - Switch between "auto" and "manual" modes
-- `loxone/growatt/status` - Status feedback to Loxone
-
-### Override Logic
-- Manual commands should temporarily override automated scheduling
-- Need timeout mechanism to return to automatic mode
-- Preserve safety limits (battery protection, grid constraints)
-- Log all manual interventions for audit trail
-
-### Safety Considerations
-- Validate all incoming commands
-- Implement rate limiting for control messages
-- Maintain battery protection regardless of control source
-- Add emergency stop functionality
-
-## 📊 Current Status
-- **System Status**: Fully functional with enhanced async operations
-- **Test Coverage**: 76/76 tests passing
-- **Code Quality**: All linting checks pass
-- **Performance**: Optimized with connection pooling and batching
-- **Logging**: Enhanced with timezone awareness and service prefixes
+## Notes
+- Current discharge margin (2.5�) is more realistic than previous (4.0�)
+- Retry mechanism now uses exponential backoff capped at 30s
+- Clock drift buffer is configurable (2-10 minutes)
+- Rollback mechanism ensures consistent inverter state on failures

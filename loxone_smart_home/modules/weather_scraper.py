@@ -4,7 +4,7 @@ import asyncio
 import json
 from collections import namedtuple
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import aiohttp
 
@@ -137,7 +137,7 @@ class WeatherScraper(BaseModule):
         )
 
         url = self.settings.weather.openmeteo_url
-        params = {
+        params: Dict[str, Union[str, float]] = {
             "latitude": self.settings.weather.latitude,
             "longitude": self.settings.weather.longitude,
             "hourly": fields,
@@ -166,7 +166,7 @@ class WeatherScraper(BaseModule):
         # Air quality data
         air_fields = "pm10,pm2_5,ozone,aerosol_optical_depth,uv_index"
         air_url = "https://air-quality-api.open-meteo.com/v1/air-quality"
-        air_params = {
+        air_params: Dict[str, Union[str, float]] = {
             "latitude": self.settings.weather.latitude,
             "longitude": self.settings.weather.longitude,
             "hourly": air_fields,
@@ -281,7 +281,7 @@ class WeatherScraper(BaseModule):
             raise ValueError("OpenWeatherMap API key not configured")
 
         url = self.settings.weather.openweathermap_url
-        params = {
+        params: Dict[str, Union[str, float]] = {
             "lat": self.settings.weather.latitude,
             "lon": self.settings.weather.longitude,
             "exclude": "minutely,daily,alerts",

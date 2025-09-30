@@ -96,15 +96,10 @@ class ModeManager:
         retry_delay = self.config.command_retry_delay
 
         for attempt in range(1, retry_count + 1):
-            # Log the attempt
-            if attempt > 1:
-                self.logger.info(
-                    f"🔄 Retry attempt {attempt}/{retry_count} for {command_description}"
-                )
-            else:
-                self.logger.info(
-                    f"📤 Sending {command_description}: topic={topic}, "
-                    f"payload={json.dumps(payload)}"
+            # Log the initial attempt only
+            if attempt == 1:
+                self.logger.debug(
+                    f"Sending {command_description}: topic={topic}"
                 )
 
             # Send the command
@@ -119,33 +114,32 @@ class ModeManager:
                 # Success!
                 if attempt > 1:
                     self.logger.info(
-                        f"✅ {command_description} succeeded on attempt {attempt}"
+                        f"✅ {command_description} succeeded ({attempt - 1} retries)"
                     )
+                else:
+                    self.logger.debug(f"✅ {command_description} succeeded")
                 return (True, result)
 
-            # Command failed
+            # Command failed - store error for potential final report
             error_msg = result.get("message", "Unknown error") if result else "Timeout"
 
             if attempt < retry_count:
-                # Will retry
-                self.logger.warning(
-                    f"⚠️ {command_description} failed "
-                    f"(attempt {attempt}/{retry_count}): {error_msg}"
+                # Will retry - only log to debug
+                self.logger.debug(
+                    f"Command attempt {attempt} failed: {error_msg}, retrying..."
                 )
-                if result:
-                    self.logger.debug(f"Failed response: {json.dumps(result, indent=2)}")
 
-                # Wait before retry with exponential backoff
-                wait_time = retry_delay * (2 ** (attempt - 1))
-                self.logger.debug(f"Waiting {wait_time:.1f}s before retry...")
+                # Wait before retry with exponential backoff (capped at 30s)
+                wait_time = min(30.0, retry_delay * (1.5 ** (attempt - 1)))
                 await asyncio.sleep(wait_time)
             else:
-                # Final failure
+                # Final failure - single concise error message
                 self.logger.error(
-                    f"❌ {command_description} FAILED after {retry_count} attempts: {error_msg}"
+                    f"❌ {command_description} failed after {retry_count} attempts"
                 )
+                self.logger.debug(f"Final error: {error_msg}")
                 if result:
-                    self.logger.error(f"📋 Final error response: {json.dumps(result, indent=2)}")
+                    self.logger.debug(f"Final response: {json.dumps(result, indent=2)}")
                 return (False, result)
 
         # Should never reach here, but just in case

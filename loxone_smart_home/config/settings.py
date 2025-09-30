@@ -202,7 +202,7 @@ class GrowattConfig(BaseSettings):
         description="Delay between inverter commands in seconds"
     )
     command_retry_count: int = Field(
-        default=3, ge=1, le=10,
+        default=10, ge=1, le=20,
         description="Maximum number of retry attempts for failed commands"
     )
     command_retry_delay: float = Field(
@@ -210,8 +210,12 @@ class GrowattConfig(BaseSettings):
         description="Initial delay between command retries in seconds (exponential backoff)"
     )
     command_timeout: float = Field(
-        default=5.0, ge=1.0, le=30.0,
+        default=10.0, ge=1.0, le=30.0,
         description="Timeout for waiting for command results in seconds"
+    )
+    clock_drift_buffer_minutes: int = Field(
+        default=2, ge=1, le=10,
+        description="Buffer minutes for clock drift compensation in immediate activation"
     )
 
     # MQTT topics for Growatt control

@@ -513,7 +513,8 @@ class GrowattDecisionEngine:
                 f"Discharge profitable: {current_price_czk:.2f} CZK/kWh ≥ "
                 f"{effective_threshold:.2f} CZK/kWh "
                 f"(absolute min: {context.price_thresholds.discharge_price_min:.2f}, "
-                f"cheapest: {cheapest_hour_czk:.2f} × {context.price_thresholds.discharge_profit_margin:.1f} = "
+                f"cheapest: {cheapest_hour_czk:.2f} × "
+                f"{context.price_thresholds.discharge_profit_margin:.1f} = "
                 f"{required_by_margin:.2f})"
             )
             return True
@@ -521,7 +522,8 @@ class GrowattDecisionEngine:
             self.logger.debug(
                 f"No discharge: {current_price_czk:.2f} CZK/kWh < "
                 f"{effective_threshold:.2f} CZK/kWh required "
-                f"(cheapest hour: {cheapest_hour_czk:.2f} × {context.price_thresholds.discharge_profit_margin:.1f})"
+                f"(cheapest hour: {cheapest_hour_czk:.2f} × "
+                f"{context.price_thresholds.discharge_profit_margin:.1f})"
             )
             return False
 

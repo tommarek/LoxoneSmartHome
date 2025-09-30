@@ -792,8 +792,8 @@ class GrowattController(BaseModule):
             #     - Command reaches inverter at ~19:36:45 inverter time
             #     - Inverter needs to wait ~1 minute until its 19:38 → mode activates!
 
-            # Base buffer: 2 minutes for command transmission + processing
-            buffer_minutes = 2
+            # Base buffer for command transmission + processing (configurable)
+            buffer_minutes = self.config.clock_drift_buffer_minutes
 
             # Add extra time if inverter is AHEAD (negative drift)
             # If inverter is ahead, we need MORE buffer time
@@ -1343,6 +1343,33 @@ class GrowattController(BaseModule):
             source="evaluation"
         )
 
+    async def _apply_state_changes_with_rollback(
+        self,
+        old_state: Optional[InverterState],
+        new_state: InverterState
+    ) -> None:
+        """Apply state changes with rollback on failure.
+
+        Args:
+            old_state: Previous state (None for initial)
+            new_state: Desired new state
+
+        Raises:
+            Exception: If state application fails after rollback attempt
+        """
+        try:
+            await self._apply_state_changes(old_state, new_state)
+        except Exception as e:
+            self.logger.error(f"Failed to apply state changes: {e}")
+            if old_state:
+                self.logger.warning("Attempting to rollback to previous state...")
+                try:
+                    await self._apply_state_changes(None, old_state)
+                    self.logger.info("✅ Rollback successful")
+                except Exception as rollback_error:
+                    self.logger.error(f"❌ Rollback failed: {rollback_error}")
+            raise
+
     async def _apply_state_changes(
         self,
         old_state: Optional[InverterState],
@@ -1435,8 +1462,8 @@ class GrowattController(BaseModule):
         else:
             self.logger.info(f"📝 Applying initial state: {mode}")
 
-        # Apply ONLY the changes needed
-        await self._apply_state_changes(self._current_inverter_state, desired_state)
+        # Apply ONLY the changes needed (with rollback on failure)
+        await self._apply_state_changes_with_rollback(self._current_inverter_state, desired_state)
 
         # Update tracking
         self._current_inverter_state = desired_state

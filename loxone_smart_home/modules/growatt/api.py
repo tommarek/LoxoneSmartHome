@@ -364,8 +364,14 @@ async def get_status(request: web.Request) -> web.Response:
                 controller._season_mode_updated.isoformat()
                 if controller._season_mode_updated else None
             ),
-            "ac_enabled": controller._ac_enabled,
-            "export_enabled": controller._export_enabled,
+            "ac_enabled": (
+                controller._current_inverter_state.ac_charge_enabled
+                if controller._current_inverter_state else False
+            ),
+            "export_enabled": (
+                controller._current_inverter_state.export_enabled
+                if controller._current_inverter_state else True
+            ),
             "current_time": now.isoformat(),
             "simulation_mode": controller._optional_config.get(
                 "simulation_mode", False

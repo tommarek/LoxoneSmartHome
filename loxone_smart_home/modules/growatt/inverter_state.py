@@ -90,11 +90,11 @@ class InverterState:
 
         # Any of these changes require sending mode command
         return (
-            self.inverter_mode != other.inverter_mode or
-            self.stop_soc != other.stop_soc or
-            self.power_rate != other.power_rate or
-            self.time_start != other.time_start or
-            self.time_stop != other.time_stop
+            self.inverter_mode != other.inverter_mode
+            or self.stop_soc != other.stop_soc
+            or self.power_rate != other.power_rate
+            or self.time_start != other.time_start
+            or self.time_stop != other.time_stop
         )
 
     def to_dict(self) -> Dict[str, Any]:
