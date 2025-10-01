@@ -6,7 +6,7 @@ import zoneinfo
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Set, Tuple, Union
 
 import aiohttp
 from astral import LocationInfo
@@ -85,7 +85,7 @@ class GrowattController(BaseModule):
             "export_enable_topic",
             "export_disable_topic",
             "export_price_min",
-            "battery_charge_hours",
+            "battery_charge_blocks",
         ]
         missing = [k for k in required if not hasattr(self.config, k)]
         if missing:
@@ -101,19 +101,7 @@ class GrowattController(BaseModule):
             "simulation_mode": getattr(self.config, "simulation_mode", False),
         }
 
-        # Validate battery_charge_hours
-        if hasattr(self.config, "battery_charge_hours"):
-            if not 0 <= self.config.battery_charge_hours <= 24:
-                old_val = self.config.battery_charge_hours
-                self.config.battery_charge_hours = max(
-                    0, min(24, self.config.battery_charge_hours)
-                )
-                self.logger.warning(
-                    f"Invalid battery_charge_hours, clamping to 0-24 "
-                    f"(was {old_val} → now {self.config.battery_charge_hours})"
-                )
-
-        # Note: Price thresholds validation not needed as Pydantic Field has gt=0 constraint
+        # Note: All config validation is handled by Pydantic Field constraints
 
     def __init__(
         self,
@@ -172,6 +160,7 @@ class GrowattController(BaseModule):
         self._eur_czk_rate_updated: Optional[datetime] = None
 
         self._current_prices: Dict[Tuple[str, str], float] = {}
+        self._cheapest_charging_blocks: Set[Tuple[str, str]] = set()
         self._prices_date: Optional[str] = None
         self._prices_updated: Optional[datetime] = None
 
@@ -199,6 +188,8 @@ class GrowattController(BaseModule):
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
         self._last_battery_soc: float = 50.0  # Track SOC changes
+        # Track 15-minute block changes
+        self._last_evaluation_block: Optional[Tuple[int, int]] = None
         self._current_load: float = 0.0  # Current home load in kW
         self._solar_power: float = 0.0  # Current solar generation in kW
         self._last_price_fetch: Optional[datetime] = None  # Track price update time
@@ -717,9 +708,13 @@ class GrowattController(BaseModule):
                     self._clock_drift_seconds = 0
                     return True
             else:
+                sync_status = (
+                    'inverter behind' if drift > 0
+                    else 'inverter ahead' if drift < 0
+                    else 'perfect sync'
+                )
                 self.logger.info(
-                    f"⏰ Clock synchronized: {drift:.1f}s skew "
-                    f"({'inverter behind' if drift > 0 else 'inverter ahead' if drift < 0 else 'perfect sync'})"
+                    f"⏰ Clock synchronized: {drift:.1f}s skew ({sync_status})"
                 )
 
             return True
@@ -782,7 +777,7 @@ class GrowattController(BaseModule):
             # so it can cross that time and trigger the mode.
             #
             # Key insight: We must account for clock skew between server and inverter
-            # _clock_drift_seconds = server_time - inverter_time
+            # Clock drift calculation: server_time minus inverter_time
             #   - Positive: inverter is BEHIND server (inverter time < server time)
             #   - Negative: inverter is AHEAD of server (inverter time > server time)
             #
@@ -816,8 +811,9 @@ class GrowattController(BaseModule):
             # Keep the original stop time (should be 23:59 for all-day modes)
             adjusted_stop_dt = stop_dt
 
+            direction = 'behind' if self._clock_drift_seconds > 0 else 'ahead'
             skew_desc = (
-                f"{abs(self._clock_drift_seconds):.1f}s {'behind' if self._clock_drift_seconds > 0 else 'ahead'}"
+                f"{abs(self._clock_drift_seconds):.1f}s {direction}"
                 if self._clock_drift_seconds != 0
                 else "in sync"
             )
@@ -920,26 +916,73 @@ class GrowattController(BaseModule):
         return self._season_mode
 
     async def _log_price_table(
-        self, hourly_prices: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
+        self, prices_15min: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
     ) -> None:
-        """Log hourly prices in a nice table format."""
+        """Log 15-minute interval prices in a compact table format."""
         # Use provided rate for consistency
 
-        self.logger.info(f"Energy prices for {date}:")
-        self.logger.info("┌──────────┬────────────┬──────────────┐")
-        self.logger.info("│   Hour   │ EUR/MWh    │   CZK/kWh    │")
-        self.logger.info("├──────────┼────────────┼──────────────┤")
+        self.logger.info(f"Energy prices for {date} (15-minute intervals):")
 
-        # Sort hours by start time for proper display
-        sorted_hours = sorted(hourly_prices.items(), key=lambda x: x[0][0])
+        # If we have 96 blocks, show in compact 4-column format (one per quarter-hour)
+        if len(prices_15min) >= 90:
+            # Sort blocks by time
+            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
 
-        for (start_hour, end_hour), price_eur_mwh in sorted_hours:
-            price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+            self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
+            self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
+            self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
+
+            # Process 4 blocks at a time (one hour)
+            for hour in range(24):
+                hour_blocks = sorted_blocks[hour * 4:(hour + 1) * 4]
+                if len(hour_blocks) < 4:
+                    break
+
+                # Get prices for each 15-minute block in CZK/kWh
+                prices = []
+                for (start, end), price_eur in hour_blocks:
+                    price_czk = price_eur * eur_czk_rate / 1000
+                    # Mark charging blocks with 🔋
+                    if (start, end) in self._cheapest_charging_blocks:
+                        prices.append(f"{price_czk:5.2f}🔋")
+                    else:
+                        prices.append(f"{price_czk:6.2f} ")
+
+                # Pad if we don't have all 4 blocks
+                while len(prices) < 4:
+                    prices.append("   -   ")
+
+                self.logger.info(
+                    f"│ {hour:02d}:00   │ {prices[0]} │ {prices[1]} │ {prices[2]} │ {prices[3]} │"
+                )
+
+            self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
+
+            # Show summary statistics
+            all_prices = list(prices_15min.values())
+            min_price = min(all_prices) * eur_czk_rate / 1000
+            max_price = max(all_prices) * eur_czk_rate / 1000
+            avg_price = sum(all_prices) / len(all_prices) * eur_czk_rate / 1000
+
             self.logger.info(
-                f"│ {start_hour}-{end_hour} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │"
+                f"Summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
+                f"Avg={avg_price:.3f} CZK/kWh"
             )
+        else:
+            # Fallback for fewer blocks - show as list
+            self.logger.info("┌──────────────┬────────────┬──────────────┐")
+            self.logger.info("│   Period     │ EUR/MWh    │   CZK/kWh    │")
+            self.logger.info("├──────────────┼────────────┼──────────────┤")
 
-        self.logger.info("└──────────┴────────────┴──────────────┘")
+            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
+            for (start, end), price_eur_mwh in sorted_blocks:
+                price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+                period = f"{start}-{end}"
+                self.logger.info(
+                    f"│ {period:12s} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │"
+                )
+
+            self.logger.info("└──────────────┴────────────┴──────────────┘")
 
     async def start(self) -> None:
         """Start the Growatt controller."""
@@ -1122,24 +1165,68 @@ class GrowattController(BaseModule):
             # Determine target date
             target_date = self._get_local_date_string(days_ahead=0)
 
-            # Fetch energy prices from DAM
-            hourly_prices = await self._price_analyzer.fetch_dam_energy_prices(date=target_date)
+            # Fetch energy prices from DAM (now returns 15-minute intervals)
+            prices_15min = await self._price_analyzer.fetch_dam_energy_prices(date=target_date)
 
-            if not hourly_prices:
+            if not prices_15min:
                 self.logger.warning("Failed to retrieve energy prices, using mock prices")
-                hourly_prices = self._price_analyzer.generate_mock_prices(target_date)
+                prices_15min = self._price_analyzer.generate_mock_prices(target_date)
 
-            if hourly_prices:
-                # Store prices in cache
-                self._current_prices = hourly_prices
+            if prices_15min:
+                # Store prices in cache (now 15-minute intervals)
+                self._current_prices = prices_15min
                 self._prices_date = target_date
                 self._prices_updated = datetime.now()
 
                 # Get exchange rate
                 self._eur_czk_rate = await self._get_eur_czk_rate()
 
-                # Log price table
-                await self._log_price_table(hourly_prices, target_date, self._eur_czk_rate or 25.0)
+                # Log price table (now shows 15-minute intervals)
+                await self._log_price_table(prices_15min, target_date, self._eur_czk_rate or 25.0)
+
+                # Find cheapest blocks for charging (non-consecutive)
+                charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
+                charging_schedule, avg_price = self._price_analyzer.get_charging_schedule(
+                    prices_15min, num_blocks=charge_blocks
+                )
+
+                if charging_schedule:
+                    # Store cheapest blocks as a set for fast lookup
+                    self._cheapest_charging_blocks = set(
+                        (block[0], block[1]) for block in charging_schedule
+                    )
+
+                    avg_czk = avg_price * (self._eur_czk_rate or 25.0) / 1000
+                    # 15 minutes = 0.25 hours
+                    charge_duration_hours = charge_blocks * 0.25
+
+                    # Log charging schedule
+                    self.logger.info("=" * 50)
+                    self.logger.info(
+                        f"🔋 CHARGING SCHEDULE "
+                        f"({charge_blocks} blocks = {charge_duration_hours:.1f} hours)"
+                    )
+                    self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
+                    self.logger.info("   Charging blocks:")
+
+                    for start, end, price_eur in charging_schedule:
+                        rate = self._eur_czk_rate or 25.0
+                        price_czk = price_eur * rate / 1000
+                        self.logger.info(
+                            f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
+                        )
+
+                    # Calculate savings vs peak
+                    all_prices = list(prices_15min.values())
+                    max_price = max(all_prices) if all_prices else avg_price
+                    savings_pct = (
+                        ((max_price - avg_price) / max_price * 100)
+                        if max_price > 0 else 0
+                    )
+                    self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
+                    self.logger.info("=" * 50)
+                else:
+                    self._cheapest_charging_blocks = set()
 
                 # Trigger re-evaluation with new prices
                 await self._on_price_update()
@@ -1211,12 +1298,24 @@ class GrowattController(BaseModule):
             DecisionContext with current system state and price data
         """
         now = self._get_local_now()
-        current_hour = now.strftime("%H:00")
-        next_hour = (now.replace(minute=0) + timedelta(hours=1)).strftime("%H:00")
-        current_hour_key = (current_hour, next_hour)
 
-        # Get current price
-        current_price = self._current_prices.get(current_hour_key, 0.0)
+        # Calculate current 15-minute block
+        current_minute = now.minute
+        block_start_minute = (current_minute // 15) * 15
+
+        current_block_start = now.replace(minute=block_start_minute, second=0, microsecond=0)
+        current_block_end = current_block_start + timedelta(minutes=15)
+
+        # Format keys for 15-minute blocks
+        start_str = current_block_start.strftime("%H:%M")
+        if current_block_end.date() != current_block_start.date():
+            end_str = "24:00"
+        else:
+            end_str = current_block_end.strftime("%H:%M")
+        current_block_key = (start_str, end_str)
+
+        # Get current price for 15-minute block
+        current_price = self._current_prices.get(current_block_key, 0.0)
 
         # Calculate sunrise/sunset
         sun_times = sun(self._location.observer, date=now.date())
@@ -1232,16 +1331,16 @@ class GrowattController(BaseModule):
             battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85)
         )
 
-        # Calculate price ranking for current hour
+        # Calculate price ranking for current 15-minute block
         price_ranking = None
-        if self._current_prices and current_hour_key in self._current_prices:
+        if self._current_prices and current_block_key in self._current_prices:
             price_ranking = self._decision_engine.calculate_price_ranking(
-                current_hour_key, self._current_prices
+                current_block_key, self._current_prices
             )
             if price_ranking:
                 self.logger.debug(
                     f"Price ranking: rank {price_ranking.current_rank}/"
-                    f"{price_ranking.total_hours} "
+                    f"{price_ranking.total_blocks} "
                     f"(percentile {price_ranking.percentile:.1f}%, "
                     f"{price_ranking.price_quadrant}), "
                     f"spread {price_ranking.daily_spread:.2f} EUR/MWh"
@@ -1262,7 +1361,9 @@ class GrowattController(BaseModule):
             # Time and pricing
             current_time=now,
             current_price=current_price,
-            hourly_prices=self._current_prices.copy(),
+            current_block_key=current_block_key,
+            prices_15min=self._current_prices.copy(),  # Now using 15-minute prices
+            cheapest_blocks=self._cheapest_charging_blocks.copy(),  # Set of cheapest blocks
             price_thresholds=price_thresholds,
             price_ranking=price_ranking,  # Include price ranking
             # Solar schedule
@@ -1310,10 +1411,19 @@ class GrowattController(BaseModule):
             stop_soc = int(stop_soc_raw)
 
         # Determine power rate
-        default_rate = 100
-        if hasattr(self.config, 'discharge_power_rate'):
-            default_rate = self.config.discharge_power_rate
-        power_rate = int(params.get("power_rate", default_rate))
+        # AC charge from mode definition
+        ac_charge_enabled = bool(mode_def.get("ac_charge", False))
+
+        # If AC charging is enabled, ALWAYS use 100% power rate to charge quickly within the slot
+        if ac_charge_enabled:
+            power_rate = 100
+            self.logger.debug("AC charging enabled - setting power_rate to 100%")
+        else:
+            # For other modes, use configured or default rate
+            default_rate = 100
+            if hasattr(self.config, 'discharge_power_rate'):
+                default_rate = self.config.discharge_power_rate
+            power_rate = int(params.get("power_rate", default_rate))
 
         # Map mode to inverter mode
         inverter_mode = str(mode_def.get("inverter_mode", "load_first"))
@@ -1327,9 +1437,6 @@ class GrowattController(BaseModule):
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:
             self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
-
-        # AC charge from mode definition
-        ac_charge_enabled = bool(mode_def.get("ac_charge", False))
 
         return InverterState(
             inverter_mode=inverter_mode,
@@ -1383,12 +1490,12 @@ class GrowattController(BaseModule):
         """
         # Mode change (inverter_mode, stop_soc, power_rate, time window)
         mode_changed = (
-            not old_state or
-            old_state.inverter_mode != new_state.inverter_mode or
-            old_state.stop_soc != new_state.stop_soc or
-            old_state.power_rate != new_state.power_rate or
-            old_state.time_start != new_state.time_start or
-            old_state.time_stop != new_state.time_stop
+            not old_state
+            or old_state.inverter_mode != new_state.inverter_mode
+            or old_state.stop_soc != new_state.stop_soc
+            or old_state.power_rate != new_state.power_rate
+            or old_state.time_start != new_state.time_start
+            or old_state.time_stop != new_state.time_stop
         )
 
         if mode_changed:
@@ -1480,17 +1587,92 @@ class GrowattController(BaseModule):
 
     async def _periodic_evaluation_loop(self) -> None:
         """Periodically check for condition changes that need re-evaluation."""
+        last_midnight_check = None
+
         while self._running:
             try:
                 await asyncio.sleep(60)  # Check every minute
 
                 now = self._get_local_now()
 
-                # Check for hour change (price changes)
-                current_hour = now.hour
-                if self._last_evaluation_hour != current_hour:
-                    self._last_evaluation_hour = current_hour
-                    await self._evaluate_conditions("hour_change")
+                # Check for midnight - fetch and log next day's prices
+                if now.hour == 0 and now.minute == 0:
+                    # Only fetch once per midnight
+                    current_midnight = now.date()
+                    if last_midnight_check != current_midnight:
+                        last_midnight_check = current_midnight
+                        self.logger.info("🕛 Midnight - fetching next day's prices...")
+
+                        try:
+                            # Fetch tomorrow's prices (1 day ahead)
+                            tomorrow_date = self._get_local_date_string(days_ahead=1)
+                            tomorrow_prices = await (
+                                self._price_analyzer.fetch_dam_energy_prices(
+                                    date=tomorrow_date
+                                )
+                            )
+
+                            if tomorrow_prices:
+                                # Get exchange rate
+                                eur_czk = await self._get_eur_czk_rate()
+
+                                # Calculate cheapest blocks for tomorrow
+                                charge_blocks = getattr(
+                                    self.config, 'battery_charge_blocks', 8
+                                )
+                                tomorrow_schedule, avg_price = (
+                                    self._price_analyzer.get_charging_schedule(
+                                        tomorrow_prices, num_blocks=charge_blocks
+                                    )
+                                )
+
+                                # Temporarily store tomorrow's charging blocks for display
+                                tomorrow_cheapest = set(
+                                    (block[0], block[1]) for block in tomorrow_schedule
+                                )
+                                old_blocks = self._cheapest_charging_blocks
+                                self._cheapest_charging_blocks = tomorrow_cheapest
+
+                                # Log the price table for tomorrow
+                                self.logger.info("=" * 50)
+                                self.logger.info(
+                                    f"📊 NEXT DAY SPOT PRICES ({tomorrow_date})"
+                                )
+                                self.logger.info("=" * 50)
+                                await self._log_price_table(
+                                    tomorrow_prices, tomorrow_date, eur_czk
+                                )
+
+                                # Log tomorrow's charging schedule
+                                if tomorrow_schedule:
+                                    avg_czk = avg_price * eur_czk / 1000
+                                    self.logger.info("=" * 50)
+                                    self.logger.info("🔋 TOMORROW'S CHARGING BLOCKS:")
+                                    for start, end, price_eur in tomorrow_schedule:
+                                        price_czk = price_eur * eur_czk / 1000
+                                        self.logger.info(
+                                            f"   {start}-{end}: {price_czk:.3f} CZK/kWh"
+                                        )
+                                    self.logger.info(f"   Average: {avg_czk:.3f} CZK/kWh")
+                                self.logger.info("=" * 50)
+
+                                # Restore current day's charging blocks
+                                self._cheapest_charging_blocks = old_blocks
+                            else:
+                                self.logger.warning(
+                                    f"Could not fetch next day prices for {tomorrow_date} "
+                                    f"(may not be published yet)"
+                                )
+                        except Exception as e:
+                            self.logger.error(
+                                f"Failed to fetch next day prices: {e}", exc_info=True
+                            )
+
+                # Check for 15-minute block change (price changes every 15 minutes)
+                current_block = (now.hour, now.minute // 15)
+                if self._last_evaluation_block != current_block:
+                    self._last_evaluation_block = current_block
+                    await self._evaluate_conditions("15min_block_change")
 
                 # Check for battery SOC change (>5%)
                 if abs(self._battery_soc - self._last_battery_soc) >= 5:

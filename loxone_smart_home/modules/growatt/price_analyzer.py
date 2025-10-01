@@ -33,7 +33,15 @@ class PriceAnalyzer:
     async def fetch_dam_energy_prices(
         self, date: Optional[str] = None
     ) -> Dict[Tuple[str, str], float]:
-        """Fetch energy prices from OTE DAM API (DST-safe)."""
+        """Fetch energy prices from OTE DAM API.
+
+        Returns prices in 15-minute intervals. If API provides hourly data (24 points),
+        it's expanded to 15-minute intervals (96 points).
+
+        Returns:
+            Dictionary with (start_time, end_time) tuples as keys and EUR/MWh prices as values.
+            Times are in "HH:MM" format, with 15-minute intervals.
+        """
         if date is None:
             date = self._get_local_date_string(days_ahead=1)
 
@@ -55,89 +63,158 @@ class PriceAnalyzer:
 
                     data = await response.json()
 
-            # dataLine[0]: CZK/MWh, dataLine[1]: EUR/MWh
-            hourly_prices: Dict[Tuple[str, str], float] = {}
+            # Process data based on format (24 hourly or 96 15-minute intervals)
+            prices_15min: Dict[Tuple[str, str], float] = {}
             if data.get("data", {}).get("dataLine"):
                 lines = data["data"]["dataLine"]
 
-                # Identify EUR line
+                # Identify EUR line based on metadata
                 def is_eur_line(line: Dict[str, Any]) -> bool:
                     """Check if this line contains EUR prices based on metadata."""
                     name = (line.get("name") or "").lower()
+                    title = (line.get("title") or "").lower()
                     tooltip = (line.get("tooltip") or "").lower()
-                    # Look for EUR indicators in metadata
-                    return "eur/mwh" in name or "eur" in name or "eur/mwh" in tooltip
+                    # Look for EUR indicators - check for 15min or 60min price lines
+                    return (
+                        "eur/mwh" in name or "eur" in name
+                        or "eur/mwh" in tooltip or "price" in title
+                    )
 
-                eur_line = next((ln for ln in lines if is_eur_line(ln)), None)
-                if eur_line:
-                    price_data = eur_line.get("point", [])
-                    self.logger.debug("Using identified EUR line for prices")
-                elif len(lines) >= 2:
-                    price_data = lines[1].get("point", [])
+                # Find the appropriate price line
+                eur_line = None
+                for line in lines:
+                    title = (line.get("title") or "").lower()
+                    # Prefer 15min price line if available
+                    if "15min price" in title and "eur/mwh" in title:
+                        eur_line = line
+                        self.logger.info("Using 15-minute price data")
+                        break
+                    # Otherwise use any EUR line
+                    elif is_eur_line(line):
+                        eur_line = line
+
+                # Fallback to line[1] if no EUR line identified
+                if not eur_line and len(lines) >= 2:
+                    eur_line = lines[1]
                     self.logger.debug("Using second line (usual EUR position) for prices")
-                else:
+                elif not eur_line:
                     # Only one line available
-                    price_data = lines[0].get("point", [])
+                    eur_line = lines[0]
                     self.logger.warning("Only one dataLine found, prices might be in CZK")
 
-                date_obj = datetime.strptime(date, "%Y-%m-%d").date()
-                base_dt = datetime.combine(date_obj, dt_time(0, 0), self._local_tz)
+                if eur_line:
+                    price_data = eur_line.get("point", [])
 
-                def _pkey(p: Dict[str, Any]) -> float:
-                    try:
-                        return float(p.get("x", 0))
-                    except Exception:
-                        return 0.0
-                price_data = sorted(price_data, key=_pkey)
+                    # Sort price data by x value (hour or 15-min index)
+                    date_obj = datetime.strptime(date, "%Y-%m-%d").date()
+                    base_dt = datetime.combine(date_obj, dt_time(0, 0), self._local_tz)
 
-                # DST merge policy for 25-hour days (fall back)
-                merge_policy = self._optional_config.get("dst_merge_policy", "avg")
+                    def _pkey(p: Dict[str, Any]) -> float:
+                        try:
+                            return float(p.get("x", 0))
+                        except Exception:
+                            return 0.0
+                    price_data = sorted(price_data, key=_pkey)
 
-                def _merge_duplicate(existing: float, new: float) -> float:
-                    """Merge duplicate hour prices during DST transitions."""
-                    if merge_policy == "min":
-                        return min(existing, new)
-                    elif merge_policy == "max":
-                        return max(existing, new)
-                    elif merge_policy == "first":
-                        return existing
-                    elif merge_policy == "second":
-                        return new
-                    else:  # avg (default)
-                        return (existing + new) / 2.0
+                    num_points = len(price_data)
+                    self.logger.info(f"Processing {num_points} price points from OTE API")
 
-                for i, point in enumerate(price_data):
-                    try:
-                        price = float(point["y"])
-                    except (ValueError, TypeError):
-                        self.logger.warning(f"Invalid price value at index {i}: {point.get('y')}")
-                        continue
+                    if 92 <= num_points <= 100:
+                        # Native 15-minute data (96 normal, 92 spring DST, 100 fall DST)
+                        if num_points != 96:
+                            dst_type = "spring forward" if num_points == 92 else "fall back"
+                            self.logger.info(
+                                f"DST transition day detected: {num_points} blocks ({dst_type})"
+                            )
+                        self.logger.info(f"Processing {num_points} points as 15-minute intervals")
+                        for i, point in enumerate(price_data):
+                            try:
+                                price = float(point["y"])
+                            except (ValueError, TypeError):
+                                self.logger.warning(
+                                    f"Invalid price at index {i}: {point.get('y')}"
+                                )
+                                continue
 
-                    # Skip non-finite prices (but keep negative prices - they're valid!)
-                    if not (price == price) or price in (float("inf"), float("-inf")):
-                        self.logger.warning(f"Skipping non-finite price at index {i}: {price}")
-                        continue
+                            # Skip non-finite prices (but keep negative prices)
+                            if not (price == price) or price in (float("inf"), float("-inf")):
+                                self.logger.warning(f"Skipping non-finite price at {i}: {price}")
+                                continue
 
-                    start_dt = base_dt + timedelta(hours=i)
-                    stop_dt = start_dt + timedelta(hours=1)
+                            # Calculate 15-minute time slots
+                            minutes = i * 15
+                            start_dt = base_dt + timedelta(minutes=minutes)
+                            stop_dt = start_dt + timedelta(minutes=15)
 
-                    start_time = start_dt.strftime("%H:%M")
-                    if stop_dt.date() != start_dt.date():
-                        stop_time = "24:00"  # Next day
-                    else:
-                        stop_time = stop_dt.strftime("%H:%M")
+                            start_time = start_dt.strftime("%H:%M")
+                            if stop_dt.date() != start_dt.date():
+                                # Handle day boundary
+                                if stop_dt.hour == 0:
+                                    stop_time = "24:00"
+                                else:
+                                    stop_time = stop_dt.strftime("%H:%M")
+                            else:
+                                stop_time = stop_dt.strftime("%H:%M")
 
-                    key = (start_time, stop_time)
-                    if key in hourly_prices:
-                        self.logger.debug(
-                            f"DST duplicate hour {key} detected, merging with {merge_policy}"
+                            key = (start_time, stop_time)
+                            prices_15min[key] = price
+
+                    elif num_points <= 24:
+                        # Hourly data or partial data - expand to 15-minute intervals
+                        self.logger.info(
+                            f"Processing {num_points} hourly points, "
+                            f"expanding to 15-minute intervals"
                         )
-                        hourly_prices[key] = _merge_duplicate(hourly_prices[key], price)
-                    else:
-                        hourly_prices[key] = price
+                        for i, point in enumerate(price_data):
+                            try:
+                                price = float(point["y"])
+                            except (ValueError, TypeError):
+                                self.logger.warning(
+                                    f"Invalid price at hour {i}: {point.get('y')}"
+                                )
+                                continue
 
-            self.logger.info(f"Successfully fetched {len(hourly_prices)} DAM price points")
-            return hourly_prices
+                            # Skip non-finite prices
+                            if not (price == price) or price in (float("inf"), float("-inf")):
+                                self.logger.warning(f"Skipping non-finite price at {i}: {price}")
+                                continue
+
+                            # Create 4 15-minute intervals for each hour
+                            hour_dt = base_dt + timedelta(hours=i)
+                            for quarter in range(4):
+                                minutes = quarter * 15
+                                start_dt = hour_dt + timedelta(minutes=minutes)
+                                stop_dt = start_dt + timedelta(minutes=15)
+
+                                start_time = start_dt.strftime("%H:%M")
+                                if stop_dt.date() != start_dt.date():
+                                    if stop_dt.hour == 0:
+                                        stop_time = "24:00"
+                                    else:
+                                        stop_time = stop_dt.strftime("%H:%M")
+                                else:
+                                    stop_time = stop_dt.strftime("%H:%M")
+
+                                key = (start_time, stop_time)
+                                # Use same price for all 15-min blocks in the hour
+                                prices_15min[key] = price
+
+                    elif num_points > 24 and num_points < 92:
+                        # Unexpected format - between hourly and 15-min
+                        self.logger.error(
+                            f"Unexpected number of price points: {num_points}. "
+                            f"Expected 24 (hourly) or 92-100 (15-minute)"
+                        )
+                        return {}
+
+            # Validate data completeness
+            if prices_15min and len(prices_15min) < 90:
+                self.logger.warning(
+                    f"Incomplete price data: {len(prices_15min)} blocks, expected 92-100"
+                )
+
+            self.logger.info(f"Successfully processed {len(prices_15min)} 15-minute price points")
+            return prices_15min
 
         except Exception as e:
             self.logger.error(f"Error fetching DAM prices: {e}", exc_info=True)
@@ -150,43 +227,112 @@ class PriceAnalyzer:
         - Lower prices at night (2-6 AM)
         - Higher prices during peak hours (8-10 AM, 5-8 PM)
         - Medium prices during day
+
+        Returns 96 15-minute intervals.
         """
         random.seed(date)  # Consistent prices for same date
 
-        hourly_prices: Dict[Tuple[str, str], float] = {}
+        prices_15min: Dict[Tuple[str, str], float] = {}
         base_price = 80.0  # EUR/MWh
 
         for hour in range(24):
-            start = f"{hour:02d}:00"
-            end = f"{(hour + 1) % 24:02d}:00" if hour < 23 else "24:00"
-
-            # Night valley (2-6 AM) - cheapest
+            # Determine base hourly price based on time of day
             if 2 <= hour < 6:
-                price = base_price * random.uniform(0.5, 0.7)
-            # Morning peak (8-10 AM) - expensive
+                # Night valley (2-6 AM) - cheapest
+                hour_price = base_price * random.uniform(0.5, 0.7)
             elif 8 <= hour < 10:
-                price = base_price * random.uniform(1.3, 1.5)
-            # Evening peak (17-20 PM) - most expensive
+                # Morning peak (8-10 AM) - expensive
+                hour_price = base_price * random.uniform(1.3, 1.5)
             elif 17 <= hour < 20:
-                price = base_price * random.uniform(1.4, 1.6)
-            # Night (22-2 AM) - cheap
+                # Evening peak (17-20 PM) - most expensive
+                hour_price = base_price * random.uniform(1.4, 1.6)
             elif hour >= 22 or hour < 2:
-                price = base_price * random.uniform(0.6, 0.8)
-            # Day hours - medium
+                # Night (22-2 AM) - cheap
+                hour_price = base_price * random.uniform(0.6, 0.8)
             else:
-                price = base_price * random.uniform(0.9, 1.1)
+                # Day hours - medium
+                hour_price = base_price * random.uniform(0.9, 1.1)
 
-            hourly_prices[(start, end)] = round(price, 2)
+            # Create 4 15-minute intervals with slight variations
+            for quarter in range(4):
+                start_minutes = hour * 60 + quarter * 15
+                start_hour = start_minutes // 60
+                start_min = start_minutes % 60
+                end_minutes = start_minutes + 15
+                end_hour = end_minutes // 60
+                end_min = end_minutes % 60
 
-        self.logger.warning(f"Using mock prices for {date} (OTE data unavailable)")
-        return hourly_prices
+                start = f"{start_hour:02d}:{start_min:02d}"
+                if end_hour >= 24:
+                    end = "24:00"
+                else:
+                    end = f"{end_hour:02d}:{end_min:02d}"
 
-    def find_n_most_expensive_hours(
-        self, prices: Dict[Tuple[str, str], float], n: int = 4
+                # Add slight variation within the hour (±5%)
+                variation = random.uniform(0.95, 1.05)
+                quarter_price = hour_price * variation
+
+                prices_15min[(start, end)] = round(quarter_price, 2)
+
+        self.logger.warning(f"Using mock prices for {date} (OTE data unavailable) - 96 intervals")
+        return prices_15min
+
+    def find_n_most_expensive_blocks(
+        self, prices: Dict[Tuple[str, str], float], n: int = 16
     ) -> List[Tuple[str, str, float]]:
-        """Find N most expensive individual hours."""
+        """Find N most expensive 15-minute blocks.
+
+        Args:
+            prices: Dictionary of 15-minute interval prices
+            n: Number of blocks to return (default 16 = 4 hours)
+
+        Returns:
+            List of (start, stop, price) tuples for most expensive blocks
+        """
         sorted_prices = sorted(
             [(start, stop, price) for (start, stop), price in prices.items()],
             key=lambda x: x[2], reverse=True
         )
         return sorted_prices[:n]
+
+    def find_cheapest_blocks(
+        self, prices: Dict[Tuple[str, str], float], num_blocks: int = 8
+    ) -> List[Tuple[str, str, float]]:
+        """Find the cheapest N 15-minute blocks (not necessarily consecutive).
+
+        Args:
+            prices: Dictionary of 15-minute interval prices
+            num_blocks: Number of blocks to find (default 8 = 2 hours)
+
+        Returns:
+            List of (start, stop, price) tuples for cheapest blocks
+        """
+        sorted_prices = sorted(
+            [(start, stop, price) for (start, stop), price in prices.items()],
+            key=lambda x: x[2]
+        )
+        return sorted_prices[:num_blocks]
+
+    def get_charging_schedule(
+        self, prices: Dict[Tuple[str, str], float], num_blocks: int = 8
+    ) -> Tuple[List[Tuple[str, str, float]], float]:
+        """Get the charging schedule with cheapest blocks sorted by time.
+
+        Args:
+            prices: Dictionary of 15-minute interval prices
+            num_blocks: Number of blocks to charge (default 8 = 2 hours)
+
+        Returns:
+            Tuple of (sorted list of charging blocks, average price)
+        """
+        cheapest = self.find_cheapest_blocks(prices, num_blocks)
+        if not cheapest:
+            return [], 0.0
+
+        # Sort by start time for display
+        sorted_blocks = sorted(cheapest, key=lambda x: x[0])
+
+        # Calculate average price
+        avg_price = sum(block[2] for block in cheapest) / len(cheapest) if cheapest else 0
+
+        return sorted_blocks, avg_price

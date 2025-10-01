@@ -98,7 +98,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         self.mock_controller.config.min_soc = 20
         self.mock_controller.config.max_soc = 90
         self.mock_controller.config.export_price_min = 1.0
-        self.mock_controller.config.battery_charge_hours = 2
+        self.mock_controller.config.battery_charge_blocks = 8
         self.mock_controller.config.summer_price_threshold = 1.0
         self.mock_controller.config.schedule_hour = 23
         self.mock_controller.config.schedule_minute = 59

@@ -35,7 +35,7 @@ def mock_settings() -> Settings:
     settings.growatt = GrowattConfig(
         simulation_mode=False,
         export_price_min=2.5,
-        battery_charge_hours=2
+        battery_charge_blocks=8
     )
     # Add logging configuration
     settings.log_level = "INFO"
@@ -66,13 +66,11 @@ def growatt_controller(
     return controller
 
 
-
 async def test_controller_initialization(growatt_controller: GrowattController) -> None:
     """Test Growatt controller initialization."""
     assert growatt_controller.name == "GrowattController"
     assert growatt_controller.config is not None
     assert growatt_controller._periodic_check_task is None
-
 
 
 async def test_fetch_dam_energy_prices_success(
@@ -118,12 +116,16 @@ async def test_fetch_dam_energy_prices_success(
             "2024-01-01"
         )
 
-        assert len(prices) == 3
+        # Now expecting 15-minute intervals (3 hours × 4 blocks = 12)
+        assert len(prices) == 12
         # Should use dataLine[1] which contains EUR/MWh prices
-        assert prices[("00:00", "01:00")] == 98.5
-        assert prices[("01:00", "02:00")] == 105.2
-        assert prices[("02:00", "03:00")] == 92.7
-
+        # Each hour is expanded to 4 15-minute blocks with the same price
+        assert prices[("00:00", "00:15")] == 98.5
+        assert prices[("00:15", "00:30")] == 98.5
+        assert prices[("00:30", "00:45")] == 98.5
+        assert prices[("00:45", "01:00")] == 98.5
+        assert prices[("01:00", "01:15")] == 105.2
+        assert prices[("02:00", "02:15")] == 92.7
 
 
 async def test_fetch_dam_energy_prices_failure(
@@ -169,9 +171,11 @@ async def test_fetch_dam_energy_prices_single_dataline(
         prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
             "2024-01-01"
         )
-        assert len(prices) == 2
-        assert prices[("00:00", "01:00")] == 100.0
-        assert prices[("01:00", "02:00")] == 110.0
+        # Now expecting 15-minute intervals (2 hours × 4 blocks = 8)
+        assert len(prices) == 8
+        assert prices[("00:00", "00:15")] == 100.0
+        assert prices[("00:15", "00:30")] == 100.0
+        assert prices[("01:00", "01:15")] == 110.0
 
 
 @pytest.mark.asyncio
@@ -203,13 +207,15 @@ async def test_fetch_dam_energy_prices_full_day(
         prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
             "2024-01-01"
         )
-        assert len(prices) == 24
-        assert prices[("00:00", "01:00")] == 110.0
-        # The last hour in the day is 23:00-24:00
-        assert prices[("23:00", "24:00")] == 340.0
+        # Now expecting 15-minute intervals (24 hours × 4 blocks = 96)
+        assert len(prices) == 96
+        assert prices[("00:00", "00:15")] == 110.0
+        assert prices[("00:15", "00:30")] == 110.0
+        # The last 15-minute block in the day is 23:45-24:00
+        assert prices[("23:45", "24:00")] == 340.0
+
 
 @pytest.mark.asyncio
-
 async def test_export_control_commands(
     growatt_controller: GrowattController,
     mock_mqtt_client: AsyncMock,

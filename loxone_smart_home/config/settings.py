@@ -193,8 +193,11 @@ class GrowattConfig(BaseSettings):
         description="Required multiplier over cheapest hour (4.0 = sell at 4× cheapest price)"
     )
 
-    # Scheduling
-    battery_charge_hours: int = Field(default=2, ge=1, le=12)  # Consecutive hours for AC charging
+    # Scheduling - using 15-minute blocks (non-consecutive)
+    battery_charge_blocks: int = Field(
+        default=8, ge=1, le=96,
+        description="Number of 15-minute blocks to charge battery (8 = 2 hours, non-consecutive)"
+    )
 
     # Command control parameters
     command_delay: float = Field(

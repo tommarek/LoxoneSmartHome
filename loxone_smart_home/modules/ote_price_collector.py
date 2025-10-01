@@ -398,7 +398,7 @@ class OTEPriceCollector(BaseModule):
                 delay = (first_check_time - now).total_seconds()
 
                 self.logger.info(
-                    f"Next daily price check cycle starts in {delay/3600:.1f} hours "
+                    f"Next daily price check cycle starts in {delay / 3600:.1f} hours "
                     f"at {first_check_time}"
                 )
 
@@ -471,7 +471,7 @@ class OTEPriceCollector(BaseModule):
                     delay = (next_check - datetime.now(self._local_tz)).total_seconds()
 
                     if delay > 0:
-                        self.logger.info(f"Waiting {delay/60:.0f} minutes until next check...")
+                        self.logger.info(f"Waiting {delay / 60:.0f} minutes until next check...")
                         await asyncio.sleep(delay)
 
                     current_hour += 1

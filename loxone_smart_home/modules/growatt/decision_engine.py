@@ -8,7 +8,7 @@ manual overrides, high loads, scheduled periods, etc.
 from dataclasses import dataclass, field
 from datetime import datetime, time
 from enum import IntEnum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 import logging
 import statistics
 
@@ -35,12 +35,12 @@ class PriceThresholds:
 
 @dataclass
 class PriceRankingData:
-    """Price ranking information for current hour within daily context."""
-    current_rank: int  # 1 = cheapest hour of day
-    total_hours: int  # Total hours in price data
+    """Price ranking information for current 15-minute block within daily context."""
+    current_rank: int  # 1 = cheapest block of day
+    total_blocks: int  # Total 15-minute blocks in price data (96 for full day)
     percentile: float  # 0-100, lower = cheaper
-    hours_cheaper_count: int  # How many hours are cheaper
-    hours_more_expensive_count: int  # How many hours are more expensive
+    blocks_cheaper_count: int  # How many blocks are cheaper
+    blocks_more_expensive_count: int  # How many blocks are more expensive
     daily_min: float  # Cheapest price today
     daily_max: float  # Most expensive price today
     daily_avg: float  # Average price today
@@ -65,8 +65,11 @@ class DecisionContext:
     current_mode: Optional[str] = None
     current_load: float = 0.0  # Current home load in kW
     solar_power: float = 0.0  # Current solar generation in kW
-    current_price: float = 0.0  # Current hour price EUR/MWh
-    hourly_prices: Dict[Tuple[str, str], float] = field(default_factory=dict)  # Next 24-48h
+    current_price: float = 0.0  # Current 15-minute block price EUR/MWh
+    current_block_key: Optional[Tuple[str, str]] = None  # Current 15-minute block
+    prices_15min: Dict[Tuple[str, str], float] = field(default_factory=dict)  # 96 15-min blocks
+    # Set of cheapest charging blocks
+    cheapest_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     price_thresholds: Optional[PriceThresholds] = None
     price_ranking: Optional[PriceRankingData] = None  # Price ranking within day
     sunrise: Optional[time] = None
@@ -80,14 +83,13 @@ class DecisionContext:
         # Summer mode: NO AC charging at all
         if self.is_summer_mode:
             self.is_battery_charging_scheduled = False
-        # Winter mode: charge during cheapest hours (ranking)
-        elif self.price_ranking:
-            # Default to charging during 2 cheapest hours in winter
+        # Check if current block is in the cheapest charging blocks
+        elif self.current_block_key and self.cheapest_blocks:
             self.is_battery_charging_scheduled = (
-                self.price_ranking.current_rank <= 2  # Top 2 cheapest hours
+                self.current_block_key in self.cheapest_blocks
             )
+        # Fall back to price threshold if no cheapest blocks defined
         elif self.price_thresholds and self.current_price > 0:
-            # Fall back to absolute threshold (winter only)
             # Convert EUR/MWh to CZK/kWh for comparison (EUR * 25 / 1000)
             price_czk_kwh = self.current_price * 25 / 1000
             self.is_battery_charging_scheduled = (
@@ -492,15 +494,15 @@ class GrowattDecisionEngine:
         # Convert current price to CZK/kWh (EUR/MWh * 25 / 1000)
         current_price_czk = context.current_price * 25 / 1000
 
-        # Find the absolute cheapest hour price
-        if not context.hourly_prices:
+        # Find the absolute cheapest 15-minute block price
+        if not context.prices_15min:
             return False
 
-        cheapest_hour_price = min(context.hourly_prices.values())
-        cheapest_hour_czk = cheapest_hour_price * 25 / 1000
+        cheapest_block_price = min(context.prices_15min.values())
+        cheapest_block_czk = cheapest_block_price * 25 / 1000
 
         # Calculate required price based on profit margin
-        required_by_margin = cheapest_hour_czk * context.price_thresholds.discharge_profit_margin
+        required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
 
         # Effective threshold is the higher of absolute minimum or margin-based requirement
         effective_threshold = max(
@@ -513,7 +515,7 @@ class GrowattDecisionEngine:
                 f"Discharge profitable: {current_price_czk:.2f} CZK/kWh ≥ "
                 f"{effective_threshold:.2f} CZK/kWh "
                 f"(absolute min: {context.price_thresholds.discharge_price_min:.2f}, "
-                f"cheapest: {cheapest_hour_czk:.2f} × "
+                f"cheapest block: {cheapest_block_czk:.2f} × "
                 f"{context.price_thresholds.discharge_profit_margin:.1f} = "
                 f"{required_by_margin:.2f})"
             )
@@ -522,15 +524,15 @@ class GrowattDecisionEngine:
             self.logger.debug(
                 f"No discharge: {current_price_czk:.2f} CZK/kWh < "
                 f"{effective_threshold:.2f} CZK/kWh required "
-                f"(cheapest hour: {cheapest_hour_czk:.2f} × "
+                f"(cheapest 15min block: {cheapest_block_czk:.2f} × "
                 f"{context.price_thresholds.discharge_profit_margin:.1f})"
             )
             return False
 
-    def _find_consecutive_cheap_hours(
+    def _find_consecutive_cheap_blocks(
         self, context: DecisionContext
     ) -> List[Tuple[str, str, float]]:
-        """Find consecutive hours below the cheap threshold.
+        """Find consecutive 15-minute blocks below the cheap threshold.
 
         Args:
             context: Current decision context
@@ -538,21 +540,21 @@ class GrowattDecisionEngine:
         Returns:
             List of (start, end, avg_price) tuples for cheap periods
         """
-        if not context.hourly_prices or not context.price_thresholds:
+        if not context.prices_15min or not context.price_thresholds:
             return []
 
         # Validate price data
-        if not self._validate_price_data(context.hourly_prices):
+        if not self._validate_price_data(context.prices_15min):
             self.logger.warning("Invalid price data detected, skipping price-based decisions")
             return []
 
         cheap_periods = []
-        sorted_hours = sorted(context.hourly_prices.keys())
+        sorted_blocks = sorted(context.prices_15min.keys())
         i = 0
 
-        while i < len(sorted_hours):
-            start_key = sorted_hours[i]
-            price = context.hourly_prices[start_key]
+        while i < len(sorted_blocks):
+            start_key = sorted_blocks[i]
+            price = context.prices_15min[start_key]
 
             # Convert EUR/MWh to CZK/kWh for comparison
             price_czk_kwh = price * 25 / 1000
@@ -562,11 +564,18 @@ class GrowattDecisionEngine:
                 period_prices = [price]
                 j = i + 1
 
-                # Find end of cheap period
-                while j < len(sorted_hours):
-                    next_key = sorted_hours[j]
-                    next_price = context.hourly_prices[next_key]
+                # Find end of cheap period (consecutive blocks)
+                while j < len(sorted_blocks):
+                    next_key = sorted_blocks[j]
 
+                    # Check if blocks are consecutive (15-min apart)
+                    prev_end = sorted_blocks[j - 1][1]
+                    curr_start = next_key[0]
+                    is_24h_boundary = prev_end == "24:00" and curr_start == "00:00"
+                    if prev_end != curr_start and not is_24h_boundary:
+                        break  # Not consecutive
+
+                    next_price = context.prices_15min[next_key]
                     # Convert EUR/MWh to CZK/kWh for comparison
                     next_price_czk_kwh = next_price * 25 / 1000
                     if next_price_czk_kwh < context.price_thresholds.charge_price_max:
@@ -575,7 +584,7 @@ class GrowattDecisionEngine:
                     else:
                         break
 
-                period_end = sorted_hours[j - 1][1]
+                period_end = sorted_blocks[j - 1][1]
                 avg_price = sum(period_prices) / len(period_prices)
                 cheap_periods.append((period_start, period_end, avg_price))
                 i = j
@@ -645,23 +654,23 @@ class GrowattDecisionEngine:
 
     def calculate_price_ranking(
         self,
-        current_hour_key: Tuple[str, str],
-        hourly_prices: Dict[Tuple[str, str], float]
+        current_block_key: Tuple[str, str],
+        prices_15min: Dict[Tuple[str, str], float]
     ) -> Optional[PriceRankingData]:
-        """Calculate price ranking data for current hour.
+        """Calculate price ranking data for current 15-minute block.
 
         Args:
-            current_hour_key: Current hour key (start, end)
-            hourly_prices: All hourly prices for the day
+            current_block_key: Current 15-minute block key (start, end)
+            prices_15min: All 15-minute prices for the day (96 blocks)
 
         Returns:
             PriceRankingData or None if insufficient data
         """
-        if not hourly_prices or current_hour_key not in hourly_prices:
+        if not prices_15min or current_block_key not in prices_15min:
             return None
 
-        current_price = hourly_prices[current_hour_key]
-        all_prices = list(hourly_prices.values())
+        current_price = prices_15min[current_block_key]
+        all_prices = list(prices_15min.values())
 
         # Calculate statistics
         daily_min = min(all_prices)
@@ -681,8 +690,8 @@ class GrowattDecisionEngine:
                 break
 
         # Calculate counts
-        hours_cheaper_count = current_rank - 1
-        hours_more_expensive_count = len(all_prices) - current_rank
+        blocks_cheaper_count = current_rank - 1
+        blocks_more_expensive_count = len(all_prices) - current_rank
 
         # Calculate percentile (0 = cheapest, 100 = most expensive)
         percentile = (current_rank - 1) / max(1, len(all_prices) - 1) * 100
@@ -699,10 +708,10 @@ class GrowattDecisionEngine:
 
         return PriceRankingData(
             current_rank=current_rank,
-            total_hours=len(all_prices),
+            total_blocks=len(all_prices),
             percentile=percentile,
-            hours_cheaper_count=hours_cheaper_count,
-            hours_more_expensive_count=hours_more_expensive_count,
+            blocks_cheaper_count=blocks_cheaper_count,
+            blocks_more_expensive_count=blocks_more_expensive_count,
             daily_min=daily_min,
             daily_max=daily_max,
             daily_avg=daily_avg,

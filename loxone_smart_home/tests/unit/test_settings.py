@@ -128,11 +128,10 @@ class TestGrowattConfig:
         assert config.min_soc == 20.0
         assert config.max_soc == 90.0
 
-        # Invalid: max_soc <= min_soc
+        # Test invalid cases
         with pytest.raises(ValidationError):
             GrowattConfig(min_soc=50.0, max_soc=40.0)
 
-        # Invalid: SOC > 100
         with pytest.raises(ValidationError):
             GrowattConfig(min_soc=20.0, max_soc=101.0)
 

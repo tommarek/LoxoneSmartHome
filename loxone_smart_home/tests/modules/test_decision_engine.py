@@ -2,6 +2,7 @@
 
 import pytest
 from datetime import datetime, time
+from typing import Dict, Tuple
 from unittest.mock import MagicMock
 
 from modules.growatt.decision_engine import (
@@ -12,6 +13,33 @@ from modules.growatt.decision_engine import (
     MODE_DEFINITIONS,
     Priority
 )
+
+
+def create_15min_prices(hour_prices: Dict[int, float]) -> Dict[Tuple[str, str], float]:
+    """Helper to create 15-minute price blocks from hourly prices.
+
+    Args:
+        hour_prices: Dict mapping hour (0-23) to price
+
+    Returns:
+        Dict with 15-minute block keys
+    """
+    prices_15min = {}
+    for hour, price in hour_prices.items():
+        for i in range(4):  # 4 blocks per hour
+            start_min = i * 15
+            end_min = start_min + 15
+            if hour == 23 and end_min == 60:
+                start_str = f"{hour:02d}:{start_min:02d}"
+                end_str = "24:00"
+            else:
+                start_str = f"{hour:02d}:{start_min:02d}"
+                if end_min < 60:
+                    end_str = f"{hour:02d}:{end_min:02d}"
+                else:
+                    end_str = f"{(hour + 1) % 24:02d}:00"
+            prices_15min[(start_str, end_str)] = price
+    return prices_15min
 
 
 @pytest.fixture
@@ -296,6 +324,20 @@ def test_price_based_charging_decision(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test that cheap prices trigger battery charging."""
+    # Create 15-minute price data
+    prices_15min = {}
+    # Add blocks for 3:00-4:00 (4 blocks of 15 minutes each)
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"03:{start_min:02d}"
+        end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
+        prices_15min[(start_str, end_str)] = 60.0  # Cheap price
+
+    # Mark current block as one of the cheapest
+    current_block = ("03:00", "03:15")
+    cheapest_blocks = {current_block, ("03:15", "03:30"), ("03:30", "03:45"), ("03:45", "04:00")}
+
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
@@ -304,11 +346,9 @@ def test_price_based_charging_decision(
         manual_override_mode=None,
         current_mode="regular",
         current_price=60.0,  # Cheap price
-        hourly_prices={
-            ("03:00", "04:00"): 60.0,
-            ("04:00", "05:00"): 65.0,
-            ("05:00", "06:00"): 70.0,
-        },
+        current_block_key=current_block,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=3.0,  # 120.0 EUR/MWh
@@ -329,10 +369,25 @@ def test_price_based_discharge_decision(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test that very high prices with sufficient spread trigger battery discharge."""
-    hourly_prices = {
-        ("03:00", "04:00"): 30.0,  # Cheap charge price (0.75 CZK/kWh)
-        ("18:00", "19:00"): 150.0,  # Current high price (3.75 CZK/kWh)
-    }
+    # Create 15-minute price data
+    prices_15min = {}
+    # Add cheap blocks (3:00-4:00)
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"03:{start_min:02d}"
+        end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
+        prices_15min[(start_str, end_str)] = 30.0  # Cheap price
+
+    # Add expensive blocks (18:00-19:00)
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"18:{start_min:02d}"
+        end_str = f"18:{end_min:02d}" if end_min < 60 else "19:00"
+        prices_15min[(start_str, end_str)] = 150.0  # High price
+
+    current_block = ("18:00", "18:15")
 
     context = DecisionContext(
         manual_override_active=False,
@@ -342,7 +397,9 @@ def test_price_based_discharge_decision(
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 18, 0),  # 6 PM peak
         current_price=150.0,  # 3.75 CZK/kWh
-        hourly_prices=hourly_prices,
+        current_block_key=current_block,
+        prices_15min=prices_15min,
+        cheapest_blocks=set(),  # Not a charging block
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -352,10 +409,10 @@ def test_price_based_discharge_decision(
         ),
         price_ranking=PriceRankingData(
             current_rank=2,
-            total_hours=2,
+            total_blocks=2,
             percentile=100.0,
-            hours_cheaper_count=1,
-            hours_more_expensive_count=0,
+            blocks_cheaper_count=1,
+            blocks_more_expensive_count=0,
             daily_min=30.0,  # 0.75 CZK/kWh
             daily_max=150.0,
             daily_avg=90.0,
@@ -380,6 +437,14 @@ def test_low_battery_prevents_discharge(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test that low battery SOC prevents discharge even with high prices."""
+    prices_15min = {}
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"18:{start_min:02d}"
+        end_str = f"18:{end_min:02d}" if end_min < 60 else "19:00"
+        prices_15min[(start_str, end_str)] = 150.0  # High price
+
     context = DecisionContext(
         manual_override_active=False,
         manual_override_mode=None,
@@ -388,7 +453,9 @@ def test_low_battery_prevents_discharge(
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 18, 0),
         current_price=150.0,  # High price
-        hourly_prices={("18:00", "19:00"): 150.0},
+        current_block_key=("18:00", "18:15"),
+        prices_15min=prices_15min,
+        cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -407,6 +474,17 @@ def test_full_battery_prevents_charging(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test that full battery prevents charging even with cheap prices."""
+    prices_15min = {}
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"03:{start_min:02d}"
+        end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
+        prices_15min[(start_str, end_str)] = 50.0  # Very cheap
+
+    current_block = ("03:00", "03:15")
+    cheapest_blocks = {current_block}  # Mark as cheapest block
+
     context = DecisionContext(
         manual_override_active=False,
         manual_override_mode=None,
@@ -415,7 +493,9 @@ def test_full_battery_prevents_charging(
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 3, 0),
         current_price=50.0,  # Very cheap
-        hourly_prices={("03:00", "04:00"): 50.0},
+        current_block_key=current_block,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
             export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
@@ -498,13 +578,23 @@ def test_price_validation_invalid_data(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test that invalid price data is handled correctly."""
+    prices_15min = {}
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        start_str = f"03:{start_min:02d}"
+        end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
+        prices_15min[(start_str, end_str)] = -50.0  # Invalid negative price
+
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 0),
         current_price=-50.0,  # Invalid negative price
-        hourly_prices={("03:00", "04:00"): -50.0},
+        current_block_key=("03:00", "03:15"),
+        prices_15min=prices_15min,
+        cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
             export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
@@ -523,19 +613,36 @@ def test_time_range_overnight(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test overnight time range handling."""
+    prices_15min = {}
+    # Add overnight 15-minute blocks
+    for hour in [23, 0, 1, 2, 3]:
+        for i in range(4):
+            start_min = i * 15
+            end_min = start_min + 15
+            if hour == 23 and end_min == 60:
+                start_str = f"{hour:02d}:{start_min:02d}"
+                end_str = "24:00"
+            else:
+                start_str = f"{hour:02d}:{start_min:02d}"
+                if end_min < 60:
+                    end_str = f"{hour:02d}:{end_min:02d}"
+                else:
+                    end_str = f"{(hour + 1) % 24:02d}:00"
+            prices_15min[(start_str, end_str)] = 60.0
+
+    current_block = ("02:00", "02:15")
+    # Mark this as a cheapest block for charging
+    cheapest_blocks = {current_block}
+
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 0),  # 2 AM
         current_price=60.0,
-        hourly_prices={
-            ("23:00", "00:00"): 60.0,
-            ("00:00", "01:00"): 60.0,
-            ("01:00", "02:00"): 60.0,
-            ("02:00", "03:00"): 60.0,
-            ("03:00", "04:00"): 60.0,
-        },
+        current_block_key=current_block,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
             export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
@@ -554,16 +661,20 @@ def test_profit_margin_calculation(
     decision_engine: GrowattDecisionEngine
 ) -> None:
     """Test profit margin prevents unprofitable discharge."""
+    prices_15min = create_15min_prices({
+        3: 100.0,  # Charge price too high
+        18: 125.0,  # Current price
+    })
+
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=80.0,
         current_time=datetime(2024, 1, 1, 18, 0),
         current_price=125.0,  # Above export threshold but not profitable enough
-        hourly_prices={
-            ("03:00", "04:00"): 100.0,  # Charge price too high
-            ("18:00", "19:00"): 125.0,  # Current price
-        },
+        current_block_key=("18:00", "18:15"),
+        prices_15min=prices_15min,
+        cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
             export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
@@ -595,20 +706,39 @@ def test_mode_change_detection(
 def test_consecutive_cheap_hours_grouping(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """Test that consecutive cheap hours are properly grouped."""
+    """Test that charging blocks are selected based on cheapest prices (non-consecutive OK)."""
+    prices_15min = create_15min_prices({
+        2: 60.0,   # Cheap
+        3: 65.0,   # Cheap
+        4: 70.0,   # Cheap
+        5: 85.0,   # Expensive
+        6: 60.0,   # Cheap again (non-consecutive)
+        7: 90.0,   # Expensive
+        8: 55.0,   # Cheapest
+    })
+
+    # The 8 cheapest blocks should be from hours 8, 2, 6, 3 (in price order)
+    # That's 4 blocks from hour 8, 4 blocks from hour 2
+    cheapest_blocks = set()
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        # Hour 8 blocks (cheapest at 55.0)
+        h8_end = f"08:{end_min:02d}" if end_min < 60 else "09:00"
+        cheapest_blocks.add((f"08:{start_min:02d}", h8_end))
+        # Hour 2 blocks (second cheapest at 60.0)
+        h2_end = f"02:{end_min:02d}" if end_min < 60 else "03:00"
+        cheapest_blocks.add((f"02:{start_min:02d}", h2_end))
+
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
-        current_time=datetime(2024, 1, 1, 3, 0),
-        current_price=60.0,
-        hourly_prices={
-            ("02:00", "03:00"): 60.0,
-            ("03:00", "04:00"): 65.0,
-            ("04:00", "05:00"): 70.0,
-            ("05:00", "06:00"): 85.0,  # Above threshold
-            ("06:00", "07:00"): 60.0,  # New cheap period
-        },
+        current_time=datetime(2024, 1, 1, 8, 0),
+        current_price=55.0,
+        current_block_key=("08:00", "08:15"),
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
             export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
@@ -618,17 +748,9 @@ def test_consecutive_cheap_hours_grouping(
         )
     )
 
-    # Access private method for testing
-    cheap_periods = decision_engine._find_consecutive_cheap_hours(context)
-
-    # Should have 2 separate periods
-    assert len(cheap_periods) == 2
-    # First period: 02:00-05:00
-    assert cheap_periods[0][0] == "02:00"
-    assert cheap_periods[0][1] == "05:00"
-    # Second period: 06:00-07:00
-    assert cheap_periods[1][0] == "06:00"
-    assert cheap_periods[1][1] == "07:00"
+    # Should charge when in a cheapest block
+    decision = decision_engine.decide(context)
+    assert decision == "charge_from_grid"
 
 
 def test_invalid_time_format_handling(
@@ -683,7 +805,9 @@ def test_no_price_data_fallback(
         manual_override_mode=None,
         current_mode="regular",
         current_price=0.0,  # No price data
-        hourly_prices={},    # Empty prices
+        current_block_key=None,
+        prices_15min={},    # Empty prices
+        cheapest_blocks=set(),
         price_thresholds=None  # No thresholds
     )
 
@@ -694,59 +818,68 @@ def test_no_price_data_fallback(
 
 def test_calculate_price_ranking(decision_engine: GrowattDecisionEngine) -> None:
     """Test price ranking calculation."""
-    hourly_prices = {
-        ("00:00", "01:00"): 50.0,
-        ("01:00", "02:00"): 40.0,  # Cheapest
-        ("02:00", "03:00"): 60.0,
-        ("03:00", "04:00"): 80.0,
-        ("04:00", "05:00"): 100.0,  # Most expensive
-        ("05:00", "06:00"): 70.0,
-    }
+    # Create 15-minute prices - we need at least a few different price levels
+    prices_15min = {}
+    prices_15min.update(create_15min_prices({0: 50.0}))  # 4 blocks
+    prices_15min.update(create_15min_prices({1: 40.0}))  # 4 blocks - Cheapest
+    prices_15min.update(create_15min_prices({2: 60.0}))  # 4 blocks
+    prices_15min.update(create_15min_prices({3: 80.0}))  # 4 blocks
+    prices_15min.update(create_15min_prices({4: 100.0}))  # 4 blocks - Most expensive
+    prices_15min.update(create_15min_prices({5: 70.0}))  # 4 blocks
+    # Total: 24 blocks
 
-    # Test cheapest hour
-    ranking = decision_engine.calculate_price_ranking(("01:00", "02:00"), hourly_prices)
+    # Test cheapest block (from hour 1)
+    ranking = decision_engine.calculate_price_ranking(("01:00", "01:15"), prices_15min)
     assert ranking is not None
     assert ranking.current_rank == 1
     assert ranking.percentile == 0.0
     assert ranking.price_quadrant == "Cheapest"
     assert ranking.is_relatively_cheap is True
-    assert ranking.hours_cheaper_count == 0
-    assert ranking.hours_more_expensive_count == 5
+    assert ranking.blocks_cheaper_count == 0
+    # Total 24 blocks, this is 1st, so 23 are more expensive
+    assert ranking.blocks_more_expensive_count == 23
 
-    # Test most expensive hour
-    ranking = decision_engine.calculate_price_ranking(("04:00", "05:00"), hourly_prices)
+    # Test most expensive block (from hour 4)
+    ranking = decision_engine.calculate_price_ranking(("04:00", "04:15"), prices_15min)
     assert ranking is not None
-    assert ranking.current_rank == 6
-    assert ranking.percentile == 100.0
+    assert ranking.current_rank == 21  # 20 blocks are cheaper, this is 21st
+    assert ranking.percentile >= 80.0  # Should be near 100%
     assert ranking.price_quadrant == "Most Expensive"
     assert ranking.is_relatively_expensive is True
-    assert ranking.hours_cheaper_count == 5
-    assert ranking.hours_more_expensive_count == 0
+    assert ranking.blocks_cheaper_count == 20
+    # There are 3 other blocks from hour 4 with the same price, so they're also at rank 21
+    assert ranking.blocks_more_expensive_count == 3
 
-    # Test middle hour
-    ranking = decision_engine.calculate_price_ranking(("02:00", "03:00"), hourly_prices)
+    # Test middle block (from hour 2)
+    ranking = decision_engine.calculate_price_ranking(("02:00", "02:15"), prices_15min)
     assert ranking is not None
-    assert ranking.current_rank == 3
-    assert 35 < ranking.percentile < 45  # Around 40%
+    assert ranking.current_rank == 9  # 8 blocks cheaper (4 from hour 1, 4 from hour 0)
+    assert 30 < ranking.percentile < 40  # Around 35%
     assert ranking.price_quadrant == "Cheap"
 
 
 def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngine) -> None:
     """Test that charging decisions use percentile ranking when available."""
-    hourly_prices = {
-        ("00:00", "01:00"): 80.0,
-        ("01:00", "02:00"): 40.0,  # Bottom 25% - should charge
-        ("02:00", "03:00"): 90.0,
-        ("03:00", "04:00"): 100.0,
+    prices_15min = create_15min_prices({
+        0: 80.0,
+        1: 40.0,  # Cheapest - should charge
+        2: 90.0,
+        3: 100.0,
+    })
+
+    # Mark hour 1 blocks as cheapest
+    cheapest_blocks = {
+        ("01:00", "01:15"), ("01:15", "01:30"),
+        ("01:30", "01:45"), ("01:45", "02:00")
     }
 
-    # Create ranking for cheap hour
+    # Create ranking for cheap block
     price_ranking = PriceRankingData(
         current_rank=1,
-        total_hours=4,
+        total_blocks=16,  # 4 hours * 4 blocks
         percentile=0.0,
-        hours_cheaper_count=0,
-        hours_more_expensive_count=3,
+        blocks_cheaper_count=0,
+        blocks_more_expensive_count=15,
         daily_min=40.0,
         daily_max=100.0,
         daily_avg=77.5,
@@ -763,7 +896,9 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 1, 30),
         current_price=40.0,
-        hourly_prices=hourly_prices,
+        current_block_key=("01:30", "01:45"),
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=1.2,  # 50.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -775,26 +910,26 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
     )
 
     decision = decision_engine.decide(context)
-    # Should charge because percentile (0%) <= threshold (25%)
+    # Should charge because in cheapest blocks
     assert decision == "charge_from_grid"
 
 
 def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine) -> None:
     """Test that export decisions use absolute threshold only (percentile info is for context)."""
-    hourly_prices = {
-        ("00:00", "01:00"): 30.0,  # Below threshold
-        ("01:00", "02:00"): 40.0,  # At threshold
-        ("02:00", "03:00"): 60.0,  # Above threshold
-        ("03:00", "04:00"): 80.0,  # Well above threshold
-    }
+    prices_15min = create_15min_prices({
+        0: 30.0,  # Below threshold
+        1: 40.0,  # At threshold
+        2: 60.0,  # Above threshold
+        3: 80.0,  # Well above threshold
+    })
 
     # Test 1: Price below absolute threshold - should NOT export
     price_ranking = PriceRankingData(
         current_rank=4,
-        total_hours=4,
+        total_blocks=4,
         percentile=0.0,  # Cheapest hour
-        hours_cheaper_count=3,
-        hours_more_expensive_count=0,
+        blocks_cheaper_count=3,
+        blocks_more_expensive_count=0,
         daily_min=30.0,
         daily_max=80.0,
         daily_avg=52.5,
@@ -811,7 +946,9 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
         battery_soc=100.0,  # Full battery to prevent charging decision
         current_time=datetime(2024, 1, 1, 0, 30),
         current_price=30.0,  # Below threshold
-        hourly_prices=hourly_prices,
+        current_block_key=("00:30", "00:45"),
+        prices_15min=prices_15min,
+        cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
             charge_price_max=0.5,  # 20.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -843,21 +980,33 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
 
 def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
     """Test that winter mode only charges during 2 cheapest hours."""
-    hourly_prices = {
-        ("00:00", "01:00"): 20.0,  # Rank 1 - cheapest
-        ("01:00", "02:00"): 25.0,  # Rank 2 - second cheapest
-        ("02:00", "03:00"): 35.0,  # Rank 3
-        ("03:00", "04:00"): 40.0,  # Rank 4
-        ("04:00", "05:00"): 50.0,  # Rank 5 - most expensive
-    }
+    prices_15min = create_15min_prices({
+        0: 20.0,  # Cheapest hour
+        1: 25.0,  # Second cheapest
+        2: 35.0,  # Third
+        3: 40.0,  # Fourth
+        4: 50.0,  # Most expensive
+    })
+
+    # Mark hours 0 and 1 blocks as cheapest (8 blocks total = 2 hours)
+    cheapest_blocks = set()
+    for i in range(4):
+        start_min = i * 15
+        end_min = start_min + 15
+        # Hour 0 blocks
+        h0_end = f"00:{end_min:02d}" if end_min < 60 else "01:00"
+        cheapest_blocks.add((f"00:{start_min:02d}", h0_end))
+        # Hour 1 blocks
+        h1_end = f"01:{end_min:02d}" if end_min < 60 else "02:00"
+        cheapest_blocks.add((f"01:{start_min:02d}", h1_end))
 
     # Test 1: Winter mode, rank 1 (cheapest hour) - should charge
     price_ranking = PriceRankingData(
         current_rank=1,
-        total_hours=5,
+        total_blocks=5,
         percentile=0.0,
-        hours_cheaper_count=0,
-        hours_more_expensive_count=4,
+        blocks_cheaper_count=0,
+        blocks_more_expensive_count=4,
         daily_min=20.0,
         daily_max=50.0,
         daily_avg=34.0,
@@ -874,7 +1023,9 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         battery_soc=50.0,  # Not full
         current_time=datetime(2024, 1, 1, 0, 30),
         current_price=20.0,
-        hourly_prices=hourly_prices,
+        current_block_key=("00:30", "00:45"),
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=0.8,  # 30.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -898,7 +1049,8 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 30),
         current_price=35.0,
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=0.8,  # 30.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -908,10 +1060,10 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         ),
         price_ranking=PriceRankingData(
             current_rank=3,
-            total_hours=5,
+            total_blocks=5,
             percentile=50.0,
-            hours_cheaper_count=2,
-            hours_more_expensive_count=2,
+            blocks_cheaper_count=2,
+            blocks_more_expensive_count=2,
             daily_min=20.0,
             daily_max=50.0,
             daily_avg=34.0,
@@ -937,7 +1089,8 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 0, 30),
         current_price=20.0,  # Cheapest price
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=0.8,  # 30.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -947,10 +1100,10 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         ),
         price_ranking=PriceRankingData(
             current_rank=1,  # Cheapest hour
-            total_hours=5,
+            total_blocks=5,
             percentile=0.0,  # Lowest percentile
-            hours_cheaper_count=0,
-            hours_more_expensive_count=4,
+            blocks_cheaper_count=0,
+            blocks_more_expensive_count=4,
             daily_min=20.0,
             daily_max=50.0,
             daily_avg=34.0,
@@ -975,7 +1128,8 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 30),
         current_price=40.0,  # At threshold
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=0.8,  # 30.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -985,10 +1139,10 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
-            total_hours=5,
+            total_blocks=5,
             percentile=75.0,  # Below discharge threshold
-            hours_cheaper_count=3,
-            hours_more_expensive_count=1,
+            blocks_cheaper_count=3,
+            blocks_more_expensive_count=1,
             daily_min=20.0,
             daily_max=50.0,
             daily_avg=34.0,
@@ -1010,23 +1164,26 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
 def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) -> None:
     """Test smart discharge based on price spread relative to daily minimum."""
     # Create a day with significant price variation
-    hourly_prices = {
-        ("00:00", "01:00"): 32.0,  # 0.8 CZK/kWh
-        ("01:00", "02:00"): 36.0,  # 0.9 CZK/kWh
-        ("02:00", "03:00"): 40.0,  # 1.0 CZK/kWh
-        ("06:00", "07:00"): 80.0,  # 2.0 CZK/kWh
-        ("07:00", "08:00"): 120.0,  # 3.0 CZK/kWh - should discharge
-        ("08:00", "09:00"): 140.0,  # 3.5 CZK/kWh - should discharge
-    }
+    prices_15min = create_15min_prices({
+        0: 32.0,   # 0.8 CZK/kWh
+        1: 36.0,   # 0.9 CZK/kWh
+        2: 40.0,   # 1.0 CZK/kWh
+        6: 80.0,   # 2.0 CZK/kWh
+        7: 120.0,  # 3.0 CZK/kWh - should discharge
+        8: 140.0,  # 3.5 CZK/kWh - should discharge
+    })
+
+    # For this test, no blocks are marked as cheapest (not charging time)
+    cheapest_blocks = set()
 
     # Test 1: High price with sufficient spread - should discharge
     # 3.0 CZK/kWh > max(2.0 min, 0.8*3.0 margin) = max(2.0, 2.4) = 2.4 ✓
     price_ranking = PriceRankingData(
         current_rank=5,
-        total_hours=6,
+        total_blocks=6,
         percentile=83.3,
-        hours_cheaper_count=4,
-        hours_more_expensive_count=1,
+        blocks_cheaper_count=4,
+        blocks_more_expensive_count=1,
         daily_min=32.0,  # 0.8 CZK/kWh
         daily_max=140.0,
         daily_avg=73.0,
@@ -1043,7 +1200,8 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 7, 30),
         current_price=120.0,  # 3.0 CZK/kWh
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -1069,7 +1227,8 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 6, 30),
         current_price=80.0,  # 2.0 CZK/kWh
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -1079,10 +1238,10 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
-            total_hours=6,
+            total_blocks=6,
             percentile=66.7,
-            hours_cheaper_count=3,
-            hours_more_expensive_count=2,
+            blocks_cheaper_count=3,
+            blocks_more_expensive_count=2,
             daily_min=32.0,  # 0.8 CZK/kWh
             daily_max=140.0,
             daily_avg=73.0,
@@ -1106,7 +1265,8 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 30),
         current_price=40.0,  # 1.0 CZK/kWh
-        hourly_prices=hourly_prices,
+        prices_15min=prices_15min,
+        cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -1116,10 +1276,10 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         ),
         price_ranking=PriceRankingData(
             current_rank=3,
-            total_hours=6,
+            total_blocks=6,
             percentile=50.0,
-            hours_cheaper_count=2,
-            hours_more_expensive_count=3,
+            blocks_cheaper_count=2,
+            blocks_more_expensive_count=3,
             daily_min=32.0,
             daily_max=140.0,
             daily_avg=73.0,
@@ -1136,12 +1296,12 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     assert decision == "charge_from_grid"  # Charge at low price
 
     # Test 4: Flat price day - should NOT discharge even at high prices
-    flat_prices = {
-        ("00:00", "01:00"): 76.0,  # 1.9 CZK/kWh
-        ("01:00", "02:00"): 80.0,  # 2.0 CZK/kWh
-        ("02:00", "03:00"): 84.0,  # 2.1 CZK/kWh
-        ("03:00", "04:00"): 88.0,  # 2.2 CZK/kWh
-    }
+    flat_prices_15min = create_15min_prices({
+        0: 76.0,  # 1.9 CZK/kWh
+        1: 80.0,  # 2.0 CZK/kWh
+        2: 84.0,  # 2.1 CZK/kWh
+        3: 88.0,  # 2.2 CZK/kWh
+    })
 
     context = DecisionContext(
         manual_override_active=False,
@@ -1149,7 +1309,9 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 30),
         current_price=88.0,  # 2.2 CZK/kWh
-        hourly_prices=flat_prices,
+        current_block_key=("03:30", "03:45"),
+        prices_15min=flat_prices_15min,
+        cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
             charge_price_max=2.0,  # 80.0 EUR/MWh
             export_price_min=1.0,  # 40.0 EUR/MWh
@@ -1159,10 +1321,10 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         ),
         price_ranking=PriceRankingData(
             current_rank=4,
-            total_hours=4,
+            total_blocks=4,
             percentile=100.0,
-            hours_cheaper_count=3,
-            hours_more_expensive_count=0,
+            blocks_cheaper_count=3,
+            blocks_more_expensive_count=0,
             daily_min=76.0,  # 1.9 CZK/kWh
             daily_max=88.0,
             daily_avg=82.0,
