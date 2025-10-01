@@ -303,31 +303,107 @@ class OTEPriceCollector(BaseModule):
     def _parse_ote_response(
         self, data: Dict[str, Any], date_str: str
     ) -> Optional[Dict[Tuple[str, str], float]]:
-        """Parse OTE API response data."""
-        hourly_prices = {}
+        """Parse OTE API response data and convert to 15-minute intervals."""
+        prices_15min: Dict[Tuple[str, str], float] = {}
 
         if "data" in data and "dataLine" in data["data"] and len(data["data"]["dataLine"]) > 1:
             # The structure is: data.dataLine[1].point contains the price data
             price_data = data["data"]["dataLine"][1].get("point", [])
 
-            for point in price_data:
-                hour = int(point["x"]) - 1  # OTE uses 1-based hour indexing
-                price = float(point["y"])  # EUR/MWh
+            # Sort by x value
+            price_data = sorted(price_data, key=lambda p: float(p.get("x", 0)))
+            num_points = len(price_data)
 
-                start_time = f"{hour:02d}:00"
-                stop_time = f"{(hour + 1) % 24:02d}:00"
+            # Parse date for timestamp calculations
+            date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
+            from datetime import time as dt_time
+            base_dt = datetime.combine(date_obj, dt_time(0, 0))
+            base_dt = self._local_tz.localize(base_dt)
 
-                hourly_prices[(start_time, stop_time)] = price
+            if 92 <= num_points <= 100:
+                # Native 15-minute data (96 normal, 92 spring DST, 100 fall DST)
+                if num_points != 96:
+                    dst_type = "spring forward" if num_points == 92 else "fall back"
+                    self.logger.info(
+                        f"DST transition day detected: {num_points} blocks ({dst_type})"
+                    )
+                self.logger.debug(f"Processing {num_points} points as 15-minute intervals")
 
-            # Validate reasonable hour count (23-25 for DST transitions, normally 24)
-            if 23 <= len(hourly_prices) <= 25:
-                self.logger.debug(f"Fetched {len(hourly_prices)} price points for {date_str}")
-                return hourly_prices
-            else:
-                self.logger.warning(
-                    f"Unexpected hour count for {date_str}: {len(hourly_prices)} points"
+                for i, point in enumerate(price_data):
+                    try:
+                        price = float(point["y"])
+                    except (ValueError, TypeError):
+                        self.logger.warning(f"Invalid price at index {i}: {point.get('y')}")
+                        continue
+
+                    # Skip non-finite prices
+                    if not (price == price) or price in (float("inf"), float("-inf")):
+                        self.logger.warning(f"Skipping non-finite price at {i}: {price}")
+                        continue
+
+                    # Calculate 15-minute time slots
+                    minutes = i * 15
+                    start_dt = base_dt + timedelta(minutes=minutes)
+                    stop_dt = start_dt + timedelta(minutes=15)
+
+                    start_time = start_dt.strftime("%H:%M")
+                    if stop_dt.date() != start_dt.date():
+                        stop_time = "24:00" if stop_dt.hour == 0 else stop_dt.strftime("%H:%M")
+                    else:
+                        stop_time = stop_dt.strftime("%H:%M")
+
+                    prices_15min[(start_time, stop_time)] = price
+
+            elif num_points <= 25:
+                # Hourly data (23-25 for DST transitions, normally 24) - expand to 15-minute
+                self.logger.debug(
+                    f"Processing {num_points} hourly points, expanding to 15-minute intervals"
                 )
-                return hourly_prices  # Still return the data, just log warning
+
+                for point in price_data:
+                    try:
+                        hour = int(point["x"]) - 1  # OTE uses 1-based hour indexing
+                        price = float(point["y"])
+                    except (ValueError, TypeError, KeyError):
+                        self.logger.warning(f"Invalid data point: {point}")
+                        continue
+
+                    # Skip non-finite prices
+                    if not (price == price) or price in (float("inf"), float("-inf")):
+                        self.logger.warning(f"Skipping non-finite price at hour {hour}: {price}")
+                        continue
+
+                    # Create 4 15-minute intervals for each hour
+                    hour_dt = base_dt + timedelta(hours=hour)
+                    for quarter in range(4):
+                        minutes = quarter * 15
+                        start_dt = hour_dt + timedelta(minutes=minutes)
+                        stop_dt = start_dt + timedelta(minutes=15)
+
+                        start_time = start_dt.strftime("%H:%M")
+                        if stop_dt.date() != start_dt.date():
+                            stop_time = "24:00" if stop_dt.hour == 0 else stop_dt.strftime("%H:%M")
+                        else:
+                            stop_time = stop_dt.strftime("%H:%M")
+
+                        # Use same price for all 15-min blocks in the hour
+                        prices_15min[(start_time, stop_time)] = price
+
+            else:
+                self.logger.error(
+                    f"Unexpected number of price points: {num_points}. "
+                    f"Expected 23-25 (hourly) or 92-100 (15-minute)"
+                )
+                return None
+
+            # Validate data completeness
+            if prices_15min and len(prices_15min) < 90:
+                self.logger.warning(
+                    f"Incomplete price data: {len(prices_15min)} blocks, expected 92-100"
+                )
+
+            self.logger.debug(f"Successfully parsed {len(prices_15min)} 15-minute price points")
+            return prices_15min
         else:
             self.logger.warning(f"Unexpected data structure for {date_str}")
             return None
@@ -337,7 +413,7 @@ class OTEPriceCollector(BaseModule):
         return await self._fetch_prices_for_date_with_retry(date_str)
 
     async def _store_prices(self, prices: Dict[Tuple[str, str], float], date_str: str) -> None:
-        """Store prices in InfluxDB."""
+        """Store prices in InfluxDB at 15-minute resolution."""
         if not self.influxdb_client:
             return
 
@@ -345,16 +421,19 @@ class OTEPriceCollector(BaseModule):
         date = datetime.strptime(date_str, "%Y-%m-%d")
         local_date = self._local_tz.localize(date)
 
-        for (start_hour, _), price_eur_mwh in prices.items():
-            # Create timestamp for this hour
-            hour = int(start_hour.split(":")[0])
-            # Handle DST transitions by adding hours to base date instead of using replace
+        for (start_time, _), price_eur_mwh in prices.items():
+            # Parse HH:MM format (15-minute intervals)
+            time_parts = start_time.split(":")
+            hour = int(time_parts[0])
+            minute = int(time_parts[1]) if len(time_parts) > 1 else 0
+
+            # Calculate timestamp using timedelta to handle DST transitions
             if hour == 24:
                 # Hour 24 means next day at 00:00
                 timestamp = local_date + timedelta(days=1)
             else:
                 # Use timedelta to handle DST transitions properly
-                timestamp = local_date + timedelta(hours=hour)
+                timestamp = local_date + timedelta(hours=hour, minutes=minute)
 
             # Convert to UTC for storage
             utc_timestamp = timestamp.astimezone(pytz.UTC)
@@ -373,7 +452,7 @@ class OTEPriceCollector(BaseModule):
                     "market": "day_ahead",
                     "currency": "EUR_MWh",
                     "source": "OTE",
-                    "resolution": "PT60M",
+                    "resolution": "PT15M",  # Changed from PT60M to PT15M
                 },
                 timestamp=utc_timestamp,
             )

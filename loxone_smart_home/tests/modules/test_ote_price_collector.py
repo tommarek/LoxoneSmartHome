@@ -79,7 +79,7 @@ async def test_fetch_prices_for_date(
     ote_collector: OTEPriceCollector,
     mock_ote_response: Dict[str, Any],
 ) -> None:
-    """Test fetching prices for a specific date."""
+    """Test fetching prices for a specific date (expands hourly to 15-minute intervals)."""
     # Mock HTTP session with proper async context manager
     mock_response = AsyncMock()
     mock_response.status = 200
@@ -96,13 +96,20 @@ async def test_fetch_prices_for_date(
     # Fetch prices
     prices = await ote_collector._fetch_prices_for_date("2025-06-06")
 
-    # Verify results
+    # Verify results - 4 hourly points expand to 16 15-minute intervals
     assert prices is not None
-    assert len(prices) == 4
-    assert prices[("00:00", "01:00")] == 45.50
-    assert prices[("01:00", "02:00")] == 43.25
-    assert prices[("02:00", "03:00")] == 41.00
-    assert prices[("03:00", "04:00")] == 42.75
+    assert len(prices) == 16  # 4 hours × 4 15-minute blocks per hour
+    # First hour (00:00-01:00) is expanded to 4 blocks with same price
+    assert prices[("00:00", "00:15")] == 45.50
+    assert prices[("00:15", "00:30")] == 45.50
+    assert prices[("00:30", "00:45")] == 45.50
+    assert prices[("00:45", "01:00")] == 45.50
+    # Second hour (01:00-02:00)
+    assert prices[("01:00", "01:15")] == 43.25
+    # Third hour (02:00-03:00)
+    assert prices[("02:00", "02:15")] == 41.00
+    # Fourth hour (03:00-04:00)
+    assert prices[("03:00", "03:15")] == 42.75
 
 
 @pytest.mark.asyncio
@@ -153,10 +160,10 @@ async def test_store_prices(
     ote_collector: OTEPriceCollector,
     mock_influxdb_client: AsyncMock,
 ) -> None:
-    """Test storing prices in InfluxDB."""
+    """Test storing prices in InfluxDB at 15-minute resolution."""
     prices = {
-        ("00:00", "01:00"): 45.50,
-        ("01:00", "02:00"): 43.25,
+        ("00:00", "00:15"): 45.50,
+        ("00:15", "00:30"): 43.25,
     }
 
     await ote_collector._store_prices(prices, "2025-06-06")
@@ -173,7 +180,7 @@ async def test_store_prices(
     assert first_call.kwargs["tags"]["market"] == "day_ahead"
     assert first_call.kwargs["tags"]["currency"] == "EUR_MWh"
     assert first_call.kwargs["tags"]["source"] == "OTE"
-    assert first_call.kwargs["tags"]["resolution"] == "PT60M"
+    assert first_call.kwargs["tags"]["resolution"] == "PT15M"
 
     # Check timestamp conversion
     timestamp = first_call.kwargs["timestamp"]
