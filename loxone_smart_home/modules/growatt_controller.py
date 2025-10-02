@@ -1504,6 +1504,34 @@ class GrowattController(BaseModule):
             # Extract previous mode for optimization (only disable the mode that was active)
             previous_mode = old_state.inverter_mode if old_state else None
 
+            # Log detailed mode transition explanation
+            if old_state:
+                self.logger.info(
+                    f"🔄 Inverter mode transition: {old_state.inverter_mode} → "
+                    f"{new_state.inverter_mode} (source: {new_state.source})"
+                )
+                # Log parameter changes
+                param_changes = []
+                if old_state.stop_soc != new_state.stop_soc:
+                    param_changes.append(f"stopSOC: {old_state.stop_soc}% → {new_state.stop_soc}%")
+                if old_state.power_rate != new_state.power_rate:
+                    param_changes.append(
+                        f"powerRate: {old_state.power_rate}% → {new_state.power_rate}%"
+                    )
+                if (old_state.time_start != new_state.time_start
+                        or old_state.time_stop != new_state.time_stop):
+                    param_changes.append(
+                        f"timeWindow: {old_state.time_start}-{old_state.time_stop} → "
+                        f"{new_state.time_start}-{new_state.time_stop}"
+                    )
+                if param_changes:
+                    self.logger.info(f"   Parameters: {', '.join(param_changes)}")
+            else:
+                self.logger.info(
+                    f"🔄 Initial inverter mode: {new_state.inverter_mode} "
+                    f"(stopSOC={new_state.stop_soc}%, source: {new_state.source})"
+                )
+
             # Detect if this is for immediate activation (all-day time window)
             # Time window of 00:00-23:59 indicates mode should be active NOW
             immediate_activation = (
@@ -1541,15 +1569,27 @@ class GrowattController(BaseModule):
             self._commands_sent_count += 1
             if new_state.export_enabled:
                 await self._mode_manager.enable_export()
-                self.logger.info("Export ENABLED (price-based)")
+                self.logger.info(
+                    f"⚡ Export to grid ENABLED (source: {new_state.source})"
+                )
             else:
                 await self._mode_manager.disable_export()
-                self.logger.info("Export DISABLED (price-based)")
+                self.logger.info(
+                    f"⚡ Export to grid DISABLED (source: {new_state.source})"
+                )
 
         # AC charge change
         if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:
             self._commands_sent_count += 1
             await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled)
+            if new_state.ac_charge_enabled:
+                self.logger.info(
+                    f"🔌 AC charging from grid ENABLED (source: {new_state.source})"
+                )
+            else:
+                self.logger.info(
+                    f"🔌 AC charging from grid DISABLED (source: {new_state.source})"
+                )
 
     async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
         """Apply a mode based on its definition from MODE_DEFINITIONS.
