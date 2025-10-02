@@ -1259,16 +1259,18 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
 
     # Test 3: Price below absolute threshold - should NOT discharge
     # 1.0 CZK/kWh < max(2.0 min, 0.8*3.0 margin) = max(2.0, 2.4) = 2.4 ✗
+    # NOTE: With new cheapest-blocks logic, won't charge unless block is in cheapest set
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 30),
         current_price=40.0,  # 1.0 CZK/kWh
+        current_block_key=("02:00", "02:15"),  # Current block
         prices_15min=prices_15min,
-        cheapest_blocks=cheapest_blocks,
+        cheapest_blocks=cheapest_blocks,  # Empty - not a charging block
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
+            charge_price_max=2.0,  # 80.0 EUR/MWh (not used with new logic)
             export_price_min=1.0,  # 40.0 EUR/MWh
             discharge_price_min=2.0,
             discharge_profit_margin=3.0,  # Changed from 1.5 for consistency
@@ -1292,8 +1294,8 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     )
 
     decision = decision_engine.decide(context)
-    # Should charge because 1.0 < 2.0 charge threshold
-    assert decision == "charge_from_grid"  # Charge at low price
+    # Should NOT charge (block not in cheapest set) and should NOT discharge (price too low)
+    assert decision == "regular"  # Just export, no charge, no discharge
 
     # Test 4: Flat price day - should NOT discharge even at high prices
     flat_prices_15min = create_15min_prices({

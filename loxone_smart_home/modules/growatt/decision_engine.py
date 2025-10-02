@@ -88,16 +88,12 @@ class DecisionContext:
             self.is_battery_charging_scheduled = (
                 self.current_block_key in self.cheapest_blocks
             )
-        # Fall back to price threshold if no cheapest blocks defined
-        elif self.price_thresholds and self.current_price > 0:
-            # Convert EUR/MWh to CZK/kWh for comparison (EUR * 25 / 1000)
-            price_czk_kwh = self.current_price * 25 / 1000
-            self.is_battery_charging_scheduled = (
-                price_czk_kwh < self.price_thresholds.charge_price_max
-            )
         # Legacy: Check if the scheduled mode is battery charging
         elif self.scheduled_mode == "charge_from_grid":
             self.is_battery_charging_scheduled = True
+        # No fallback to price threshold - only charge during cheapest blocks
+        else:
+            self.is_battery_charging_scheduled = False
 
 
 @dataclass
@@ -209,23 +205,25 @@ class GrowattDecisionEngine:
                 condition=lambda ctx: (
                     ctx.high_loads_active
                     and ctx.battery_soc < 100
-                    and (ctx.is_battery_charging_scheduled or self._should_charge_battery(ctx))
+                    and ctx.is_battery_charging_scheduled
                 ),
                 action="battery_first_ac_charge",
-                explanation="Cheap hour with high loads - battery-first mode with AC charging"
+                explanation=(
+                    "Scheduled charging hour with high loads - "
+                    "battery-first mode with AC charging"
+                )
             ),
 
-            # Priority 2B: Cheap Hour Charging - Charge battery during low prices
+            # Priority 2B: Cheap Hour Charging - Charge battery during cheapest blocks
             DecisionNode(
-                name="Cheap Hour Battery Charging",
+                name="Scheduled Battery Charging",
                 priority=Priority.SCHEDULED_BATTERY_CHARGING,
                 condition=lambda ctx: (
-                    ctx.battery_soc < 100 and (
-                        ctx.is_battery_charging_scheduled or self._should_charge_battery(ctx)
-                    )
+                    ctx.battery_soc < 100
+                    and ctx.is_battery_charging_scheduled
                 ),
                 action="charge_from_grid",
-                explanation="Cheap electricity hour - charging battery to 100%"
+                explanation="Cheapest electricity blocks - charging battery to 100%"
             ),
 
             # Priority 3: High Load Protection - Prevent ALL battery discharge
@@ -235,7 +233,6 @@ class GrowattDecisionEngine:
                 condition=lambda ctx: (
                     ctx.high_loads_active
                     and not ctx.is_battery_charging_scheduled
-                    and not self._should_charge_battery(ctx)
                 ),
                 action="high_load_protected",
                 explanation=(
@@ -423,44 +420,6 @@ class GrowattDecisionEngine:
 
     # Price-aware decision helper methods
 
-    def _should_charge_battery(self, context: DecisionContext) -> bool:
-        """Determine if battery should charge based on price ranking and SOC.
-
-        Args:
-            context: Current decision context
-
-        Returns:
-            True if battery should charge from grid
-        """
-        # Don't charge if battery is full
-        if context.battery_soc >= 100:
-            return False
-
-        # Summer mode: NEVER charge from AC
-        if context.is_summer_mode:
-            self.logger.debug("Summer mode: AC charging disabled")
-            return False
-
-        # Check if current price is below charge threshold
-        if context.price_thresholds and context.current_price > 0:
-            # Convert current price from EUR/MWh to CZK/kWh
-            current_price_czk = context.current_price * 25 / 1000
-            should_charge = current_price_czk < context.price_thresholds.charge_price_max
-
-            if should_charge:
-                self.logger.debug(
-                    f"Charging: price {current_price_czk:.2f} CZK/kWh "
-                    f"< {context.price_thresholds.charge_price_max:.2f} CZK/kWh threshold"
-                )
-            else:
-                self.logger.debug(
-                    f"No charge: price {current_price_czk:.2f} CZK/kWh "
-                    f"> {context.price_thresholds.charge_price_max:.2f} CZK/kWh threshold"
-                )
-            return should_charge
-
-        return False
-
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on simple price thresholds.
 
@@ -528,70 +487,6 @@ class GrowattDecisionEngine:
                 f"{context.price_thresholds.discharge_profit_margin:.1f})"
             )
             return False
-
-    def _find_consecutive_cheap_blocks(
-        self, context: DecisionContext
-    ) -> List[Tuple[str, str, float]]:
-        """Find consecutive 15-minute blocks below the cheap threshold.
-
-        Args:
-            context: Current decision context
-
-        Returns:
-            List of (start, end, avg_price) tuples for cheap periods
-        """
-        if not context.prices_15min or not context.price_thresholds:
-            return []
-
-        # Validate price data
-        if not self._validate_price_data(context.prices_15min):
-            self.logger.warning("Invalid price data detected, skipping price-based decisions")
-            return []
-
-        cheap_periods = []
-        sorted_blocks = sorted(context.prices_15min.keys())
-        i = 0
-
-        while i < len(sorted_blocks):
-            start_key = sorted_blocks[i]
-            price = context.prices_15min[start_key]
-
-            # Convert EUR/MWh to CZK/kWh for comparison
-            price_czk_kwh = price * 25 / 1000
-            if price_czk_kwh < context.price_thresholds.charge_price_max:
-                # Start of cheap period
-                period_start = start_key[0]
-                period_prices = [price]
-                j = i + 1
-
-                # Find end of cheap period (consecutive blocks)
-                while j < len(sorted_blocks):
-                    next_key = sorted_blocks[j]
-
-                    # Check if blocks are consecutive (15-min apart)
-                    prev_end = sorted_blocks[j - 1][1]
-                    curr_start = next_key[0]
-                    is_24h_boundary = prev_end == "24:00" and curr_start == "00:00"
-                    if prev_end != curr_start and not is_24h_boundary:
-                        break  # Not consecutive
-
-                    next_price = context.prices_15min[next_key]
-                    # Convert EUR/MWh to CZK/kWh for comparison
-                    next_price_czk_kwh = next_price * 25 / 1000
-                    if next_price_czk_kwh < context.price_thresholds.charge_price_max:
-                        period_prices.append(next_price)
-                        j += 1
-                    else:
-                        break
-
-                period_end = sorted_blocks[j - 1][1]
-                avg_price = sum(period_prices) / len(period_prices)
-                cheap_periods.append((period_start, period_end, avg_price))
-                i = j
-            else:
-                i += 1
-
-        return cheap_periods
 
     def _is_hour_in_range(self, hour: str, start: str, end: str) -> bool:
         """Check if an hour is within a time range.
