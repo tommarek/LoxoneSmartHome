@@ -213,3 +213,119 @@ async def test_simulation_mode(mode_manager, mock_controller):
     # Verify no actual MQTT calls were made
     assert mock_controller.mqtt_client.publish.call_count == 0
     assert mock_controller._wait_for_command_result.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_disable_battery_first_fails_gracefully(mode_manager, mock_controller):
+    """Test that disable_battery_first returns early on failure without updating state."""
+    # Set initial state
+    mode_manager._battery_first_slots[1] = {"enabled": True}
+
+    # Mock command to always fail
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+
+    # Call disable
+    await mode_manager.disable_battery_first()
+
+    # Verify state was NOT updated (still enabled)
+    assert mode_manager._battery_first_slots[1]["enabled"] is True
+
+    # Verify error was logged
+    assert any("Failed to disable battery-first mode" in str(call)
+               for call in mode_manager.logger.error.call_args_list)
+
+    # Verify success message was NOT logged
+    assert not any("BATTERY-FIRST MODE DISABLED" in str(call)
+                   for call in mode_manager.logger.info.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_disable_grid_first_fails_gracefully(mode_manager, mock_controller):
+    """Test that disable_grid_first returns early on failure without updating state."""
+    # Mock command to always fail
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+
+    # Call disable
+    await mode_manager.disable_grid_first()
+
+    # Verify error was logged
+    assert any("Failed to disable grid-first mode" in str(call)
+               for call in mode_manager.logger.error.call_args_list)
+
+    # Verify success message was NOT logged
+    assert not any("GRID-FIRST MODE DISABLED" in str(call)
+                   for call in mode_manager.logger.info.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_set_export_fails_gracefully(mode_manager, mock_controller):
+    """Test that set_export returns early on failure without updating state."""
+    mode_manager._export_enabled = False
+
+    # Mock command to always fail
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+
+    # Try to enable export
+    await mode_manager.set_export(True)
+
+    # Verify state was NOT updated (still disabled)
+    assert mode_manager._export_enabled is False
+
+    # Verify error was logged
+    assert any("Failed to enable export" in str(call)
+               for call in mode_manager.logger.error.call_args_list)
+
+    # Verify success message was NOT logged
+    assert not any("EXPORT ENABLED" in str(call)
+                   for call in mode_manager.logger.info.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_set_ac_charge_fails_gracefully(mode_manager, mock_controller):
+    """Test that set_ac_charge returns early on failure without updating state."""
+    mode_manager._ac_enabled = False
+
+    # Mock command to always fail
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+
+    # Try to enable AC charge
+    await mode_manager.set_ac_charge(True)
+
+    # Verify state was NOT updated (still disabled)
+    assert mode_manager._ac_enabled is False
+
+    # Verify error was logged
+    assert any("Failed to set AC charge" in str(call)
+               for call in mode_manager.logger.error.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_set_load_first_aborts_on_stopsoc_failure(mode_manager, mock_controller):
+    """Test that set_load_first returns early when stopSOC fails."""
+    mock_controller.config.load_first_stopsoc_topic = "test/stopsoc"
+
+    # Mock disable methods to succeed, but stopSOC to fail
+    mode_manager.disable_battery_first = AsyncMock()
+    mode_manager.disable_grid_first = AsyncMock()
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+
+    # Try to set load_first
+    await mode_manager.set_load_first(stop_soc=100, previous_mode=None)
+
+    # Verify error was logged
+    assert any("Failed to set load-first stopSOC" in str(call)
+               for call in mode_manager.logger.error.call_args_list)
+
+    # Verify final success message was NOT logged
+    assert not any("LOAD-FIRST MODE SET" in str(call)
+                   for call in mode_manager.logger.info.call_args_list)

@@ -75,8 +75,7 @@ class DecisionContext:
     sunrise: Optional[time] = None
     sunset: Optional[time] = None
     is_summer_mode: bool = False
-    scheduled_mode: Optional[str] = None  # Legacy compatibility
-    is_battery_charging_scheduled: bool = False  # Legacy compatibility
+    is_battery_charging_scheduled: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
@@ -88,9 +87,6 @@ class DecisionContext:
             self.is_battery_charging_scheduled = (
                 self.current_block_key in self.cheapest_blocks
             )
-        # Legacy: Check if the scheduled mode is battery charging
-        elif self.scheduled_mode == "charge_from_grid":
-            self.is_battery_charging_scheduled = True
         # No fallback to price threshold - only charge during cheapest blocks
         else:
             self.is_battery_charging_scheduled = False
@@ -341,7 +337,6 @@ class GrowattDecisionEngine:
             "context": {
                 "manual_override": ctx.manual_override_active,
                 "high_loads": ctx.high_loads_active,
-                "scheduled_mode": ctx.scheduled_mode,
                 "battery_soc": ctx.battery_soc,
                 "battery_charging_scheduled": ctx.is_battery_charging_scheduled
             }
@@ -382,14 +377,12 @@ class GrowattDecisionEngine:
     def test_scenario(self,
                       manual_override: bool = False,
                       high_loads: bool = False,
-                      scheduled_mode: Optional[str] = None,
                       battery_soc: float = 50.0) -> Dict[str, Any]:
         """Test a specific scenario for debugging.
 
         Args:
             manual_override: Whether manual override is active
             high_loads: Whether high loads are active
-            scheduled_mode: Current scheduled mode
             battery_soc: Current battery SOC
 
         Returns:
@@ -401,7 +394,6 @@ class GrowattDecisionEngine:
             battery_soc=battery_soc,
             current_time=datetime.now(),
             manual_override_mode="regular" if manual_override else None,
-            scheduled_mode=scheduled_mode,
             current_mode=None
         )
 
@@ -412,7 +404,6 @@ class GrowattDecisionEngine:
             "scenario": {
                 "manual_override": manual_override,
                 "high_loads": high_loads,
-                "scheduled_mode": scheduled_mode,
                 "battery_soc": battery_soc
             },
             "result": explanation

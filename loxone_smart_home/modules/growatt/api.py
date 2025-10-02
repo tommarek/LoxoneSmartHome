@@ -300,7 +300,6 @@ def create_growatt_api(
 
     # Register routes
     app.router.add_get('/api/growatt/status', get_status)
-    app.router.add_get('/api/growatt/schedule', get_schedule)
     app.router.add_get('/api/growatt/prices', get_prices)
     app.router.add_post('/api/growatt/mode', set_mode)
     app.router.add_post('/api/growatt/sync-time', sync_time)
@@ -390,27 +389,6 @@ async def get_status(request: web.Request) -> web.Response:
         import traceback
         controller.logger.error(f"Error in get_status: {e}", exc_info=True)
         return web.json_response({"error": str(e), "traceback": traceback.format_exc()}, status=500)
-
-
-async def get_schedule(request: web.Request) -> web.Response:
-    """Get current schedule (deprecated - scheduling system removed).
-
-    Returns:
-        JSON indicating scheduling is no longer used.
-    """
-    controller: Optional[GrowattController] = request.app.get(GROWATT_CONTROLLER_KEY)
-    if not controller:
-        return web.json_response(
-            {"error": "Controller not initialized"}, status=503
-        )
-
-    # Scheduling system has been removed in favor of real-time evaluation
-    return web.json_response({
-        "message": "Scheduling system deprecated - using real-time evaluation",
-        "schedule": [],
-        "active_now": None,
-        "total_periods": 0
-    })
 
 
 async def get_prices(request: web.Request) -> web.Response:

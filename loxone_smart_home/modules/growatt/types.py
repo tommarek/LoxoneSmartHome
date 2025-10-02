@@ -44,11 +44,3 @@ class Period:
         else:
             # Wrap case: period spans midnight
             return t >= self.start or t <= self.end
-
-    def to_string_tuple(self) -> Tuple[str, str, str]:
-        """Convert to string tuple for logging."""
-        return (
-            self.kind,
-            self.start.strftime("%H:%M"),
-            self.end.strftime("%H:%M"),
-        )

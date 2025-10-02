@@ -36,10 +36,6 @@ class Period:
         else:
             return t >= self.start or t < self.end
 
-    def to_string_tuple(self) -> Tuple[str, str, str]:
-        """Convert to legacy string tuple format for logging."""
-        return (self.kind, self.start.strftime("%H:%M"), self.end.strftime("%H:%M"))
-
 
 def is_24(s: str) -> bool:
     """Check if time string represents 24:00 (end of day)."""

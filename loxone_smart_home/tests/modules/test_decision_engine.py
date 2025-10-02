@@ -58,7 +58,6 @@ def base_context() -> DecisionContext:
         battery_soc=50.0,
         current_time=datetime.now(),
         manual_override_mode=None,
-        scheduled_mode=None,
         current_mode=None
     )
 
@@ -79,7 +78,6 @@ def test_manual_override_highest_priority(
     base_context.manual_override_active = True
     base_context.manual_override_mode = "regular"
     base_context.high_loads_active = True
-    base_context.scheduled_mode = "charge_from_grid"
 
     decision = decision_engine.decide(base_context)
     explanation = decision_engine.explain_decision()
@@ -95,8 +93,7 @@ def test_battery_charging_overrides_high_load(
 ) -> None:
     """Test that battery charging overrides high load protection."""
     base_context.high_loads_active = True
-    base_context.scheduled_mode = "charge_from_grid"
-    base_context.is_battery_charging_scheduled = True  # Must set this explicitly
+    base_context.is_battery_charging_scheduled = True  # Battery charging scheduled
 
     decision = decision_engine.decide(base_context)
     explanation = decision_engine.explain_decision()
@@ -113,7 +110,7 @@ def test_high_load_protection_triggers(
 ) -> None:
     """Test that high load protection triggers when conditions are met."""
     base_context.high_loads_active = True
-    base_context.scheduled_mode = "regular"  # Not battery charging
+    # Not battery charging (is_battery_charging_scheduled defaults to False)
 
     decision = decision_engine.decide(base_context)
     explanation = decision_engine.explain_decision()
@@ -126,23 +123,6 @@ def test_high_load_protection_triggers(
     mode_def = MODE_DEFINITIONS["high_load_protected"]
     assert mode_def["stop_soc"] == 100  # Should prevent discharge
     assert mode_def["inverter_mode"] == "load_first"
-
-
-def test_scheduled_mode_ignored_for_price_decisions(
-    decision_engine: GrowattDecisionEngine,
-    base_context: DecisionContext
-) -> None:
-    """Test that scheduled modes are ignored in favor of price-based decisions."""
-    base_context.scheduled_mode = "sell_production"  # Legacy field
-
-    decision = decision_engine.decide(base_context)
-    explanation = decision_engine.explain_decision()
-
-    # Should fall back to regular mode without price data or conditions
-    assert decision == "regular"
-    assert explanation["priority"]["level"] == Priority.DEFAULT_MODE
-    # Expect default mode reason, not scheduled
-    assert "special" in explanation["reason"].lower() or "regular" in explanation["reason"].lower()
 
 
 def test_default_mode_fallback(
@@ -165,7 +145,6 @@ def test_mode_transitions(
 ) -> None:
     """Test mode transitions as conditions change."""
     # Start with regular mode
-    base_context.scheduled_mode = "regular"
     assert decision_engine.decide(base_context) == "regular"
 
     # High load triggers protection
@@ -173,8 +152,7 @@ def test_mode_transitions(
     assert decision_engine.decide(base_context) == "high_load_protected"
 
     # Battery charging with high load -> battery_first_ac_charge
-    base_context.scheduled_mode = "charge_from_grid"
-    base_context.is_battery_charging_scheduled = True  # Must set this explicitly
+    base_context.is_battery_charging_scheduled = True
     assert decision_engine.decide(base_context) == "battery_first_ac_charge"
 
     # Manual override takes precedence over everything
@@ -190,9 +168,8 @@ def test_mode_transitions(
     base_context.high_loads_active = False
     assert decision_engine.decide(base_context) == "charge_from_grid"
 
-    # Change scheduled mode to regular
-    base_context.scheduled_mode = "regular"
-    base_context.is_battery_charging_scheduled = False  # No longer charging
+    # Change to regular (no battery charging)
+    base_context.is_battery_charging_scheduled = False
     assert decision_engine.decide(base_context) == "regular"
 
 
@@ -234,7 +211,6 @@ def test_test_scenario_method(decision_engine: GrowattDecisionEngine) -> None:
     result = decision_engine.test_scenario(
         manual_override=False,
         high_loads=True,
-        scheduled_mode="regular",
         battery_soc=45.0
     )
 
@@ -258,7 +234,6 @@ def test_explanation_with_context(
 ) -> None:
     """Test explanation with a provided context."""
     base_context.high_loads_active = True
-    base_context.scheduled_mode = "regular"
 
     # Explain without making decision first
     decision_engine._last_decision = None
@@ -273,19 +248,20 @@ def test_explanation_with_context(
 def test_charge_from_grid_detection(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """Test that charge_from_grid is properly detected."""
-    # Create context with charge_from_grid to trigger __post_init__
+    """Test that charge_from_grid is properly detected via cheapest blocks."""
+    # Create context with current block in cheapest blocks
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime.now(),
         manual_override_mode=None,
-        scheduled_mode="charge_from_grid",
-        current_mode=None
+        current_mode=None,
+        current_block_key=("10:00", "10:15"),
+        cheapest_blocks={("10:00", "10:15"), ("11:00", "11:15")}
     )
 
-    # Should be detected in post_init
+    # Should be detected in post_init based on current_block_key in cheapest_blocks
     assert context.is_battery_charging_scheduled is True
 
     decision = decision_engine.decide(context)
@@ -314,9 +290,8 @@ def test_all_composite_modes_supported(
     ]
 
     for mode in composite_modes:
-        base_context.scheduled_mode = mode
         decision = decision_engine.decide(base_context)
-        # Should either be the mode itself or overridden by higher priority
+        # Should be determined by decision logic based on context
         assert decision in MODE_DEFINITIONS
 
 

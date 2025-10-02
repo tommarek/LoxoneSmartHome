@@ -371,7 +371,8 @@ async def test_home_status_battery_soc_update(
     # Mock detect method to return no high loads
     setattr(growatt_controller, "_detect_high_loads_from_status", lambda x: {"active": False})
     setattr(growatt_controller, "_handle_high_load_start", AsyncMock())
-    setattr(growatt_controller, "_determine_and_apply_mode", AsyncMock())
+    # Note: _determine_and_apply_mode was removed - using _evaluate_conditions instead
+    setattr(growatt_controller, "_evaluate_conditions", AsyncMock())
 
     # Test battery SOC update
     payload = {

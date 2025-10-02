@@ -1031,14 +1031,6 @@ class GrowattController(BaseModule):
 
         self.logger.info("Growatt controller stopped")
 
-    async def _determine_and_apply_mode(self) -> None:
-        """Legacy adapter - redirects to new evaluation system.
-
-        This method exists for backward compatibility with code that still
-        calls the old method. It simply triggers a re-evaluation.
-        """
-        await self._evaluate_conditions("legacy_call")
-
     async def _on_home_status(self, _topic: str, payload: Any) -> None:
         """Handle home status updates from UDP listener.
 
@@ -1096,8 +1088,8 @@ class GrowattController(BaseModule):
                     await self._handle_high_load_start()
                 else:
                     self.logger.info("✅ High loads cleared - Restoring scheduled operation")
-                    # Use decision tree to determine what mode to apply now
-                    await self._determine_and_apply_mode()
+                    # Re-evaluate conditions to determine what mode to apply now
+                    await self._evaluate_conditions("high_load_cleared")
 
         except Exception as e:
             self.logger.error(f"Failed to process home status: {e}", exc_info=True)
@@ -1154,8 +1146,8 @@ class GrowattController(BaseModule):
         """Handle high loads by applying decision tree logic."""
         try:
             self.logger.info("⚡ High loads detected - using decision tree to determine action")
-            # The decision tree will handle this - just re-evaluate current state
-            await self._determine_and_apply_mode()
+            # Re-evaluate current state with the decision tree
+            await self._evaluate_conditions("high_load_detected")
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 

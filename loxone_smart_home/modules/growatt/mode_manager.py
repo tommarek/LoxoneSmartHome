@@ -309,12 +309,6 @@ class ModeManager:
         stop_dev = self._to_device_hhmm(adjusted_stop)
         payload = {"start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1}
 
-        # DEBUG
-        self.logger.warning(
-            f"🔍 DEBUG battery-first payload: start={start_dev!r}, stop={stop_dev!r}, "
-            f"enabled=True, slot=1 (adjusted from {adjusted_start} to {adjusted_stop})"
-        )
-
         self.logger.debug(f"Enabling battery-first mode for {adjusted_start}-{adjusted_stop}")
         success, _ = await self._execute_command_with_retry(
             self.config.battery_first_topic,
@@ -377,7 +371,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error(f"Failed to set AC charge to {state_text}")
-            # Continue anyway, not critical
+            return  # Don't update state if command failed
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         state = "ENABLED" if enabled else "DISABLED"
@@ -405,11 +399,6 @@ class ModeManager:
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
-        # DEBUG
-        self.logger.warning(
-            "🔍 DEBUG disable battery-first payload: start='00:00', stop='00:00', "
-            "enabled=False, slot=1"
-        )
         success, _ = await self._execute_command_with_retry(
             self.config.battery_first_topic,
             payload,
@@ -418,7 +407,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to disable battery-first mode")
-            # Continue anyway to update state
+            return  # Don't update state if command failed
 
         self._battery_first_slots[1] = {
             "enabled": False,
@@ -463,7 +452,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to enable export")
-                # Continue anyway to update state
+                return  # Don't update state if command failed
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {topic}")
@@ -477,7 +466,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to disable export")
-                # Continue anyway to update state
+                return  # Don't update state if command failed
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {topic}")
@@ -551,8 +540,6 @@ class ModeManager:
         # Set stop SOC (battery level to stop discharging)
         stopsoc_payload = {"value": stop_soc}
         self.logger.debug(f"Setting grid-first stopSOC to {stop_soc}%")
-        # DEBUG
-        self.logger.warning(f"🔍 DEBUG grid-first stopSOC payload: value={stop_soc}")
         success, _ = await self._execute_command_with_retry(
             self.config.grid_first_stopsoc_topic,
             stopsoc_payload,
@@ -568,8 +555,6 @@ class ModeManager:
 
         powerrate_payload = {"value": power_rate}
         self.logger.debug(f"Setting grid-first powerRate to {power_rate}%")
-        # DEBUG
-        self.logger.warning(f"🔍 DEBUG grid-first powerRate payload: value={power_rate}")
         success, _ = await self._execute_command_with_retry(
             self.config.grid_first_powerrate_topic,
             powerrate_payload,
@@ -593,13 +578,6 @@ class ModeManager:
         timeslot_payload = {
             "start": start_dev, "stop": stop_dev, "enabled": True, "slot": 1
         }
-
-        # TEMPORARY DEBUG: Show exact payload and parameters
-        self.logger.warning(
-            f"🔍 DEBUG grid-first timeslot payload: start={start_dev!r}, stop={stop_dev!r}, "
-            f"enabled=True, slot=1 (adjusted from {adjusted_start} to {adjusted_stop}), "
-            f"stopSOC={stop_soc}, powerRate={power_rate}"
-        )
 
         self.logger.debug(f"Enabling grid-first mode for {adjusted_start}-{adjusted_stop}")
         success, _ = await self._execute_command_with_retry(
@@ -654,11 +632,6 @@ class ModeManager:
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
-        # DEBUG
-        self.logger.warning(
-            "🔍 DEBUG disable grid-first payload: start='00:00', stop='00:00', "
-            "enabled=False, slot=1"
-        )
         success, _ = await self._execute_command_with_retry(
             self.config.grid_first_topic,
             payload,
@@ -667,7 +640,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to disable grid-first mode")
-            # Continue anyway to update state
+            return  # Don't update state if command failed
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -754,7 +727,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to set load-first stopSOC")
-                # Continue anyway, not critical
+                return  # Don't update state if command failed
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
