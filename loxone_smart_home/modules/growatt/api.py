@@ -334,7 +334,7 @@ async def get_status(request: web.Request) -> web.Response:
         now = controller._get_local_now()
 
         # Since scheduling is removed, we just use the current mode
-        primary_mode = controller._current_mode or "regular"
+        primary_mode = getattr(controller, '_current_mode', None) or "regular"
 
         # Get inverter mode data from actual device
         inverter_data = {}
@@ -356,21 +356,25 @@ async def get_status(request: web.Request) -> web.Response:
         # Get manual override status
         manual_override = controller.get_manual_override_status()
 
+        # Get current inverter state with defensive access
+        current_state = getattr(controller, '_current_inverter_state', None)
+        season_mode_updated = getattr(controller, '_season_mode_updated', None)
+
         status = {
-            "running": controller._running,
+            "running": getattr(controller, '_running', False),
             "current_mode": primary_mode,
-            "season_mode": controller._season_mode,
+            "season_mode": getattr(controller, '_season_mode', None),
             "season_mode_updated": (
-                controller._season_mode_updated.isoformat()
-                if controller._season_mode_updated else None
+                season_mode_updated.isoformat()
+                if season_mode_updated else None
             ),
             "ac_enabled": (
-                controller._current_inverter_state.ac_charge_enabled
-                if controller._current_inverter_state else False
+                current_state.ac_charge_enabled
+                if current_state else False
             ),
             "export_enabled": (
-                controller._current_inverter_state.export_enabled
-                if controller._current_inverter_state else True
+                current_state.export_enabled
+                if current_state else True
             ),
             "current_time": now.isoformat(),
             "simulation_mode": controller._optional_config.get(
@@ -684,6 +688,9 @@ async def get_config(request: web.Request) -> web.Response:
             "battery_capacity": getattr(
                 controller.config, "battery_capacity", None
             ),
+            "max_charge_power": getattr(
+                controller.config, "max_charge_power", None
+            ),
             "min_soc": getattr(controller.config, "min_soc", None),
             "max_soc": getattr(controller.config, "max_soc", None),
             "discharge_min_soc": getattr(controller.config, "discharge_min_soc", None),
@@ -693,8 +700,8 @@ async def get_config(request: web.Request) -> web.Response:
             "export_price_min": getattr(controller.config, "export_price_min", 1.0),
             "discharge_price_min": getattr(controller.config, "discharge_price_min", 3.0),
             "discharge_profit_margin": getattr(controller.config, "discharge_profit_margin", 4.0),
-            "battery_charge_blocks": (
-                controller.config.battery_charge_blocks
+            "battery_charge_blocks": getattr(
+                controller.config, "battery_charge_blocks", 8
             ),
             "summer_temp_threshold": controller._optional_config.get(
                 "summer_temp_threshold", 15.0

@@ -3,7 +3,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, create_autospec
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "loxone_smart_home"))
 
@@ -24,10 +24,16 @@ class TestGrowattAPI(AioHTTPTestCase):
         # Create mock controller
         self.mock_controller = MagicMock()
         self.mock_controller._running = True
+        self.mock_controller._current_mode = "load_first"
         self.mock_controller._season_mode = "winter"
         self.mock_controller._season_mode_updated = datetime.now()
-        self.mock_controller._ac_enabled = True
-        self.mock_controller._export_enabled = False
+
+        # Mock current inverter state
+        mock_state = MagicMock()
+        mock_state.ac_charge_enabled = True
+        mock_state.export_enabled = False
+        self.mock_controller._current_inverter_state = mock_state
+
         self.mock_controller._scheduled_periods = []
         self.mock_controller._optional_config = {
             "simulation_mode": False,
@@ -37,7 +43,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         }
         self.mock_controller._eur_czk_rate = 25.0
         self.mock_controller._eur_czk_rate_updated = datetime.now()
-        
+
         # Mock price data
         self.mock_controller._current_prices = {
             ("00:00", "01:00"): 60.0,
@@ -67,7 +73,7 @@ class TestGrowattAPI(AioHTTPTestCase):
         }
         self.mock_controller._prices_date = "2024-12-17"
         self.mock_controller._prices_updated = datetime.now()
-        
+
         self.mock_controller._get_local_now = MagicMock(
             return_value=datetime.now()
         )
@@ -92,12 +98,19 @@ class TestGrowattAPI(AioHTTPTestCase):
         )
         self.mock_controller.logger = MagicMock()
 
-        # Mock config
+        # Mock config with all attributes to avoid MagicMock JSON serialization issues
         self.mock_controller.config = MagicMock()
         self.mock_controller.config.battery_capacity = 10.0
+        self.mock_controller.config.max_charge_power = 3.0
         self.mock_controller.config.min_soc = 20
         self.mock_controller.config.max_soc = 90
+        self.mock_controller.config.discharge_min_soc = 20
+        self.mock_controller.config.battery_efficiency = 0.85
+        self.mock_controller.config.discharge_power_rate = 25
+        self.mock_controller.config.charge_price_max = 1.5
         self.mock_controller.config.export_price_min = 1.0
+        self.mock_controller.config.discharge_price_min = 3.0
+        self.mock_controller.config.discharge_profit_margin = 4.0
         self.mock_controller.config.battery_charge_blocks = 8
         self.mock_controller.config.summer_price_threshold = 1.0
         self.mock_controller.config.schedule_hour = 23

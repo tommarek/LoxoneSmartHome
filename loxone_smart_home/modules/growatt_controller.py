@@ -1501,6 +1501,9 @@ class GrowattController(BaseModule):
         if mode_changed:
             self._commands_sent_count += 1
 
+            # Extract previous mode for optimization (only disable the mode that was active)
+            previous_mode = old_state.inverter_mode if old_state else None
+
             # Detect if this is for immediate activation (all-day time window)
             # Time window of 00:00-23:59 indicates mode should be active NOW
             immediate_activation = (
@@ -1508,14 +1511,18 @@ class GrowattController(BaseModule):
             )
 
             if new_state.inverter_mode == "load_first":
-                await self._mode_manager.set_load_first(stop_soc=new_state.stop_soc)
+                await self._mode_manager.set_load_first(
+                    stop_soc=new_state.stop_soc,
+                    previous_mode=previous_mode
+                )
             elif new_state.inverter_mode == "battery_first":
                 await self._mode_manager.set_battery_first(
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
                     power_rate=new_state.power_rate,
-                    immediate_activation=immediate_activation
+                    immediate_activation=immediate_activation,
+                    previous_mode=previous_mode
                 )
             elif new_state.inverter_mode == "grid_first":
                 await self._mode_manager.set_grid_first(
@@ -1523,7 +1530,8 @@ class GrowattController(BaseModule):
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
                     power_rate=new_state.power_rate,
-                    immediate_activation=immediate_activation
+                    immediate_activation=immediate_activation,
+                    previous_mode=previous_mode
                 )
 
             await asyncio.sleep(0.5)

@@ -145,19 +145,54 @@ class ModeManager:
         # Should never reach here, but just in case
         return (False, None)
 
-    async def ensure_exclusive(self, primary: str) -> None:
+    async def ensure_exclusive(self, primary: str, previous_mode: Optional[str] = None) -> None:
         """Ensure modes are mutually exclusive at the device level.
 
-        First resets to load-first mode to ensure clean state, then applies the requested mode.
+        Args:
+            primary: The mode being activated ("battery_first" or "grid_first")
+            previous_mode: The previously active mode (if known). If None, disables both for safety.
+
+        Behavior:
+        - If previous_mode is None (startup/unknown): Disable both modes for full reset
+        - If previous_mode is known and != primary: Only disable that specific mode
+        - If previous_mode == primary: No disable needed (already exclusive)
         """
-        self.logger.info(f"🔄 Ensuring exclusive mode for {primary}, resetting other modes...")
-
-        await self.disable_battery_first()
-        await asyncio.sleep(self.config.command_delay)
-        await self.disable_grid_first()
-        await asyncio.sleep(self.config.command_delay)
-
-        self.logger.debug(f"Reset to load-first mode before applying {primary}")
+        if previous_mode is None:
+            # Startup or unknown state - full reset for safety
+            self.logger.info(
+                f"🔄 Ensuring exclusive mode for {primary}, "
+                f"full reset (unknown previous state)..."
+            )
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
+            self.logger.debug(f"Full reset completed before applying {primary}")
+        elif previous_mode == primary:
+            # Already in the target mode, no disable needed
+            self.logger.debug(f"Already in {primary} mode, no reset needed")
+        elif previous_mode == "battery_first":
+            # Only disable battery_first
+            self.logger.info(f"🔄 Disabling {previous_mode} before applying {primary}...")
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+        elif previous_mode == "grid_first":
+            # Only disable grid_first
+            self.logger.info(f"🔄 Disabling {previous_mode} before applying {primary}...")
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
+        elif previous_mode == "load_first":
+            # Coming from load_first, no active slots to disable
+            self.logger.debug(f"Transitioning from load_first to {primary}, no slots to disable")
+        else:
+            # Unknown mode - full reset for safety
+            self.logger.warning(
+                f"Unknown previous mode '{previous_mode}', performing full reset..."
+            )
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
 
         state = await self._query_inverter_state()
 
@@ -186,7 +221,7 @@ class ModeManager:
     async def set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: Optional[int] = None,
         power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False,
-        immediate_activation: bool = False
+        immediate_activation: bool = False, previous_mode: Optional[str] = None
     ) -> None:
         """Set battery-first mode for specified time window.
 
@@ -195,6 +230,7 @@ class ModeManager:
         power_rate: Charge rate in % (default 100%)
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         immediate_activation: If True, set start time in past for immediate activation
+        previous_mode: The previously active mode (if known). If None, disables both for safety.
         """
         if stop_soc is None:
             stop_soc = int(self.config.max_soc)
@@ -236,7 +272,7 @@ class ModeManager:
 
         assert self.mqtt_client is not None
 
-        await self.ensure_exclusive("battery_first")
+        await self.ensure_exclusive("battery_first", previous_mode=previous_mode)
 
         if stop_soc != 90:
             stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
@@ -459,7 +495,7 @@ class ModeManager:
     async def set_grid_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,
         *, preserve_duration: bool = True, pre_scheduled: bool = False,
-        immediate_activation: bool = False
+        immediate_activation: bool = False, previous_mode: Optional[str] = None
     ) -> None:
         """Set grid-first mode for specified time window.
 
@@ -468,6 +504,7 @@ class ModeManager:
         power_rate: Discharge rate in % (default 100%)
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         immediate_activation: If True, set start time in past for immediate activation
+        previous_mode: The previously active mode (if known). If None, disables both for safety.
         """
         if pre_scheduled:
             adjusted_start, adjusted_stop = start_hour, stop_hour
@@ -508,7 +545,7 @@ class ModeManager:
 
         assert self.mqtt_client is not None
 
-        await self.ensure_exclusive("grid_first")
+        await self.ensure_exclusive("grid_first", previous_mode=previous_mode)
 
         # First set the parameters before enabling the mode
         # Set stop SOC (battery level to stop discharging)
@@ -638,22 +675,31 @@ class ModeManager:
             f"Topic: {self.config.grid_first_topic}"
         )
 
-    async def set_load_first(self, stop_soc: Optional[int] = None) -> None:
+    async def set_load_first(
+        self, stop_soc: Optional[int] = None, previous_mode: Optional[str] = None
+    ) -> None:
         """Set load-first mode (default/neutral mode).
 
         This is the inverter's default state where it prioritizes powering loads.
-        stop_soc: Minimum battery level to maintain in load-first mode (default from config.min_soc)
+
+        Args:
+            stop_soc: Minimum battery level to maintain in load-first mode
+                     (default from config.min_soc)
+            previous_mode: The previously active mode (if known).
+                          If None, disables both for safety.
+
+        Behavior:
+        - If previous_mode is None (startup): Disable both modes for full reset
+        - If previous_mode is "battery_first": Only disable battery_first
+        - If previous_mode is "grid_first": Only disable grid_first
+        - If previous_mode is "load_first": No disable needed (already in that mode)
         """
         if stop_soc is None:
             stop_soc = int(self.config.min_soc)
 
         stop_soc = max(5, min(100, stop_soc))
 
-        # Check if already in this state
         sig = ("load_first", stop_soc)
-        if self._last_applied.get("load_first") == sig:
-            self.logger.debug(f"Load-first already at stopSOC={stop_soc}%, skipping")
-            return
 
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -664,14 +710,36 @@ class ModeManager:
             self._last_applied["load_first"] = sig
             return
 
-        # Load-first is achieved by disabling both battery-first and grid-first
-        self.logger.info("🏠 Setting LOAD-FIRST mode (disabling all time-based modes)")
-
-        # Disable battery-first and grid-first to achieve load-first
-        await self.disable_battery_first()
-        await asyncio.sleep(self.config.command_delay)
-        await self.disable_grid_first()
-        await asyncio.sleep(self.config.command_delay)
+        # Disable the previous mode to achieve load-first
+        if previous_mode is None:
+            # Startup or unknown state - full reset for safety
+            self.logger.info("🏠 Setting LOAD-FIRST mode (full reset - unknown previous state)")
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
+        elif previous_mode == "load_first":
+            # Already in load_first, only update SOC if needed
+            self.logger.debug(f"Already in load_first mode, updating SOC to {stop_soc}%")
+        elif previous_mode == "battery_first":
+            # Only disable battery_first
+            self.logger.info(f"🏠 Setting LOAD-FIRST mode (disabling {previous_mode})")
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+        elif previous_mode == "grid_first":
+            # Only disable grid_first
+            self.logger.info(f"🏠 Setting LOAD-FIRST mode (disabling {previous_mode})")
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
+        else:
+            # Unknown mode - full reset for safety
+            self.logger.warning(
+                f"Unknown previous mode '{previous_mode}', performing full reset..."
+            )
+            await self.disable_battery_first()
+            await asyncio.sleep(self.config.command_delay)
+            await self.disable_grid_first()
+            await asyncio.sleep(self.config.command_delay)
 
         # Set the stop SOC for load-first mode
         if hasattr(self.config, 'load_first_stopsoc_topic'):
