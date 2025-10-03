@@ -81,14 +81,8 @@ class LoxoneSmartHome:
         """Initialize all modules."""
         logger = logging.getLogger(__name__)
 
-        # Initialize shared clients
-        await self.mqtt_client.connect()
-        logger.info("MQTT client connected")
-
-        await self.influxdb_client.start()
-        logger.info("InfluxDB client started")
-
-        # Initialize modules based on configuration
+        # Initialize modules FIRST (before MQTT connection)
+        # This allows modules to pre-register their subscriptions
         if self.settings.modules.udp_listener_enabled:
             self.udp_listener = UDPListener(self.influxdb_client, self.settings, self.mqtt_client)
             logger.info("UDP Listener module initialized")
@@ -112,6 +106,13 @@ class LoxoneSmartHome:
         if self.settings.ote_collector_enabled:
             self.ote_collector = OTEPriceCollector(self.influxdb_client, self.settings)
             logger.info("OTE Price Collector module initialized")
+
+        # NOW connect shared clients (after modules have pre-registered subscriptions)
+        await self.mqtt_client.connect()
+        logger.info("MQTT client connected")
+
+        await self.influxdb_client.start()
+        logger.info("InfluxDB client started")
 
     async def start_api_server(self) -> None:
         """Start the API server for Growatt controller."""

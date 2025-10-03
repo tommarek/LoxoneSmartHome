@@ -17,7 +17,7 @@ class TestSettings:
             settings = Settings(influxdb_token="test-token")
 
             assert settings.log_level == "INFO"
-            assert settings.mqtt_broker == "localhost"
+            assert settings.mqtt_broker == "mqtt"
             assert settings.mqtt_port == 1883
             assert settings.influxdb_token == "test-token"
 

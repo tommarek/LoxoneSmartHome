@@ -75,20 +75,23 @@ async def test_mqtt_bridge_init(mock_mqtt_client: MagicMock, mock_settings: Sett
 async def test_start_subscribes_to_topics(
     mqtt_bridge: MQTTBridge, mock_mqtt_client: MagicMock
 ) -> None:
-    """Test that start() subscribes to configured topics."""
-    await mqtt_bridge.start()
-
-    # Should subscribe to each topic with the callback
-    assert mock_mqtt_client.subscribe.call_count == 2
+    """Test that pre-registration happens during init (not start)."""
+    # With pre-registration, subscriptions happen in __init__ via register_subscription
+    # Check that register_subscription was called during init
+    assert mock_mqtt_client.register_subscription.call_count == 2
 
     # Check the topics are correct
-    actual_calls = mock_mqtt_client.subscribe.call_args_list
+    actual_calls = mock_mqtt_client.register_subscription.call_args_list
     topics = [call[0][0] for call in actual_calls]
     callbacks = [call[0][1] for call in actual_calls]
 
     assert "energy/solar" in topics
     assert "teplomer/TC" in topics
     assert all(callback == mqtt_bridge.on_mqtt_message for callback in callbacks)
+
+    # start() should NOT subscribe again (already pre-registered)
+    await mqtt_bridge.start()
+    assert mock_mqtt_client.subscribe.call_count == 0
 
 
 @pytest.mark.asyncio

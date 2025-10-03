@@ -29,6 +29,7 @@ from .growatt.decision_engine import (
     GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
 )
 from .growatt.inverter_state import InverterState
+from .growatt.command_queue import CommandQueue
 
 
 class GrowattController(BaseModule):
@@ -201,9 +202,8 @@ class GrowattController(BaseModule):
         self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
-        # Command response tracking (persistent subscription)
-        self._current_command_future: Optional[asyncio.Future[Dict[str, Any]]] = None
-        self._current_command_type: Optional[str] = None
+        # Command queue for managing multiple concurrent commands
+        self._command_queue = CommandQueue(self.logger)
 
         # Pre-register MQTT subscriptions before connection
         # This ensures subscriptions are active before the message loop starts
@@ -215,7 +215,11 @@ class GrowattController(BaseModule):
             self.logger.info(f"Pre-registered subscription for home status: {self._home_status_topic}")
 
     async def _result_handler(self, _topic: str, payload: Any) -> None:
-        """Persistent handler for energy/solar/result MQTT messages."""
+        """Persistent handler for energy/solar/result MQTT messages.
+
+        This handler is always listening and matches responses to pending commands
+        in the command queue. It handles multiple concurrent commands properly.
+        """
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode()
@@ -224,22 +228,23 @@ class GrowattController(BaseModule):
             command = data.get("command")
             success = data.get("success", False)
 
-            # Check if we're waiting for a command response
-            if (
-                self._current_command_future
-                and not self._current_command_future.done()
-                and command == self._current_command_type
-            ):
-                # Resolve the future with the result
-                self._current_command_future.set_result(data)
+            # Try to resolve a pending command in the queue
+            resolved = await self._command_queue.resolve_command(command, data)
 
-                # Log the result
-                message = data.get("message", "No message")
+            # Log the result
+            message = data.get("message", "No message")
+            if resolved:
                 if success:
                     self.logger.info(f"✅ Command {command} succeeded: {message}")
                 else:
                     self.logger.error(f"❌ Command {command} FAILED: {message}")
                     self.logger.error(f"📋 Full error response: {json.dumps(data, indent=2)}")
+            else:
+                # Orphaned response (no pending command)
+                self.logger.debug(
+                    f"Received orphaned response for {command}: {message} "
+                    f"(no pending command or already resolved)"
+                )
 
         except json.JSONDecodeError as e:
             self.logger.error(f"Failed to parse MQTT result payload: {e}")
@@ -254,10 +259,10 @@ class GrowattController(BaseModule):
         payload: Dict[str, Any],
         timeout: float = 10.0
     ) -> Optional[Dict[str, Any]]:
-        """Send MQTT command and wait for response using persistent subscription.
+        """Send MQTT command and wait for response using command queue.
 
-        This is the unified method for all MQTT command/response operations.
-        Uses the persistent _result_handler to avoid subscription conflicts.
+        This method uses the command queue to track pending commands,
+        allowing for multiple concurrent commands and proper retry handling.
 
         Args:
             command_topic: MQTT topic to send command to
@@ -273,39 +278,36 @@ class GrowattController(BaseModule):
 
         assert self.mqtt_client is not None
 
-        # Set up tracking for this command
-        self._current_command_type = command_type
-        self._current_command_future = asyncio.get_running_loop().create_future()
+        # Queue the command and get a future for its response
+        command_id, future = await self._command_queue.add_command(command_type, timeout)
 
         try:
             # Send the command
             await self.mqtt_client.publish(command_topic, json.dumps(payload))
 
-            # Wait for persistent handler to resolve the future
-            result = await asyncio.wait_for(self._current_command_future, timeout=timeout)
+            # Wait for the response (the result handler will resolve the future)
+            result = await future
 
             # Store for later reference
             self._last_command_results[command_type] = result
             return result
 
         except asyncio.TimeoutError:
+            # Timeout is already logged by the command queue
             self.logger.warning(f"⏱️ Timeout waiting for {command_type} result after {timeout}s")
             return None
 
-        finally:
-            # Clean up
-            self._current_command_type = None
-            self._current_command_future = None
+        except Exception as e:
+            self.logger.error(f"Error sending command {command_type}: {e}")
+            return None
 
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
-        """Wait for command result via persistent subscription.
+        """Wait for command result via command queue.
 
         DEPRECATED: Use _send_command_and_wait() for new code.
         Kept for compatibility with mode_manager.py which sends commands separately.
-
-        Uses the persistent _result_handler subscription to avoid race conditions.
 
         Args:
             command_type: The command type to wait for (e.g., "batteryfirst/set/timeslot")
@@ -317,23 +319,21 @@ class GrowattController(BaseModule):
         if self._optional_config.get("simulation_mode", False):
             return {"success": True, "message": "Simulated"}
 
-        # Create future for this specific command
-        self._current_command_type = command_type
-        self._current_command_future = asyncio.get_running_loop().create_future()
+        # Queue the command expectation and get a future for its response
+        command_id, future = await self._command_queue.add_command(command_type, timeout)
 
         try:
-            # Wait for persistent handler to resolve the future
-            result = await asyncio.wait_for(self._current_command_future, timeout=timeout)
+            # Wait for the response (the result handler will resolve the future)
+            result = await future
             # Store for later reference
             self._last_command_results[command_type] = result
             return result
         except asyncio.TimeoutError:
             self.logger.warning(f"⏱️ Timeout waiting for {command_type} result after {timeout}s")
             return None
-        finally:
-            # Clean up
-            self._current_command_type = None
-            self._current_command_future = None
+        except Exception as e:
+            self.logger.error(f"Error waiting for {command_type} result: {e}")
+            return None
 
     async def _query_inverter_state(self) -> Dict[str, Any]:
         """Query current inverter state (battery-first and grid-first settings).
@@ -1005,6 +1005,9 @@ class GrowattController(BaseModule):
         """Stop the Growatt controller."""
         self._running = False  # Clear the flag to stop evaluation loop
 
+        # Cancel all pending commands in the queue
+        await self._command_queue.cancel_all()
+
         # Cancel periodic check task
         if self._periodic_check_task and not self._periodic_check_task.done():
             self._periodic_check_task.cancel()
@@ -1032,8 +1035,7 @@ class GrowattController(BaseModule):
                 self.logger.debug(f"Error unsubscribing from result topic: {e}")
 
         # Cancel any pending command future
-        if self._current_command_future and not self._current_command_future.done():
-            self._current_command_future.cancel()
+        # Note: Pending commands are already cancelled above via _command_queue.cancel_all()
 
         # Apply safe shutdown mode
         self.logger.info("🔄 Resetting inverter to safe shutdown state...")

@@ -101,9 +101,9 @@ async def test_command_retry_max_attempts(mode_manager, mock_controller):
     # Verify MQTT was called 3 times (max retry count)
     assert mock_controller.mqtt_client.publish.call_count == 3
 
-    # Verify error was logged (new format)
+    # Verify error was logged with correct retry count
     assert any(
-        "failed after 3 attempts" in str(call)
+        "FAILED after 3 attempts" in str(call)
         for call in mode_manager.logger.error.call_args_list
     )
 
@@ -128,10 +128,10 @@ async def test_command_retry_with_timeout(mode_manager, mock_controller):
     # Verify success after timeout retry
     assert success is True
 
-    # Verify timeout was logged to debug (new quiet logging)
+    # Verify timeout was logged to warning
     assert any(
         "Timeout" in str(call)
-        for call in mode_manager.logger.debug.call_args_list
+        for call in mode_manager.logger.warning.call_args_list
     )
 
 
