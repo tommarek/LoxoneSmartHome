@@ -273,8 +273,10 @@ class AsyncMQTTClient:
 
         # Execute callbacks concurrently
         if callbacks:
+            self.logger.info(f"⚙️ About to execute {len(callbacks)} callbacks for topic {topic}")
             tasks = []
             for callback in callbacks:
+                self.logger.info(f"⚙️ Creating task for callback: {callback}")
                 task = asyncio.create_task(self._execute_callback(callback, topic, payload))
                 tasks.append(task)
 
