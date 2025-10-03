@@ -201,10 +201,49 @@ class GrowattController(BaseModule):
         self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
+        # Command response tracking (persistent subscription)
+        self._current_command_future: Optional[asyncio.Future[Dict[str, Any]]] = None
+        self._current_command_type: Optional[str] = None
+
+    async def _result_handler(self, _topic: str, payload: Any) -> None:
+        """Persistent handler for energy/solar/result MQTT messages."""
+        try:
+            if isinstance(payload, bytes):
+                payload = payload.decode()
+
+            data = json.loads(payload)
+            command = data.get("command")
+            success = data.get("success", False)
+
+            # Check if we're waiting for a command response
+            if (
+                self._current_command_future
+                and not self._current_command_future.done()
+                and command == self._current_command_type
+            ):
+                # Resolve the future with the result
+                self._current_command_future.set_result(data)
+
+                # Log the result
+                message = data.get("message", "No message")
+                if success:
+                    self.logger.info(f"✅ Command {command} succeeded: {message}")
+                else:
+                    self.logger.error(f"❌ Command {command} FAILED: {message}")
+                    self.logger.error(f"📋 Full error response: {json.dumps(data, indent=2)}")
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Failed to parse MQTT result payload: {e}")
+            self.logger.error(f"Raw payload: {payload}")
+        except Exception as e:
+            self.logger.error(f"Error in result handler: {e}", exc_info=True)
+
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
-        """Wait for and capture command result from energy/solar/result topic.
+        """Wait for command result via persistent subscription.
+
+        Uses the persistent _result_handler subscription to avoid race conditions.
 
         Args:
             command_type: The command type to wait for (e.g., "batteryfirst/set/timeslot")
@@ -216,64 +255,23 @@ class GrowattController(BaseModule):
         if self._optional_config.get("simulation_mode", False):
             return {"success": True, "message": "Simulated"}
 
-        result_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-
-        async def result_handler(_topic: str, payload: Any) -> None:
-            try:
-                if isinstance(payload, bytes):
-                    payload = payload.decode()
-
-                # Log ALL messages received on result topic for debugging
-                self.logger.info(f"📨 Received on energy/solar/result: {payload}")
-
-                data = json.loads(payload)
-
-                # Log parsed data
-                self.logger.info(
-                    f"📋 Parsed result: command={data.get('command')}, "
-                    f"success={data.get('success')}, waiting_for={command_type}"
-                )
-
-                # Check if this is our command result
-                if data.get("command") == command_type:
-                    if not result_future.done():
-                        result_future.set_result(data)
-                        # Store for later reference
-                        self._last_command_results[command_type] = data
-
-                        # Log the result
-                        success = data.get("success", False)
-                        message = data.get("message", "No message")
-                        if success:
-                            self.logger.info(f"✅ Command {command_type} succeeded: {message}")
-                        else:
-                            self.logger.error(f"❌ Command {command_type} FAILED: {message}")
-                            self.logger.error(
-                                f"📋 Full error response: {json.dumps(data, indent=2)}"
-                            )
-                else:
-                    self.logger.warning(
-                        f"⚠️ Received response for '{data.get('command')}' but waiting for "
-                        f"'{command_type}' - ignoring"
-                    )
-
-            except Exception as e:
-                self.logger.error(f"Error parsing command result: {e}")
-                self.logger.error(f"Raw payload was: {payload}")
-
-        # Subscribe to result topic
-        assert self.mqtt_client is not None
-        await self.mqtt_client.subscribe("energy/solar/result", result_handler)
+        # Create future for this specific command
+        self._current_command_type = command_type
+        self._current_command_future = asyncio.get_running_loop().create_future()
 
         try:
-            # Wait for result with timeout
-            result = await asyncio.wait_for(result_future, timeout=timeout)
+            # Wait for persistent handler to resolve the future
+            result = await asyncio.wait_for(self._current_command_future, timeout=timeout)
+            # Store for later reference
+            self._last_command_results[command_type] = result
             return result
         except asyncio.TimeoutError:
             self.logger.warning(f"⏱️ Timeout waiting for {command_type} result after {timeout}s")
             return None
         finally:
-            await self.mqtt_client.unsubscribe("energy/solar/result")
+            # Clean up
+            self._current_command_type = None
+            self._current_command_future = None
 
     async def _query_inverter_state(self) -> Dict[str, Any]:
         """Query current inverter state (battery-first and grid-first settings).
@@ -1020,6 +1018,10 @@ class GrowattController(BaseModule):
             self.logger.info(f"Subscribing to home status topic: {self._home_status_topic}")
             await self.mqtt_client.subscribe(self._home_status_topic, self._on_home_status)
 
+            # Subscribe to command results (persistent subscription to avoid race condition)
+            self.logger.info("Subscribing to command result topic: energy/solar/result")
+            await self.mqtt_client.subscribe("energy/solar/result", self._result_handler)
+
         # Fetch initial prices
         await self._fetch_prices()
 
@@ -1052,6 +1054,18 @@ class GrowattController(BaseModule):
             except asyncio.CancelledError:
                 pass
             self._price_fetch_task = None
+
+        # Unsubscribe from command results
+        if self.mqtt_client:
+            try:
+                await self.mqtt_client.unsubscribe("energy/solar/result")
+                self.logger.info("Unsubscribed from command result topic")
+            except Exception as e:
+                self.logger.debug(f"Error unsubscribing from result topic: {e}")
+
+        # Cancel any pending command future
+        if self._current_command_future and not self._current_command_future.done():
+            self._current_command_future.cancel()
 
         # Apply safe shutdown mode
         self.logger.info("🔄 Resetting inverter to safe shutdown state...")

@@ -120,29 +120,22 @@ class ModeManager:
                     self.logger.debug(f"✅ {command_description} succeeded")
                 return (True, result)
 
-            # Command failed - log full details for debugging
+            # Command failed
             error_msg = result.get("message", "Unknown error") if result else "Timeout"
 
             if attempt < retry_count:
-                # Will retry - log at WARNING level with full result
+                # Will retry - log concisely
                 self.logger.warning(
                     f"⚠️ Attempt {attempt}/{retry_count} failed for {command_description}: "
                     f"{error_msg}"
                 )
-                if result:
-                    self.logger.warning(
-                        f"📋 Full response from attempt {attempt}: "
-                        f"{json.dumps(result, indent=2)}"
-                    )
-                else:
-                    self.logger.warning(f"📋 Attempt {attempt}: No response (timeout)")
 
                 # Wait before retry with exponential backoff (capped at 30s)
                 wait_time = min(30.0, retry_delay * (1.5 ** (attempt - 1)))
                 self.logger.info(f"⏳ Retrying in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
             else:
-                # Final failure - detailed error message
+                # Final failure - show full response for debugging
                 self.logger.error(
                     f"❌ {command_description} FAILED after {retry_count} attempts"
                 )
