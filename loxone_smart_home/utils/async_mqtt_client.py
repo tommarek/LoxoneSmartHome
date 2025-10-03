@@ -38,6 +38,7 @@ class AsyncMQTTClient:
         self._read_task: Optional[asyncio.Task[None]] = None
         self._publish_task: Optional[asyncio.Task[None]] = None
         self._reconnect_task: Optional[asyncio.Task[None]] = None
+        self._message_tasks: set[asyncio.Task[None]] = set()
 
         # Track message loop state to handle late subscriptions
         self._message_loop_started = False
@@ -146,7 +147,9 @@ class AsyncMQTTClient:
         self._running = False
 
         # Cancel background tasks and wait for completion
-        for task in [self._read_task, self._publish_task, self._reconnect_task]:
+        all_tasks = [self._read_task, self._publish_task, self._reconnect_task]
+        all_tasks.extend(list(self._message_tasks))  # Include message handler tasks
+        for task in all_tasks:
             if task and not task.done():
                 task.cancel()
                 try:
@@ -155,6 +158,7 @@ class AsyncMQTTClient:
                     pass
                 except Exception:
                     pass  # Ignore other exceptions during cleanup
+        self._message_tasks.clear()
 
         # Disconnect client
         try:
@@ -288,7 +292,12 @@ class AsyncMQTTClient:
                 async with self.client.messages() as messages:
                     async for message in messages:
                         self.messages_received += 1
-                        await self._handle_message(message)
+                        # Process message in background to avoid blocking the message loop
+                        # This prevents message loss when handlers take time to process
+                        task = asyncio.create_task(self._handle_message(message))
+                        self._message_tasks.add(task)
+                        # Clean up completed tasks periodically
+                        task.add_done_callback(self._message_tasks.discard)
 
             except asyncio.CancelledError:
                 # Task was cancelled, this is expected during shutdown
