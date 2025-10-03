@@ -220,6 +220,8 @@ class GrowattController(BaseModule):
         This handler is always listening and matches responses to pending commands
         in the command queue. It handles multiple concurrent commands properly.
         """
+        self.logger.info(f"🎯 RESULT HANDLER CALLED! Topic: {_topic}, Payload type: {type(payload)}")
+        self.logger.info(f"🎯 Raw payload: {payload[:200] if isinstance(payload, (str, bytes)) else str(payload)[:200]}")
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode()

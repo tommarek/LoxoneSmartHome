@@ -306,6 +306,9 @@ class AsyncMQTTClient:
         """Handle incoming MQTT message."""
         topic = str(message.topic)
 
+        # DEBUG: Log every single message received
+        self.logger.info(f"📨 Received MQTT message on topic: {topic}")
+
         # Handle payload decoding with error handling
         if isinstance(message.payload, (bytes, bytearray)):
             try:
@@ -330,6 +333,10 @@ class AsyncMQTTClient:
         # Get callbacks with lock
         async with self.subscribers_lock:
             callbacks = list(self.subscribers.get(topic, []))
+            # DEBUG: Log subscription lookup
+            self.logger.info(f"📋 Looking for callbacks for topic '{topic}'")
+            self.logger.info(f"📋 Available topics: {list(self.subscribers.keys())}")
+            self.logger.info(f"📋 Found {len(callbacks)} callback(s) for topic '{topic}'")
 
         # Execute callbacks concurrently
         if callbacks:
@@ -350,6 +357,7 @@ class AsyncMQTTClient:
         self, callback: Callable[[str, Any], Any], topic: str, payload: str
     ) -> None:
         """Execute a callback safely."""
+        self.logger.info(f"🔄 Executing callback {callback.__name__ if hasattr(callback, '__name__') else callback} for topic {topic}")
         try:
             if asyncio.iscoroutinefunction(callback):
                 await callback(topic, payload)
