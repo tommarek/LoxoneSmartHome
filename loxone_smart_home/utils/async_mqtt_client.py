@@ -72,19 +72,29 @@ class AsyncMQTTClient:
             if self._connected:
                 return
 
+            # First, move pre-registered subscriptions to main subscribers dict
+            # This must happen BEFORE connection so they're included in the initial subscribe
+            async with self.subscribers_lock:
+                for topic, callbacks in self._pre_registered_subscriptions.items():
+                    if topic not in self.subscribers:
+                        self.subscribers[topic] = set()
+                    self.subscribers[topic].update(callbacks)
+                    self.logger.info(f"Prepared pre-registered topic for subscription: {topic}")
+
+            # Clear pre-registered list after moving to main dict
+            num_pre_registered = len(self._pre_registered_subscriptions)
+            self._pre_registered_subscriptions.clear()
+
             self._running = True
             await self._connect_with_retry()
-
-            # Apply pre-registered subscriptions before starting message loop
-            await self._apply_pre_registered_subscriptions()
 
             # Start publish and monitor tasks immediately
             self._publish_task = asyncio.create_task(self._publish_loop())
             self._reconnect_task = asyncio.create_task(self._monitor_connection())
 
-            # Start the read task immediately now that all subscriptions are ready
+            # Start the read task immediately - all subscriptions are already active
             self._read_task = asyncio.create_task(self._read_messages())
-            self.logger.info("Started MQTT message reading task with all pre-registered subscriptions")
+            self.logger.info(f"Started MQTT message reading task with {num_pre_registered} pre-registered subscriptions active")
 
     async def _connect_with_retry(self, max_retries: int = 5) -> None:
         """Connect to MQTT broker with exponential backoff."""
@@ -101,14 +111,17 @@ class AsyncMQTTClient:
                 await self.client.connect()
                 self._connected = True
 
-                # Re-subscribe to all topics
+                # Subscribe to all topics (including pre-registered ones)
                 async with self.subscribers_lock:
+                    subscription_count = 0
                     for topic in self.subscribers:
                         await self.client.subscribe(topic)
+                        subscription_count += 1
+                        self.logger.info(f"Subscribed to topic: {topic}")
 
                 self.logger.info(
                     f"Connected to MQTT broker at {self.settings.mqtt.broker}:"
-                    f"{self.settings.mqtt.port}"
+                    f"{self.settings.mqtt.port} with {subscription_count} active subscriptions"
                 )
                 return
 
@@ -125,29 +138,6 @@ class AsyncMQTTClient:
                         f"Failed to connect to MQTT broker after " f"{max_retries} attempts: {e}"
                     )
                     raise
-
-    async def _apply_pre_registered_subscriptions(self) -> None:
-        """Apply all pre-registered subscriptions to the broker and internal state."""
-        if not self._pre_registered_subscriptions:
-            self.logger.debug("No pre-registered subscriptions to apply")
-            return
-
-        self.logger.info(f"Applying {len(self._pre_registered_subscriptions)} pre-registered subscriptions")
-
-        async with self.subscribers_lock:
-            for topic, callbacks in self._pre_registered_subscriptions.items():
-                # Add to internal subscribers dict
-                if topic not in self.subscribers:
-                    self.subscribers[topic] = set()
-                self.subscribers[topic].update(callbacks)
-
-                # Subscribe to broker
-                if self.client and self._connected:
-                    await self.client.subscribe(topic)
-                    self.logger.info(f"Subscribed to pre-registered topic: {topic}")
-
-        # Clear pre-registered subscriptions after applying
-        self._pre_registered_subscriptions.clear()
 
     async def disconnect(self) -> None:
         """Disconnect from the MQTT broker."""
