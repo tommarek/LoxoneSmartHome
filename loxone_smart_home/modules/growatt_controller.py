@@ -222,7 +222,17 @@ class GrowattController(BaseModule):
             try:
                 if isinstance(payload, bytes):
                     payload = payload.decode()
+
+                # Log ALL messages received on result topic for debugging
+                self.logger.info(f"📨 Received on energy/solar/result: {payload}")
+
                 data = json.loads(payload)
+
+                # Log parsed data
+                self.logger.info(
+                    f"📋 Parsed result: command={data.get('command')}, "
+                    f"success={data.get('success')}, waiting_for={command_type}"
+                )
 
                 # Check if this is our command result
                 if data.get("command") == command_type:
@@ -241,9 +251,15 @@ class GrowattController(BaseModule):
                             self.logger.error(
                                 f"📋 Full error response: {json.dumps(data, indent=2)}"
                             )
+                else:
+                    self.logger.warning(
+                        f"⚠️ Received response for '{data.get('command')}' but waiting for "
+                        f"'{command_type}' - ignoring"
+                    )
 
             except Exception as e:
                 self.logger.error(f"Error parsing command result: {e}")
+                self.logger.error(f"Raw payload was: {payload}")
 
         # Subscribe to result topic
         assert self.mqtt_client is not None
