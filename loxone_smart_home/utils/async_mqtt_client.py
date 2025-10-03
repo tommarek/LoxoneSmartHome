@@ -90,7 +90,10 @@ class AsyncMQTTClient:
 
             # Start the read task immediately - all subscriptions are already active
             self._read_task = asyncio.create_task(self._read_messages())
-            self.logger.info(f"Started MQTT message reading task with {num_pre_registered} pre-registered subscriptions active")
+            self.logger.info(
+                f"Started MQTT message reading task with {num_pre_registered} "
+                f"pre-registered subscriptions active"
+            )
 
     async def _connect_with_retry(self, max_retries: int = 5) -> None:
         """Connect to MQTT broker with exponential backoff."""
@@ -273,7 +276,6 @@ class AsyncMQTTClient:
                     await self.client.unsubscribe(topic)
                     self.logger.debug(f"Unsubscribed from topic: {topic}")
 
-
     async def _read_messages(self) -> None:
         """Read messages from subscribed topics."""
         while self._running:
@@ -282,7 +284,9 @@ class AsyncMQTTClient:
                     await asyncio.sleep(1)
                     continue
 
-                self.logger.debug("Entering MQTT messages context manager with all subscriptions active")
+                self.logger.debug(
+                    "Entering MQTT messages context manager with all subscriptions active"
+                )
 
                 async with self.client.messages() as messages:
                     async for message in messages:

@@ -212,7 +212,9 @@ class GrowattController(BaseModule):
             self.logger.info("Pre-registered subscription for command results: energy/solar/result")
 
             self.mqtt_client.register_subscription(self._home_status_topic, self._on_home_status)
-            self.logger.info(f"Pre-registered subscription for home status: {self._home_status_topic}")
+            self.logger.info(
+                f"Pre-registered subscription for home status: {self._home_status_topic}"
+            )
 
     async def _result_handler(self, _topic: str, payload: Any) -> None:
         """Persistent handler for energy/solar/result MQTT messages.

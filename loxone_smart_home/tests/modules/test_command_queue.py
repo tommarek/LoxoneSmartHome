@@ -2,8 +2,6 @@
 
 import asyncio
 import pytest
-from datetime import datetime
-from typing import Dict, Any
 
 from modules.growatt.command_queue import CommandQueue
 
