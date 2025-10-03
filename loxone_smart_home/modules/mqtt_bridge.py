@@ -21,15 +21,21 @@ class MQTTBridge(BaseModule):
         )
         self.udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
+        # Pre-register MQTT subscriptions before connection
+        # This ensures subscriptions are active before the message loop starts
+        if mqtt_client:
+            for topic in settings.loxone_bridge.bridge_topics:
+                mqtt_client.register_subscription(topic, self.on_mqtt_message)
+                self.logger.info(f"Pre-registered subscription for topic: {topic}")
+
     async def start(self) -> None:
         """Start the MQTT bridge."""
         if self.mqtt_client is None:
             self.logger.error("MQTT client not available")
             return
-        # Subscribe to configured topics
-        for topic in self.settings.loxone_bridge.bridge_topics:
-            await self.mqtt_client.subscribe(topic, self.on_mqtt_message)
-            self.logger.info(f"Subscribed to topic: {topic}")
+
+        # Note: MQTT subscriptions are pre-registered in __init__ to ensure they're
+        # active before the message loop starts (avoids asyncio-mqtt race conditions)
 
         self.logger.info("MQTT to Loxone bridge started")
 

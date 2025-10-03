@@ -27,6 +27,10 @@ class AsyncMQTTClient:
         self.subscribers: Dict[str, Set[Callable[..., Any]]] = {}
         self.subscribers_lock = asyncio.Lock()
 
+        # Pre-registration system for early subscriptions
+        self._pre_registered_subscriptions: Dict[str, Set[Callable[[str, Any], Any]]] = {}
+        self._pre_registration_lock = asyncio.Lock()
+
         # Publish queue for reliability
         self.publish_queue: asyncio.Queue[tuple[str, Any, bool]] = asyncio.Queue()
 
@@ -45,6 +49,23 @@ class AsyncMQTTClient:
         self.messages_received = 0
         self.reconnect_attempts = 0
 
+    def register_subscription(self, topic: str, callback: Callable[[str, Any], Any]) -> None:
+        """Pre-register a subscription before connection.
+
+        This method should be called before connect() to ensure subscriptions
+        are active before the message loop starts. This avoids race conditions
+        with the asyncio-mqtt message iterator.
+
+        Args:
+            topic: MQTT topic to subscribe to
+            callback: Callback function to handle messages
+        """
+        # Use regular lock since this is called before async operations start
+        if topic not in self._pre_registered_subscriptions:
+            self._pre_registered_subscriptions[topic] = set()
+        self._pre_registered_subscriptions[topic].add(callback)
+        self.logger.debug(f"Pre-registered subscription for topic: {topic}")
+
     async def connect(self) -> None:
         """Connect to the MQTT broker with retry logic."""
         async with self.connection_lock:
@@ -54,13 +75,16 @@ class AsyncMQTTClient:
             self._running = True
             await self._connect_with_retry()
 
+            # Apply pre-registered subscriptions before starting message loop
+            await self._apply_pre_registered_subscriptions()
+
             # Start publish and monitor tasks immediately
             self._publish_task = asyncio.create_task(self._publish_loop())
             self._reconnect_task = asyncio.create_task(self._monitor_connection())
 
-            # Delay starting the read task to allow initial subscriptions
-            # This ensures subscriptions made immediately after connect() work properly
-            asyncio.create_task(self._delayed_start_read_task())
+            # Start the read task immediately now that all subscriptions are ready
+            self._read_task = asyncio.create_task(self._read_messages())
+            self.logger.info("Started MQTT message reading task with all pre-registered subscriptions")
 
     async def _connect_with_retry(self, max_retries: int = 5) -> None:
         """Connect to MQTT broker with exponential backoff."""
@@ -101,6 +125,29 @@ class AsyncMQTTClient:
                         f"Failed to connect to MQTT broker after " f"{max_retries} attempts: {e}"
                     )
                     raise
+
+    async def _apply_pre_registered_subscriptions(self) -> None:
+        """Apply all pre-registered subscriptions to the broker and internal state."""
+        if not self._pre_registered_subscriptions:
+            self.logger.debug("No pre-registered subscriptions to apply")
+            return
+
+        self.logger.info(f"Applying {len(self._pre_registered_subscriptions)} pre-registered subscriptions")
+
+        async with self.subscribers_lock:
+            for topic, callbacks in self._pre_registered_subscriptions.items():
+                # Add to internal subscribers dict
+                if topic not in self.subscribers:
+                    self.subscribers[topic] = set()
+                self.subscribers[topic].update(callbacks)
+
+                # Subscribe to broker
+                if self.client and self._connected:
+                    await self.client.subscribe(topic)
+                    self.logger.info(f"Subscribed to pre-registered topic: {topic}")
+
+        # Clear pre-registered subscriptions after applying
+        self._pre_registered_subscriptions.clear()
 
     async def disconnect(self) -> None:
         """Disconnect from the MQTT broker."""
@@ -192,19 +239,24 @@ class AsyncMQTTClient:
                     )
 
     async def subscribe(self, topic: str, callback: Callable[[str, Any], Any]) -> None:
-        """Subscribe to a topic with a callback."""
+        """Subscribe to a topic with a callback.
+
+        WARNING: For reliable message delivery, use register_subscription() before
+        connecting instead of this method. Subscriptions made after the message loop
+        starts may not receive messages due to asyncio-mqtt limitations.
+        """
         async with self.subscribers_lock:
             is_new_topic = topic not in self.subscribers
 
             if is_new_topic:
                 self.subscribers[topic] = set()
 
-                # Only log late subscriptions but don't restart automatically
-                # The delayed start should handle most cases
-                if self._message_loop_started:
+                # Warn about subscriptions after connection
+                if self._connected:
                     self.logger.warning(
-                        f"Late subscription to '{topic}' after message loop started. "
-                        "Messages may not be received until reconnection."
+                        f"Runtime subscription to '{topic}' after connection. "
+                        "This may not work reliably. Use register_subscription() before "
+                        "connect() for guaranteed message delivery."
                     )
 
                 # Subscribe if connected
@@ -232,35 +284,6 @@ class AsyncMQTTClient:
                     await self.client.unsubscribe(topic)
                     self.logger.debug(f"Unsubscribed from topic: {topic}")
 
-    async def _delayed_start_read_task(self) -> None:
-        """Start the read task after a brief delay to allow initial subscriptions."""
-        # Give sufficient time for all modules to subscribe (500ms window)
-        # This prevents race conditions with asyncio-mqtt message context manager
-        await asyncio.sleep(0.5)
-
-        # Start the read task if not already started
-        if self._read_task is None or self._read_task.done():
-            self._read_task = asyncio.create_task(self._read_messages())
-            self.logger.info("Started MQTT message reading task after subscription window")
-
-    async def _restart_read_task(self) -> None:
-        """Restart the read task to pick up new subscriptions."""
-        self.logger.info("Restarting MQTT message loop for new subscriptions")
-
-        # Cancel the current read task if it exists
-        if self._read_task and not self._read_task.done():
-            self._read_task.cancel()
-            try:
-                await asyncio.wait_for(self._read_task, timeout=1.0)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                pass
-
-        # Reset the restart flag
-        self._restart_message_loop = False
-        self._message_loop_started = False
-
-        # Start a new read task
-        self._read_task = asyncio.create_task(self._read_messages())
 
     async def _read_messages(self) -> None:
         """Read messages from subscribed topics."""
@@ -270,9 +293,7 @@ class AsyncMQTTClient:
                     await asyncio.sleep(1)
                     continue
 
-                # Mark that the message loop has started
-                self._message_loop_started = True
-                self.logger.debug("Entering MQTT messages context manager")
+                self.logger.debug("Entering MQTT messages context manager with all subscriptions active")
 
                 async with self.client.messages() as messages:
                     async for message in messages:
@@ -280,8 +301,8 @@ class AsyncMQTTClient:
                         await self._handle_message(message)
 
             except asyncio.CancelledError:
-                # Task was cancelled for restart, this is expected
-                self.logger.debug("Read task cancelled for restart")
+                # Task was cancelled, this is expected during shutdown
+                self.logger.debug("Read task cancelled")
                 raise
             except MqttError as e:
                 self.logger.error(f"MQTT read error: {e}")

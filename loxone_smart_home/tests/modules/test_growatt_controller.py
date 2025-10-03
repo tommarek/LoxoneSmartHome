@@ -309,8 +309,9 @@ async def test_start_stop(
     growatt_controller._fetch_prices.assert_called_once()  # type: ignore[attr-defined]
     growatt_controller._evaluate_conditions.assert_called()  # type: ignore[attr-defined]
 
-    # Verify MQTT subscriptions (two topics: result and status)
-    assert mock_mqtt_client.subscribe.call_count == 2
+    # Verify MQTT pre-registrations (two topics: result and status)
+    # Note: Subscriptions are now pre-registered in __init__, not in start()
+    assert mock_mqtt_client.register_subscription.call_count == 2
 
     # Test stop
     await growatt_controller.stop()

@@ -205,6 +205,15 @@ class GrowattController(BaseModule):
         self._current_command_future: Optional[asyncio.Future[Dict[str, Any]]] = None
         self._current_command_type: Optional[str] = None
 
+        # Pre-register MQTT subscriptions before connection
+        # This ensures subscriptions are active before the message loop starts
+        if self.mqtt_client:
+            self.mqtt_client.register_subscription("energy/solar/result", self._result_handler)
+            self.logger.info("Pre-registered subscription for command results: energy/solar/result")
+
+            self.mqtt_client.register_subscription(self._home_status_topic, self._on_home_status)
+            self.logger.info(f"Pre-registered subscription for home status: {self._home_status_topic}")
+
     async def _result_handler(self, _topic: str, payload: Any) -> None:
         """Persistent handler for energy/solar/result MQTT messages."""
         try:
@@ -974,17 +983,10 @@ class GrowattController(BaseModule):
         """Start the Growatt controller."""
         self._running = True
 
-        # Subscribe to MQTT topics FIRST (before any commands are sent)
-        if self.mqtt_client:
-            # Subscribe to command results (persistent subscription - MUST be first!)
-            self.logger.info("Subscribing to command result topic: energy/solar/result")
-            await self.mqtt_client.subscribe("energy/solar/result", self._result_handler)
+        # Note: MQTT subscriptions are pre-registered in __init__ to ensure they're
+        # active before the message loop starts (avoids asyncio-mqtt race conditions)
 
-            # Subscribe to home status for high load detection
-            self.logger.info(f"Subscribing to home status topic: {self._home_status_topic}")
-            await self.mqtt_client.subscribe(self._home_status_topic, self._on_home_status)
-
-        # Sync inverter time on startup (requires result subscription to be active)
+        # Sync inverter time on startup
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
 
