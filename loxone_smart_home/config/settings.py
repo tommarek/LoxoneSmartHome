@@ -245,7 +245,25 @@ class GrowattConfig(BaseSettings):
     # Simulation mode
     simulation_mode: bool = False
 
-    # Retry settings
+    # Price fetching settings
+    price_fetch_hour: int = Field(
+        default=14, ge=0, le=23,
+        description="Hour of day to start fetching next day's DAM prices (14 = 2 PM)"
+    )
+    price_fetch_retry_initial_delay: int = Field(
+        default=5, ge=1, le=60,
+        description="Initial retry delay in minutes for price fetching (exponential backoff)"
+    )
+    price_fetch_retry_max_delay: int = Field(
+        default=60, ge=1, le=120,
+        description="Maximum retry delay in minutes for price fetching"
+    )
+    price_fetch_retry_max_attempts: int = Field(
+        default=20, ge=1, le=50,
+        description="Maximum retry attempts for price fetching before giving up"
+    )
+
+    # Retry settings (generic, kept for backward compatibility)
     max_retries: int = Field(default=3, ge=1)
     retry_delay: int = Field(default=60, ge=1)  # seconds
 

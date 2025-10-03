@@ -220,6 +220,87 @@ class PriceAnalyzer:
             self.logger.error(f"Error fetching DAM prices: {e}", exc_info=True)
             return {}
 
+    async def fetch_dam_energy_prices_with_retry(
+        self,
+        target_date: Optional[str] = None,
+        initial_delay_minutes: int = 5,
+        max_delay_minutes: int = 60,
+        max_attempts: int = 20
+    ) -> Dict[Tuple[str, str], float]:
+        """Fetch DAM energy prices with exponential backoff retry logic.
+
+        Handles midnight rollover: if we start fetching before midnight and cross over,
+        the target date is recalculated to ensure we're always fetching the correct day.
+
+        Args:
+            target_date: Target date in YYYY-MM-DD format. If None, calculates next day.
+            initial_delay_minutes: Initial retry delay in minutes (default: 5)
+            max_delay_minutes: Maximum retry delay in minutes (default: 60)
+            max_attempts: Maximum retry attempts (default: 20)
+
+        Returns:
+            Dictionary with (start_time, end_time) tuples as keys and EUR/MWh prices as values.
+            Returns empty dict if all retries exhausted.
+        """
+        import asyncio
+
+        attempt = 0
+        delay_minutes = initial_delay_minutes
+
+        while attempt < max_attempts:
+            attempt += 1
+
+            # Recalculate target date on each attempt to handle midnight rollover
+            # If target_date was explicitly provided, use it. Otherwise calculate "next day"
+            if target_date is None:
+                # Calculate next day based on current time
+                # This ensures if we cross midnight during retries, we adjust the target
+                now = datetime.now(self._local_tz)
+                # If it's before the price fetch hour, we want tomorrow's prices
+                # If it's after, we still want tomorrow's prices (they should be available)
+                fetch_target = now + timedelta(days=1)
+                current_target = fetch_target.strftime("%Y-%m-%d")
+            else:
+                current_target = target_date
+
+            self.logger.info(
+                f"📊 Attempt {attempt}/{max_attempts}: Fetching DAM prices for {current_target}"
+            )
+
+            # Attempt to fetch prices
+            prices = await self.fetch_dam_energy_prices(date=current_target)
+
+            if prices and len(prices) >= 90:
+                # Success! We have valid price data (at least 90 blocks for a full day)
+                self.logger.info(
+                    f"✅ Successfully fetched {len(prices)} price points for {current_target} "
+                    f"on attempt {attempt}"
+                )
+                return prices
+
+            # Failed - log and prepare for retry
+            if attempt < max_attempts:
+                self.logger.warning(
+                    f"⏳ No valid prices yet for {current_target} "
+                    f"({len(prices)} blocks received, need ≥90). "
+                    f"Retrying in {delay_minutes} minutes... "
+                    f"(attempt {attempt}/{max_attempts})"
+                )
+
+                # Wait for the retry delay
+                await asyncio.sleep(delay_minutes * 60)
+
+                # Exponential backoff with cap
+                delay_minutes = min(delay_minutes * 2, max_delay_minutes)
+            else:
+                # Max attempts reached
+                self.logger.error(
+                    f"❌ Failed to fetch prices for {current_target} after {max_attempts} attempts. "
+                    f"Prices may not be published yet or API is unavailable."
+                )
+
+        return {}
+
     def generate_mock_prices(self, date: str) -> Dict[Tuple[str, str], float]:
         """Generate mock energy prices for testing when OTE data unavailable.
 

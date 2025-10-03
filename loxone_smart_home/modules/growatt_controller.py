@@ -194,6 +194,13 @@ class GrowattController(BaseModule):
         self._solar_power: float = 0.0  # Current solar generation in kW
         self._last_price_fetch: Optional[datetime] = None  # Track price update time
 
+        # Next-day price fetching state
+        self._next_day_prices_fetched: bool = False  # Flag: have we fetched next day's prices?
+        self._next_day_prices: Dict[Tuple[str, str], float] = {}  # Store next day's prices
+        self._next_day_prices_date: Optional[str] = None  # Date of next day prices
+        self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
+        self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
+
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
@@ -1021,6 +1028,15 @@ class GrowattController(BaseModule):
                 pass
             self._periodic_check_task = None
 
+        # Cancel price fetch task
+        if self._price_fetch_task and not self._price_fetch_task.done():
+            self._price_fetch_task.cancel()
+            try:
+                await self._price_fetch_task
+            except asyncio.CancelledError:
+                pass
+            self._price_fetch_task = None
+
         # Apply safe shutdown mode
         self.logger.info("🔄 Resetting inverter to safe shutdown state...")
         try:
@@ -1231,6 +1247,48 @@ class GrowattController(BaseModule):
     async def _on_price_update(self) -> None:
         """Handle new price data availability."""
         await self._evaluate_conditions("price_update")
+
+    async def _fetch_next_day_prices_task(self) -> None:
+        """Background task to fetch next day's prices with retry logic."""
+        try:
+            # Get target date (tomorrow)
+            tomorrow_date = self._get_local_date_string(days_ahead=1)
+
+            self.logger.info(
+                f"🔄 Starting next-day price fetch for {tomorrow_date} "
+                f"(will retry until successful)"
+            )
+
+            # Fetch with retry using config parameters
+            prices = await self._price_analyzer.fetch_dam_energy_prices_with_retry(
+                target_date=tomorrow_date,
+                initial_delay_minutes=self.config.price_fetch_retry_initial_delay,
+                max_delay_minutes=self.config.price_fetch_retry_max_delay,
+                max_attempts=self.config.price_fetch_retry_max_attempts
+            )
+
+            if prices:
+                # Store next day's prices
+                self._next_day_prices = prices
+                self._next_day_prices_date = tomorrow_date
+                self._next_day_prices_fetched = True
+
+                # Simple confirmation log (no verbose table)
+                self.logger.info(
+                    f"✅ Successfully fetched and stored {len(prices)} price blocks "
+                    f"for {tomorrow_date}"
+                )
+            else:
+                self.logger.error(
+                    f"❌ Failed to fetch prices for {tomorrow_date} after all retries"
+                )
+                self._next_day_prices_fetched = False
+
+        except Exception as e:
+            self.logger.error(
+                f"Error in next-day price fetch task: {e}", exc_info=True
+            )
+            self._next_day_prices_fetched = False
 
     async def _on_load_threshold_crossed(self, high_loads: bool) -> None:
         """Handle load threshold crossing.
@@ -1628,6 +1686,7 @@ class GrowattController(BaseModule):
     async def _periodic_evaluation_loop(self) -> None:
         """Periodically check for condition changes that need re-evaluation."""
         last_midnight_check = None
+        last_fetch_check = None
 
         while self._running:
             try:
@@ -1635,77 +1694,157 @@ class GrowattController(BaseModule):
 
                 now = self._get_local_now()
 
-                # Check for midnight - fetch and log next day's prices
+                # Check if it's time to start fetching next day's prices
+                if now.hour == self.config.price_fetch_hour and now.minute == 0:
+                    current_fetch_check = now.date()
+                    should_fetch = (
+                        last_fetch_check != current_fetch_check
+                        and not self._next_day_prices_fetched
+                    )
+                    if should_fetch:
+                        last_fetch_check = current_fetch_check
+                        self.logger.info(
+                            f"⏰ {now.hour:02d}:00 - Starting next-day price fetch "
+                            f"(configured hour: {self.config.price_fetch_hour})"
+                        )
+
+                        # Cancel any existing fetch task
+                        if self._price_fetch_task and not self._price_fetch_task.done():
+                            self._price_fetch_task.cancel()
+                            try:
+                                await self._price_fetch_task
+                            except asyncio.CancelledError:
+                                pass
+
+                        # Start new fetch task in background
+                        self._price_fetch_task = asyncio.create_task(
+                            self._fetch_next_day_prices_task()
+                        )
+
+                # Check for midnight - activate next day's prices
                 if now.hour == 0 and now.minute == 0:
-                    # Only fetch once per midnight
+                    # Only process once per midnight
                     current_midnight = now.date()
                     if last_midnight_check != current_midnight:
                         last_midnight_check = current_midnight
-                        self.logger.info("🕛 Midnight - fetching next day's prices...")
+                        self.logger.info("🕛 Midnight - activating next day's prices...")
 
-                        try:
-                            # Fetch tomorrow's prices (1 day ahead)
-                            tomorrow_date = self._get_local_date_string(days_ahead=1)
-                            tomorrow_prices = await (
-                                self._price_analyzer.fetch_dam_energy_prices(
-                                    date=tomorrow_date
+                        # If we successfully fetched next day's prices, activate them
+                        if self._next_day_prices_fetched and self._next_day_prices:
+                            # Move next-day prices to current prices
+                            self._current_prices = self._next_day_prices
+                            self._prices_date = self._next_day_prices_date
+                            self._prices_updated = now
+
+                            # Recalculate cheapest blocks with the new prices
+                            charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
+                            charging_schedule, avg_price = (
+                                self._price_analyzer.get_charging_schedule(
+                                    self._current_prices, num_blocks=charge_blocks
                                 )
                             )
+                            self._cheapest_charging_blocks = set(
+                                (block[0], block[1]) for block in charging_schedule
+                            )
 
-                            if tomorrow_prices:
-                                # Get exchange rate
-                                eur_czk = await self._get_eur_czk_rate()
+                            self.logger.info(
+                                f"✅ Activated prices for {self._prices_date} "
+                                f"({len(self._current_prices)} blocks)"
+                            )
 
-                                # Calculate cheapest blocks for tomorrow
-                                charge_blocks = getattr(
-                                    self.config, 'battery_charge_blocks', 8
+                            # Trigger re-evaluation with new prices
+                            await self._on_price_update()
+
+                            # Clear next-day price storage and reset flag
+                            self._next_day_prices = {}
+                            self._next_day_prices_date = None
+                            self._next_day_prices_fetched = False
+
+                            # Now fetch and display NEXT day's prices (for visibility)
+                            try:
+                                next_day_date = self._get_local_date_string(days_ahead=1)
+                                self.logger.info(
+                                    f"🔄 Fetching prices for upcoming day: {next_day_date}"
                                 )
-                                tomorrow_schedule, avg_price = (
-                                    self._price_analyzer.get_charging_schedule(
-                                        tomorrow_prices, num_blocks=charge_blocks
+
+                                # Fetch next day prices (will retry if needed)
+                                next_prices = await (
+                                    self._price_analyzer.fetch_dam_energy_prices_with_retry(
+                                        target_date=next_day_date,
+                                        initial_delay_minutes=(
+                                            self.config.price_fetch_retry_initial_delay
+                                        ),
+                                        max_delay_minutes=(
+                                            self.config.price_fetch_retry_max_delay
+                                        ),
+                                        max_attempts=self.config.price_fetch_retry_max_attempts
                                     )
                                 )
 
-                                # Temporarily store tomorrow's charging blocks for display
-                                tomorrow_cheapest = set(
-                                    (block[0], block[1]) for block in tomorrow_schedule
-                                )
-                                old_blocks = self._cheapest_charging_blocks
-                                self._cheapest_charging_blocks = tomorrow_cheapest
+                                if next_prices:
+                                    # Store for later activation
+                                    self._next_day_prices = next_prices
+                                    self._next_day_prices_date = next_day_date
+                                    self._next_day_prices_fetched = True
 
-                                # Log the price table for tomorrow
-                                self.logger.info("=" * 50)
-                                self.logger.info(
-                                    f"📊 NEXT DAY SPOT PRICES ({tomorrow_date})"
-                                )
-                                self.logger.info("=" * 50)
-                                await self._log_price_table(
-                                    tomorrow_prices, tomorrow_date, eur_czk
-                                )
+                                    # Get exchange rate
+                                    eur_czk = await self._get_eur_czk_rate()
 
-                                # Log tomorrow's charging schedule
-                                if tomorrow_schedule:
-                                    avg_czk = avg_price * eur_czk / 1000
-                                    self.logger.info("=" * 50)
-                                    self.logger.info("🔋 TOMORROW'S CHARGING BLOCKS:")
-                                    for start, end, price_eur in tomorrow_schedule:
-                                        price_czk = price_eur * eur_czk / 1000
-                                        self.logger.info(
-                                            f"   {start}-{end}: {price_czk:.3f} CZK/kWh"
+                                    # Calculate cheapest blocks for next day
+                                    charge_blocks = getattr(
+                                        self.config, 'battery_charge_blocks', 8
+                                    )
+                                    next_schedule, avg_price = (
+                                        self._price_analyzer.get_charging_schedule(
+                                            next_prices, num_blocks=charge_blocks
                                         )
-                                    self.logger.info(f"   Average: {avg_czk:.3f} CZK/kWh")
-                                self.logger.info("=" * 50)
+                                    )
 
-                                # Restore current day's charging blocks
-                                self._cheapest_charging_blocks = old_blocks
-                            else:
-                                self.logger.warning(
-                                    f"Could not fetch next day prices for {tomorrow_date} "
-                                    f"(may not be published yet)"
+                                    # Temporarily set charging blocks for display
+                                    old_blocks = self._cheapest_charging_blocks
+                                    self._cheapest_charging_blocks = set(
+                                        (block[0], block[1]) for block in next_schedule
+                                    )
+
+                                    # Display price table for upcoming day
+                                    self.logger.info("=" * 50)
+                                    self.logger.info(
+                                        f"📊 UPCOMING DAY SPOT PRICES ({next_day_date})"
+                                    )
+                                    self.logger.info("=" * 50)
+                                    await self._log_price_table(
+                                        next_prices, next_day_date, eur_czk
+                                    )
+
+                                    # Display charging schedule
+                                    if next_schedule:
+                                        avg_czk = avg_price * eur_czk / 1000
+                                        self.logger.info("=" * 50)
+                                        self.logger.info("🔋 TOMORROW'S CHARGING BLOCKS:")
+                                        for start, end, price_eur in next_schedule:
+                                            price_czk = price_eur * eur_czk / 1000
+                                            self.logger.info(
+                                                f"   {start}-{end}: {price_czk:.3f} CZK/kWh"
+                                            )
+                                        self.logger.info(f"   Average: {avg_czk:.3f} CZK/kWh")
+                                    self.logger.info("=" * 50)
+
+                                    # Restore current charging blocks
+                                    self._cheapest_charging_blocks = old_blocks
+                                else:
+                                    self.logger.warning(
+                                        f"⚠️ Could not fetch prices for {next_day_date} "
+                                        f"(will retry at {self.config.price_fetch_hour}:00)"
+                                    )
+                            except Exception as e:
+                                self.logger.error(
+                                    f"Failed to fetch upcoming day prices at midnight: {e}",
+                                    exc_info=True
                                 )
-                        except Exception as e:
-                            self.logger.error(
-                                f"Failed to fetch next day prices: {e}", exc_info=True
+                        else:
+                            self.logger.warning(
+                                "⚠️ No next-day prices available at midnight. "
+                                "Will continue with current prices."
                             )
 
                 # Check for 15-minute block change (price changes every 15 minutes)
