@@ -207,6 +207,7 @@ class GrowattController(BaseModule):
 
     async def _result_handler(self, _topic: str, payload: Any) -> None:
         """Persistent handler for energy/solar/result MQTT messages."""
+        self.logger.info(f"🔔 _result_handler CALLED with payload: {payload}")
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode()
@@ -214,6 +215,12 @@ class GrowattController(BaseModule):
             data = json.loads(payload)
             command = data.get("command")
             success = data.get("success", False)
+
+            self.logger.info(
+                f"🔍 Parsed: command={command}, waiting_for={self._current_command_type}, "
+                f"has_future={self._current_command_future is not None}, "
+                f"future_done={self._current_command_future.done() if self._current_command_future else 'N/A'}"
+            )
 
             # Check if we're waiting for a command response
             if (
