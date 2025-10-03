@@ -974,18 +974,19 @@ class GrowattController(BaseModule):
         """Start the Growatt controller."""
         self._running = True
 
-        # Sync inverter time on startup
-        self.logger.info("Checking inverter time synchronization...")
-        await self._sync_inverter_time()
-
-        # Subscribe to home status for high load detection
+        # Subscribe to MQTT topics FIRST (before any commands are sent)
         if self.mqtt_client:
+            # Subscribe to command results (persistent subscription - MUST be first!)
+            self.logger.info("Subscribing to command result topic: energy/solar/result")
+            await self.mqtt_client.subscribe("energy/solar/result", self._result_handler)
+
+            # Subscribe to home status for high load detection
             self.logger.info(f"Subscribing to home status topic: {self._home_status_topic}")
             await self.mqtt_client.subscribe(self._home_status_topic, self._on_home_status)
 
-            # Subscribe to command results (persistent subscription to avoid race condition)
-            self.logger.info("Subscribing to command result topic: energy/solar/result")
-            await self.mqtt_client.subscribe("energy/solar/result", self._result_handler)
+        # Sync inverter time on startup (requires result subscription to be active)
+        self.logger.info("Checking inverter time synchronization...")
+        await self._sync_inverter_time()
 
         # Fetch initial prices
         await self._fetch_prices()
