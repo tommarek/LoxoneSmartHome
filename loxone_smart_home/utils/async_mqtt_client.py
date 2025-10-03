@@ -291,12 +291,14 @@ class AsyncMQTTClient:
     ) -> None:
         """Execute a callback safely."""
         try:
+            self.logger.info(f"🚀 Executing callback {callback.__name__} for topic {topic}")
             if asyncio.iscoroutinefunction(callback):
                 await callback(topic, payload)
             else:
                 # Run sync callbacks in executor to not block
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, callback, topic, payload)
+            self.logger.info(f"✅ Callback {callback.__name__} completed successfully")
         except Exception as e:
             self.logger.error(f"Error executing callback for {topic}: {e}", exc_info=True)
             raise
