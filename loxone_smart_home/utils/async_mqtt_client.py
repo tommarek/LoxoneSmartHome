@@ -238,6 +238,9 @@ class AsyncMQTTClient:
         """Handle incoming MQTT message."""
         topic = str(message.topic)
 
+        # DEBUG: Log all received messages
+        self.logger.info(f"📨 MQTT message on topic: {topic}")
+
         # Handle payload decoding with error handling
         if isinstance(message.payload, (bytes, bytearray)):
             try:
@@ -262,6 +265,11 @@ class AsyncMQTTClient:
         # Get callbacks with lock
         async with self.subscribers_lock:
             callbacks = list(self.subscribers.get(topic, []))
+            # DEBUG: Log subscription lookup
+            self.logger.info(
+                f"🔍 Looking for callbacks on '{topic}': found {len(callbacks)} callbacks"
+            )
+            self.logger.info(f"🔍 All subscribed topics: {list(self.subscribers.keys())}")
 
         # Execute callbacks concurrently
         if callbacks:
