@@ -199,14 +199,13 @@ class AsyncMQTTClient:
             if is_new_topic:
                 self.subscribers[topic] = set()
 
-                # If message loop already started, we need to restart it after subscribing
+                # Only log late subscriptions but don't restart automatically
+                # The delayed start should handle most cases
                 if self._message_loop_started:
-                    self.logger.info(
-                        f"Late subscription detected for topic '{topic}'. "
-                        "Will restart message loop to ensure proper message delivery."
+                    self.logger.warning(
+                        f"Late subscription to '{topic}' after message loop started. "
+                        "Messages may not be received until reconnection."
                     )
-                    self._pending_subscriptions.add(topic)
-                    self._restart_message_loop = True
 
                 # Subscribe if connected
                 if self.client and self._connected:
@@ -214,10 +213,6 @@ class AsyncMQTTClient:
                     self.logger.debug(f"Subscribed to topic: {topic}")
 
             self.subscribers[topic].add(callback)
-
-        # If we need to restart the message loop, do it outside the lock
-        if is_new_topic and self._restart_message_loop and self._message_loop_started:
-            await self._restart_read_task()
 
     async def unsubscribe(
         self, topic: str, callback: Optional[Callable[[str, Any], Any]] = None
@@ -239,13 +234,14 @@ class AsyncMQTTClient:
 
     async def _delayed_start_read_task(self) -> None:
         """Start the read task after a brief delay to allow initial subscriptions."""
-        # Give a brief window for initial subscriptions (100ms should be enough)
-        await asyncio.sleep(0.1)
+        # Give sufficient time for all modules to subscribe (500ms window)
+        # This prevents race conditions with asyncio-mqtt message context manager
+        await asyncio.sleep(0.5)
 
         # Start the read task if not already started
         if self._read_task is None or self._read_task.done():
             self._read_task = asyncio.create_task(self._read_messages())
-            self.logger.debug("Started MQTT message reading task")
+            self.logger.info("Started MQTT message reading task after subscription window")
 
     async def _restart_read_task(self) -> None:
         """Restart the read task to pick up new subscriptions."""
@@ -282,11 +278,6 @@ class AsyncMQTTClient:
                     async for message in messages:
                         self.messages_received += 1
                         await self._handle_message(message)
-
-                        # Check if we need to restart for new subscriptions
-                        if self._restart_message_loop:
-                            self.logger.info("Exiting message loop to apply new subscriptions")
-                            break
 
             except asyncio.CancelledError:
                 # Task was cancelled for restart, this is expected

@@ -51,7 +51,7 @@ class TestAsyncMQTTClient:
                 assert mqtt_client._running is True
 
                 # The read task is now started with a delay, so wait for it
-                await asyncio.sleep(0.15)  # Wait for the 100ms delay
+                await asyncio.sleep(0.55)  # Wait for the 500ms delay
                 assert mqtt_client._read_task is not None
 
     @pytest.mark.asyncio
@@ -149,7 +149,7 @@ class TestAsyncMQTTClient:
 
     @pytest.mark.asyncio
     async def test_late_subscription_handling(self, mqtt_client: AsyncMQTTClient) -> None:
-        """Test that late subscriptions after connection trigger message loop restart."""
+        """Test that late subscriptions after connection are handled properly."""
         with patch("utils.async_mqtt_client.Client") as mock_client_class:
             mock_client = AsyncMock()
             mock_client_class.return_value = mock_client
@@ -158,16 +158,23 @@ class TestAsyncMQTTClient:
             await mqtt_client.connect()
 
             # Wait for delayed read task to start
-            await asyncio.sleep(0.15)
+            await asyncio.sleep(0.55)
 
             # Verify message loop has started
             assert mqtt_client._message_loop_started is True
 
             # Now subscribe to a topic (late subscription)
             callback = AsyncMock()
-            await mqtt_client.subscribe("late/topic", callback)
 
-            # Verify that the late subscription was detected and restart was triggered
+            # Capture warning logs to verify late subscription is detected
+            with patch.object(mqtt_client.logger, 'warning') as mock_warning:
+                await mqtt_client.subscribe("late/topic", callback)
+
+                # Verify warning about late subscription
+                mock_warning.assert_called_once()
+                assert "Late subscription" in mock_warning.call_args[0][0]
+
+            # Verify subscription was still processed
             assert "late/topic" in mqtt_client.subscribers
             assert callback in mqtt_client.subscribers["late/topic"]
 
