@@ -690,8 +690,8 @@ class GrowattController(BaseModule):
                 )
                 return None
             finally:
-                # Unsubscribe from result topic
-                await self.mqtt_client.unsubscribe(response_topic)
+                # Unsubscribe ONLY this specific handler (not all callbacks on this topic)
+                await self.mqtt_client.unsubscribe(response_topic, response_handler)
 
         except Exception as e:
             self.logger.error(f"Failed to get inverter time: {e}")
