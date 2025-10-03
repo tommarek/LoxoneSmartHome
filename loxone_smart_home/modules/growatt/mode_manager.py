@@ -120,26 +120,39 @@ class ModeManager:
                     self.logger.debug(f"✅ {command_description} succeeded")
                 return (True, result)
 
-            # Command failed - store error for potential final report
+            # Command failed - log full details for debugging
             error_msg = result.get("message", "Unknown error") if result else "Timeout"
 
             if attempt < retry_count:
-                # Will retry - only log to debug
-                self.logger.debug(
-                    f"Command attempt {attempt} failed: {error_msg}, retrying..."
+                # Will retry - log at WARNING level with full result
+                self.logger.warning(
+                    f"⚠️ Attempt {attempt}/{retry_count} failed for {command_description}: "
+                    f"{error_msg}"
                 )
+                if result:
+                    self.logger.warning(
+                        f"📋 Full response from attempt {attempt}: "
+                        f"{json.dumps(result, indent=2)}"
+                    )
+                else:
+                    self.logger.warning(f"📋 Attempt {attempt}: No response (timeout)")
 
                 # Wait before retry with exponential backoff (capped at 30s)
                 wait_time = min(30.0, retry_delay * (1.5 ** (attempt - 1)))
+                self.logger.info(f"⏳ Retrying in {wait_time:.1f}s...")
                 await asyncio.sleep(wait_time)
             else:
-                # Final failure - single concise error message
+                # Final failure - detailed error message
                 self.logger.error(
-                    f"❌ {command_description} failed after {retry_count} attempts"
+                    f"❌ {command_description} FAILED after {retry_count} attempts"
                 )
-                self.logger.debug(f"Final error: {error_msg}")
+                self.logger.error(f"Final error: {error_msg}")
                 if result:
-                    self.logger.debug(f"Final response: {json.dumps(result, indent=2)}")
+                    self.logger.error(
+                        f"📋 Final response: {json.dumps(result, indent=2)}"
+                    )
+                else:
+                    self.logger.error("📋 Final attempt: No response (timeout)")
                 return (False, result)
 
         # Should never reach here, but just in case
