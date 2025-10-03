@@ -49,7 +49,9 @@ class TestAsyncMQTTClient:
                 assert mqtt_client.client is not None
                 mock_client.connect.assert_called_once()
                 assert mqtt_client._running is True
-                # Verify _read_messages task was created
+
+                # The read task is now started with a delay, so wait for it
+                await asyncio.sleep(0.15)  # Wait for the 100ms delay
                 assert mqtt_client._read_task is not None
 
     @pytest.mark.asyncio
@@ -144,6 +146,33 @@ class TestAsyncMQTTClient:
         # Test sync callback
         await mqtt_client._execute_callback(sync_callback, "test/topic", "payload")
         sync_callback.assert_called_once_with("test/topic", "payload")
+
+    @pytest.mark.asyncio
+    async def test_late_subscription_handling(self, mqtt_client: AsyncMQTTClient) -> None:
+        """Test that late subscriptions after connection trigger message loop restart."""
+        with patch("utils.async_mqtt_client.Client") as mock_client_class:
+            mock_client = AsyncMock()
+            mock_client_class.return_value = mock_client
+
+            # Connect first
+            await mqtt_client.connect()
+
+            # Wait for delayed read task to start
+            await asyncio.sleep(0.15)
+
+            # Verify message loop has started
+            assert mqtt_client._message_loop_started is True
+
+            # Now subscribe to a topic (late subscription)
+            callback = AsyncMock()
+            await mqtt_client.subscribe("late/topic", callback)
+
+            # Verify that the late subscription was detected and restart was triggered
+            assert "late/topic" in mqtt_client.subscribers
+            assert callback in mqtt_client.subscribers["late/topic"]
+
+            # Verify MQTT client subscribe was called
+            mock_client.subscribe.assert_called_with("late/topic")
 
     @pytest.mark.asyncio
     async def test_callback_error_handling(self, mqtt_client: AsyncMQTTClient) -> None:
