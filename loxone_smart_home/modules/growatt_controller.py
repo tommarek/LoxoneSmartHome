@@ -207,7 +207,6 @@ class GrowattController(BaseModule):
 
     async def _result_handler(self, _topic: str, payload: Any) -> None:
         """Persistent handler for energy/solar/result MQTT messages."""
-        self.logger.info(f"🔔 _result_handler CALLED with payload: {payload}")
         try:
             if isinstance(payload, bytes):
                 payload = payload.decode()
@@ -215,12 +214,6 @@ class GrowattController(BaseModule):
             data = json.loads(payload)
             command = data.get("command")
             success = data.get("success", False)
-
-            self.logger.info(
-                f"🔍 Parsed: command={command}, waiting_for={self._current_command_type}, "
-                f"has_future={self._current_command_future is not None}, "
-                f"future_done={self._current_command_future.done() if self._current_command_future else 'N/A'}"
-            )
 
             # Check if we're waiting for a command response
             if (
@@ -245,10 +238,63 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error in result handler: {e}", exc_info=True)
 
+    async def _send_command_and_wait(
+        self,
+        command_topic: str,
+        command_type: str,
+        payload: Dict[str, Any],
+        timeout: float = 10.0
+    ) -> Optional[Dict[str, Any]]:
+        """Send MQTT command and wait for response using persistent subscription.
+
+        This is the unified method for all MQTT command/response operations.
+        Uses the persistent _result_handler to avoid subscription conflicts.
+
+        Args:
+            command_topic: MQTT topic to send command to
+            command_type: Command type for response matching (e.g., "datetime/get")
+            payload: Command payload dict
+            timeout: How long to wait for response
+
+        Returns:
+            Response dict if received, None if timeout
+        """
+        if self._optional_config.get("simulation_mode", False):
+            return {"success": True, "message": "Simulated"}
+
+        assert self.mqtt_client is not None
+
+        # Set up tracking for this command
+        self._current_command_type = command_type
+        self._current_command_future = asyncio.get_running_loop().create_future()
+
+        try:
+            # Send the command
+            await self.mqtt_client.publish(command_topic, json.dumps(payload))
+
+            # Wait for persistent handler to resolve the future
+            result = await asyncio.wait_for(self._current_command_future, timeout=timeout)
+
+            # Store for later reference
+            self._last_command_results[command_type] = result
+            return result
+
+        except asyncio.TimeoutError:
+            self.logger.warning(f"⏱️ Timeout waiting for {command_type} result after {timeout}s")
+            return None
+
+        finally:
+            # Clean up
+            self._current_command_type = None
+            self._current_command_future = None
+
     async def _wait_for_command_result(
         self, command_type: str, timeout: float = 3.0
     ) -> Optional[Dict[str, Any]]:
         """Wait for command result via persistent subscription.
+
+        DEPRECATED: Use _send_command_and_wait() for new code.
+        Kept for compatibility with mode_manager.py which sends commands separately.
 
         Uses the persistent _result_handler subscription to avoid race conditions.
 
@@ -297,33 +343,17 @@ class GrowattController(BaseModule):
 
         state = {}
 
-        # Query battery-first state
+        # Query battery-first state using unified method
         try:
-            assert self.mqtt_client is not None
-
-            # Set up result handler
-            bf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-
-            async def bf_handler(_topic: str, payload: Any) -> None:
-                try:
-                    if isinstance(payload, bytes):
-                        payload = payload.decode()
-                    data = json.loads(payload)
-                    if data.get("command") == "batteryfirst/get":
-                        if not bf_future.done():
-                            bf_future.set_result(data)
-                except Exception as e:
-                    self.logger.error(f"Error parsing battery-first state: {e}")
-
-            await self.mqtt_client.subscribe("energy/solar/result", bf_handler)
-
-            # Send query
             self.logger.debug("Querying battery-first state...")
-            await self.mqtt_client.publish("energy/solar/command/batteryfirst/get", "{}")
+            bf_result = await self._send_command_and_wait(
+                command_topic="energy/solar/command/batteryfirst/get",
+                command_type="batteryfirst/get",
+                payload={},
+                timeout=3.0
+            )
 
-            # Wait for response
-            try:
-                bf_result = await asyncio.wait_for(bf_future, timeout=3.0)
+            if bf_result:
                 state["battery_first"] = bf_result
 
                 # Log the state
@@ -340,44 +370,25 @@ class GrowattController(BaseModule):
                         f"Failed to query battery-first state: {bf_result.get('message')}"
                     )
                     self.logger.debug(f"📋 Full query response: {json.dumps(bf_result, indent=2)}")
-
-            except asyncio.TimeoutError:
+            else:
                 self.logger.warning("Timeout querying battery-first state")
                 state["battery_first"] = {}
-            finally:
-                await self.mqtt_client.unsubscribe("energy/solar/result")
 
         except Exception as e:
             self.logger.error(f"Error querying battery-first state: {e}")
             state["battery_first"] = {}
 
-        # Query grid-first state
+        # Query grid-first state using unified method
         try:
-            assert self.mqtt_client is not None
-
-            # Set up result handler
-            gf_future: asyncio.Future[Dict[str, Any]] = asyncio.get_running_loop().create_future()
-
-            async def gf_handler(_topic: str, payload: Any) -> None:
-                try:
-                    if isinstance(payload, bytes):
-                        payload = payload.decode()
-                    data = json.loads(payload)
-                    if data.get("command") == "gridfirst/get":
-                        if not gf_future.done():
-                            gf_future.set_result(data)
-                except Exception as e:
-                    self.logger.error(f"Error parsing grid-first state: {e}")
-
-            await self.mqtt_client.subscribe("energy/solar/result", gf_handler)
-
-            # Send query
             self.logger.debug("Querying grid-first state...")
-            await self.mqtt_client.publish("energy/solar/command/gridfirst/get", "{}")
+            gf_result = await self._send_command_and_wait(
+                command_topic="energy/solar/command/gridfirst/get",
+                command_type="gridfirst/get",
+                payload={},
+                timeout=3.0
+            )
 
-            # Wait for response
-            try:
-                gf_result = await asyncio.wait_for(gf_future, timeout=3.0)
+            if gf_result:
                 state["grid_first"] = gf_result
 
                 # Log the state
@@ -396,12 +407,9 @@ class GrowattController(BaseModule):
                         f"Failed to query grid-first state: {gf_result.get('message')}"
                     )
                     self.logger.debug(f"📋 Full query response: {json.dumps(gf_result, indent=2)}")
-
-            except asyncio.TimeoutError:
+            else:
                 self.logger.warning("Timeout querying grid-first state")
                 state["grid_first"] = {}
-            finally:
-                await self.mqtt_client.unsubscribe("energy/solar/result")
 
         except Exception as e:
             self.logger.error(f"Error querying grid-first state: {e}")
@@ -604,94 +612,44 @@ class GrowattController(BaseModule):
             return self._get_local_now()
 
         try:
-            assert self.mqtt_client is not None
+            # Send command using unified method
+            result = await self._send_command_and_wait(
+                command_topic="energy/solar/command/datetime/get",
+                command_type="datetime/get",
+                payload={},
+                timeout=5.0
+            )
 
-            # Set up the request/response pattern
-            request_topic = "energy/solar/command/datetime/get"
-            # The inverter responds on a common result topic
-            response_topic = "energy/solar/result"
-
-            # Create a correlation ID for tracking this specific request
-            import uuid
-            correlation_id = f"datetime-{uuid.uuid4().hex[:8]}"
-
-            # Create a future to wait for the response
-            loop = asyncio.get_running_loop()
-            response_future: asyncio.Future[datetime] = loop.create_future()
-
-            # Handler for the response
-            async def response_handler(_topic: str, payload: Any) -> None:
-                try:
-                    # Payload could be bytes or string
-                    if isinstance(payload, bytes):
-                        payload = payload.decode()
-                    data = json.loads(payload)
-
-                    # Check if this is our datetime response
-                    if data.get("command") != "datetime/get":
-                        return  # Not our response, ignore
-
-                    # Check success
-                    if not data.get("success", False):
-                        error_msg = data.get("message", "Unknown error")
-                        if not response_future.done():
-                            response_future.set_exception(
-                                ValueError(f"Inverter returned error: {error_msg}")
-                            )
-                        return
-
-                    value = data.get("value")  # Format: "YYYY-MM-DD HH:MM:SS"
-
-                    if value:
-                        # Parse the datetime string
-                        dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
-
-                        # Handle potential year issue: firmware may return 2-digit year
-                        # If year < 100, it's likely years since 2000, so add 2000
-                        if dt.year < 100:
-                            dt = dt.replace(year=dt.year + 2000)
-                            self.logger.debug(f"Adjusted 2-digit year to {dt.year}")
-
-                        # Add timezone info
-                        dt = dt.replace(tzinfo=self._local_tz)
-
-                        if not response_future.done():
-                            response_future.set_result(dt)
-                            self.logger.debug(f"Received inverter time: {value}")
-                    else:
-                        if not response_future.done():
-                            response_future.set_exception(ValueError("No value in response"))
-
-                except Exception as e:
-                    self.logger.error(f"Error parsing inverter time response: {e}")
-                    if not response_future.done():
-                        response_future.set_exception(e)
-
-            # Subscribe to the result topic
-            await self.mqtt_client.subscribe(response_topic, response_handler)
-
-            try:
-                # Send the request with correlation ID
-                request_payload = {"correlationId": correlation_id}
-                self.logger.debug(
-                    f"Requesting inverter time via {request_topic} "
-                    f"with correlationId: {correlation_id}"
-                )
-                await self.mqtt_client.publish(request_topic, json.dumps(request_payload))
-
-                # Wait for response with timeout
-                inverter_time = await asyncio.wait_for(response_future, timeout=5.0)
-                return inverter_time
-
-            except asyncio.TimeoutError:
-                self.logger.warning(
-                    f"Inverter time request timed out after 5 seconds. "
-                    f"Expected response on {response_topic} with command=datetime/get"
-                )
+            if not result:
+                self.logger.warning("Inverter time request timed out or failed")
                 return None
-            finally:
-                # Unsubscribe ONLY this specific handler (not all callbacks on this topic)
-                await self.mqtt_client.unsubscribe(response_topic, response_handler)
+
+            # Check success
+            if not result.get("success", False):
+                error_msg = result.get("message", "Unknown error")
+                self.logger.error(f"Inverter returned error: {error_msg}")
+                return None
+
+            # Parse the datetime value
+            value = result.get("value")  # Format: "YYYY-MM-DD HH:MM:SS"
+            if not value:
+                self.logger.error("No value in inverter time response")
+                return None
+
+            # Parse the datetime string
+            dt = datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+            # Handle potential year issue: firmware may return 2-digit year
+            # If year < 100, it's likely years since 2000, so add 2000
+            if dt.year < 100:
+                dt = dt.replace(year=dt.year + 2000)
+                self.logger.debug(f"Adjusted 2-digit year to {dt.year}")
+
+            # Add timezone info
+            dt = dt.replace(tzinfo=self._local_tz)
+
+            self.logger.debug(f"Received inverter time: {value}")
+            return dt
 
         except Exception as e:
             self.logger.error(f"Failed to get inverter time: {e}")

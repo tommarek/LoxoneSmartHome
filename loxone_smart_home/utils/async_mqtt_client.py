@@ -238,9 +238,6 @@ class AsyncMQTTClient:
         """Handle incoming MQTT message."""
         topic = str(message.topic)
 
-        # DEBUG: Log all received messages
-        self.logger.info(f"📨 MQTT message on topic: {topic}")
-
         # Handle payload decoding with error handling
         if isinstance(message.payload, (bytes, bytearray)):
             try:
@@ -265,18 +262,11 @@ class AsyncMQTTClient:
         # Get callbacks with lock
         async with self.subscribers_lock:
             callbacks = list(self.subscribers.get(topic, []))
-            # DEBUG: Log subscription lookup
-            self.logger.info(
-                f"🔍 Looking for callbacks on '{topic}': found {len(callbacks)} callbacks"
-            )
-            self.logger.info(f"🔍 All subscribed topics: {list(self.subscribers.keys())}")
 
         # Execute callbacks concurrently
         if callbacks:
-            self.logger.info(f"⚙️ About to execute {len(callbacks)} callbacks for topic {topic}")
             tasks = []
             for callback in callbacks:
-                self.logger.info(f"⚙️ Creating task for callback: {callback}")
                 task = asyncio.create_task(self._execute_callback(callback, topic, payload))
                 tasks.append(task)
 
@@ -293,14 +283,12 @@ class AsyncMQTTClient:
     ) -> None:
         """Execute a callback safely."""
         try:
-            self.logger.info(f"🚀 Executing callback {callback.__name__} for topic {topic}")
             if asyncio.iscoroutinefunction(callback):
                 await callback(topic, payload)
             else:
                 # Run sync callbacks in executor to not block
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, callback, topic, payload)
-            self.logger.info(f"✅ Callback {callback.__name__} completed successfully")
         except Exception as e:
             self.logger.error(f"Error executing callback for {topic}: {e}", exc_info=True)
             raise
