@@ -1769,87 +1769,22 @@ class GrowattController(BaseModule):
                             self._next_day_prices_date = None
                             self._next_day_prices_fetched = False
 
-                            # Now fetch and display NEXT day's prices (for visibility)
-                            try:
-                                next_day_date = self._get_local_date_string(days_ahead=1)
-                                self.logger.info(
-                                    f"🔄 Fetching prices for upcoming day: {next_day_date}"
-                                )
+                            # Start background fetch for next day's prices (non-blocking)
+                            # This ensures periodic evaluations continue without interruption
+                            if self._price_fetch_task and not self._price_fetch_task.done():
+                                self._price_fetch_task.cancel()
+                                try:
+                                    await self._price_fetch_task
+                                except asyncio.CancelledError:
+                                    pass
 
-                                # Fetch next day prices (will retry if needed)
-                                next_prices = await (
-                                    self._price_analyzer.fetch_dam_energy_prices_with_retry(
-                                        target_date=next_day_date,
-                                        initial_delay_minutes=(
-                                            self.config.price_fetch_retry_initial_delay
-                                        ),
-                                        max_delay_minutes=(
-                                            self.config.price_fetch_retry_max_delay
-                                        ),
-                                        max_attempts=self.config.price_fetch_retry_max_attempts
-                                    )
-                                )
-
-                                if next_prices:
-                                    # Store for later activation
-                                    self._next_day_prices = next_prices
-                                    self._next_day_prices_date = next_day_date
-                                    self._next_day_prices_fetched = True
-
-                                    # Get exchange rate
-                                    eur_czk = await self._get_eur_czk_rate()
-
-                                    # Calculate cheapest blocks for next day
-                                    charge_blocks = getattr(
-                                        self.config, 'battery_charge_blocks', 8
-                                    )
-                                    next_schedule, avg_price = (
-                                        self._price_analyzer.get_charging_schedule(
-                                            next_prices, num_blocks=charge_blocks
-                                        )
-                                    )
-
-                                    # Temporarily set charging blocks for display
-                                    old_blocks = self._cheapest_charging_blocks
-                                    self._cheapest_charging_blocks = set(
-                                        (block[0], block[1]) for block in next_schedule
-                                    )
-
-                                    # Display price table for upcoming day
-                                    self.logger.info("=" * 50)
-                                    self.logger.info(
-                                        f"📊 UPCOMING DAY SPOT PRICES ({next_day_date})"
-                                    )
-                                    self.logger.info("=" * 50)
-                                    await self._log_price_table(
-                                        next_prices, next_day_date, eur_czk
-                                    )
-
-                                    # Display charging schedule
-                                    if next_schedule:
-                                        avg_czk = avg_price * eur_czk / 1000
-                                        self.logger.info("=" * 50)
-                                        self.logger.info("🔋 TOMORROW'S CHARGING BLOCKS:")
-                                        for start, end, price_eur in next_schedule:
-                                            price_czk = price_eur * eur_czk / 1000
-                                            self.logger.info(
-                                                f"   {start}-{end}: {price_czk:.3f} CZK/kWh"
-                                            )
-                                        self.logger.info(f"   Average: {avg_czk:.3f} CZK/kWh")
-                                    self.logger.info("=" * 50)
-
-                                    # Restore current charging blocks
-                                    self._cheapest_charging_blocks = old_blocks
-                                else:
-                                    self.logger.warning(
-                                        f"⚠️ Could not fetch prices for {next_day_date} "
-                                        f"(will retry at {self.config.price_fetch_hour}:00)"
-                                    )
-                            except Exception as e:
-                                self.logger.error(
-                                    f"Failed to fetch upcoming day prices at midnight: {e}",
-                                    exc_info=True
-                                )
+                            self._price_fetch_task = asyncio.create_task(
+                                self._fetch_next_day_prices_task()
+                            )
+                            self.logger.info(
+                                "🔄 Started background fetch for next day's prices "
+                                "(main display at configured fetch hour)"
+                            )
                         else:
                             self.logger.warning(
                                 "⚠️ No next-day prices available at midnight. "
