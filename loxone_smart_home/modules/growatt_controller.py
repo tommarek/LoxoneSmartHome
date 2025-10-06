@@ -1176,10 +1176,17 @@ class GrowattController(BaseModule):
             target_date = self._get_local_date_string(days_ahead=0)
 
             # Fetch energy prices from DAM (now returns 15-minute intervals)
-            prices_15min = await self._price_analyzer.fetch_dam_energy_prices(date=target_date)
+            prices_15min, status = await self._price_analyzer.fetch_dam_energy_prices(
+                date=target_date
+            )
 
             if not prices_15min:
-                self.logger.warning("Failed to retrieve energy prices, using mock prices")
+                if status == "not_published":
+                    self.logger.info(
+                        f"Prices for {target_date} not published yet, using mock prices"
+                    )
+                else:
+                    self.logger.warning("Failed to retrieve energy prices, using mock prices")
                 prices_15min = self._price_analyzer.generate_mock_prices(target_date)
 
             if prices_15min:

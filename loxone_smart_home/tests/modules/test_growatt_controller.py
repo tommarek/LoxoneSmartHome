@@ -112,12 +112,13 @@ async def test_fetch_dam_energy_prices_success(
             return_value=mock_get
         )
 
-        prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
+        prices, status = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
             "2024-01-01"
         )
 
         # Now expecting 15-minute intervals (3 hours × 4 blocks = 12)
         assert len(prices) == 12
+        assert status == "partial"  # Only 12 blocks, expected 90-100
         # Should use dataLine[1] which contains EUR/MWh prices
         # Each hour is expanded to 4 15-minute blocks with the same price
         assert prices[("00:00", "00:15")] == 98.5
@@ -139,8 +140,38 @@ async def test_fetch_dam_energy_prices_failure(
             return_value=mock_get
         )
 
-        prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices()
+        prices, status = await growatt_controller._price_analyzer.fetch_dam_energy_prices()
         assert prices == {}
+        assert status == "error"
+
+
+async def test_fetch_dam_energy_prices_not_published(
+    growatt_controller: GrowattController
+) -> None:
+    """Test price fetching when OTE hasn't published prices yet (empty dataLine)."""
+    mock_response = {
+        "axis": {
+            "x": {"decimals": 0, "legend": "Hour"},
+            "y": {"decimals": 0, "legend": "Price (EUR/MWh)"}
+        },
+        "data": {
+            "dataLine": []  # Empty - prices not published yet
+        },
+        "graph": {"title": "Day-Ahead Market Results - 07.10.2025"}
+    }
+    with patch("aiohttp.ClientSession") as mock_session:
+        mock_get = AsyncMock()
+        mock_get.__aenter__.return_value.status = 200
+        mock_get.__aenter__.return_value.json = AsyncMock(return_value=mock_response)
+        mock_session.return_value.__aenter__.return_value.get = MagicMock(
+            return_value=mock_get
+        )
+
+        prices, status = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
+            "2025-10-07"
+        )
+        assert prices == {}
+        assert status == "not_published"
 
 
 @pytest.mark.asyncio
@@ -168,11 +199,12 @@ async def test_fetch_dam_energy_prices_single_dataline(
             return_value=mock_get
         )
 
-        prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
+        prices, status = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
             "2024-01-01"
         )
         # Now expecting 15-minute intervals (2 hours × 4 blocks = 8)
         assert len(prices) == 8
+        assert status == "partial"  # Only 8 blocks, expected 90-100
         assert prices[("00:00", "00:15")] == 100.0
         assert prices[("00:15", "00:30")] == 100.0
         assert prices[("01:00", "01:15")] == 110.0
@@ -204,11 +236,12 @@ async def test_fetch_dam_energy_prices_full_day(
             return_value=mock_get
         )
 
-        prices = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
+        prices, status = await growatt_controller._price_analyzer.fetch_dam_energy_prices(
             "2024-01-01"
         )
         # Now expecting 15-minute intervals (24 hours × 4 blocks = 96)
         assert len(prices) == 96
+        assert status == "success"  # Full day of data
         assert prices[("00:00", "00:15")] == 110.0
         assert prices[("00:15", "00:30")] == 110.0
         # The last 15-minute block in the day is 23:45-24:00

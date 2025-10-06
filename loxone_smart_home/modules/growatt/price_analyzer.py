@@ -32,15 +32,18 @@ class PriceAnalyzer:
 
     async def fetch_dam_energy_prices(
         self, date: Optional[str] = None
-    ) -> Dict[Tuple[str, str], float]:
+    ) -> Tuple[Dict[Tuple[str, str], float], str]:
         """Fetch energy prices from OTE DAM API.
 
         Returns prices in 15-minute intervals. If API provides hourly data (24 points),
         it's expanded to 15-minute intervals (96 points).
 
         Returns:
-            Dictionary with (start_time, end_time) tuples as keys and EUR/MWh prices as values.
-            Times are in "HH:MM" format, with 15-minute intervals.
+            Tuple of (prices_dict, status) where status is:
+            - "success": Got valid price data (>=90 blocks)
+            - "not_published": Valid API response but no price data (prices not published yet)
+            - "partial": Valid response but incomplete data (<90 blocks)
+            - "error": API error, malformed response, or other failure
         """
         if date is None:
             date = self._get_local_date_string(days_ahead=1)
@@ -59,14 +62,24 @@ class PriceAnalyzer:
                 ) as response:
                     if response.status != 200:
                         self.logger.error(f"Failed to fetch DAM prices: HTTP {response.status}")
-                        return {}
+                        return {}, "error"
 
                     data = await response.json()
 
             # Process data based on format (24 hourly or 96 15-minute intervals)
             prices_15min: Dict[Tuple[str, str], float] = {}
-            if data.get("data", {}).get("dataLine"):
-                lines = data["data"]["dataLine"]
+            dataLine = data.get("data", {}).get("dataLine", [])
+
+            # Check if dataLine is empty (prices not published yet)
+            if not dataLine:
+                self.logger.info(
+                    f"OTE API returned valid response but no price data for {date} - "
+                    f"prices not published yet"
+                )
+                return {}, "not_published"
+
+            if dataLine:
+                lines = dataLine
 
                 # Identify EUR line based on metadata
                 def is_eur_line(line: Dict[str, Any]) -> bool:
@@ -205,20 +218,30 @@ class PriceAnalyzer:
                             f"Unexpected number of price points: {num_points}. "
                             f"Expected 24 (hourly) or 92-100 (15-minute)"
                         )
-                        return {}
+                        return {}, "error"
 
-            # Validate data completeness
-            if prices_15min and len(prices_15min) < 90:
+            # Validate data completeness and determine status
+            if not prices_15min:
+                # No prices extracted despite having dataLine
+                self.logger.warning("Failed to extract any valid prices from response")
+                return {}, "error"
+            elif len(prices_15min) < 90:
+                # Partial data - might be in process of being published
                 self.logger.warning(
-                    f"Incomplete price data: {len(prices_15min)} blocks, expected 92-100"
+                    f"Incomplete price data: {len(prices_15min)} blocks, expected 90-100 "
+                    f"(might be publishing in progress)"
                 )
-
-            self.logger.info(f"Successfully processed {len(prices_15min)} 15-minute price points")
-            return prices_15min
+                return prices_15min, "partial"
+            else:
+                # Full data set
+                self.logger.info(
+                    f"Successfully processed {len(prices_15min)} 15-minute price points"
+                )
+                return prices_15min, "success"
 
         except Exception as e:
             self.logger.error(f"Error fetching DAM prices: {e}", exc_info=True)
-            return {}
+            return {}, "error"
 
     async def fetch_dam_energy_prices_with_retry(
         self,
@@ -227,7 +250,11 @@ class PriceAnalyzer:
         max_delay_minutes: int = 60,
         max_attempts: int = 20
     ) -> Dict[Tuple[str, str], float]:
-        """Fetch DAM energy prices with exponential backoff retry logic.
+        """Fetch DAM energy prices with smart retry logic.
+
+        Only retries on actual errors. If prices aren't published yet (valid API response
+        but empty data), returns immediately without retrying - caller should wait until
+        next scheduled fetch time.
 
         Handles midnight rollover: if we start fetching before midnight and cross over,
         the target date is recalculated to ensure we're always fetching the correct day.
@@ -236,11 +263,11 @@ class PriceAnalyzer:
             target_date: Target date in YYYY-MM-DD format. If None, calculates next day.
             initial_delay_minutes: Initial retry delay in minutes (default: 5)
             max_delay_minutes: Maximum retry delay in minutes (default: 60)
-            max_attempts: Maximum retry attempts (default: 20)
+            max_attempts: Maximum retry attempts for actual errors (default: 20)
 
         Returns:
             Dictionary with (start_time, end_time) tuples as keys and EUR/MWh prices as values.
-            Returns empty dict if all retries exhausted.
+            Returns empty dict if prices not published or all retries exhausted.
         """
         import asyncio
 
@@ -268,9 +295,9 @@ class PriceAnalyzer:
             )
 
             # Attempt to fetch prices
-            prices = await self.fetch_dam_energy_prices(date=current_target)
+            prices, status = await self.fetch_dam_energy_prices(date=current_target)
 
-            if prices and len(prices) >= 90:
+            if status == "success":
                 # Success! We have valid price data (at least 90 blocks for a full day)
                 self.logger.info(
                     f"✅ Successfully fetched {len(prices)} price points for {current_target} "
@@ -278,26 +305,50 @@ class PriceAnalyzer:
                 )
                 return prices
 
-            # Failed - log and prepare for retry
-            if attempt < max_attempts:
-                self.logger.warning(
-                    f"⏳ No valid prices yet for {current_target} "
-                    f"({len(prices)} blocks received, need ≥90). "
-                    f"Retrying in {delay_minutes} minutes... "
-                    f"(attempt {attempt}/{max_attempts})"
+            elif status == "not_published":
+                # Valid API response but no price data - prices aren't published yet
+                # NO POINT RETRYING - just wait until next scheduled fetch time
+                self.logger.info(
+                    f"📅 Prices for {current_target} not published yet by OTE. "
+                    f"Will check again at next scheduled fetch time (no retry needed)."
                 )
+                return {}
 
-                # Wait for the retry delay
-                await asyncio.sleep(delay_minutes * 60)
+            elif status == "partial":
+                # Partial data - might be in process of being published
+                # Retry a few times in case it's actively being updated
+                if attempt < 3:  # Only retry partial data 3 times
+                    self.logger.info(
+                        f"⏳ Partial price data for {current_target} ({len(prices)} blocks). "
+                        f"Retrying in {delay_minutes} minutes (might be publishing)..."
+                    )
+                    await asyncio.sleep(delay_minutes * 60)
+                    delay_minutes = min(delay_minutes * 2, max_delay_minutes)
+                else:
+                    self.logger.warning(
+                        f"⚠️ Still getting partial data after {attempt} attempts. "
+                        f"Using {len(prices)} blocks available."
+                    )
+                    return prices
 
-                # Exponential backoff with cap
-                delay_minutes = min(delay_minutes * 2, max_delay_minutes)
-            else:
-                # Max attempts reached
-                self.logger.error(
-                    f"❌ Failed to fetch prices for {current_target} after {max_attempts} attempts. "
-                    f"Prices may not be published yet or API is unavailable."
-                )
+            elif status == "error":
+                # Actual error (HTTP error, timeout, malformed data)
+                # Retry with exponential backoff
+                if attempt < max_attempts:
+                    self.logger.warning(
+                        f"⏳ Error fetching prices for {current_target}. "
+                        f"Retrying in {delay_minutes} minutes... "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                    await asyncio.sleep(delay_minutes * 60)
+                    delay_minutes = min(delay_minutes * 2, max_delay_minutes)
+                else:
+                    # Max attempts reached
+                    self.logger.error(
+                        f"❌ Failed to fetch prices for {current_target} after "
+                        f"{max_attempts} attempts due to API errors."
+                    )
+                    return {}
 
         return {}
 
