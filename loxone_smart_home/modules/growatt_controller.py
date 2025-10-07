@@ -237,7 +237,7 @@ class GrowattController(BaseModule):
             message = data.get("message", "No message")
             if resolved:
                 if success:
-                    self.logger.info(f"✅ Command {command} succeeded: {message}")
+                    self.logger.debug(f"✅ Command {command} succeeded: {message}")
                 else:
                     self.logger.error(f"❌ Command {command} FAILED: {message}")
                     self.logger.error(f"📋 Full error response: {json.dumps(data, indent=2)}")
@@ -1099,13 +1099,13 @@ class GrowattController(BaseModule):
                         details.append(
                             f"Heating: {len(high_loads.get('heating_relays', []))} relays"
                         )
-                    self.logger.warning(
+                    self.logger.debug(
                         f"⚡ High loads detected! {', '.join(details)} - Checking if action needed"
                     )
                     # Handle high load start
                     await self._handle_high_load_start()
                 else:
-                    self.logger.info("✅ High loads cleared - Restoring scheduled operation")
+                    self.logger.debug("✅ High loads cleared - Restoring scheduled operation")
                     # Re-evaluate conditions to determine what mode to apply now
                     await self._evaluate_conditions("high_load_cleared")
 
@@ -1163,7 +1163,7 @@ class GrowattController(BaseModule):
     async def _handle_high_load_start(self) -> None:
         """Handle high loads by applying decision tree logic."""
         try:
-            self.logger.info("⚡ High loads detected - using decision tree to determine action")
+            self.logger.debug("⚡ High loads detected - using decision tree to determine action")
             # Re-evaluate current state with the decision tree
             await self._evaluate_conditions("high_load_detected")
         except Exception as e:
@@ -1334,14 +1334,10 @@ class GrowattController(BaseModule):
                 if self._decision_engine.has_mode_changed(new_mode):
                     # Get explanation for logging
                     explanation = self._decision_engine.explain_decision()
-                    self.logger.info(
-                        f"📊 Mode change ({reason}): {self._current_mode} → {new_mode} - "
-                        f"Reason: {explanation['reason']} "
-                        f"(Priority: {explanation['priority']['name']})"
-                    )
+                    # Log mode change with state details (done in _apply_decided_mode)
 
-                    # Apply the new mode
-                    await self._apply_decided_mode(new_mode)
+                    # Apply the new mode (will log consolidated one-liner)
+                    await self._apply_decided_mode(new_mode, reason=reason, explanation=explanation)
                     self._current_mode = new_mode
                 else:
                     self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
@@ -1563,9 +1559,9 @@ class GrowattController(BaseModule):
             # Extract previous mode for optimization (only disable the mode that was active)
             previous_mode = old_state.inverter_mode if old_state else None
 
-            # Log detailed mode transition explanation
+            # Log detailed mode transition explanation (debug only)
             if old_state:
-                self.logger.info(
+                self.logger.debug(
                     f"🔄 Inverter mode transition: {old_state.inverter_mode} → "
                     f"{new_state.inverter_mode} (source: {new_state.source})"
                 )
@@ -1584,9 +1580,9 @@ class GrowattController(BaseModule):
                         f"{new_state.time_start}-{new_state.time_stop}"
                     )
                 if param_changes:
-                    self.logger.info(f"   Parameters: {', '.join(param_changes)}")
+                    self.logger.debug(f"   Parameters: {', '.join(param_changes)}")
             else:
-                self.logger.info(
+                self.logger.debug(
                     f"🔄 Initial inverter mode: {new_state.inverter_mode} "
                     f"(stopSOC={new_state.stop_soc}%, source: {new_state.source})"
                 )
@@ -1628,12 +1624,12 @@ class GrowattController(BaseModule):
             self._commands_sent_count += 1
             if new_state.export_enabled:
                 await self._mode_manager.enable_export()
-                self.logger.info(
+                self.logger.debug(
                     f"⚡ Export to grid ENABLED (source: {new_state.source})"
                 )
             else:
                 await self._mode_manager.disable_export()
-                self.logger.info(
+                self.logger.debug(
                     f"⚡ Export to grid DISABLED (source: {new_state.source})"
                 )
 
@@ -1642,20 +1638,28 @@ class GrowattController(BaseModule):
             self._commands_sent_count += 1
             await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled)
             if new_state.ac_charge_enabled:
-                self.logger.info(
+                self.logger.debug(
                     f"🔌 AC charging from grid ENABLED (source: {new_state.source})"
                 )
             else:
-                self.logger.info(
+                self.logger.debug(
                     f"🔌 AC charging from grid DISABLED (source: {new_state.source})"
                 )
 
-    async def _apply_decided_mode(self, mode: str, params: Optional[Dict[str, Any]] = None) -> None:
+    async def _apply_decided_mode(
+        self,
+        mode: str,
+        params: Optional[Dict[str, Any]] = None,
+        reason: Optional[str] = None,
+        explanation: Optional[Dict[str, Any]] = None
+    ) -> None:
         """Apply a mode based on its definition from MODE_DEFINITIONS.
 
         Args:
             mode: Mode name from decision engine
             params: Optional parameters for configurable modes
+            reason: What triggered the mode change
+            explanation: Decision explanation from decision engine
         """
         # Build desired state from mode and current conditions
         desired_state = await self._build_desired_state(mode, params)
@@ -1669,12 +1673,15 @@ class GrowattController(BaseModule):
             )
             return
 
-        # Identify what changed
+        # Log consolidated one-liner with all essential info
         if self._current_inverter_state:
-            changes = desired_state.significant_changes(self._current_inverter_state)
-            self.logger.info(f"📝 Applying changes: {', '.join(changes)}")
+            old_mode = self._current_mode or "unknown"
+            brief_reason = explanation['reason'].split(' - ')[0] if explanation else "mode change"
+            self.logger.info(
+                f"📊 Mode: {old_mode} → {mode} ({desired_state.summary()}) - {brief_reason}"
+            )
         else:
-            self.logger.info(f"📝 Applying initial state: {mode}")
+            self.logger.info(f"📊 Initial mode: {mode} ({desired_state.summary()})")
 
         # Apply ONLY the changes needed (with rollback on failure)
         await self._apply_state_changes_with_rollback(self._current_inverter_state, desired_state)
@@ -1687,8 +1694,6 @@ class GrowattController(BaseModule):
 
         # Track if we're in high load protected mode
         self._high_load_protected_mode_active = (mode == "high_load_protected")
-
-        self.logger.info(f"✅ State applied: {desired_state.summary()}")
 
     # Event-driven evaluation methods
 
