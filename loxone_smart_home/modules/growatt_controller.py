@@ -1258,22 +1258,28 @@ class GrowattController(BaseModule):
         await self._evaluate_conditions("price_update")
 
     async def _fetch_next_day_prices_task(self) -> None:
-        """Background task to fetch next day's prices with retry logic."""
+        """Background task to fetch next day's prices with infinite retry.
+
+        This task runs continuously, retrying with smart time-based backoff until:
+        1. Prices are successfully fetched, OR
+        2. Task is cancelled (e.g., at midnight when switching to next day)
+        """
         try:
             # Get target date (tomorrow)
             tomorrow_date = self._get_local_date_string(days_ahead=1)
 
             self.logger.info(
                 f"🔄 Starting next-day price fetch for {tomorrow_date} "
-                f"(will retry until successful)"
+                f"(will retry until successful or cancelled)"
             )
 
-            # Fetch with retry using config parameters
+            # Fetch with infinite retry using config parameters
+            # This will only return empty dict if cancelled
             prices = await self._price_analyzer.fetch_dam_energy_prices_with_retry(
                 target_date=tomorrow_date,
                 initial_delay_minutes=self.config.price_fetch_retry_initial_delay,
                 max_delay_minutes=self.config.price_fetch_retry_max_delay,
-                max_attempts=self.config.price_fetch_retry_max_attempts
+                max_attempts=self.config.price_fetch_retry_max_attempts  # Ignored by retry func
             )
 
             if prices:
@@ -1288,14 +1294,23 @@ class GrowattController(BaseModule):
                     f"for {tomorrow_date}"
                 )
             else:
-                self.logger.error(
-                    f"❌ Failed to fetch prices for {tomorrow_date} after all retries"
+                # Empty dict means task was cancelled (e.g., midnight rollover)
+                self.logger.debug(
+                    f"Price fetch for {tomorrow_date} returned empty (task cancelled)"
                 )
                 self._next_day_prices_fetched = False
 
+        except asyncio.CancelledError:
+            # Task cancelled (normal at midnight rollover)
+            self.logger.debug(
+                "Price fetch task cancelled (normal at midnight rollover)"
+            )
+            self._next_day_prices_fetched = False
+            raise  # Re-raise to properly handle cancellation
+
         except Exception as e:
             self.logger.error(
-                f"Error in next-day price fetch task: {e}", exc_info=True
+                f"Unexpected error in next-day price fetch task: {e}", exc_info=True
             )
             self._next_day_prices_fetched = False
 
@@ -1743,6 +1758,19 @@ class GrowattController(BaseModule):
                         last_midnight_check = current_midnight
                         self.logger.info("🕛 Midnight - activating next day's prices...")
 
+                        # Cancel any ongoing fetch task for yesterday's "tomorrow"
+                        # (which is now obsolete as we're entering a new day)
+                        if self._price_fetch_task and not self._price_fetch_task.done():
+                            self.logger.debug(
+                                "Cancelling previous price fetch task (midnight rollover)"
+                            )
+                            self._price_fetch_task.cancel()
+                            try:
+                                await self._price_fetch_task
+                            except asyncio.CancelledError:
+                                pass
+                            self._price_fetch_task = None
+
                         # If we successfully fetched next day's prices, activate them
                         if self._next_day_prices_fetched and self._next_day_prices:
                             # Move next-day prices to current prices
@@ -1774,26 +1802,23 @@ class GrowattController(BaseModule):
                             self._next_day_prices_date = None
                             self._next_day_prices_fetched = False
 
-                            # Start background fetch for next day's prices (non-blocking)
-                            # This ensures periodic evaluations continue without interruption
-                            if self._price_fetch_task and not self._price_fetch_task.done():
-                                self._price_fetch_task.cancel()
-                                try:
-                                    await self._price_fetch_task
-                                except asyncio.CancelledError:
-                                    pass
-
+                            # Start background fetch for NEW next day's prices (non-blocking)
+                            # This task will retry indefinitely with smart time-based backoff
                             self._price_fetch_task = asyncio.create_task(
                                 self._fetch_next_day_prices_task()
                             )
                             self.logger.info(
                                 "🔄 Started background fetch for next day's prices "
-                                "(main display at configured fetch hour)"
+                                "(will retry with smart backoff until successful)"
                             )
                         else:
                             self.logger.warning(
                                 "⚠️ No next-day prices available at midnight. "
-                                "Will continue with current prices."
+                                "Will continue with current prices and start fetching new prices."
+                            )
+                            # Start fetching anyway - better late than never
+                            self._price_fetch_task = asyncio.create_task(
+                                self._fetch_next_day_prices_task()
                             )
 
                 # Check for 15-minute block change (price changes every 15 minutes)
