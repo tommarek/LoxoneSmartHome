@@ -6,7 +6,7 @@ import zoneinfo
 from datetime import datetime
 from datetime import time as dt_time
 from datetime import timedelta
-from typing import Any, Dict, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import aiohttp
 from astral import LocationInfo
@@ -1198,9 +1198,6 @@ class GrowattController(BaseModule):
                 # Get exchange rate
                 self._eur_czk_rate = await self._get_eur_czk_rate()
 
-                # Log price table (now shows 15-minute intervals)
-                await self._log_price_table(prices_15min, target_date, self._eur_czk_rate or 25.0)
-
                 # Find cheapest blocks for charging (non-consecutive)
                 charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
                 charging_schedule, avg_price = self._price_analyzer.get_charging_schedule(
@@ -1212,38 +1209,13 @@ class GrowattController(BaseModule):
                     self._cheapest_charging_blocks = set(
                         (block[0], block[1]) for block in charging_schedule
                     )
-
-                    avg_czk = avg_price * (self._eur_czk_rate or 25.0) / 1000
-                    # 15 minutes = 0.25 hours
-                    charge_duration_hours = charge_blocks * 0.25
-
-                    # Log charging schedule
-                    self.logger.info("=" * 50)
-                    self.logger.info(
-                        f"🔋 CHARGING SCHEDULE "
-                        f"({charge_blocks} blocks = {charge_duration_hours:.1f} hours)"
-                    )
-                    self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
-                    self.logger.info("   Charging blocks:")
-
-                    for start, end, price_eur in charging_schedule:
-                        rate = self._eur_czk_rate or 25.0
-                        price_czk = price_eur * rate / 1000
-                        self.logger.info(
-                            f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
-                        )
-
-                    # Calculate savings vs peak
-                    all_prices = list(prices_15min.values())
-                    max_price = max(all_prices) if all_prices else avg_price
-                    savings_pct = (
-                        ((max_price - avg_price) / max_price * 100)
-                        if max_price > 0 else 0
-                    )
-                    self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
-                    self.logger.info("=" * 50)
                 else:
                     self._cheapest_charging_blocks = set()
+
+                # Log comprehensive price analysis
+                await self._log_price_analysis(
+                    prices_15min, target_date, charging_schedule, charge_blocks
+                )
 
                 # Trigger re-evaluation with new prices
                 await self._on_price_update()
@@ -1252,6 +1224,61 @@ class GrowattController(BaseModule):
 
         except Exception as e:
             self.logger.error(f"Error fetching prices: {e}", exc_info=True)
+
+    async def _log_price_analysis(
+        self,
+        prices: Dict[Tuple[str, str], float],
+        date: str,
+        charging_schedule: List[Tuple[str, str, float]],
+        charge_blocks: int
+    ) -> None:
+        """Log comprehensive price analysis including table and charging schedule.
+
+        Args:
+            prices: Dictionary of 15-minute price blocks
+            date: Date string for the prices
+            charging_schedule: List of cheapest charging blocks
+            charge_blocks: Number of blocks configured for charging
+        """
+        # Ensure we have exchange rate
+        if not self._eur_czk_rate:
+            self._eur_czk_rate = await self._get_eur_czk_rate()
+
+        rate = self._eur_czk_rate or 25.0
+
+        # Log price table
+        await self._log_price_table(prices, date, rate)
+
+        if charging_schedule:
+            # Calculate average price for charging blocks
+            avg_price = sum(block[2] for block in charging_schedule) / len(charging_schedule)
+            avg_czk = avg_price * rate / 1000
+            charge_duration_hours = charge_blocks * 0.25  # 15 minutes = 0.25 hours
+
+            # Log charging schedule
+            self.logger.info("=" * 50)
+            self.logger.info(
+                f"🔋 CHARGING SCHEDULE "
+                f"({charge_blocks} blocks = {charge_duration_hours:.1f} hours)"
+            )
+            self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
+            self.logger.info("   Charging blocks:")
+
+            for start, end, price_eur in charging_schedule:
+                price_czk = price_eur * rate / 1000
+                self.logger.info(
+                    f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
+                )
+
+            # Calculate savings vs peak
+            all_prices = list(prices.values())
+            max_price = max(all_prices) if all_prices else avg_price
+            savings_pct = (
+                ((max_price - avg_price) / max_price * 100)
+                if max_price > 0 else 0
+            )
+            self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
+            self.logger.info("=" * 50)
 
     async def _on_price_update(self) -> None:
         """Handle new price data availability."""
@@ -1793,6 +1820,16 @@ class GrowattController(BaseModule):
                                 f"✅ Activated prices for {self._prices_date} "
                                 f"({len(self._current_prices)} blocks)"
                             )
+
+                            # Display comprehensive price analysis for the new day
+                            if self._prices_date:  # Type guard for mypy
+                                self.logger.info(f"🕛 Energy prices for TODAY ({self._prices_date}):")
+                                await self._log_price_analysis(
+                                    self._current_prices,
+                                    self._prices_date,
+                                    charging_schedule,
+                                    charge_blocks
+                                )
 
                             # Trigger re-evaluation with new prices
                             await self._on_price_update()
