@@ -939,9 +939,12 @@ class GrowattController(BaseModule):
                 prices = []
                 for (start, end), price_eur in hour_blocks:
                     price_czk = price_eur * eur_czk_rate / 1000
-                    # Mark charging blocks with 🔋
+                    # Mark charging blocks with 🔋 and discharge blocks with ⚡
                     if (start, end) in self._cheapest_charging_blocks:
                         prices.append(f"{price_czk:5.2f}🔋")
+                    elif (hasattr(self, '_discharge_periods') and
+                          (start, end) in self._discharge_periods):
+                        prices.append(f"{price_czk:5.2f}⚡")
                     else:
                         prices.append(f"{price_czk:6.2f} ")
 
@@ -954,6 +957,15 @@ class GrowattController(BaseModule):
                 )
 
             self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
+
+            # Show legend
+            legend_items = []
+            if self._cheapest_charging_blocks:
+                legend_items.append("🔋=Charge")
+            if hasattr(self, '_discharge_periods') and self._discharge_periods:
+                legend_items.append("⚡=Discharge")
+            if legend_items:
+                self.logger.info(f"Legend: {', '.join(legend_items)}")
 
             # Show summary statistics
             all_prices = list(prices_15min.values())
@@ -1225,6 +1237,45 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error fetching prices: {e}", exc_info=True)
 
+    def _calculate_discharge_periods(
+        self,
+        prices: Dict[Tuple[str, str], float],
+        rate: float
+    ) -> List[Tuple[str, str, float]]:
+        """Calculate periods when battery discharge would be profitable.
+
+        Args:
+            prices: Dictionary of 15-minute price blocks
+            rate: EUR to CZK conversion rate
+
+        Returns:
+            List of tuples (start_time, end_time, price_eur) for discharge periods
+        """
+        if not prices:
+            return []
+
+        discharge_periods = []
+
+        # Get thresholds from config
+        discharge_min_czk = self.config.discharge_price_min
+        profit_margin = self.config.discharge_profit_margin
+
+        # Find cheapest block price
+        cheapest_price_eur = min(prices.values())
+        cheapest_price_czk = cheapest_price_eur * rate / 1000
+
+        # Calculate effective threshold
+        required_by_margin = cheapest_price_czk * profit_margin
+        effective_threshold_czk = max(discharge_min_czk, required_by_margin)
+
+        # Find all periods above threshold
+        for (start, end), price_eur in sorted(prices.items()):
+            price_czk = price_eur * rate / 1000
+            if price_czk >= effective_threshold_czk:
+                discharge_periods.append((start, end, price_eur))
+
+        return discharge_periods
+
     async def _log_price_analysis(
         self,
         prices: Dict[Tuple[str, str], float],
@@ -1246,7 +1297,15 @@ class GrowattController(BaseModule):
 
         rate = self._eur_czk_rate or 25.0
 
-        # Log price table
+        # Calculate discharge periods
+        discharge_periods = self._calculate_discharge_periods(prices, rate)
+
+        # Store discharge periods for price table display
+        self._discharge_periods = set(
+            (period[0], period[1]) for period in discharge_periods
+        )
+
+        # Log price table (will now show discharge periods too)
         await self._log_price_table(prices, date, rate)
 
         if charging_schedule:
@@ -1278,6 +1337,70 @@ class GrowattController(BaseModule):
                 if max_price > 0 else 0
             )
             self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
+            self.logger.info("=" * 50)
+
+        # Log discharge schedule if there are discharge periods
+        if discharge_periods:
+            # Calculate average price for discharge blocks
+            avg_discharge_price = sum(p[2] for p in discharge_periods) / len(discharge_periods)
+            avg_discharge_czk = avg_discharge_price * rate / 1000
+            discharge_duration_hours = len(discharge_periods) * 0.25
+
+            # Get cheapest price for profit calculation
+            cheapest_price_eur = min(prices.values())
+            cheapest_price_czk = cheapest_price_eur * rate / 1000
+
+            # Calculate profit margin
+            profit_margin = avg_discharge_czk / cheapest_price_czk if cheapest_price_czk > 0 else 0
+
+            self.logger.info("=" * 50)
+            self.logger.info(
+                f"⚡ DISCHARGE SCHEDULE "
+                f"({len(discharge_periods)} blocks = {discharge_duration_hours:.1f} hours)"
+            )
+            self.logger.info(f"   Average price: {avg_discharge_czk:.3f} CZK/kWh")
+            self.logger.info(f"   Cheapest block: {cheapest_price_czk:.3f} CZK/kWh")
+            self.logger.info(f"   Profit margin: {profit_margin:.1f}x")
+            self.logger.info(
+                f"   Discharge threshold: {self.config.discharge_price_min:.2f} CZK/kWh"
+            )
+            self.logger.info("   Discharge blocks:")
+
+            # Group consecutive blocks for cleaner display
+            grouped_periods = []
+            current_group = [discharge_periods[0]]
+
+            for i in range(1, len(discharge_periods)):
+                prev_end = current_group[-1][1]
+                curr_start = discharge_periods[i][0]
+
+                # Check if consecutive (end time of prev equals start time of current)
+                if prev_end == curr_start:
+                    current_group.append(discharge_periods[i])
+                else:
+                    # Start new group
+                    grouped_periods.append(current_group)
+                    current_group = [discharge_periods[i]]
+
+            # Add the last group
+            grouped_periods.append(current_group)
+
+            # Display grouped periods
+            for group in grouped_periods:
+                start = group[0][0]
+                end = group[-1][1]
+                avg_group_price = sum(p[2] for p in group) / len(group)
+                avg_group_czk = avg_group_price * rate / 1000
+                if len(group) > 1:
+                    self.logger.info(
+                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh "
+                        f"(avg of {len(group)} blocks)"
+                    )
+                else:
+                    self.logger.info(
+                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh"
+                    )
+
             self.logger.info("=" * 50)
 
     async def _on_price_update(self) -> None:
@@ -1823,7 +1946,9 @@ class GrowattController(BaseModule):
 
                             # Display comprehensive price analysis for the new day
                             if self._prices_date:  # Type guard for mypy
-                                self.logger.info(f"🕛 Energy prices for TODAY ({self._prices_date}):")
+                                self.logger.info(
+                                    f"🕛 Energy prices for TODAY ({self._prices_date}):"
+                                )
                                 await self._log_price_analysis(
                                     self._current_prices,
                                     self._prices_date,
