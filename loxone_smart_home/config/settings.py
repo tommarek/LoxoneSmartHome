@@ -171,8 +171,8 @@ class GrowattConfig(BaseSettings):
         description="Battery round-trip efficiency (15% loss)"
     )
     discharge_power_rate: int = Field(
-        default=25, ge=10, le=100,
-        description="Discharge power rate % (25% = gentle)"
+        default=35, ge=10, le=100,
+        description="Discharge power rate % (35% = moderate)"
     )
 
     # Simple price thresholds (all in CZK/kWh for consistency)
@@ -197,6 +197,20 @@ class GrowattConfig(BaseSettings):
     battery_charge_blocks: int = Field(
         default=8, ge=1, le=96,
         description="Number of 15-minute blocks to charge battery (8 = 2 hours, non-consecutive)"
+    )
+
+    # Pre-discharge charging parameters
+    pre_discharge_charge_blocks: int = Field(
+        default=8, ge=1, le=96,
+        description="Number of 15-minute blocks to charge before discharge peaks (8 = 2 hours)"
+    )
+    pre_discharge_window_hours: int = Field(
+        default=6, ge=2, le=12,
+        description="Hours to look back for cheap blocks before peaks"
+    )
+    discharge_peak_threshold: float = Field(
+        default=1.5, ge=1.0, le=3.0,
+        description="Multiplier to identify significant discharge peaks (1.5 = 50% above average)"
     )
 
     # Command control parameters

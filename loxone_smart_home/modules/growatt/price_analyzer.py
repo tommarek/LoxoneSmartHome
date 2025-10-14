@@ -527,3 +527,159 @@ class PriceAnalyzer:
         avg_price = sum(block[2] for block in cheapest) / len(cheapest) if cheapest else 0
 
         return sorted_blocks, avg_price
+
+    def identify_discharge_peaks(
+        self,
+        discharge_periods: List[Tuple[str, str, float]],
+        threshold_multiplier: float = 1.5
+    ) -> List[List[Tuple[str, str, float]]]:
+        """Identify significant discharge peaks that warrant pre-charging.
+
+        Groups consecutive discharge blocks and identifies peaks that are
+        significantly above average discharge price.
+
+        Args:
+            discharge_periods: List of discharge periods (start, end, price_eur)
+            threshold_multiplier: Multiplier for average to identify peaks
+
+        Returns:
+            List of peak groups, where each group is a list of consecutive blocks
+        """
+        if not discharge_periods:
+            return []
+
+        # Calculate average discharge price
+        avg_discharge_price = sum(p[2] for p in discharge_periods) / len(discharge_periods)
+        peak_threshold = avg_discharge_price * threshold_multiplier
+
+        # Filter for significant peaks
+        significant_periods = [p for p in discharge_periods if p[2] >= peak_threshold]
+
+        if not significant_periods:
+            return []
+
+        # Group consecutive blocks into peaks
+        peaks = []
+        current_peak = [significant_periods[0]]
+
+        for i in range(1, len(significant_periods)):
+            prev_end = current_peak[-1][1]
+            curr_start = significant_periods[i][0]
+
+            # Check if consecutive (end time of prev equals start time of current)
+            if prev_end == curr_start:
+                current_peak.append(significant_periods[i])
+            else:
+                # Start new peak
+                peaks.append(current_peak)
+                current_peak = [significant_periods[i]]
+
+        # Add the last peak
+        peaks.append(current_peak)
+
+        # Sort peaks by average price (highest first) and take top ones
+        peaks_with_avg = [(peak, sum(p[2] for p in peak) / len(peak)) for peak in peaks]
+        peaks_with_avg.sort(key=lambda x: x[1], reverse=True)
+
+        # Return top peaks (limit to avoid over-scheduling)
+        max_peaks = 3  # Configurable: maximum number of peaks to prepare for
+        return [peak for peak, _ in peaks_with_avg[:max_peaks]]
+
+    def find_pre_discharge_blocks(
+        self,
+        prices: Dict[Tuple[str, str], float],
+        peak_start: str,
+        num_blocks: int = 8,
+        window_hours: int = 6
+    ) -> List[Tuple[str, str, float]]:
+        """Find cheapest blocks before a discharge peak for pre-charging.
+
+        Args:
+            prices: Dictionary of 15-minute interval prices
+            peak_start: Start time of the discharge peak (HH:MM)
+            num_blocks: Number of blocks to find (default 8 = 2 hours)
+            window_hours: Hours to look back from peak start
+
+        Returns:
+            List of (start, stop, price) tuples for pre-charge blocks
+        """
+        # Parse peak start time
+        peak_hour = int(peak_start.split(':')[0])
+        peak_minute = int(peak_start.split(':')[1])
+
+        # Calculate window start (handle day boundary)
+        window_start_hour = peak_hour - window_hours
+        if window_start_hour < 0:
+            window_start_hour += 24
+
+        # Filter blocks within the window
+        blocks_in_window = []
+        for (start, end), price in prices.items():
+            start_hour = int(start.split(':')[0])
+            start_minute = int(start.split(':')[1])
+
+            # Check if block is within window (handle day wrap)
+            if window_start_hour < peak_hour:
+                # Normal case: window doesn't wrap midnight
+                if (start_hour > window_start_hour or
+                   (start_hour == window_start_hour and start_minute >= 0)):
+                    if (start_hour < peak_hour or
+                       (start_hour == peak_hour and start_minute < peak_minute)):
+                        blocks_in_window.append((start, end, price))
+            else:
+                # Window wraps midnight (e.g., peak at 02:00, window starts at 20:00)
+                if start_hour >= window_start_hour or start_hour < peak_hour:
+                    blocks_in_window.append((start, end, price))
+
+        # Sort by price and return cheapest blocks
+        blocks_in_window.sort(key=lambda x: x[2])
+        return blocks_in_window[:num_blocks]
+
+    def calculate_pre_discharge_schedule(
+        self,
+        prices: Dict[Tuple[str, str], float],
+        discharge_periods: List[Tuple[str, str, float]],
+        peak_threshold: float = 1.5,
+        charge_blocks: int = 8,
+        window_hours: int = 6
+    ) -> Tuple[List[Tuple[str, str, float]], Dict[str, List[Tuple[str, str, float]]]]:
+        """Calculate complete pre-discharge charging schedule for all peaks.
+
+        Args:
+            prices: Dictionary of 15-minute interval prices
+            discharge_periods: List of all discharge periods
+            peak_threshold: Multiplier to identify significant peaks
+            charge_blocks: Number of blocks to charge before each peak
+            window_hours: Hours to look back for cheap blocks
+
+        Returns:
+            Tuple of:
+            - Combined list of all pre-discharge charging blocks
+            - Dictionary mapping peak period to its pre-charge blocks
+        """
+        # Identify significant peaks
+        peaks = self.identify_discharge_peaks(discharge_periods, peak_threshold)
+
+        all_pre_charge_blocks = []
+        peak_to_precharge = {}
+
+        for peak in peaks:
+            # Get peak start time and average price
+            peak_start = peak[0][0]
+            peak_key = f"{peak[0][0]}-{peak[-1][1]}"  # Full peak period
+
+            # Find pre-charge blocks for this peak
+            pre_charge_blocks = self.find_pre_discharge_blocks(
+                prices, peak_start, charge_blocks, window_hours
+            )
+
+            peak_to_precharge[peak_key] = pre_charge_blocks
+            all_pre_charge_blocks.extend(pre_charge_blocks)
+
+        # Remove duplicates from combined list (keep unique blocks)
+        unique_blocks = list({(b[0], b[1]): b for b in all_pre_charge_blocks}.values())
+
+        # Sort by time for display
+        unique_blocks.sort(key=lambda x: x[0])
+
+        return unique_blocks, peak_to_precharge

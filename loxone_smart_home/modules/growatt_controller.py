@@ -162,6 +162,9 @@ class GrowattController(BaseModule):
 
         self._current_prices: Dict[Tuple[str, str], float] = {}
         self._cheapest_charging_blocks: Set[Tuple[str, str]] = set()
+        self._pre_discharge_blocks: Set[Tuple[str, str]] = set()
+        self._peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
+        self._combined_charging_blocks: Set[Tuple[str, str]] = set()
         self._prices_date: Optional[str] = None
         self._prices_updated: Optional[datetime] = None
 
@@ -939,8 +942,11 @@ class GrowattController(BaseModule):
                 prices = []
                 for (start, end), price_eur in hour_blocks:
                     price_czk = price_eur * eur_czk_rate / 1000
-                    # Mark charging blocks with 🔋 and discharge blocks with ⚡
-                    if (start, end) in self._cheapest_charging_blocks:
+                    # Mark blocks: 🔋=regular charge, 🔌=pre-discharge charge, ⚡=discharge
+                    if (hasattr(self, '_pre_discharge_blocks') and
+                            (start, end) in self._pre_discharge_blocks):
+                        prices.append(f"{price_czk:5.2f}🔌")
+                    elif (start, end) in self._cheapest_charging_blocks:
                         prices.append(f"{price_czk:5.2f}🔋")
                     elif (hasattr(self, '_discharge_periods') and
                           (start, end) in self._discharge_periods):
@@ -962,6 +968,8 @@ class GrowattController(BaseModule):
             legend_items = []
             if self._cheapest_charging_blocks:
                 legend_items.append("🔋=Charge")
+            if hasattr(self, '_pre_discharge_blocks') and self._pre_discharge_blocks:
+                legend_items.append("🔌=Pre-discharge")
             if hasattr(self, '_discharge_periods') and self._discharge_periods:
                 legend_items.append("⚡=Discharge")
             if legend_items:
@@ -1210,7 +1218,7 @@ class GrowattController(BaseModule):
                 # Get exchange rate
                 self._eur_czk_rate = await self._get_eur_czk_rate()
 
-                # Find cheapest blocks for charging (non-consecutive)
+                # Find cheapest blocks for regular charging (non-consecutive)
                 charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
                 charging_schedule, avg_price = self._price_analyzer.get_charging_schedule(
                     prices_15min, num_blocks=charge_blocks
@@ -1224,9 +1232,50 @@ class GrowattController(BaseModule):
                 else:
                     self._cheapest_charging_blocks = set()
 
+                # Calculate discharge periods and pre-discharge schedule
+                rate = self._eur_czk_rate or 25.0
+                discharge_periods = self._calculate_discharge_periods(prices_15min, rate)
+
+                # Calculate pre-discharge charging schedule if we have discharge periods
+                pre_discharge_schedule: List[Tuple[str, str, float]] = []
+                self._peak_to_precharge_map = {}
+                if discharge_periods:
+                    pre_discharge_charge_blocks = getattr(
+                        self.config, 'pre_discharge_charge_blocks', 8
+                    )
+                    window_hours = getattr(self.config, 'pre_discharge_window_hours', 6)
+                    peak_threshold = getattr(self.config, 'discharge_peak_threshold', 1.5)
+
+                    pre_discharge_schedule, self._peak_to_precharge_map = (
+                        self._price_analyzer.calculate_pre_discharge_schedule(
+                            prices_15min,
+                            discharge_periods,
+                            peak_threshold,
+                            pre_discharge_charge_blocks,
+                            window_hours
+                        )
+                    )
+
+                    # Store pre-discharge blocks
+                    self._pre_discharge_blocks = set(
+                        (block[0], block[1]) for block in pre_discharge_schedule
+                    )
+                else:
+                    self._pre_discharge_blocks = set()
+
+                # Combine regular and pre-discharge charging blocks
+                self._combined_charging_blocks = (
+                    self._cheapest_charging_blocks | self._pre_discharge_blocks
+                )
+
                 # Log comprehensive price analysis
                 await self._log_price_analysis(
-                    prices_15min, target_date, charging_schedule, charge_blocks
+                    prices_15min,
+                    target_date,
+                    charging_schedule,
+                    charge_blocks,
+                    pre_discharge_schedule,
+                    self._peak_to_precharge_map
                 )
 
                 # Trigger re-evaluation with new prices
@@ -1281,7 +1330,9 @@ class GrowattController(BaseModule):
         prices: Dict[Tuple[str, str], float],
         date: str,
         charging_schedule: List[Tuple[str, str, float]],
-        charge_blocks: int
+        charge_blocks: int,
+        pre_discharge_schedule: Optional[List[Tuple[str, str, float]]] = None,
+        peak_to_precharge_map: Optional[Dict[str, List[Tuple[str, str, float]]]] = None
     ) -> None:
         """Log comprehensive price analysis including table and charging schedule.
 
@@ -1290,6 +1341,8 @@ class GrowattController(BaseModule):
             date: Date string for the prices
             charging_schedule: List of cheapest charging blocks
             charge_blocks: Number of blocks configured for charging
+            pre_discharge_schedule: Optional list of pre-discharge charging blocks
+            peak_to_precharge_map: Optional mapping of peaks to their pre-charge blocks
         """
         # Ensure we have exchange rate
         if not self._eur_czk_rate:
@@ -1399,6 +1452,56 @@ class GrowattController(BaseModule):
                 else:
                     self.logger.info(
                         f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh"
+                    )
+
+            self.logger.info("=" * 50)
+
+        # Log pre-discharge preparation schedule if available
+        if pre_discharge_schedule and peak_to_precharge_map:
+            self.logger.info("=" * 50)
+            self.logger.info(
+                f"🔌 PRE-DISCHARGE PREPARATION "
+                f"({len(pre_discharge_schedule)} unique blocks)"
+            )
+
+            # Calculate total unique charging blocks
+            total_unique_blocks = len(self._combined_charging_blocks)
+            total_hours = total_unique_blocks * 0.25
+
+            self.logger.info(
+                f"   Total charging: {total_unique_blocks} blocks = {total_hours:.1f} hours"
+            )
+            self.logger.info(
+                f"   Regular charging: {len(self._cheapest_charging_blocks)} blocks"
+            )
+            self.logger.info(
+                f"   Pre-discharge charging: {len(self._pre_discharge_blocks)} blocks"
+            )
+
+            # Show details for each peak
+            for peak_period, pre_charge_blocks in peak_to_precharge_map.items():
+                if pre_charge_blocks:
+                    # Parse peak period
+                    peak_start = peak_period.split('-')[0]
+                    peak_end = peak_period.split('-')[1]
+
+                    # Calculate average price for pre-charge blocks
+                    avg_pre_charge = (
+                        sum(b[2] for b in pre_charge_blocks) / len(pre_charge_blocks)
+                    )
+                    avg_pre_charge_czk = avg_pre_charge * rate / 1000
+
+                    self.logger.info(f"\n   Peak: {peak_start}-{peak_end}")
+                    self.logger.info(
+                        f"   Pre-charge blocks ({len(pre_charge_blocks)}):"
+                    )
+                    for start, end, price_eur in sorted(pre_charge_blocks):
+                        price_czk = price_eur * rate / 1000
+                        self.logger.info(
+                            f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
+                        )
+                    self.logger.info(
+                        f"   Avg pre-charge price: {avg_pre_charge_czk:.3f} CZK/kWh"
                     )
 
             self.logger.info("=" * 50)
@@ -1583,7 +1686,7 @@ class GrowattController(BaseModule):
             current_price=current_price,
             current_block_key=current_block_key,
             prices_15min=self._current_prices.copy(),  # Now using 15-minute prices
-            cheapest_blocks=self._cheapest_charging_blocks.copy(),  # Set of cheapest blocks
+            cheapest_blocks=self._combined_charging_blocks.copy(),  # Combined charging blocks
             price_thresholds=price_thresholds,
             price_ranking=price_ranking,  # Include price ranking
             # Solar schedule
@@ -1939,6 +2042,47 @@ class GrowattController(BaseModule):
                                 (block[0], block[1]) for block in charging_schedule
                             )
 
+                            # Calculate discharge and pre-discharge schedules
+                            rate = self._eur_czk_rate or 25.0
+                            discharge_periods = self._calculate_discharge_periods(
+                                self._current_prices, rate
+                            )
+
+                            # Calculate pre-discharge schedule
+                            pre_discharge_schedule: List[Tuple[str, str, float]] = []
+                            self._peak_to_precharge_map = {}
+                            if discharge_periods:
+                                pre_discharge_charge_blocks = getattr(
+                                    self.config, 'pre_discharge_charge_blocks', 8
+                                )
+                                window_hours = getattr(
+                                    self.config, 'pre_discharge_window_hours', 6
+                                )
+                                peak_threshold = getattr(
+                                    self.config, 'discharge_peak_threshold', 1.5
+                                )
+
+                                pre_discharge_schedule, self._peak_to_precharge_map = (
+                                    self._price_analyzer.calculate_pre_discharge_schedule(
+                                        self._current_prices,
+                                        discharge_periods,
+                                        peak_threshold,
+                                        pre_discharge_charge_blocks,
+                                        window_hours
+                                    )
+                                )
+
+                                self._pre_discharge_blocks = set(
+                                    (block[0], block[1]) for block in pre_discharge_schedule
+                                )
+                            else:
+                                self._pre_discharge_blocks = set()
+
+                            # Combine regular and pre-discharge charging blocks
+                            self._combined_charging_blocks = (
+                                self._cheapest_charging_blocks | self._pre_discharge_blocks
+                            )
+
                             self.logger.info(
                                 f"✅ Activated prices for {self._prices_date} "
                                 f"({len(self._current_prices)} blocks)"
@@ -1953,7 +2097,9 @@ class GrowattController(BaseModule):
                                     self._current_prices,
                                     self._prices_date,
                                     charging_schedule,
-                                    charge_blocks
+                                    charge_blocks,
+                                    pre_discharge_schedule,
+                                    self._peak_to_precharge_map
                                 )
 
                             # Trigger re-evaluation with new prices
