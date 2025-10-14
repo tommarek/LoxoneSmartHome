@@ -590,15 +590,18 @@ class PriceAnalyzer:
         prices: Dict[Tuple[str, str], float],
         peak_start: str,
         num_blocks: int = 8,
-        window_hours: int = 6
+        window_hours: int = 24  # Default to full day
     ) -> List[Tuple[str, str, float]]:
         """Find cheapest blocks before a discharge peak for pre-charging.
+
+        Searches the entire day for the cheapest blocks that occur before the peak.
+        This ensures we use the absolute cheapest power available for pre-charging.
 
         Args:
             prices: Dictionary of 15-minute interval prices
             peak_start: Start time of the discharge peak (HH:MM)
             num_blocks: Number of blocks to find (default 8 = 2 hours)
-            window_hours: Hours to look back from peak start
+            window_hours: Unused, kept for compatibility (always uses full day)
 
         Returns:
             List of (start, stop, price) tuples for pre-charge blocks
@@ -607,33 +610,20 @@ class PriceAnalyzer:
         peak_hour = int(peak_start.split(':')[0])
         peak_minute = int(peak_start.split(':')[1])
 
-        # Calculate window start (handle day boundary)
-        window_start_hour = peak_hour - window_hours
-        if window_start_hour < 0:
-            window_start_hour += 24
-
-        # Filter blocks within the window
-        blocks_in_window = []
+        # Find all blocks that occur before the peak
+        blocks_before_peak = []
         for (start, end), price in prices.items():
             start_hour = int(start.split(':')[0])
             start_minute = int(start.split(':')[1])
 
-            # Check if block is within window (handle day wrap)
-            if window_start_hour < peak_hour:
-                # Normal case: window doesn't wrap midnight
-                if (start_hour > window_start_hour or
-                   (start_hour == window_start_hour and start_minute >= 0)):
-                    if (start_hour < peak_hour or
-                       (start_hour == peak_hour and start_minute < peak_minute)):
-                        blocks_in_window.append((start, end, price))
-            else:
-                # Window wraps midnight (e.g., peak at 02:00, window starts at 20:00)
-                if start_hour >= window_start_hour or start_hour < peak_hour:
-                    blocks_in_window.append((start, end, price))
+            # Check if block is before peak
+            if (start_hour < peak_hour or
+                    (start_hour == peak_hour and start_minute < peak_minute)):
+                blocks_before_peak.append((start, end, price))
 
         # Sort by price and return cheapest blocks
-        blocks_in_window.sort(key=lambda x: x[2])
-        return blocks_in_window[:num_blocks]
+        blocks_before_peak.sort(key=lambda x: x[2])
+        return blocks_before_peak[:num_blocks]
 
     def calculate_pre_discharge_schedule(
         self,

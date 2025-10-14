@@ -1243,7 +1243,7 @@ class GrowattController(BaseModule):
                     pre_discharge_charge_blocks = getattr(
                         self.config, 'pre_discharge_charge_blocks', 8
                     )
-                    window_hours = getattr(self.config, 'pre_discharge_window_hours', 6)
+                    window_hours = getattr(self.config, 'pre_discharge_window_hours', 24)
                     peak_threshold = getattr(self.config, 'discharge_peak_threshold', 1.5)
 
                     pre_discharge_schedule, self._peak_to_precharge_map = (
@@ -2056,7 +2056,7 @@ class GrowattController(BaseModule):
                                     self.config, 'pre_discharge_charge_blocks', 8
                                 )
                                 window_hours = getattr(
-                                    self.config, 'pre_discharge_window_hours', 6
+                                    self.config, 'pre_discharge_window_hours', 24
                                 )
                                 peak_threshold = getattr(
                                     self.config, 'discharge_peak_threshold', 1.5

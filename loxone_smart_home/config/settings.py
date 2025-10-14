@@ -205,8 +205,8 @@ class GrowattConfig(BaseSettings):
         description="Number of 15-minute blocks to charge before discharge peaks (8 = 2 hours)"
     )
     pre_discharge_window_hours: int = Field(
-        default=6, ge=2, le=12,
-        description="Hours to look back for cheap blocks before peaks"
+        default=24, ge=2, le=24,
+        description="Hours to look back for cheap blocks (default 24 = entire day before peak)"
     )
     discharge_peak_threshold: float = Field(
         default=1.5, ge=1.0, le=3.0,
