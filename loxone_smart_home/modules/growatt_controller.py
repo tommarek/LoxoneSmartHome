@@ -1474,31 +1474,43 @@ class GrowattController(BaseModule):
                 f"   Pre-discharge charging: {len(self._pre_discharge_blocks)} blocks"
             )
 
-            # Show details for each discharge period
-            for discharge_period, pre_charge_blocks in peak_to_precharge_map.items():
-                if pre_charge_blocks:
-                    # Parse discharge period
-                    period_start = discharge_period.split('-')[0]
-                    period_end = discharge_period.split('-')[1]
+            # Show summary for each discharge period
+            self.logger.info("")
+            for discharge_period, info in peak_to_precharge_map.items():
+                if info:
+                    # Handle both old format (list) and new format (dict)
+                    if isinstance(info, dict):
+                        pre_charge_blocks = info.get('blocks', [])
+                        discharge_duration = info.get('discharge_duration', 0)
+                        charge_blocks_used = info.get('charge_blocks_used', len(pre_charge_blocks))
+                    else:
+                        # Backward compatibility: if it's a list
+                        pre_charge_blocks = info
+                        discharge_duration = 0
+                        charge_blocks_used = len(pre_charge_blocks)
 
-                    # Calculate average price for pre-charge blocks
-                    avg_pre_charge = (
-                        sum(b[2] for b in pre_charge_blocks) / len(pre_charge_blocks)
-                    )
-                    avg_pre_charge_czk = avg_pre_charge * rate / 1000
+                    if pre_charge_blocks:
+                        # Parse discharge period
+                        period_start = discharge_period.split('-')[0]
+                        period_end = discharge_period.split('-')[1]
 
-                    self.logger.info(f"\n   Discharge period: {period_start}-{period_end}")
-                    self.logger.info(
-                        f"   Pre-charge blocks ({len(pre_charge_blocks)}):"
-                    )
-                    for start, end, price_eur in sorted(pre_charge_blocks):
-                        price_czk = price_eur * rate / 1000
-                        self.logger.info(
-                            f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
+                        # Calculate average price for pre-charge blocks
+                        avg_pre_charge = (
+                            sum(b[2] for b in pre_charge_blocks) / len(pre_charge_blocks)
                         )
-                    self.logger.info(
-                        f"   Avg pre-charge price: {avg_pre_charge_czk:.3f} CZK/kWh"
-                    )
+                        avg_pre_charge_czk = avg_pre_charge * rate / 1000
+
+                        # Calculate durations
+                        discharge_hours = discharge_duration * 0.25
+                        charge_hours = charge_blocks_used * 0.25
+
+                        # Single line summary per discharge period
+                        self.logger.info(
+                            f"   {period_start}-{period_end} "
+                            f"({discharge_hours:.1f}h discharge): "
+                            f"{charge_blocks_used} blocks pre-charge "
+                            f"({charge_hours:.1f}h) @ {avg_pre_charge_czk:.2f} CZK/kWh avg"
+                        )
 
             self.logger.info("=" * 50)
 

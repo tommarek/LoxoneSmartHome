@@ -571,6 +571,60 @@ class PriceAnalyzer:
 
         return groups
 
+    def merge_close_discharge_groups(
+        self,
+        groups: List[List[Tuple[str, str, float]]],
+        max_gap_minutes: int = 60
+    ) -> List[List[Tuple[str, str, float]]]:
+        """Merge discharge groups that are close in time.
+
+        If discharge periods are within max_gap_minutes of each other,
+        treat them as one discharge event for pre-charging purposes.
+
+        Args:
+            groups: List of discharge groups from group_consecutive_discharge_blocks
+            max_gap_minutes: Maximum gap in minutes to consider groups as one event
+
+        Returns:
+            List of merged discharge groups
+        """
+        if not groups:
+            return []
+
+        merged = []
+        current_merged = groups[0].copy()
+
+        for next_group in groups[1:]:
+            # Get end of current merged group and start of next group
+            current_end = current_merged[-1][1]
+            next_start = next_group[0][0]
+
+            # Parse times
+            curr_end_hour, curr_end_min = map(int, current_end.split(':'))
+            next_start_hour, next_start_min = map(int, next_start.split(':'))
+
+            # Calculate gap in minutes
+            curr_minutes = curr_end_hour * 60 + curr_end_min
+            next_minutes = next_start_hour * 60 + next_start_min
+            gap_minutes = next_minutes - curr_minutes
+
+            # Handle day wrap (shouldn't happen in practice but be safe)
+            if gap_minutes < 0:
+                gap_minutes += 24 * 60
+
+            if gap_minutes <= max_gap_minutes:
+                # Merge groups - they're close enough to be one event
+                current_merged.extend(next_group)
+            else:
+                # Groups are too far apart - save current and start new
+                merged.append(current_merged)
+                current_merged = next_group.copy()
+
+        # Add the last merged group
+        merged.append(current_merged)
+
+        return merged
+
     def find_pre_discharge_blocks(
         self,
         prices: Dict[Tuple[str, str], float],
@@ -615,17 +669,18 @@ class PriceAnalyzer:
         self,
         prices: Dict[Tuple[str, str], float],
         discharge_periods: List[Tuple[str, str, float]],
-        charge_blocks: int = 8
+        max_charge_blocks: int = 8
     ) -> Tuple[List[Tuple[str, str, float]], Dict[str, List[Tuple[str, str, float]]]]:
         """Calculate pre-discharge charging schedule for all discharge periods.
 
         For each discharge period, find the cheapest blocks before it starts
-        to ensure the battery is charged for discharge.
+        to ensure the battery is charged for discharge. The number of pre-charge
+        blocks is scaled based on the discharge duration.
 
         Args:
             prices: Dictionary of 15-minute interval prices
             discharge_periods: List of all discharge periods
-            charge_blocks: Number of blocks to charge before each discharge period
+            max_charge_blocks: Maximum blocks to charge before discharge (default 8)
 
         Returns:
             Tuple of:
@@ -635,20 +690,38 @@ class PriceAnalyzer:
         # Group consecutive discharge blocks into periods
         discharge_groups = self.group_consecutive_discharge_blocks(discharge_periods)
 
+        # Merge groups that are close in time (within 60 minutes)
+        merged_groups = self.merge_close_discharge_groups(discharge_groups, max_gap_minutes=60)
+
         all_pre_charge_blocks = []
         period_to_precharge = {}
 
-        for group in discharge_groups:
+        for group in merged_groups:
+            # Calculate scaled pre-charge blocks based on discharge duration
+            discharge_blocks = len(group)
+
+            # Scale: 1:1 with discharge duration, max 8 blocks
+            scaled_charge_blocks = min(
+                max_charge_blocks,
+                discharge_blocks  # Same duration as discharge
+            )
+
             # Get discharge period start time
             period_start = group[0][0]
             period_key = f"{group[0][0]}-{group[-1][1]}"  # Full discharge period
 
             # Find pre-charge blocks for this discharge period
             pre_charge_blocks = self.find_pre_discharge_blocks(
-                prices, period_start, charge_blocks
+                prices, period_start, scaled_charge_blocks
             )
 
-            period_to_precharge[period_key] = pre_charge_blocks
+            # Store with info about scaling
+            period_info = {
+                'blocks': pre_charge_blocks,
+                'discharge_duration': discharge_blocks,
+                'charge_blocks_used': scaled_charge_blocks
+            }
+            period_to_precharge[period_key] = period_info
             all_pre_charge_blocks.extend(pre_charge_blocks)
 
         # Remove duplicates from combined list (keep unique blocks)
