@@ -582,7 +582,7 @@ class PriceAnalyzer:
         peaks_with_avg.sort(key=lambda x: x[1], reverse=True)
 
         # Return top peaks (limit to avoid over-scheduling)
-        max_peaks = 3  # Configurable: maximum number of peaks to prepare for
+        max_peaks = 5  # Handle up to 5 peaks per day to ensure all opportunities are covered
         return [peak for peak, _ in peaks_with_avg[:max_peaks]]
 
     def find_pre_discharge_blocks(

@@ -171,8 +171,8 @@ class GrowattConfig(BaseSettings):
         description="Battery round-trip efficiency (15% loss)"
     )
     discharge_power_rate: int = Field(
-        default=35, ge=10, le=100,
-        description="Discharge power rate % (35% = moderate)"
+        default=25, ge=10, le=100,
+        description="Discharge power rate % (25% = gentle)"
     )
 
     # Simple price thresholds (all in CZK/kWh for consistency)
