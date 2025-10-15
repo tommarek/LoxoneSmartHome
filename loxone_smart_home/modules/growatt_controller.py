@@ -2003,16 +2003,15 @@ class GrowattController(BaseModule):
                             self._fetch_next_day_prices_task()
                         )
 
-                # Check for midnight - activate next day's prices
+                # Check for midnight - update date display
                 if now.hour == 0 and now.minute == 0:
                     # Only process once per midnight
                     current_midnight = now.date()
                     if last_midnight_check != current_midnight:
                         last_midnight_check = current_midnight
-                        self.logger.info("🕛 Midnight - activating next day's prices...")
+                        self.logger.info("🕛 Midnight - new day starting...")
 
-                        # Cancel any ongoing fetch task for yesterday's "tomorrow"
-                        # (which is now obsolete as we're entering a new day)
+                        # Cancel any ongoing fetch task (if exists)
                         if self._price_fetch_task and not self._price_fetch_task.done():
                             self.logger.debug(
                                 "Cancelling previous price fetch task (midnight rollover)"
@@ -2024,7 +2023,7 @@ class GrowattController(BaseModule):
                                 pass
                             self._price_fetch_task = None
 
-                        # If we successfully fetched next day's prices, activate them
+                        # If we have next day's prices ready, activate them
                         if self._next_day_prices_fetched and self._next_day_prices:
                             # Move next-day prices to current prices
                             self._current_prices = self._next_day_prices
@@ -2120,13 +2119,74 @@ class GrowattController(BaseModule):
                                 "(will retry with smart backoff until successful)"
                             )
                         else:
-                            self.logger.warning(
-                                "⚠️ No next-day prices available at midnight. "
-                                "Will continue with current prices and start fetching new prices."
+                            # No next-day prices yet (normal case) - keep using current prices
+                            current_date = self._get_local_date_string(days_ahead=0)
+
+                            self.logger.info(
+                                f"📊 Continuing with existing price data for {current_date} "
+                                f"(new prices will be fetched at {self.config.price_fetch_hour}:00)"
                             )
-                            # Start fetching anyway - better late than never
-                            self._price_fetch_task = asyncio.create_task(
-                                self._fetch_next_day_prices_task()
+
+                            # Update the display date to current date and show price table
+                            if self._current_prices:
+                                # Display the price table with the current date
+                                self.logger.info(f"🕛 Energy prices for TODAY ({current_date}):")
+
+                                # Recalculate schedules with existing prices
+                                charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
+                                charging_schedule, _ = self._price_analyzer.get_charging_schedule(
+                                    self._current_prices, num_blocks=charge_blocks
+                                )
+
+                                # Calculate discharge periods
+                                rate = self._eur_czk_rate or 25.0
+                                discharge_periods = self._calculate_discharge_periods(
+                                    self._current_prices, rate
+                                )
+
+                                # Calculate pre-discharge schedule
+                                pre_discharge_schedule: List[Tuple[str, str, float]] = []
+                                peak_to_precharge_map = {}
+                                if discharge_periods:
+                                    pre_discharge_charge_blocks = getattr(
+                                        self.config, 'pre_discharge_charge_blocks', 8
+                                    )
+                                    window_hours = getattr(
+                                        self.config, 'pre_discharge_window_hours', 24
+                                    )
+                                    peak_threshold = getattr(
+                                        self.config, 'discharge_peak_threshold', 1.5
+                                    )
+
+                                    pre_discharge_schedule, peak_to_precharge_map = (
+                                        self._price_analyzer.calculate_pre_discharge_schedule(
+                                            self._current_prices,
+                                            discharge_periods,
+                                            peak_threshold,
+                                            pre_discharge_charge_blocks,
+                                            window_hours
+                                        )
+                                    )
+
+                                # Show the price analysis with current date
+                                await self._log_price_analysis(
+                                    self._current_prices,
+                                    current_date,  # Use current date for display
+                                    charging_schedule,
+                                    charge_blocks,
+                                    pre_discharge_schedule,
+                                    peak_to_precharge_map
+                                )
+
+                            # Reset the fetch flag for the new day
+                            self._next_day_prices_fetched = False
+                            self._next_day_prices = {}
+                            self._next_day_prices_date = None
+
+                            # DON'T start fetching - wait for configured fetch hour (14:00)
+                            self.logger.info(
+                                f"⏰ Next-day prices will be fetched at "
+                                f"{self.config.price_fetch_hour}:00 when OTE publishes them"
                             )
 
                 # Check for 15-minute block change (price changes every 15 minutes)
