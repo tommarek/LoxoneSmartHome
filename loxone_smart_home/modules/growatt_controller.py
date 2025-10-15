@@ -1243,16 +1243,12 @@ class GrowattController(BaseModule):
                     pre_discharge_charge_blocks = getattr(
                         self.config, 'pre_discharge_charge_blocks', 8
                     )
-                    window_hours = getattr(self.config, 'pre_discharge_window_hours', 24)
-                    peak_threshold = getattr(self.config, 'discharge_peak_threshold', 1.1)
 
                     pre_discharge_schedule, self._peak_to_precharge_map = (
                         self._price_analyzer.calculate_pre_discharge_schedule(
                             prices_15min,
                             discharge_periods,
-                            peak_threshold,
-                            pre_discharge_charge_blocks,
-                            window_hours
+                            pre_discharge_charge_blocks
                         )
                     )
 
@@ -1478,12 +1474,12 @@ class GrowattController(BaseModule):
                 f"   Pre-discharge charging: {len(self._pre_discharge_blocks)} blocks"
             )
 
-            # Show details for each peak
-            for peak_period, pre_charge_blocks in peak_to_precharge_map.items():
+            # Show details for each discharge period
+            for discharge_period, pre_charge_blocks in peak_to_precharge_map.items():
                 if pre_charge_blocks:
-                    # Parse peak period
-                    peak_start = peak_period.split('-')[0]
-                    peak_end = peak_period.split('-')[1]
+                    # Parse discharge period
+                    period_start = discharge_period.split('-')[0]
+                    period_end = discharge_period.split('-')[1]
 
                     # Calculate average price for pre-charge blocks
                     avg_pre_charge = (
@@ -1491,7 +1487,7 @@ class GrowattController(BaseModule):
                     )
                     avg_pre_charge_czk = avg_pre_charge * rate / 1000
 
-                    self.logger.info(f"\n   Peak: {peak_start}-{peak_end}")
+                    self.logger.info(f"\n   Discharge period: {period_start}-{period_end}")
                     self.logger.info(
                         f"   Pre-charge blocks ({len(pre_charge_blocks)}):"
                     )
@@ -2054,20 +2050,12 @@ class GrowattController(BaseModule):
                                 pre_discharge_charge_blocks = getattr(
                                     self.config, 'pre_discharge_charge_blocks', 8
                                 )
-                                window_hours = getattr(
-                                    self.config, 'pre_discharge_window_hours', 24
-                                )
-                                peak_threshold = getattr(
-                                    self.config, 'discharge_peak_threshold', 1.5
-                                )
 
                                 pre_discharge_schedule, self._peak_to_precharge_map = (
                                     self._price_analyzer.calculate_pre_discharge_schedule(
                                         self._current_prices,
                                         discharge_periods,
-                                        peak_threshold,
-                                        pre_discharge_charge_blocks,
-                                        window_hours
+                                        pre_discharge_charge_blocks
                                     )
                                 )
 
@@ -2151,20 +2139,12 @@ class GrowattController(BaseModule):
                                     pre_discharge_charge_blocks = getattr(
                                         self.config, 'pre_discharge_charge_blocks', 8
                                     )
-                                    window_hours = getattr(
-                                        self.config, 'pre_discharge_window_hours', 24
-                                    )
-                                    peak_threshold = getattr(
-                                        self.config, 'discharge_peak_threshold', 1.5
-                                    )
 
                                     pre_discharge_schedule, peak_to_precharge_map = (
                                         self._price_analyzer.calculate_pre_discharge_schedule(
                                             self._current_prices,
                                             discharge_periods,
-                                            peak_threshold,
-                                            pre_discharge_charge_blocks,
-                                            window_hours
+                                            pre_discharge_charge_blocks
                                         )
                                     )
 
