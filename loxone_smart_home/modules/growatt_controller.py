@@ -1454,64 +1454,16 @@ class GrowattController(BaseModule):
 
         # Log pre-discharge preparation schedule if available
         if pre_discharge_schedule and peak_to_precharge_map:
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"🔌 PRE-DISCHARGE PREPARATION "
-                f"({len(pre_discharge_schedule)} unique blocks)"
-            )
-
-            # Calculate total unique charging blocks
+            # Calculate totals
             total_unique_blocks = len(self._combined_charging_blocks)
             total_hours = total_unique_blocks * 0.25
+            pre_discharge_count = len(self._pre_discharge_blocks)
 
+            self.logger.info("=" * 50)
             self.logger.info(
-                f"   Total charging: {total_unique_blocks} blocks = {total_hours:.1f} hours"
+                f"🔌 PRE-DISCHARGE: {pre_discharge_count} blocks added "
+                f"(total charging: {total_unique_blocks} blocks = {total_hours:.1f}h)"
             )
-            self.logger.info(
-                f"   Regular charging: {len(self._cheapest_charging_blocks)} blocks"
-            )
-            self.logger.info(
-                f"   Pre-discharge charging: {len(self._pre_discharge_blocks)} blocks"
-            )
-
-            # Show summary for each discharge period
-            self.logger.info("")
-            for discharge_period, info in peak_to_precharge_map.items():
-                if info:
-                    # Handle both old format (list) and new format (dict)
-                    if isinstance(info, dict):
-                        pre_charge_blocks = info.get('blocks', [])
-                        discharge_duration = info.get('discharge_duration', 0)
-                        charge_blocks_used = info.get('charge_blocks_used', len(pre_charge_blocks))
-                    else:
-                        # Backward compatibility: if it's a list
-                        pre_charge_blocks = info
-                        discharge_duration = 0
-                        charge_blocks_used = len(pre_charge_blocks)
-
-                    if pre_charge_blocks:
-                        # Parse discharge period
-                        period_start = discharge_period.split('-')[0]
-                        period_end = discharge_period.split('-')[1]
-
-                        # Calculate average price for pre-charge blocks
-                        avg_pre_charge = (
-                            sum(b[2] for b in pre_charge_blocks) / len(pre_charge_blocks)
-                        )
-                        avg_pre_charge_czk = avg_pre_charge * rate / 1000
-
-                        # Calculate durations
-                        discharge_hours = discharge_duration * 0.25
-                        charge_hours = charge_blocks_used * 0.25
-
-                        # Single line summary per discharge period
-                        self.logger.info(
-                            f"   {period_start}-{period_end} "
-                            f"({discharge_hours:.1f}h discharge): "
-                            f"{charge_blocks_used} blocks pre-charge "
-                            f"({charge_hours:.1f}h) @ {avg_pre_charge_czk:.2f} CZK/kWh avg"
-                        )
-
             self.logger.info("=" * 50)
 
     async def _on_price_update(self) -> None:
