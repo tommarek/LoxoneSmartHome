@@ -64,6 +64,9 @@ def growatt_controller(
     controller._current_prices = {}
     controller._eur_czk_rate = 25.0
     controller._last_price_fetch = datetime.now()
+    controller._cheapest_charging_blocks = set()
+    controller._pre_discharge_blocks = set()
+    controller._combined_charging_blocks = set()
     return controller
 
 
@@ -92,6 +95,8 @@ async def test_decision_engine_integration_cheap_hour_charging(
         ("03:00", "03:15"), ("03:15", "03:30"),
         ("03:30", "03:45"), ("03:45", "04:00")
     }
+    # Set combined blocks (no pre-discharge in this test)
+    growatt_controller._combined_charging_blocks = growatt_controller._cheapest_charging_blocks.copy()
 
     # Mock season and sun calculation
     with patch.object(growatt_controller, "_get_season_mode", AsyncMock(return_value="winter")):
@@ -137,6 +142,7 @@ async def test_decision_engine_integration_high_price_discharge(
 
     # Not a charging time - empty cheapest blocks
     growatt_controller._cheapest_charging_blocks = set()
+    growatt_controller._combined_charging_blocks = set()
 
     # Mock season and sun calculation
     with patch.object(growatt_controller, "_get_season_mode", AsyncMock(return_value="winter")):
@@ -343,6 +349,7 @@ async def test_price_data_in_context(
 
     # Empty cheapest blocks
     growatt_controller._cheapest_charging_blocks = set()
+    growatt_controller._combined_charging_blocks = set()
 
     # Mock season
     with patch.object(growatt_controller, "_get_season_mode", AsyncMock(return_value="winter")):
