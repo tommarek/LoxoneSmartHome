@@ -209,8 +209,8 @@ class GrowattConfig(BaseSettings):
         description="Hours to look back for cheap blocks (default 24 = entire day before peak)"
     )
     discharge_peak_threshold: float = Field(
-        default=1.5, ge=1.0, le=3.0,
-        description="Multiplier to identify significant discharge peaks (1.5 = 50% above average)"
+        default=1.1, ge=1.0, le=3.0,
+        description="Multiplier to identify significant discharge peaks (1.1 = 10% above average)"
     )
 
     # Command control parameters
