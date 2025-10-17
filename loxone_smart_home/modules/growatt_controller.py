@@ -211,12 +211,18 @@ class GrowattController(BaseModule):
         self._tomorrow_cheaper_by: Optional[float] = None  # How much cheaper tomorrow is (%)
 
         # Cross-day scheduling (NEW: date-aware optimization across available window)
-        self._cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()  # Today's optimal blocks
-        self._cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()  # Tomorrow's blocks
-        self._pre_discharge_blocks_today: Set[Tuple[str, str]] = set()  # Today's pre-discharge
-        self._pre_discharge_blocks_tomorrow: Set[Tuple[str, str]] = set()  # Tomorrow's pre-discharge
-        self._discharge_periods_today: Set[Tuple[str, str]] = set()  # Today's discharge periods
-        self._discharge_periods_tomorrow: Set[Tuple[str, str]] = set()  # Tomorrow's discharge
+        # Today's optimal blocks
+        self._cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's blocks
+        self._cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()
+        # Today's pre-discharge
+        self._pre_discharge_blocks_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's pre-discharge
+        self._pre_discharge_blocks_tomorrow: Set[Tuple[str, str]] = set()
+        # Today's discharge periods
+        self._discharge_periods_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's discharge
+        self._discharge_periods_tomorrow: Set[Tuple[str, str]] = set()
 
         # Queued schedules for midnight application
         self._queued_tomorrow_charging: List[Tuple[datetime, datetime, float]] = []
@@ -1455,7 +1461,10 @@ class GrowattController(BaseModule):
             if discharge_today:
                 # Group consecutive blocks for cleaner display
                 groups = self._group_consecutive_blocks_datetime(discharge_today)
-                self.logger.info(f"   Today: {len(discharge_today)} blocks in {len(groups)} period(s)")
+                self.logger.info(
+                    f"   Today: {len(discharge_today)} blocks in "
+                    f"{len(groups)} period(s)"
+                )
                 for group in groups:
                     start = group[0][0]
                     end = group[-1][1]
@@ -1521,13 +1530,19 @@ class GrowattController(BaseModule):
 
                 pre_discharge_blocks.extend(pre_charge)
 
-            # Remove duplicates (a block might be selected for multiple discharge periods)
-            unique_pre = list({(s, e): (s, e, p) for s, e, p in pre_discharge_blocks}.values())
+            # Remove duplicates (block might be selected for multiple discharge periods)
+            unique_pre = list(
+                {(s, e): (s, e, p) for s, e, p in pre_discharge_blocks}.values()
+            )
             pre_discharge_blocks = sorted(unique_pre, key=lambda x: x[0])
 
             # Separate into today vs tomorrow
-            pre_discharge_today = [(s, e, p) for s, e, p in pre_discharge_blocks if s.date() == today]
-            pre_discharge_tomorrow = [(s, e, p) for s, e, p in pre_discharge_blocks if s.date() > today]
+            pre_discharge_today = [
+                (s, e, p) for s, e, p in pre_discharge_blocks if s.date() == today
+            ]
+            pre_discharge_tomorrow = [
+                (s, e, p) for s, e, p in pre_discharge_blocks if s.date() > today
+            ]
 
             if pre_discharge_blocks:
                 self.logger.info("")
@@ -2587,12 +2602,20 @@ class GrowattController(BaseModule):
                             self._next_day_prices_fetched = False
 
                             # NEW: Shift queued tomorrow schedules to today
-                            self.logger.info("🔄 Applying queued tomorrow's schedule as today's schedule")
+                            self.logger.info(
+                                "🔄 Applying queued tomorrow's schedule as today's schedule"
+                            )
 
                             # What was "tomorrow" is now "today"
-                            self._cheapest_charging_blocks_today = self._cheapest_charging_blocks_tomorrow.copy()
-                            self._pre_discharge_blocks_today = self._pre_discharge_blocks_tomorrow.copy()
-                            self._discharge_periods_today = self._discharge_periods_tomorrow.copy()
+                            self._cheapest_charging_blocks_today = (
+                                self._cheapest_charging_blocks_tomorrow.copy()
+                            )
+                            self._pre_discharge_blocks_today = (
+                                self._pre_discharge_blocks_tomorrow.copy()
+                            )
+                            self._discharge_periods_today = (
+                                self._discharge_periods_tomorrow.copy()
+                            )
 
                             # Clear tomorrow's schedules
                             self._cheapest_charging_blocks_tomorrow = set()
@@ -2605,10 +2628,15 @@ class GrowattController(BaseModule):
                             self._queued_tomorrow_discharge = []
 
                             # Update backward-compatible sets
-                            self._cheapest_charging_blocks = self._cheapest_charging_blocks_today.copy()
-                            self._pre_discharge_blocks = self._pre_discharge_blocks_today.copy()
+                            self._cheapest_charging_blocks = (
+                                self._cheapest_charging_blocks_today.copy()
+                            )
+                            self._pre_discharge_blocks = (
+                                self._pre_discharge_blocks_today.copy()
+                            )
                             self._combined_charging_blocks = (
-                                self._cheapest_charging_blocks_today | self._pre_discharge_blocks_today
+                                self._cheapest_charging_blocks_today
+                                | self._pre_discharge_blocks_today
                             )
 
                             # Clear old defer flag (replaced by cross-day logic)
@@ -2617,14 +2645,14 @@ class GrowattController(BaseModule):
 
                             self.logger.info(
                                 f"✅ Schedule shift complete: "
-                                f"{len(self._combined_charging_blocks)} charging blocks active today"
+                                f"{len(self._combined_charging_blocks)} charging blocks "
+                                f"active today"
                             )
 
-                            # Recalculate cross-day optimal schedule with new TODAY prices
-                            # This will find new TOMORROW blocks if next-day prices available
-                            await self._calculate_cross_day_optimal_schedule()
-
-                            # Trigger re-evaluation with updated schedule
+                            # Trigger re-evaluation with shifted schedule
+                            # Note: We don't recalculate here because we don't have new
+                            # tomorrow prices yet. The background fetch will recalculate
+                            # when new tomorrow data arrives.
                             await self._on_price_update()
 
                             # Start background fetch for NEW next day's prices (non-blocking)
