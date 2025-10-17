@@ -4,6 +4,7 @@ import asyncio
 import json
 import zoneinfo
 from datetime import datetime
+from datetime import date as date_type
 from datetime import time as dt_time
 from datetime import timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
@@ -669,6 +670,178 @@ class GrowattController(BaseModule):
         groups.append(current_group)
 
         return groups
+
+    async def _log_cross_day_price_table(
+        self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float
+    ) -> None:
+        """Log comprehensive cross-day price table showing all available blocks.
+
+        Displays a compact table with visual markers for each block's treatment:
+        - 🔋 = Regular charging block
+        - 🔌 = Pre-discharge charging block
+        - ⚡ = Discharge block
+        - (blank) = No special action
+
+        Args:
+            window: List of (start_dt, end_dt, price_eur) covering available price window
+            eur_czk_rate: Exchange rate for EUR to CZK conversion
+        """
+        if not window:
+            return
+
+        now = self._get_local_now()
+        today = now.date()
+
+        # Create lookup sets for fast classification
+        charging_today = self._cheapest_charging_blocks_today
+        charging_tomorrow = self._cheapest_charging_blocks_tomorrow
+        pre_discharge_today = self._pre_discharge_blocks_today
+        pre_discharge_tomorrow = self._pre_discharge_blocks_tomorrow
+        discharge_today = self._discharge_periods_today
+        discharge_tomorrow = self._discharge_periods_tomorrow
+
+        self.logger.info("")
+        self.logger.info("=" * 70)
+        self.logger.info("📊 COMPREHENSIVE PRICE TABLE (entire available window)")
+        self.logger.info("=" * 70)
+
+        # Group blocks by date
+        today_blocks = [(s, e, p) for s, e, p in window if s.date() == today]
+        tomorrow_blocks = [(s, e, p) for s, e, p in window if s.date() > today]
+
+        # Display today's prices (if any remaining)
+        if today_blocks:
+            self._log_price_table_for_date(
+                today_blocks,
+                today,
+                eur_czk_rate,
+                charging_today,
+                pre_discharge_today,
+                discharge_today,
+                "TODAY (remaining hours)"
+            )
+
+        # Display tomorrow's prices (if available)
+        if tomorrow_blocks:
+            tomorrow_date = tomorrow_blocks[0][0].date()
+            self._log_price_table_for_date(
+                tomorrow_blocks,
+                tomorrow_date,
+                eur_czk_rate,
+                charging_tomorrow,
+                pre_discharge_tomorrow,
+                discharge_tomorrow,
+                "TOMORROW"
+            )
+
+        # Display legend
+        self.logger.info("")
+        legend_items = []
+        if charging_today or charging_tomorrow:
+            legend_items.append("🔋=Regular charge")
+        if pre_discharge_today or pre_discharge_tomorrow:
+            legend_items.append("🔌=Pre-discharge charge")
+        if discharge_today or discharge_tomorrow:
+            legend_items.append("⚡=Discharge")
+        if legend_items:
+            self.logger.info(f"Legend: {', '.join(legend_items)}")
+
+        # Display summary statistics across entire window
+        all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
+        min_price = min(all_prices_czk)
+        max_price = max(all_prices_czk)
+        avg_price = sum(all_prices_czk) / len(all_prices_czk)
+
+        self.logger.info(
+            f"Window summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
+            f"Avg={avg_price:.3f} CZK/kWh"
+        )
+        self.logger.info("=" * 70)
+
+    def _log_price_table_for_date(
+        self,
+        blocks: List[Tuple[datetime, datetime, float]],
+        date: date_type,
+        eur_czk_rate: float,
+        charging_blocks: Set[Tuple[str, str]],
+        pre_discharge_blocks: Set[Tuple[str, str]],
+        discharge_blocks: Set[Tuple[str, str]],
+        title: str
+    ) -> None:
+        """Log price table for a single date in 4-column format.
+
+        Args:
+            blocks: List of (start_dt, end_dt, price_eur) for this date
+            date: Date being displayed
+            eur_czk_rate: Exchange rate
+            charging_blocks: Set of (start_str, end_str) for charging
+            pre_discharge_blocks: Set of (start_str, end_str) for pre-discharge
+            discharge_blocks: Set of (start_str, end_str) for discharge
+            title: Title to display for this table
+        """
+        self.logger.info("")
+        self.logger.info(f"--- {title} ({date.strftime('%Y-%m-%d')}) ---")
+        self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
+        self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
+        self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
+
+        # Create a dict for fast lookup by time string
+        block_dict = {}
+        for start_dt, end_dt, price in blocks:
+            start_str = start_dt.strftime("%H:%M")
+            end_str = end_dt.strftime("%H:%M")
+            block_dict[(start_str, end_str)] = price
+
+        # Process by hour (4 blocks per hour)
+        # Determine hour range from actual blocks
+        if blocks:
+            start_hour = blocks[0][0].hour
+            end_hour = blocks[-1][0].hour
+
+            for hour in range(start_hour, end_hour + 1):
+                row_prices = []
+
+                # Process 4 quarter-hour blocks
+                for quarter in range(4):
+                    minute = quarter * 15
+                    next_minute = (quarter + 1) * 15
+
+                    start_str = f"{hour:02d}:{minute:02d}"
+                    if next_minute < 60:
+                        end_str = f"{hour:02d}:{next_minute:02d}"
+                    else:
+                        end_str = f"{hour+1:02d}:00"
+
+                    # Find matching block
+                    block_key = (start_str, end_str)
+                    if block_key in block_dict:
+                        price_eur = block_dict[block_key]
+                        price_czk = price_eur * eur_czk_rate / 1000
+
+                        # Determine marker
+                        if block_key in pre_discharge_blocks:
+                            marker = "🔌"
+                        elif block_key in charging_blocks:
+                            marker = "🔋"
+                        elif block_key in discharge_blocks:
+                            marker = "⚡"
+                        else:
+                            marker = " "
+
+                        row_prices.append(f"{price_czk:5.2f}{marker}")
+                    else:
+                        row_prices.append("   -   ")
+
+                # Pad if we don't have all 4 blocks
+                while len(row_prices) < 4:
+                    row_prices.append("   -   ")
+
+                self.logger.info(
+                    f"│ {hour:02d}:00   │ {row_prices[0]} │ {row_prices[1]} │ "
+                    f"{row_prices[2]} │ {row_prices[3]} │"
+                )
+
+        self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
@@ -1614,6 +1787,9 @@ class GrowattController(BaseModule):
         self._combined_charging_blocks = (
             self._cheapest_charging_blocks_today | self._pre_discharge_blocks_today
         )
+
+        # Display comprehensive cross-day price table
+        await self._log_cross_day_price_table(window, rate)
 
         self.logger.info(
             f"✅ Cross-day schedule updated: "
