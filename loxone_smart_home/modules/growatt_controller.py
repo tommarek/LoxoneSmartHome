@@ -205,6 +205,10 @@ class GrowattController(BaseModule):
         self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
+        # Two-day lookahead state (defer charging if tomorrow significantly cheaper)
+        self._defer_charging_to_tomorrow: bool = False  # Flag: skip today's charging for tomorrow
+        self._tomorrow_cheaper_by: Optional[float] = None  # How much cheaper tomorrow is (%)
+
         # Command queue for managing multiple concurrent commands
         self._command_queue = CommandQueue(self.logger)
 
@@ -1518,6 +1522,149 @@ class GrowattController(BaseModule):
         """Handle new price data availability."""
         await self._evaluate_conditions("price_update")
 
+    async def _analyze_tomorrow_vs_today(self) -> None:
+        """Compare tomorrow's prices vs today's remaining hours.
+
+        If tomorrow is significantly cheaper (based on defer_to_tomorrow_threshold),
+        set flag to defer charging until tomorrow.
+        """
+        if not self._next_day_prices or not self._current_prices:
+            return
+
+        now = self._get_local_now()
+        current_block = (now.hour, now.minute // 15)
+
+        # Get remaining today's prices (from now to 23:59)
+        remaining_today: Dict[Tuple[str, str], float] = {}
+        for (start, end), price in self._current_prices.items():
+            start_hour, start_min = map(int, start.split(':'))
+            block = (start_hour, start_min // 15)
+            if block >= current_block:
+                remaining_today[(start, end)] = price
+
+        if not remaining_today:
+            # No remaining hours today
+            self.logger.debug("No remaining hours today for comparison")
+            return
+
+        # Find cheapest N blocks from today's remaining
+        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
+        today_schedule, today_avg = self._price_analyzer.get_charging_schedule(
+            remaining_today, num_blocks=min(charge_blocks, len(remaining_today))
+        )
+
+        # Find cheapest N blocks from tomorrow
+        tomorrow_schedule, tomorrow_avg = self._price_analyzer.get_charging_schedule(
+            self._next_day_prices, num_blocks=charge_blocks
+        )
+
+        # Get exchange rate
+        rate = self._eur_czk_rate or 25.0
+
+        # Compare averages
+        if today_avg > 0:
+            cheaper_by_percent = (1 - tomorrow_avg / today_avg) * 100
+
+            # Convert to CZK/kWh for display
+            today_avg_czk = today_avg * rate / 1000
+            tomorrow_avg_czk = tomorrow_avg * rate / 1000
+
+            # Decision threshold from config
+            defer_threshold = self.config.defer_to_tomorrow_threshold
+
+            self.logger.info("=" * 50)
+            self.logger.info("📊 TWO-DAY PRICE COMPARISON")
+            self.logger.info("=" * 50)
+            self.logger.info(
+                f"Today's remaining {len(today_schedule)} cheapest blocks: "
+                f"avg {today_avg_czk:.2f} CZK/kWh"
+            )
+            self.logger.info(
+                f"Tomorrow's {len(tomorrow_schedule)} cheapest blocks: "
+                f"avg {tomorrow_avg_czk:.2f} CZK/kWh"
+            )
+            self.logger.info(
+                f"Difference: {cheaper_by_percent:+.1f}% "
+                f"(threshold: {defer_threshold:.1f}%)"
+            )
+
+            if cheaper_by_percent >= defer_threshold:
+                self._defer_charging_to_tomorrow = True
+                self._tomorrow_cheaper_by = cheaper_by_percent
+
+                self.logger.info(
+                    f"🚫 DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
+                    f"(≥{defer_threshold:.1f}% threshold)"
+                )
+                self.logger.info(
+                    "   ⏸️  Deferring all charging to tomorrow's cheaper hours"
+                )
+                self.logger.info(
+                    f"   💰 Potential savings: "
+                    f"{(today_avg_czk - tomorrow_avg_czk):.2f} CZK/kWh"
+                )
+            else:
+                self._defer_charging_to_tomorrow = False
+                self._tomorrow_cheaper_by = None
+
+                self.logger.info(
+                    f"✅ DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
+                    f"(<{defer_threshold:.1f}% threshold)"
+                )
+                self.logger.info(
+                    "   ▶️  Continue with today's charging schedule"
+                )
+
+            self.logger.info("=" * 50)
+
+    async def _display_next_day_prices(self) -> None:
+        """Display next-day price table and charging schedule."""
+        if not self._next_day_prices or not self._next_day_prices_date:
+            return
+
+        self.logger.info("")
+        self.logger.info("=" * 50)
+        self.logger.info(f"📅 NEXT DAY PRICES ({self._next_day_prices_date})")
+        self.logger.info("=" * 50)
+
+        # Calculate schedule for tomorrow
+        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
+        charging_schedule, _ = self._price_analyzer.get_charging_schedule(
+            self._next_day_prices, num_blocks=charge_blocks
+        )
+
+        # Calculate discharge periods
+        rate = self._eur_czk_rate or 25.0
+        discharge_periods = self._calculate_discharge_periods(
+            self._next_day_prices, rate
+        )
+
+        # Calculate pre-discharge schedule
+        pre_discharge_schedule: List[Tuple[str, str, float]] = []
+        peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
+        if discharge_periods:
+            pre_discharge_charge_blocks = getattr(
+                self.config, 'pre_discharge_charge_blocks', 8
+            )
+
+            pre_discharge_schedule, peak_to_precharge_map = (
+                self._price_analyzer.calculate_pre_discharge_schedule(
+                    self._next_day_prices,
+                    discharge_periods,
+                    pre_discharge_charge_blocks
+                )
+            )
+
+        # Display the table
+        await self._log_price_analysis(
+            self._next_day_prices,
+            self._next_day_prices_date,
+            charging_schedule,
+            charge_blocks,
+            pre_discharge_schedule,
+            peak_to_precharge_map
+        )
+
     async def _fetch_next_day_prices_task(self) -> None:
         """Background task to fetch next day's prices with infinite retry.
 
@@ -1554,6 +1701,12 @@ class GrowattController(BaseModule):
                     f"✅ Successfully fetched and stored {len(prices)} price blocks "
                     f"for {tomorrow_date}"
                 )
+
+                # NEW: Display next day's price table
+                await self._display_next_day_prices()
+
+                # NEW: Analyze and compare with today's remaining hours
+                await self._analyze_tomorrow_vs_today()
             else:
                 # Empty dict means task was cancelled (e.g., midnight rollover)
                 self.logger.debug(
@@ -1605,6 +1758,20 @@ class GrowattController(BaseModule):
 
                 # Get decision from engine
                 new_mode = self._decision_engine.decide(context)
+
+                # NEW: Check defer flag - override charging if tomorrow cheaper
+                if (
+                    self._defer_charging_to_tomorrow
+                    and new_mode in ("charge_from_grid", "battery_first_ac_charge")
+                ):
+                    # Decision engine wants to charge, but we're deferring
+                    self.logger.info(
+                        f"🚫 Overriding CHARGE decision: Deferring to "
+                        f"tomorrow's {self._tomorrow_cheaper_by:.1f}% cheaper "
+                        f"prices"
+                    )
+                    # Switch to regular mode (don't charge from grid)
+                    new_mode = "regular"
 
                 # Check if mode changed
                 if self._decision_engine.has_mode_changed(new_mode):
@@ -1977,6 +2144,7 @@ class GrowattController(BaseModule):
         """Periodically check for condition changes that need re-evaluation."""
         last_midnight_check = None
         last_fetch_check = None
+        last_pre_midnight_check = None
 
         while self._running:
             try:
@@ -2011,6 +2179,38 @@ class GrowattController(BaseModule):
                             self._fetch_next_day_prices_task()
                         )
 
+                # Check for pre-midnight (23:55) - ensure next day prices are ready
+                if now.hour == 23 and now.minute == 55:
+                    current_pre_midnight_check = now.date()
+                    if last_pre_midnight_check != current_pre_midnight_check:
+                        last_pre_midnight_check = current_pre_midnight_check
+
+                        if not self._next_day_prices_fetched:
+                            self.logger.info(
+                                "⏰ 23:55 - Pre-midnight check: Next-day prices not yet available"
+                            )
+                            self.logger.info(
+                                "🔄 Starting emergency fetch to ensure prices are ready for midnight"
+                            )
+
+                            # Cancel any existing fetch task
+                            if self._price_fetch_task and not self._price_fetch_task.done():
+                                self._price_fetch_task.cancel()
+                                try:
+                                    await self._price_fetch_task
+                                except asyncio.CancelledError:
+                                    pass
+
+                            # Start fetch task with high priority
+                            self._price_fetch_task = asyncio.create_task(
+                                self._fetch_next_day_prices_task()
+                            )
+                        else:
+                            self.logger.info(
+                                f"✅ 23:55 - Pre-midnight check: Next-day prices already "
+                                f"available for {self._next_day_prices_date}"
+                            )
+
                 # Check for midnight - update date display
                 if now.hour == 0 and now.minute == 0:
                     # Only process once per midnight
@@ -2037,6 +2237,10 @@ class GrowattController(BaseModule):
                             self._current_prices = self._next_day_prices
                             self._prices_date = self._next_day_prices_date
                             self._prices_updated = now
+
+                            # Clear defer flag (now using tomorrow's prices, which are now "today")
+                            self._defer_charging_to_tomorrow = False
+                            self._tomorrow_cheaper_by = None
 
                             # Recalculate cheapest blocks with the new prices
                             charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
@@ -2119,63 +2323,30 @@ class GrowattController(BaseModule):
                                 "(will retry with smart backoff until successful)"
                             )
                         else:
-                            # No next-day prices yet (normal case) - keep using current prices
+                            # No next-day prices available - CRITICAL: Fetch TODAY's prices!
                             current_date = self._get_local_date_string(days_ahead=0)
 
-                            self.logger.info(
-                                f"📊 Continuing with existing price data for {current_date} "
-                                f"(new prices will be fetched at {self.config.price_fetch_hour}:00)"
+                            self.logger.warning(
+                                "⚠️  Next-day prices not available at midnight! "
+                                "This should not happen if pre-fetch worked correctly."
                             )
-
-                            # Update the display date to current date and show price table
-                            if self._current_prices:
-                                # Display the price table with the current date
-                                self.logger.info(f"🕛 Energy prices for TODAY ({current_date}):")
-
-                                # Recalculate schedules with existing prices
-                                charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-                                charging_schedule, _ = self._price_analyzer.get_charging_schedule(
-                                    self._current_prices, num_blocks=charge_blocks
-                                )
-
-                                # Calculate discharge periods
-                                rate = self._eur_czk_rate or 25.0
-                                discharge_periods = self._calculate_discharge_periods(
-                                    self._current_prices, rate
-                                )
-
-                                # Calculate pre-discharge schedule
-                                pre_discharge_schedule: List[Tuple[str, str, float]] = []
-                                peak_to_precharge_map = {}
-                                if discharge_periods:
-                                    pre_discharge_charge_blocks = getattr(
-                                        self.config, 'pre_discharge_charge_blocks', 8
-                                    )
-
-                                    pre_discharge_schedule, peak_to_precharge_map = (
-                                        self._price_analyzer.calculate_pre_discharge_schedule(
-                                            self._current_prices,
-                                            discharge_periods,
-                                            pre_discharge_charge_blocks
-                                        )
-                                    )
-
-                                # Show the price analysis with current date
-                                await self._log_price_analysis(
-                                    self._current_prices,
-                                    current_date,  # Use current date for display
-                                    charging_schedule,
-                                    charge_blocks,
-                                    pre_discharge_schedule,
-                                    peak_to_precharge_map
-                                )
+                            self.logger.info(
+                                f"📊 Fetching prices for TODAY ({current_date}) immediately..."
+                            )
 
                             # Reset the fetch flag for the new day
                             self._next_day_prices_fetched = False
                             self._next_day_prices = {}
                             self._next_day_prices_date = None
 
-                            # DON'T start fetching - wait for configured fetch hour (14:00)
+                            # Clear defer flag (new day, new decisions)
+                            self._defer_charging_to_tomorrow = False
+                            self._tomorrow_cheaper_by = None
+
+                            # CRITICAL FIX: Fetch TODAY's prices immediately
+                            # This ensures control logic uses correct prices
+                            await self._fetch_prices()
+
                             self.logger.info(
                                 f"⏰ Next-day prices will be fetched at "
                                 f"{self.config.price_fetch_hour}:00 when OTE publishes them"
