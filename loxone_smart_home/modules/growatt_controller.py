@@ -1322,6 +1322,19 @@ class GrowattController(BaseModule):
         # Fetch initial prices
         await self._fetch_prices()
 
+        # Check if we should fetch tomorrow's prices at startup
+        # (if we're past the configured fetch hour and haven't fetched yet)
+        now = self._get_local_now()
+        fetch_hour = self.config.price_fetch_hour
+        if now.hour >= fetch_hour and not self._next_day_prices_fetched:
+            self.logger.info(
+                f"🔄 Startup: Current time {now.strftime('%H:%M')} is past fetch hour "
+                f"({fetch_hour:02d}:00), starting next-day price fetch"
+            )
+            self._price_fetch_task = asyncio.create_task(
+                self._fetch_next_day_prices_task()
+            )
+
         # Start periodic evaluation loop
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
