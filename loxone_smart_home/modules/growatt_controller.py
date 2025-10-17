@@ -979,6 +979,9 @@ class GrowattController(BaseModule):
     async def _sync_inverter_time(self) -> bool:
         """Synchronize inverter time with server time.
 
+        Always updates the inverter time to match server time at startup.
+        This ensures commands with 1-minute buffer work reliably.
+
         Returns True if sync was successful or not needed.
         """
         if self._optional_config.get("simulation_mode", False):
@@ -997,23 +1000,14 @@ class GrowattController(BaseModule):
             drift = (server_time - inverter_time).total_seconds()
             self._clock_drift_seconds = drift
 
-            if abs(drift) > 30:  # More than 30 seconds drift
+            # Log the current drift
+            if abs(drift) > 30:
                 self.logger.warning(
                     f"⏰ Clock skew detected: {drift:.1f}s "
                     f"({'inverter behind' if drift > 0 else 'inverter ahead'}) - "
                     f"Server: {server_time.strftime('%H:%M:%S')}, "
                     f"Inverter: {inverter_time.strftime('%H:%M:%S')}"
                 )
-
-                # Optionally update inverter time
-                if abs(drift) > 120:  # More than 2 minutes
-                    self.logger.info("Updating inverter time to match server")
-                    assert self.mqtt_client is not None
-                    topic = "energy/solar/command/datetime/set"
-                    payload = {"value": server_time.strftime("%Y-%m-%d %H:%M:%S")}
-                    await self.mqtt_client.publish(topic, json.dumps(payload))
-                    self._clock_drift_seconds = 0
-                    return True
             else:
                 sync_status = (
                     'inverter behind' if drift > 0
@@ -1021,9 +1015,29 @@ class GrowattController(BaseModule):
                     else 'perfect sync'
                 )
                 self.logger.info(
-                    f"⏰ Clock synchronized: {drift:.1f}s skew ({sync_status})"
+                    f"⏰ Clock drift: {drift:.1f}s skew ({sync_status})"
                 )
 
+            # ALWAYS sync the inverter time to match server time
+            # This ensures 1-minute command buffer works reliably
+            self.logger.info("⏰ Syncing inverter time to match server time...")
+            assert self.mqtt_client is not None
+            topic = "energy/solar/command/datetime/set"
+            payload = {"value": server_time.strftime("%Y-%m-%d %H:%M:%S")}
+            await self.mqtt_client.publish(topic, json.dumps(payload))
+
+            # Wait a moment for the command to process
+            await asyncio.sleep(2)
+
+            # Verify the sync worked
+            new_inverter_time = await self._get_inverter_time()
+            if new_inverter_time:
+                new_drift = (self._get_local_now() - new_inverter_time).total_seconds()
+                self.logger.info(
+                    f"✅ Time sync complete - new drift: {new_drift:.1f}s"
+                )
+
+            self._clock_drift_seconds = 0
             return True
 
         except Exception as e:
@@ -1097,18 +1111,12 @@ class GrowattController(BaseModule):
             # Base buffer for command transmission + processing (configurable)
             buffer_minutes = self.config.clock_drift_buffer_minutes
 
-            # Add extra time if inverter is AHEAD (negative drift)
-            # If inverter is ahead, we need MORE buffer time
-            # Example: inverter 45s ahead → add 1 minute extra
-            if self._clock_drift_seconds < 0:
-                # Inverter is ahead - add extra buffer
-                drift_adjustment_minutes = int(abs(self._clock_drift_seconds) / 60) + 1
-            else:
-                # Inverter is behind or in sync - may need slightly less time
-                # but keep at least 1 minute for safety
-                drift_adjustment_minutes = max(1, int(self._clock_drift_seconds / 60))
+            # Since we always sync the clock at startup and auto-correct drifts >2 minutes,
+            # the clock should be well-synchronized (within seconds).
+            # Add fixed 1-minute minimum for MQTT transmission and processing delay.
+            mqtt_delay_minutes = 1
 
-            total_buffer = buffer_minutes + drift_adjustment_minutes
+            total_buffer = buffer_minutes + mqtt_delay_minutes
 
             # Set start time in the FUTURE (relative to server)
             adjusted_start_dt = now.replace(microsecond=0, second=0) + timedelta(
@@ -1319,14 +1327,16 @@ class GrowattController(BaseModule):
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
 
-        # Fetch initial prices
-        await self._fetch_prices()
-
         # Check if we should fetch tomorrow's prices at startup
         # (if we're past the configured fetch hour and haven't fetched yet)
         now = self._get_local_now()
         fetch_hour = self.config.price_fetch_hour
-        if now.hour >= fetch_hour and not self._next_day_prices_fetched:
+        will_fetch_tomorrow = now.hour >= fetch_hour and not self._next_day_prices_fetched
+
+        # Fetch initial prices (suppress schedule print if we're about to fetch tomorrow's)
+        await self._fetch_prices(suppress_schedule_print=will_fetch_tomorrow)
+
+        if will_fetch_tomorrow:
             self.logger.info(
                 f"🔄 Startup: Current time {now.strftime('%H:%M')} is past fetch hour "
                 f"({fetch_hour:02d}:00), starting next-day price fetch"
@@ -1509,8 +1519,13 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
-    async def _fetch_prices(self) -> None:
-        """Fetch current energy prices and trigger evaluation."""
+    async def _fetch_prices(self, suppress_schedule_print: bool = False) -> None:
+        """Fetch current energy prices and trigger evaluation.
+
+        Args:
+            suppress_schedule_print: If True, skip printing schedule (used at startup
+                                     when we're about to fetch tomorrow's prices)
+        """
         try:
             # Determine target date
             target_date = self._get_local_date_string(days_ahead=0)
@@ -1544,7 +1559,9 @@ class GrowattController(BaseModule):
 
                 # NEW: Use cross-day optimal scheduling
                 # This will find globally cheapest blocks across today+tomorrow window
-                await self._calculate_cross_day_optimal_schedule()
+                await self._calculate_cross_day_optimal_schedule(
+                    suppress_print=suppress_schedule_print
+                )
 
                 # Trigger re-evaluation with new prices
                 await self._on_price_update()
@@ -1554,7 +1571,7 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error fetching prices: {e}", exc_info=True)
 
-    async def _calculate_cross_day_optimal_schedule(self) -> None:
+    async def _calculate_cross_day_optimal_schedule(self, suppress_print: bool = False) -> None:
         """Calculate optimal charging/discharge schedule across entire available price window.
 
         This is the core cross-day optimization method that:
@@ -1564,6 +1581,9 @@ class GrowattController(BaseModule):
         4. Computes pre-discharge charging for each discharge period
         5. Separates schedules into TODAY (apply now) and TOMORROW (queue for midnight)
         6. Updates all schedule storage attributes
+
+        Args:
+            suppress_print: If True, skip printing schedule (used during startup)
 
         This replaces the old separate-day approach with true global optimization.
         """
@@ -1590,39 +1610,40 @@ class GrowattController(BaseModule):
         charging_today = [(s, e, p) for s, e, p in cheapest_sorted if s.date() == today]
         charging_tomorrow = [(s, e, p) for s, e, p in cheapest_sorted if s.date() > today]
 
-        self.logger.info("=" * 70)
-        self.logger.info("🎯 CROSS-DAY OPTIMAL SCHEDULE (using entire available price window)")
-        self.logger.info("=" * 70)
-        self.logger.info(
-            f"Price window: {len(window)} blocks across "
-            f"{(window[-1][1] - now).total_seconds() / 3600:.1f} hours"
-        )
-        self.logger.info(
-            f"Optimal charging: {len(cheapest_blocks)} cheapest blocks "
-            f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
-        )
+        if not suppress_print:
+            self.logger.info("=" * 70)
+            self.logger.info("🎯 CROSS-DAY OPTIMAL SCHEDULE (using entire available price window)")
+            self.logger.info("=" * 70)
+            self.logger.info(
+                f"Price window: {len(window)} blocks across "
+                f"{(window[-1][1] - now).total_seconds() / 3600:.1f} hours"
+            )
+            self.logger.info(
+                f"Optimal charging: {len(cheapest_blocks)} cheapest blocks "
+                f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
+            )
 
-        # Log charging blocks for today
-        if charging_today:
-            self.logger.info("")
-            self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
-            for start_dt, end_dt, price in charging_today:
-                price_czk = price * rate / 1000
-                self.logger.info(
-                    f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
-                    f"{price_czk:.3f} CZK/kWh"
-                )
+            # Log charging blocks for today
+            if charging_today:
+                self.logger.info("")
+                self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
+                for start_dt, end_dt, price in charging_today:
+                    price_czk = price * rate / 1000
+                    self.logger.info(
+                        f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                        f"{price_czk:.3f} CZK/kWh"
+                    )
 
-        # Log charging blocks for tomorrow
-        if charging_tomorrow:
-            self.logger.info("")
-            self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
-            for start_dt, end_dt, price in charging_tomorrow:
-                price_czk = price * rate / 1000
-                self.logger.info(
-                    f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
-                    f"{price_czk:.3f} CZK/kWh"
-                )
+            # Log charging blocks for tomorrow
+            if charging_tomorrow:
+                self.logger.info("")
+                self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
+                for start_dt, end_dt, price in charging_tomorrow:
+                    price_czk = price * rate / 1000
+                    self.logger.info(
+                        f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                        f"{price_czk:.3f} CZK/kWh"
+                    )
 
         # === STEP 2: Find discharge periods across entire window ===
         discharge_threshold_czk = self.config.discharge_price_min
@@ -1637,7 +1658,7 @@ class GrowattController(BaseModule):
         discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
         discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
 
-        if discharge_blocks:
+        if not suppress_print and discharge_blocks:
             self.logger.info("")
             self.logger.info(
                 f"⚡ DISCHARGE SCHEDULE ({len(discharge_blocks)} blocks total, "
@@ -1730,7 +1751,7 @@ class GrowattController(BaseModule):
                 (s, e, p) for s, e, p in pre_discharge_blocks if s.date() > today
             ]
 
-            if pre_discharge_blocks:
+            if not suppress_print and pre_discharge_blocks:
                 self.logger.info("")
                 self.logger.info(
                     f"🔌 PRE-DISCHARGE CHARGING ({len(pre_discharge_blocks)} blocks total)"
@@ -1757,7 +1778,8 @@ class GrowattController(BaseModule):
             pre_discharge_today = []
             pre_discharge_tomorrow = []
 
-        self.logger.info("=" * 70)
+        if not suppress_print:
+            self.logger.info("=" * 70)
 
         # === STEP 4: Update storage attributes ===
 
@@ -1801,13 +1823,14 @@ class GrowattController(BaseModule):
             self._cheapest_charging_blocks_today | self._pre_discharge_blocks_today
         )
 
-        # Display comprehensive cross-day price table
-        await self._log_cross_day_price_table(window, rate)
+        if not suppress_print:
+            # Display comprehensive cross-day price table
+            await self._log_cross_day_price_table(window, rate)
 
-        self.logger.info(
-            f"✅ Cross-day schedule updated: "
-            f"{len(self._combined_charging_blocks)} charging blocks active today"
-        )
+            self.logger.info(
+                f"✅ Cross-day schedule updated: "
+                f"{len(self._combined_charging_blocks)} charging blocks active today"
+            )
 
     def _calculate_discharge_periods(
         self,
