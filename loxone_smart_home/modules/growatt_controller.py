@@ -206,8 +206,28 @@ class GrowattController(BaseModule):
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
         # Two-day lookahead state (defer charging if tomorrow significantly cheaper)
+        # NOTE: This defer logic will be replaced by cross-day optimization
         self._defer_charging_to_tomorrow: bool = False  # Flag: skip today's charging for tomorrow
         self._tomorrow_cheaper_by: Optional[float] = None  # How much cheaper tomorrow is (%)
+
+        # Cross-day scheduling (NEW: date-aware optimization across available window)
+        # Today's optimal blocks
+        self._cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's blocks
+        self._cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()
+        # Today's pre-discharge
+        self._pre_discharge_blocks_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's pre-discharge
+        self._pre_discharge_blocks_tomorrow: Set[Tuple[str, str]] = set()
+        # Today's discharge periods
+        self._discharge_periods_today: Set[Tuple[str, str]] = set()
+        # Tomorrow's discharge
+        self._discharge_periods_tomorrow: Set[Tuple[str, str]] = set()
+
+        # Queued schedules for midnight application
+        self._queued_tomorrow_charging: List[Tuple[datetime, datetime, float]] = []
+        self._queued_tomorrow_pre_discharge: List[Tuple[datetime, datetime, float]] = []
+        self._queued_tomorrow_discharge: List[Tuple[datetime, datetime, float]] = []
 
         # Command queue for managing multiple concurrent commands
         self._command_queue = CommandQueue(self.logger)
@@ -539,6 +559,116 @@ class GrowattController(BaseModule):
 
         sunrise = sunrise.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return sunrise.time()
+
+    def _get_combined_price_window(self) -> List[Tuple[datetime, datetime, float]]:
+        """Merge remaining today + tomorrow prices into single chronological window.
+
+        This creates a unified view of all available price data with absolute timestamps,
+        enabling true global optimization across day boundaries.
+
+        Returns:
+            List of (start_datetime, end_datetime, price_eur) sorted chronologically
+            Empty list if no price data available
+        """
+        now = self._get_local_now()
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
+
+        window: List[Tuple[datetime, datetime, float]] = []
+
+        # Add remaining blocks from today (only future blocks)
+        for (start_str, end_str), price in self._current_prices.items():
+            try:
+                start_dt = datetime.combine(
+                    today, self._parse_time_any(start_str), tzinfo=self._local_tz
+                )
+                end_dt = datetime.combine(
+                    today, self._parse_time_any(end_str), tzinfo=self._local_tz
+                )
+
+                # Handle 24:00 edge case (end_dt wraps to next day)
+                if end_str in ("24:00", "24:00:00"):
+                    end_dt = datetime.combine(tomorrow, dt_time(0, 0), tzinfo=self._local_tz)
+
+                # Only include blocks that haven't started yet (or are in progress)
+                # Use end time for comparison to include current block
+                if end_dt > now:
+                    window.append((start_dt, end_dt, price))
+            except Exception as e:
+                self.logger.warning(f"Error parsing today's price block {start_str}-{end_str}: {e}")
+                continue
+
+        # Add all blocks from tomorrow (if available)
+        if self._next_day_prices:
+            for (start_str, end_str), price in self._next_day_prices.items():
+                try:
+                    start_dt = datetime.combine(
+                        tomorrow, self._parse_time_any(start_str), tzinfo=self._local_tz
+                    )
+                    end_dt = datetime.combine(
+                        tomorrow, self._parse_time_any(end_str), tzinfo=self._local_tz
+                    )
+
+                    # Handle 24:00 edge case
+                    if end_str in ("24:00", "24:00:00"):
+                        day_after = tomorrow + timedelta(days=1)
+                        end_dt = datetime.combine(day_after, dt_time(0, 0), tzinfo=self._local_tz)
+
+                    window.append((start_dt, end_dt, price))
+                except Exception as e:
+                    self.logger.warning(
+                        f"Error parsing tomorrow's price block {start_str}-{end_str}: {e}"
+                    )
+                    continue
+
+        # Sort chronologically
+        window.sort(key=lambda x: x[0])
+
+        if window:
+            hours_available = (window[-1][1] - now).total_seconds() / 3600
+            self.logger.debug(
+                f"Combined price window: {len(window)} blocks covering {hours_available:.1f} hours "
+                f"from {now.strftime('%H:%M')} to {window[-1][1].strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        return window
+
+    def _group_consecutive_blocks_datetime(
+        self, blocks: List[Tuple[datetime, datetime, float]]
+    ) -> List[List[Tuple[datetime, datetime, float]]]:
+        """Group consecutive datetime-based blocks into periods.
+
+        Args:
+            blocks: List of (start_dt, end_dt, price) tuples
+
+        Returns:
+            List of groups, where each group is a list of consecutive blocks
+        """
+        if not blocks:
+            return []
+
+        # Sort by start time
+        sorted_blocks = sorted(blocks, key=lambda x: x[0])
+
+        groups: List[List[Tuple[datetime, datetime, float]]] = []
+        current_group = [sorted_blocks[0]]
+
+        for i in range(1, len(sorted_blocks)):
+            prev_end = current_group[-1][1]
+            curr_start = sorted_blocks[i][0]
+
+            # Check if consecutive (end of prev equals start of current)
+            if prev_end == curr_start:
+                current_group.append(sorted_blocks[i])
+            else:
+                # Gap found - save current group and start new one
+                groups.append(current_group)
+                current_group = [sorted_blocks[i]]
+
+        # Add the last group
+        groups.append(current_group)
+
+        return groups
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
@@ -1222,61 +1352,13 @@ class GrowattController(BaseModule):
                 # Get exchange rate
                 self._eur_czk_rate = await self._get_eur_czk_rate()
 
-                # Find cheapest blocks for regular charging (non-consecutive)
-                charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-                charging_schedule, avg_price = self._price_analyzer.get_charging_schedule(
-                    prices_15min, num_blocks=charge_blocks
+                self.logger.info(
+                    f"📊 Fetched {len(prices_15min)} price blocks for {target_date}"
                 )
 
-                if charging_schedule:
-                    # Store cheapest blocks as a set for fast lookup
-                    self._cheapest_charging_blocks = set(
-                        (block[0], block[1]) for block in charging_schedule
-                    )
-                else:
-                    self._cheapest_charging_blocks = set()
-
-                # Calculate discharge periods and pre-discharge schedule
-                rate = self._eur_czk_rate or 25.0
-                discharge_periods = self._calculate_discharge_periods(prices_15min, rate)
-
-                # Calculate pre-discharge charging schedule if we have discharge periods
-                pre_discharge_schedule: List[Tuple[str, str, float]] = []
-                self._peak_to_precharge_map = {}
-                if discharge_periods:
-                    pre_discharge_charge_blocks = getattr(
-                        self.config, 'pre_discharge_charge_blocks', 8
-                    )
-
-                    pre_discharge_schedule, self._peak_to_precharge_map = (
-                        self._price_analyzer.calculate_pre_discharge_schedule(
-                            prices_15min,
-                            discharge_periods,
-                            pre_discharge_charge_blocks
-                        )
-                    )
-
-                    # Store pre-discharge blocks
-                    self._pre_discharge_blocks = set(
-                        (block[0], block[1]) for block in pre_discharge_schedule
-                    )
-                else:
-                    self._pre_discharge_blocks = set()
-
-                # Combine regular and pre-discharge charging blocks
-                self._combined_charging_blocks = (
-                    self._cheapest_charging_blocks | self._pre_discharge_blocks
-                )
-
-                # Log comprehensive price analysis
-                await self._log_price_analysis(
-                    prices_15min,
-                    target_date,
-                    charging_schedule,
-                    charge_blocks,
-                    pre_discharge_schedule,
-                    self._peak_to_precharge_map
-                )
+                # NEW: Use cross-day optimal scheduling
+                # This will find globally cheapest blocks across today+tomorrow window
+                await self._calculate_cross_day_optimal_schedule()
 
                 # Trigger re-evaluation with new prices
                 await self._on_price_update()
@@ -1285,6 +1367,258 @@ class GrowattController(BaseModule):
 
         except Exception as e:
             self.logger.error(f"Error fetching prices: {e}", exc_info=True)
+
+    async def _calculate_cross_day_optimal_schedule(self) -> None:
+        """Calculate optimal charging/discharge schedule across entire available price window.
+
+        This is the core cross-day optimization method that:
+        1. Merges remaining today + full tomorrow into unified datetime window
+        2. Finds globally cheapest N blocks across entire window
+        3. Calculates discharge periods across both days
+        4. Computes pre-discharge charging for each discharge period
+        5. Separates schedules into TODAY (apply now) and TOMORROW (queue for midnight)
+        6. Updates all schedule storage attributes
+
+        This replaces the old separate-day approach with true global optimization.
+        """
+        # Get combined price window with absolute timestamps
+        window = self._get_combined_price_window()
+
+        if not window:
+            self.logger.warning("No price data available for cross-day optimization")
+            return
+
+        now = self._get_local_now()
+        today = now.date()
+        rate = self._eur_czk_rate or 25.0
+
+        # === STEP 1: Find globally cheapest charging blocks ===
+        charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
+
+        # Sort all blocks by price and take cheapest N
+        sorted_by_price = sorted(window, key=lambda x: x[2])
+        cheapest_blocks = sorted_by_price[:charge_blocks_count]
+        cheapest_sorted = sorted(cheapest_blocks, key=lambda x: x[0])  # Sort chronologically
+
+        # Separate into today vs tomorrow
+        charging_today = [(s, e, p) for s, e, p in cheapest_sorted if s.date() == today]
+        charging_tomorrow = [(s, e, p) for s, e, p in cheapest_sorted if s.date() > today]
+
+        self.logger.info("=" * 70)
+        self.logger.info("🎯 CROSS-DAY OPTIMAL SCHEDULE (using entire available price window)")
+        self.logger.info("=" * 70)
+        self.logger.info(
+            f"Price window: {len(window)} blocks across "
+            f"{(window[-1][1] - now).total_seconds() / 3600:.1f} hours"
+        )
+        self.logger.info(
+            f"Optimal charging: {len(cheapest_blocks)} cheapest blocks "
+            f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
+        )
+
+        # Log charging blocks for today
+        if charging_today:
+            self.logger.info("")
+            self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
+            for start_dt, end_dt, price in charging_today:
+                price_czk = price * rate / 1000
+                self.logger.info(
+                    f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                    f"{price_czk:.3f} CZK/kWh"
+                )
+
+        # Log charging blocks for tomorrow
+        if charging_tomorrow:
+            self.logger.info("")
+            self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
+            for start_dt, end_dt, price in charging_tomorrow:
+                price_czk = price * rate / 1000
+                self.logger.info(
+                    f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                    f"{price_czk:.3f} CZK/kWh"
+                )
+
+        # === STEP 2: Find discharge periods across entire window ===
+        discharge_threshold_czk = self.config.discharge_price_min
+        discharge_threshold_eur = discharge_threshold_czk * 1000 / rate
+
+        discharge_blocks = [
+            (start_dt, end_dt, price)
+            for start_dt, end_dt, price in window
+            if price >= discharge_threshold_eur
+        ]
+
+        discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
+        discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
+
+        if discharge_blocks:
+            self.logger.info("")
+            self.logger.info(
+                f"⚡ DISCHARGE SCHEDULE ({len(discharge_blocks)} blocks total, "
+                f"threshold: {discharge_threshold_czk:.2f} CZK/kWh)"
+            )
+
+            if discharge_today:
+                # Group consecutive blocks for cleaner display
+                groups = self._group_consecutive_blocks_datetime(discharge_today)
+                self.logger.info(
+                    f"   Today: {len(discharge_today)} blocks in "
+                    f"{len(groups)} period(s)"
+                )
+                for group in groups:
+                    start = group[0][0]
+                    end = group[-1][1]
+                    avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                    self.logger.info(
+                        f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
+                        f"{avg_price:.3f} CZK/kWh avg"
+                    )
+
+            if discharge_tomorrow:
+                groups = self._group_consecutive_blocks_datetime(discharge_tomorrow)
+                self.logger.info(
+                    f"   Tomorrow: {len(discharge_tomorrow)} blocks in {len(groups)} period(s)"
+                )
+                for group in groups:
+                    start = group[0][0]
+                    end = group[-1][1]
+                    avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                    self.logger.info(
+                        f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
+                        f"{avg_price:.3f} CZK/kWh avg"
+                    )
+
+        # === STEP 3: Calculate pre-discharge charging ===
+        pre_discharge_blocks: List[Tuple[datetime, datetime, float]] = []
+
+        if discharge_blocks:
+            # Group discharge blocks into consecutive periods
+            discharge_groups = self._group_consecutive_blocks_datetime(discharge_blocks)
+
+            # Merge close groups (within 60 min) to treat as single discharge event
+            merged_groups: List[List[Tuple[datetime, datetime, float]]] = []
+            if discharge_groups:
+                current_merged = discharge_groups[0].copy()
+                for next_group in discharge_groups[1:]:
+                    gap = (next_group[0][0] - current_merged[-1][1]).total_seconds() / 60
+                    if gap <= 60:  # Within 60 minutes
+                        current_merged.extend(next_group)
+                    else:
+                        merged_groups.append(current_merged)
+                        current_merged = next_group.copy()
+                merged_groups.append(current_merged)
+
+            # For each discharge period, find cheapest blocks before it
+            max_pre_charge = getattr(self.config, 'pre_discharge_charge_blocks', 8)
+
+            for group in merged_groups:
+                discharge_start = group[0][0]
+                discharge_duration = len(group)
+
+                # Scale pre-charge blocks: 1:1 ratio with discharge, max 8
+                scaled_blocks = min(max_pre_charge, discharge_duration)
+
+                # Find all blocks that end before discharge starts
+                blocks_before = [
+                    (s, e, p) for s, e, p in window
+                    if e <= discharge_start
+                ]
+
+                # Sort by price and take cheapest
+                blocks_before_sorted = sorted(blocks_before, key=lambda x: x[2])
+                pre_charge = blocks_before_sorted[:scaled_blocks]
+
+                pre_discharge_blocks.extend(pre_charge)
+
+            # Remove duplicates (block might be selected for multiple discharge periods)
+            unique_pre = list(
+                {(s, e): (s, e, p) for s, e, p in pre_discharge_blocks}.values()
+            )
+            pre_discharge_blocks = sorted(unique_pre, key=lambda x: x[0])
+
+            # Separate into today vs tomorrow
+            pre_discharge_today = [
+                (s, e, p) for s, e, p in pre_discharge_blocks if s.date() == today
+            ]
+            pre_discharge_tomorrow = [
+                (s, e, p) for s, e, p in pre_discharge_blocks if s.date() > today
+            ]
+
+            if pre_discharge_blocks:
+                self.logger.info("")
+                self.logger.info(
+                    f"🔌 PRE-DISCHARGE CHARGING ({len(pre_discharge_blocks)} blocks total)"
+                )
+
+                if pre_discharge_today:
+                    self.logger.info(f"   Today: {len(pre_discharge_today)} blocks")
+                    for start_dt, end_dt, price in pre_discharge_today:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
+
+                if pre_discharge_tomorrow:
+                    self.logger.info(f"   Tomorrow: {len(pre_discharge_tomorrow)} blocks")
+                    for start_dt, end_dt, price in pre_discharge_tomorrow:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
+        else:
+            pre_discharge_today = []
+            pre_discharge_tomorrow = []
+
+        self.logger.info("=" * 70)
+
+        # === STEP 4: Update storage attributes ===
+
+        # Today's schedules (apply immediately)
+        self._cheapest_charging_blocks_today = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in charging_today
+        }
+        self._pre_discharge_blocks_today = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in pre_discharge_today
+        }
+        self._discharge_periods_today = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in discharge_today
+        }
+
+        # Tomorrow's schedules (queue for midnight)
+        self._cheapest_charging_blocks_tomorrow = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in charging_tomorrow
+        }
+        self._pre_discharge_blocks_tomorrow = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in pre_discharge_tomorrow
+        }
+        self._discharge_periods_tomorrow = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in discharge_tomorrow
+        }
+
+        # Store queued schedules for midnight application
+        self._queued_tomorrow_charging = charging_tomorrow
+        self._queued_tomorrow_pre_discharge = pre_discharge_tomorrow
+        self._queued_tomorrow_discharge = discharge_tomorrow
+
+        # Update backward-compatible combined sets (for existing decision logic)
+        self._cheapest_charging_blocks = self._cheapest_charging_blocks_today.copy()
+        self._pre_discharge_blocks = self._pre_discharge_blocks_today.copy()
+        self._combined_charging_blocks = (
+            self._cheapest_charging_blocks_today | self._pre_discharge_blocks_today
+        )
+
+        self.logger.info(
+            f"✅ Cross-day schedule updated: "
+            f"{len(self._combined_charging_blocks)} charging blocks active today"
+        )
 
     def _calculate_discharge_periods(
         self,
@@ -1475,6 +1809,15 @@ class GrowattController(BaseModule):
         await self._evaluate_conditions("price_update")
 
     async def _analyze_tomorrow_vs_today(self) -> None:
+        """DEPRECATED: Replaced by cross-day optimal scheduling.
+
+        The new `_calculate_cross_day_optimal_schedule()` method handles this
+        automatically by finding globally optimal blocks across the entire window.
+        """
+        # No-op: Cross-day scheduling handles this automatically
+        return
+
+        # OLD CODE BELOW (kept for reference, not executed)
         """Compare tomorrow's prices vs today's remaining hours.
 
         If tomorrow is significantly cheaper (based on defer_to_tomorrow_threshold),
@@ -1570,6 +1913,15 @@ class GrowattController(BaseModule):
             self.logger.info("=" * 50)
 
     async def _display_next_day_prices(self) -> None:
+        """DEPRECATED: Replaced by cross-day optimal scheduling.
+
+        The new `_calculate_cross_day_optimal_schedule()` method displays
+        comprehensive cross-day schedule including tomorrow's blocks.
+        """
+        # No-op: Cross-day scheduling displays this automatically
+        return
+
+        # OLD CODE BELOW (kept for reference, not executed)
         """Display next-day price table and charging schedule."""
         if not self._next_day_prices or not self._next_day_prices_date:
             return
@@ -1648,17 +2000,16 @@ class GrowattController(BaseModule):
                 self._next_day_prices_date = tomorrow_date
                 self._next_day_prices_fetched = True
 
-                # Simple confirmation log (no verbose table)
                 self.logger.info(
-                    f"✅ Successfully fetched and stored {len(prices)} price blocks "
-                    f"for {tomorrow_date}"
+                    f"✅ Successfully fetched {len(prices)} price blocks for {tomorrow_date}"
                 )
 
-                # NEW: Display next day's price table
-                await self._display_next_day_prices()
+                # NEW: Recalculate cross-day optimal schedule with tomorrow's data
+                # This will find globally optimal blocks across remaining today + full tomorrow
+                await self._calculate_cross_day_optimal_schedule()
 
-                # NEW: Analyze and compare with today's remaining hours
-                await self._analyze_tomorrow_vs_today()
+                # Trigger re-evaluation with the updated schedule
+                await self._on_price_update()
             else:
                 # Empty dict means task was cancelled (e.g., midnight rollover)
                 self.logger.debug(
@@ -2183,87 +2534,78 @@ class GrowattController(BaseModule):
                                 pass
                             self._price_fetch_task = None
 
-                        # If we have next day's prices ready, activate them
+                        # NEW: Apply cross-day schedule transition at midnight
+                        # What was "tomorrow" is now "today"
+
+                        # Move next-day prices to current prices
                         if self._next_day_prices_fetched and self._next_day_prices:
-                            # Move next-day prices to current prices
                             self._current_prices = self._next_day_prices
                             self._prices_date = self._next_day_prices_date
                             self._prices_updated = now
 
-                            # Clear defer flag (now using tomorrow's prices, which are now "today")
-                            self._defer_charging_to_tomorrow = False
-                            self._tomorrow_cheaper_by = None
-
-                            # Recalculate cheapest blocks with the new prices
-                            charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-                            charging_schedule, avg_price = (
-                                self._price_analyzer.get_charging_schedule(
-                                    self._current_prices, num_blocks=charge_blocks
-                                )
-                            )
-                            self._cheapest_charging_blocks = set(
-                                (block[0], block[1]) for block in charging_schedule
-                            )
-
-                            # Calculate discharge and pre-discharge schedules
-                            rate = self._eur_czk_rate or 25.0
-                            discharge_periods = self._calculate_discharge_periods(
-                                self._current_prices, rate
-                            )
-
-                            # Calculate pre-discharge schedule
-                            pre_discharge_schedule: List[Tuple[str, str, float]] = []
-                            self._peak_to_precharge_map = {}
-                            if discharge_periods:
-                                pre_discharge_charge_blocks = getattr(
-                                    self.config, 'pre_discharge_charge_blocks', 8
-                                )
-
-                                pre_discharge_schedule, self._peak_to_precharge_map = (
-                                    self._price_analyzer.calculate_pre_discharge_schedule(
-                                        self._current_prices,
-                                        discharge_periods,
-                                        pre_discharge_charge_blocks
-                                    )
-                                )
-
-                                self._pre_discharge_blocks = set(
-                                    (block[0], block[1]) for block in pre_discharge_schedule
-                                )
-                            else:
-                                self._pre_discharge_blocks = set()
-
-                            # Combine regular and pre-discharge charging blocks
-                            self._combined_charging_blocks = (
-                                self._cheapest_charging_blocks | self._pre_discharge_blocks
-                            )
-
                             self.logger.info(
-                                f"✅ Activated prices for {self._prices_date} "
+                                f"✅ Activated next-day prices for {self._prices_date} "
                                 f"({len(self._current_prices)} blocks)"
                             )
 
-                            # Display comprehensive price analysis for the new day
-                            if self._prices_date:  # Type guard for mypy
-                                self.logger.info(
-                                    f"🕛 Energy prices for TODAY ({self._prices_date}):"
-                                )
-                                await self._log_price_analysis(
-                                    self._current_prices,
-                                    self._prices_date,
-                                    charging_schedule,
-                                    charge_blocks,
-                                    pre_discharge_schedule,
-                                    self._peak_to_precharge_map
-                                )
-
-                            # Trigger re-evaluation with new prices
-                            await self._on_price_update()
-
-                            # Clear next-day price storage and reset flag
+                            # Clear next-day storage
                             self._next_day_prices = {}
                             self._next_day_prices_date = None
                             self._next_day_prices_fetched = False
+
+                            # NEW: Shift queued tomorrow schedules to today
+                            self.logger.info(
+                                "🔄 Applying queued tomorrow's schedule as today's schedule"
+                            )
+
+                            # What was "tomorrow" is now "today"
+                            self._cheapest_charging_blocks_today = (
+                                self._cheapest_charging_blocks_tomorrow.copy()
+                            )
+                            self._pre_discharge_blocks_today = (
+                                self._pre_discharge_blocks_tomorrow.copy()
+                            )
+                            self._discharge_periods_today = (
+                                self._discharge_periods_tomorrow.copy()
+                            )
+
+                            # Clear tomorrow's schedules
+                            self._cheapest_charging_blocks_tomorrow = set()
+                            self._pre_discharge_blocks_tomorrow = set()
+                            self._discharge_periods_tomorrow = set()
+
+                            # Clear queues
+                            self._queued_tomorrow_charging = []
+                            self._queued_tomorrow_pre_discharge = []
+                            self._queued_tomorrow_discharge = []
+
+                            # Update backward-compatible sets
+                            self._cheapest_charging_blocks = (
+                                self._cheapest_charging_blocks_today.copy()
+                            )
+                            self._pre_discharge_blocks = (
+                                self._pre_discharge_blocks_today.copy()
+                            )
+                            self._combined_charging_blocks = (
+                                self._cheapest_charging_blocks_today
+                                | self._pre_discharge_blocks_today
+                            )
+
+                            # Clear old defer flag (replaced by cross-day logic)
+                            self._defer_charging_to_tomorrow = False
+                            self._tomorrow_cheaper_by = None
+
+                            self.logger.info(
+                                f"✅ Schedule shift complete: "
+                                f"{len(self._combined_charging_blocks)} charging blocks "
+                                f"active today"
+                            )
+
+                            # Trigger re-evaluation with shifted schedule
+                            # Note: We don't recalculate here because we don't have new
+                            # tomorrow prices yet. The background fetch will recalculate
+                            # when new tomorrow data arrives.
+                            await self._on_price_update()
 
                             # Start background fetch for NEW next day's prices (non-blocking)
                             # This task will retry indefinitely with smart time-based backoff
