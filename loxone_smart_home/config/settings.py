@@ -227,8 +227,8 @@ class GrowattConfig(BaseSettings):
         description="Timeout for waiting for command results in seconds"
     )
     clock_drift_buffer_minutes: int = Field(
-        default=2, ge=1, le=10,
-        description="Buffer minutes for clock drift compensation in immediate activation"
+        default=0, ge=0, le=10,
+        description="Base buffer for clock drift (1 min minimum added for MQTT)"
     )
 
     # MQTT topics for Growatt control
