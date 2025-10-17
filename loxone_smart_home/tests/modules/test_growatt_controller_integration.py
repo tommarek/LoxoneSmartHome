@@ -95,7 +95,7 @@ async def test_decision_engine_integration_cheap_hour_charging(
         ("03:00", "03:15"), ("03:15", "03:30"),
         ("03:30", "03:45"), ("03:45", "04:00")
     }
-    # Set combined blocks (no pre-discharge in this test)
+    # Also set combined blocks (used in context building)
     growatt_controller._combined_charging_blocks = growatt_controller._cheapest_charging_blocks.copy()
 
     # Mock season and sun calculation

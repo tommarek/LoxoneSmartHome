@@ -272,6 +272,13 @@ class GrowattConfig(BaseSettings):
         default=20, ge=1, le=50,
         description="Maximum retry attempts for price fetching before giving up"
     )
+    defer_to_tomorrow_threshold: float = Field(
+        default=15.0, ge=0.0, le=100.0,
+        description=(
+            "Percentage threshold for deferring charging to tomorrow "
+            "(e.g., 15.0 = defer if tomorrow is 15%+ cheaper)"
+        )
+    )
 
     # Retry settings (generic, kept for backward compatibility)
     max_retries: int = Field(default=3, ge=1)
