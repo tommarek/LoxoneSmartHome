@@ -12,6 +12,7 @@ import sys
 from typing import Any, List, Optional
 
 import colorlog
+import uvicorn
 from aiohttp import web
 from dotenv import load_dotenv
 
@@ -25,6 +26,7 @@ from modules.growatt.api import create_growatt_api
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
+from web.app import WebService
 
 
 class LoxoneSmartHome:
@@ -47,7 +49,11 @@ class LoxoneSmartHome:
         self.growatt_controller: Optional[GrowattController] = None
         self.ote_collector: Optional[OTEPriceCollector] = None
 
-        # API server
+        # Web Service (new monitoring dashboard)
+        self.web_service: Optional[WebService] = None
+        self.web_service_task: Optional[asyncio.Task[None]] = None
+
+        # API server (legacy, will be replaced by web service)
         self.api_app: Optional[web.Application] = None
         self.api_runner: Optional[web.AppRunner] = None
         self.api_site: Optional[web.TCPSite] = None
@@ -107,6 +113,15 @@ class LoxoneSmartHome:
             self.ote_collector = OTEPriceCollector(self.influxdb_client, self.settings)
             logger.info("OTE Price Collector module initialized")
 
+        # Initialize Web Service if enabled
+        if self.settings.web_service.enabled:
+            self.web_service = WebService(
+                mqtt_client=self.mqtt_client,
+                influxdb_client=self.influxdb_client,
+                settings=self.settings
+            )
+            logger.info("Web Service initialized")
+
         # NOW connect shared clients (after modules have pre-registered subscriptions)
         await self.mqtt_client.connect()
         logger.info("MQTT client connected")
@@ -138,6 +153,35 @@ class LoxoneSmartHome:
         except Exception as e:
             logger.error(f"Failed to start API server: {e}")
 
+    async def start_web_service(self) -> None:
+        """Start the FastAPI web monitoring service."""
+        logger = logging.getLogger(__name__)
+
+        if not self.web_service:
+            logger.warning("Web service not initialized, falling back to legacy API")
+            await self.start_api_server()
+            return
+
+        try:
+            # Start the web service background tasks
+            await self.web_service.start()
+
+            # Import the FastAPI app
+            from web.app import app, web_service
+
+            # Set the global web service instance
+            web_service = self.web_service
+
+            # Note: The FastAPI app will be served by uvicorn, which is handled separately
+            # The actual serving happens in a subprocess or via uvicorn command
+            logger.info(f"Web service initialized and ready on port {self.settings.web_service.port}")
+            logger.info("To access the dashboard, open: http://localhost:8080")
+
+        except Exception as e:
+            logger.error(f"Failed to start web service: {e}")
+            # Fallback to legacy API
+            await self.start_api_server()
+
     async def stop_api_server(self) -> None:
         """Stop the API server."""
         if self.api_site:
@@ -146,6 +190,11 @@ class LoxoneSmartHome:
             await self.api_runner.cleanup()
         if self.api_app:
             await self.api_app.cleanup()
+
+    async def stop_web_service(self) -> None:
+        """Stop the web service."""
+        if self.web_service:
+            await self.web_service.stop()
 
     async def start_modules(self) -> None:
         """Start all enabled modules."""
@@ -181,10 +230,14 @@ class LoxoneSmartHome:
             self.modules.append(task)
             logger.info("OTE Price Collector started")
 
-        # Start API server if Growatt controller is enabled
-        if self.growatt_controller and self.settings.growatt_controller_enabled:
+        # Start Web Service (replaces old API server)
+        if self.settings.web_service.enabled:
+            await self.start_web_service()
+            logger.info(f"Web monitoring service started on port {self.settings.web_service.port}")
+        elif self.growatt_controller and self.settings.growatt_controller_enabled:
+            # Fallback to legacy API if web service is disabled
             await self.start_api_server()
-            logger.info("API server started on port 8080")
+            logger.info("Legacy API server started on port 8080")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""
@@ -198,8 +251,11 @@ class LoxoneSmartHome:
         if self.modules:
             await asyncio.gather(*self.modules, return_exceptions=True)
 
-        # Stop API server
-        await self.stop_api_server()
+        # Stop Web Service or API server
+        if self.web_service:
+            await self.stop_web_service()
+        else:
+            await self.stop_api_server()
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()
