@@ -25,10 +25,9 @@ async def get_current_price(request: Request) -> Dict[str, Any]:
 
         # Query current price from InfluxDB
         query = f'''
-        from(bucket: "electricity_prices")
+        from(bucket: "ote_prices")
           |> range(start: -1h)
-          |> filter(fn: (r) => r["_measurement"] == "dam_prices")
-          |> filter(fn: (r) => r["hour"] == {current_hour} and r["minute"] == {current_minute})
+          |> filter(fn: (r) => r["_measurement"] == "electricity_price")
           |> last()
         '''
 
@@ -60,9 +59,9 @@ async def get_price_forecast(
     end_time = now + timedelta(hours=hours)
 
     query = f'''
-    from(bucket: "electricity_prices")
+    from(bucket: "ote_prices")
       |> range(start: {now.isoformat()}, stop: {end_time.isoformat()})
-      |> filter(fn: (r) => r["_measurement"] == "dam_prices")
+      |> filter(fn: (r) => r["_measurement"] == "electricity_price")
       |> sort(columns: ["_time"])
     '''
 
