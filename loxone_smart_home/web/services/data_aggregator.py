@@ -62,9 +62,9 @@ class DataAggregator:
 
                 # Query recent data
                 query = f'''
-                from(bucket: "solar")
-                  |> range(start: {prev_block.isoformat()}, stop: {current_block.isoformat()})
-                  |> filter(fn: (r) => r["_measurement"] == "power_flow")
+                from(bucket: "loxone")
+                  |> range(start: {prev_block.isoformat()}Z, stop: {current_block.isoformat()}Z)
+                  |> filter(fn: (r) => r["_measurement"] == "power" or r["_measurement"] == "temperature")
                   |> aggregateWindow(every: 15m, fn: mean)
                 '''
 
@@ -100,10 +100,10 @@ class DataAggregator:
 
                 # Query hourly data
                 query = f'''
-                from(bucket: "solar")
-                  |> range(start: {prev_hour.isoformat()}, stop: {current_hour.isoformat()})
-                  |> filter(fn: (r) => r["_measurement"] == "energy")
-                  |> aggregateWindow(every: 1h, fn: sum)
+                from(bucket: "loxone")
+                  |> range(start: {prev_hour.isoformat()}Z, stop: {current_hour.isoformat()}Z)
+                  |> filter(fn: (r) => r["_measurement"] == "power" or r["_measurement"] == "temperature")
+                  |> aggregateWindow(every: 1h, fn: mean)
                 '''
 
                 result = await self.influxdb_client.query(query)
@@ -138,11 +138,10 @@ class DataAggregator:
 
                 # Query daily totals
                 query = f'''
-                from(bucket: "solar")
-                  |> range(start: {yesterday.isoformat()}T00:00:00Z,
-                           stop: {today.isoformat()}T00:00:00Z)
-                  |> filter(fn: (r) => r["_measurement"] == "energy")
-                  |> aggregateWindow(every: 1d, fn: sum)
+                from(bucket: "loxone")
+                  |> range(start: {yesterday.isoformat()}T00:00:00Z, stop: {today.isoformat()}T00:00:00Z)
+                  |> filter(fn: (r) => r["_measurement"] == "power" or r["_measurement"] == "temperature")
+                  |> aggregateWindow(every: 1d, fn: mean)
                 '''
 
                 result = await self.influxdb_client.query(query)
