@@ -116,16 +116,12 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     settings = Settings(influxdb_token=influxdb_token)
 
-    # Initialize clients (shared with main application if running together)
-    mqtt_client = AsyncMQTTClient(settings)
+    # Initialize clients
+    # Web service doesn't actually need MQTT - it reads from InfluxDB
+    mqtt_client = None  # No MQTT needed for web service
     influxdb_client = AsyncInfluxDBClient(settings)
 
-    # Start clients - CRITICAL: InfluxDB client must be started to initialize connection pool
-    try:
-        await mqtt_client.connect()
-        logger.info("MQTT client connected for web service")
-    except Exception as e:
-        logger.warning(f"Failed to connect MQTT client: {e}")
+    # Start InfluxDB client - CRITICAL: Must be started to initialize connection pool
 
     await influxdb_client.start()
     logger.info("InfluxDB client started with connection pool")
@@ -145,13 +141,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if web_service:
         await web_service.stop()
 
-    # Clean up clients properly
-    try:
-        await mqtt_client.disconnect()
-        logger.info("MQTT client disconnected")
-    except Exception as e:
-        logger.warning(f"Error disconnecting MQTT: {e}")
-
+    # Clean up InfluxDB client
     await influxdb_client.stop()
     logger.info("InfluxDB client stopped")
 
