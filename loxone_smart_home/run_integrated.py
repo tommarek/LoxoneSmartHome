@@ -42,10 +42,11 @@ def run_web_service():
 
 def run_main_application():
     """Run the main application."""
+    import asyncio
     from main import main
 
-    # Run the main application
-    main()
+    # Run the main application using asyncio
+    asyncio.run(main())
 
 
 def main():
