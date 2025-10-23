@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loxone Smart Home Monitor</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <h1>🏠 Loxone Smart Home Monitor</h1>
+            <div class="header-status">
+                <span id="connection-status" class="status-badge">
+                    <span class="status-dot"></span>
+                    <span class="status-text">Connecting...</span>
+                </span>
+                <span id="current-time" class="time"></span>
+            </div>
+        </header>
+
+        <!-- Main Dashboard -->
+        <div class="dashboard">
+            <!-- Energy Flow Section -->
+            <section class="card energy-flow">
+                <h2>⚡ Energy Flow</h2>
+                <div class="power-flow-container">
+                    <div class="flow-grid">
+                        <div class="flow-item solar">
+                            <div class="flow-icon">☀️</div>
+                            <div class="flow-label">Solar</div>
+                            <div class="flow-value" id="solar-power">-- W</div>
+                        </div>
+                        <div class="flow-item grid">
+                            <div class="flow-icon">⚡</div>
+                            <div class="flow-label">Grid</div>
+                            <div class="flow-value" id="grid-power">-- W</div>
+                        </div>
+                        <div class="flow-item home">
+                            <div class="flow-icon">🏠</div>
+                            <div class="flow-label">Home</div>
+                            <div class="flow-value" id="home-power">-- W</div>
+                        </div>
+                        <div class="flow-item battery">
+                            <div class="flow-icon">🔋</div>
+                            <div class="flow-label">Battery</div>
+                            <div class="flow-value" id="battery-power">-- W</div>
+                            <div class="battery-soc">
+                                <div class="soc-bar">
+                                    <div class="soc-fill" id="battery-soc-fill"></div>
+                                </div>
+                                <span class="soc-text" id="battery-soc">--%</span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Price and Weather Row -->
+            <div class="info-row">
+                <!-- Current Price -->
+                <section class="card price-info">
+                    <h3>💰 Electricity Price</h3>
+                    <div class="price-current">
+                        <div class="price-value" id="current-price">-- CZK/kWh</div>
+                        <div class="price-level" id="price-level">--</div>
+                    </div>
+                    <div class="price-next">
+                        <span>Next change:</span>
+                        <span id="next-price-time">--:--</span>
+                        <span id="next-price-value">-- CZK/kWh</span>
+                    </div>
+                </section>
+
+                <!-- Weather Info -->
+                <section class="card weather-info">
+                    <h3>🌤️ Weather</h3>
+                    <div class="weather-current">
+                        <div class="weather-temp" id="temperature">--°C</div>
+                        <div class="weather-desc" id="weather-desc">--</div>
+                    </div>
+                    <div class="weather-details">
+                        <span>Cloud: <span id="cloud-cover">--%</span></span>
+                        <span>UV: <span id="uv-index">--</span></span>
+                    </div>
+                </section>
+
+                <!-- System Status -->
+                <section class="card system-status">
+                    <h3>📊 System Status</h3>
+                    <div class="status-grid">
+                        <div class="status-item">
+                            <span class="status-label">Mode:</span>
+                            <span class="status-value" id="system-mode">--</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Efficiency:</span>
+                            <span class="status-value" id="efficiency">--%</span>
+                        </div>
+                        <div class="status-item">
+                            <span class="status-label">Self-Suff:</span>
+                            <span class="status-value" id="self-sufficiency">--%</span>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Charts Row -->
+            <div class="charts-row">
+                <!-- Production Chart -->
+                <section class="card chart-card">
+                    <h3>📈 Energy Production (24h)</h3>
+                    <canvas id="production-chart"></canvas>
+                </section>
+
+                <!-- Price Chart -->
+                <section class="card chart-card">
+                    <h3>📊 Price Forecast (48h)</h3>
+                    <canvas id="price-chart"></canvas>
+                </section>
+            </div>
+
+            <!-- Schedule Section -->
+            <section class="card schedule-section">
+                <h3>📅 Optimal Schedule</h3>
+                <div class="schedule-container">
+                    <div class="schedule-column">
+                        <h4>🔋 Charging Blocks</h4>
+                        <ul id="charging-schedule" class="schedule-list"></ul>
+                    </div>
+                    <div class="schedule-column">
+                        <h4>⚡ Discharge Blocks</h4>
+                        <ul id="discharge-schedule" class="schedule-list"></ul>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Statistics Section -->
+            <section class="card statistics">
+                <h3>📊 Daily Statistics</h3>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <div class="stat-label">Production</div>
+                        <div class="stat-value" id="stat-production">-- kWh</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Consumption</div>
+                        <div class="stat-value" id="stat-consumption">-- kWh</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Grid Import</div>
+                        <div class="stat-value" id="stat-import">-- kWh</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Grid Export</div>
+                        <div class="stat-value" id="stat-export">-- kWh</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">Savings</div>
+                        <div class="stat-value" id="stat-savings">-- CZK</div>
+                    </div>
+                    <div class="stat-item">
+                        <div class="stat-label">CO₂ Avoided</div>
+                        <div class="stat-value" id="stat-co2">-- kg</div>
+                    </div>
+                </div>
+            </section>
+        </div>
+    </div>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+</html>

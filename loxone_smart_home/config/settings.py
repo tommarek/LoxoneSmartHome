@@ -255,6 +255,12 @@ class GrowattConfig(BaseSettings):
     # Simulation mode
     simulation_mode: bool = False
 
+    # Logging configuration
+    log_level: str = Field(
+        default="DETAIL",
+        description="Logging level for Growatt controller (SUMMARY, DETAIL, VERBOSE, DEBUG)"
+    )
+
     # Price fetching settings
     price_fetch_hour: int = Field(
         default=14, ge=0, le=23,
@@ -291,6 +297,25 @@ class GrowattConfig(BaseSettings):
         if "min_soc" in info.data and v <= info.data["min_soc"]:
             raise ValueError("max_soc must be greater than min_soc")
         return v
+
+
+class WebServiceConfig(BaseSettings):
+    """Configuration for the web monitoring service."""
+
+    enabled: bool = Field(default=False, description="Enable web service")
+    host: str = Field(default="0.0.0.0", description="Host to bind to")
+    port: int = Field(default=8080, ge=1, le=65535, description="Port to listen on")
+    cors_origins: List[str] = Field(
+        default=["http://localhost:3000"],
+        description="Allowed CORS origins for web service"
+    )
+    enable_auth: bool = Field(default=False, description="Enable API key authentication")
+    api_key: Optional[str] = Field(default=None, description="API key for authentication")
+
+    model_config = SettingsConfigDict(
+        env_prefix="WEB_SERVICE_",
+        env_nested_delimiter="__"
+    )
 
 
 class Settings(BaseSettings):
@@ -424,3 +449,9 @@ class Settings(BaseSettings):
             first_check_hour=self.ote_first_check_hour or 14,
             max_check_hour=self.ote_max_check_hour or 18,
         )
+
+    @property
+    def web_service(self) -> WebServiceConfig:
+        """Get web service configuration."""
+        # WebServiceConfig will load from WEB_SERVICE_* environment variables automatically
+        return WebServiceConfig()

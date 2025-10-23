@@ -14,7 +14,7 @@ from astral import LocationInfo
 from astral.sun import sun
 
 from config.settings import Settings
-from modules.base import BaseModule
+from .base import BaseModule
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 
@@ -24,6 +24,7 @@ from .growatt.models import (
     EOD_HHMM, EOD_HHMMSS,
     is_24
 )
+from .growatt.types import GrowattLogLevel
 from .growatt.price_analyzer import PriceAnalyzer
 from .growatt.mode_manager import ModeManager
 from .growatt.decision_engine import (
@@ -233,6 +234,15 @@ class GrowattController(BaseModule):
         # Command queue for managing multiple concurrent commands
         self._command_queue = CommandQueue(self.logger)
 
+        # Initialize log level from config
+        try:
+            self._log_level = GrowattLogLevel[self.config.log_level.upper()]
+        except KeyError:
+            self._log_level = GrowattLogLevel.DETAIL
+            self.logger.warning(
+                f"Invalid Growatt log level '{self.config.log_level}', using DETAIL"
+            )
+
         # Pre-register MQTT subscriptions before connection
         # This ensures subscriptions are active before the message loop starts
         if self.mqtt_client:
@@ -243,6 +253,125 @@ class GrowattController(BaseModule):
             self.logger.info(
                 f"Pre-registered subscription for home status: {self._home_status_topic}"
             )
+
+    def _should_log(self, level: GrowattLogLevel) -> bool:
+        """Check if we should log at given level."""
+        return self._log_level >= level
+
+    def _format_price_summary(
+        self,
+        blocks: List[Tuple[datetime, datetime, float]],
+        eur_czk_rate: float
+    ) -> str:
+        """Format a compact price summary for DETAIL level logging."""
+        if not blocks:
+            return "No blocks"
+
+        prices_czk = [p * eur_czk_rate / 1000 for _, _, p in blocks]
+        min_price = min(prices_czk)
+        max_price = max(prices_czk)
+        avg_price = sum(prices_czk) / len(prices_czk)
+
+        # Group consecutive blocks for compact display
+        groups = self._group_consecutive_blocks_datetime(blocks)
+
+        if len(groups) == 1:
+            group = groups[0]
+            start = group[0][0]
+            end = group[-1][1]
+            return (
+                f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
+                f"({len(blocks)} blocks, avg {avg_price:.2f} CZK/kWh)"
+            )
+        else:
+            return (
+                f"{len(blocks)} blocks in {len(groups)} periods, "
+                f"avg {avg_price:.2f} CZK/kWh (min {min_price:.2f}, max {max_price:.2f})"
+            )
+
+    def _log_compact_schedule(
+        self,
+        charging_today: List[Tuple[datetime, datetime, float]],
+        charging_tomorrow: List[Tuple[datetime, datetime, float]],
+        discharge_today: List[Tuple[datetime, datetime, float]],
+        discharge_tomorrow: List[Tuple[datetime, datetime, float]],
+        eur_czk_rate: float
+    ) -> None:
+        """Log compact schedule summary for DETAIL level."""
+        self.logger.info("📊 Schedule Summary:")
+
+        if charging_today:
+            summary = self._format_price_summary(charging_today, eur_czk_rate)
+            self.logger.info(f"  🔋 Charging today: {summary}")
+
+        if charging_tomorrow:
+            summary = self._format_price_summary(charging_tomorrow, eur_czk_rate)
+            self.logger.info(f"  🔋 Charging tomorrow: {summary}")
+
+        if discharge_today:
+            summary = self._format_price_summary(discharge_today, eur_czk_rate)
+            self.logger.info(f"  ⚡ Discharge today: {summary}")
+
+        if discharge_tomorrow:
+            summary = self._format_price_summary(discharge_tomorrow, eur_czk_rate)
+            self.logger.info(f"  ⚡ Discharge tomorrow: {summary}")
+
+    async def _log_periodic_summary(self) -> None:
+        """Log a periodic summary of the current state and statistics.
+
+        This method provides a compact overview of the system state,
+        useful for monitoring without flooding the logs.
+        """
+        if not self._should_log(GrowattLogLevel.SUMMARY):
+            return
+
+        now = self._get_local_now()
+        current_hour = now.hour
+        current_minute = now.minute // 15 * 15  # Round to 15-minute block
+
+        # Build summary parts
+        summary_parts = []
+
+        # Current mode
+        if self._current_mode:
+            summary_parts.append(f"Mode: {self._current_mode}")
+
+        # Battery status
+        summary_parts.append(f"Battery: {self._battery_soc:.0f}%")
+
+        # Current price
+        time_str = f"{current_hour:02d}:{current_minute:02d}"
+        end_minute = (current_minute + 15) % 60
+        end_hour = current_hour if end_minute > current_minute else (current_hour + 1) % 24
+        end_str = f"{end_hour:02d}:{end_minute:02d}"
+        block_key = (time_str, end_str)
+
+        if block_key in self._current_prices:
+            price_eur = self._current_prices[block_key]
+            price_czk = price_eur * (self._eur_czk_rate or 25.0) / 1000
+            summary_parts.append(f"Price: {price_czk:.2f} CZK/kWh")
+
+        # Command statistics
+        if self._commands_sent_count > 0 or self._commands_skipped_count > 0:
+            summary_parts.append(
+                f"Commands: {self._commands_sent_count} sent, "
+                f"{self._commands_skipped_count} skipped"
+            )
+
+        # High load status
+        if self._high_loads_active:
+            summary_parts.append("⚡ HIGH LOAD ACTIVE")
+
+        # Manual override status
+        if self._manual_override_period:
+            override_info = f"Override: {self._manual_override_period.kind}"
+            if self._manual_override_end_time:
+                remaining = (self._manual_override_end_time - now).total_seconds() / 60
+                override_info += f" ({remaining:.0f}min remaining)"
+            summary_parts.append(override_info)
+
+        # Log the summary
+        self.logger.info(f"📈 Status: {' | '.join(summary_parts)}")
 
     async def _result_handler(self, _topic: str, payload: Any) -> None:
         """Persistent handler for energy/solar/result MQTT messages.
@@ -689,6 +818,22 @@ class GrowattController(BaseModule):
         if not window:
             return
 
+        # Only show full table at VERBOSE level
+        if not self._should_log(GrowattLogLevel.VERBOSE):
+            # At DETAIL level, just show a summary
+            if self._should_log(GrowattLogLevel.DETAIL):
+                all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
+                min_price = min(all_prices_czk)
+                max_price = max(all_prices_czk)
+                avg_price = sum(all_prices_czk) / len(all_prices_czk)
+
+                self.logger.info(
+                    f"📊 Price summary ({len(window)} blocks): "
+                    f"Min={min_price:.2f} CZK/kWh, Max={max_price:.2f} CZK/kWh, "
+                    f"Avg={avg_price:.2f} CZK/kWh"
+                )
+            return
+
         now = self._get_local_now()
         today = now.date()
 
@@ -810,7 +955,7 @@ class GrowattController(BaseModule):
                     if next_minute < 60:
                         end_str = f"{hour:02d}:{next_minute:02d}"
                     else:
-                        end_str = f"{hour+1:02d}:00"
+                        end_str = f"{hour + 1:02d}:00"
 
                     # Find matching block
                     block_key = (start_str, end_str)
@@ -1611,39 +1756,64 @@ class GrowattController(BaseModule):
         charging_tomorrow = [(s, e, p) for s, e, p in cheapest_sorted if s.date() > today]
 
         if not suppress_print:
-            self.logger.info("=" * 70)
-            self.logger.info("🎯 CROSS-DAY OPTIMAL SCHEDULE (using entire available price window)")
-            self.logger.info("=" * 70)
-            self.logger.info(
-                f"Price window: {len(window)} blocks across "
-                f"{(window[-1][1] - now).total_seconds() / 3600:.1f} hours"
-            )
-            self.logger.info(
-                f"Optimal charging: {len(cheapest_blocks)} cheapest blocks "
-                f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
-            )
+            # Always show basic info at SUMMARY level or higher
+            if self._should_log(GrowattLogLevel.SUMMARY):
+                self.logger.info(
+                    f"🎯 Schedule: {len(cheapest_blocks)} charge blocks "
+                    f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
+                )
 
-            # Log charging blocks for today
-            if charging_today:
-                self.logger.info("")
-                self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
-                for start_dt, end_dt, price in charging_today:
-                    price_czk = price * rate / 1000
-                    self.logger.info(
-                        f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
-                        f"{price_czk:.3f} CZK/kWh"
-                    )
+            # Show compact summary at DETAIL level
+            if (self._should_log(GrowattLogLevel.DETAIL) and
+                    not self._should_log(GrowattLogLevel.VERBOSE)):
+                # Just show compact summaries
+                if charging_today or charging_tomorrow:
+                    self.logger.info("📊 Charging Schedule:")
+                    if charging_today:
+                        summary = self._format_price_summary(charging_today, rate)
+                        self.logger.info(f"  Today: {summary}")
+                    if charging_tomorrow:
+                        summary = self._format_price_summary(charging_tomorrow, rate)
+                        self.logger.info(f"  Tomorrow: {summary}")
 
-            # Log charging blocks for tomorrow
-            if charging_tomorrow:
-                self.logger.info("")
-                self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
-                for start_dt, end_dt, price in charging_tomorrow:
-                    price_czk = price * rate / 1000
-                    self.logger.info(
-                        f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
-                        f"{price_czk:.3f} CZK/kWh"
-                    )
+            # Show full details at VERBOSE level
+            if self._should_log(GrowattLogLevel.VERBOSE):
+                self.logger.info("=" * 70)
+                self.logger.info(
+                    "🎯 CROSS-DAY OPTIMAL SCHEDULE "
+                    "(using entire available price window)"
+                )
+                self.logger.info("=" * 70)
+                self.logger.info(
+                    f"Price window: {len(window)} blocks across "
+                    f"{(window[-1][1] - now).total_seconds() / 3600:.1f} hours"
+                )
+                self.logger.info(
+                    f"Optimal charging: {len(cheapest_blocks)} cheapest blocks "
+                    f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
+                )
+
+                # Log charging blocks for today
+                if charging_today:
+                    self.logger.info("")
+                    self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
+                    for start_dt, end_dt, price in charging_today:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
+
+                # Log charging blocks for tomorrow
+                if charging_tomorrow:
+                    self.logger.info("")
+                    self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
+                    for start_dt, end_dt, price in charging_tomorrow:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
 
         # === STEP 2: Find discharge periods across entire window ===
         discharge_threshold_czk = self.config.discharge_price_min
@@ -1659,33 +1829,52 @@ class GrowattController(BaseModule):
         discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
 
         if not suppress_print and discharge_blocks:
-            self.logger.info("")
-            self.logger.info(
-                f"⚡ DISCHARGE SCHEDULE ({len(discharge_blocks)} blocks total, "
-                f"threshold: {discharge_threshold_czk:.2f} CZK/kWh)"
-            )
-
-            if discharge_today:
-                # Group consecutive blocks for cleaner display
-                groups = self._group_consecutive_blocks_datetime(discharge_today)
+            # SUMMARY level - just count
+            if self._should_log(GrowattLogLevel.SUMMARY):
                 self.logger.info(
-                    f"   Today: {len(discharge_today)} blocks in "
-                    f"{len(groups)} period(s)"
+                    f"⚡ Discharge: {len(discharge_blocks)} blocks "
+                    f"({len(discharge_today)} today, {len(discharge_tomorrow)} tomorrow)"
                 )
-                for group in groups:
-                    start = group[0][0]
-                    end = group[-1][1]
-                    avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+
+            # DETAIL level - compact summary
+            if (self._should_log(GrowattLogLevel.DETAIL) and
+                    not self._should_log(GrowattLogLevel.VERBOSE)):
+                if discharge_today:
+                    summary = self._format_price_summary(discharge_today, rate)
+                    self.logger.info(f"  Discharge today: {summary}")
+                if discharge_tomorrow:
+                    summary = self._format_price_summary(discharge_tomorrow, rate)
+                    self.logger.info(f"  Discharge tomorrow: {summary}")
+
+            # VERBOSE level - full details
+            if self._should_log(GrowattLogLevel.VERBOSE):
+                self.logger.info("")
+                self.logger.info(
+                    f"⚡ DISCHARGE SCHEDULE ({len(discharge_blocks)} blocks total, "
+                    f"threshold: {discharge_threshold_czk:.2f} CZK/kWh)"
+                )
+
+                if discharge_today:
+                    # Group consecutive blocks for cleaner display
+                    groups = self._group_consecutive_blocks_datetime(discharge_today)
                     self.logger.info(
-                        f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
-                        f"{avg_price:.3f} CZK/kWh avg"
+                        f"   Today: {len(discharge_today)} blocks in "
+                        f"{len(groups)} period(s)"
                     )
+                    for group in groups:
+                        start = group[0][0]
+                        end = group[-1][1]
+                        avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                        self.logger.info(
+                            f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
+                            f"{avg_price:.3f} CZK/kWh avg"
+                        )
 
-            if discharge_tomorrow:
-                groups = self._group_consecutive_blocks_datetime(discharge_tomorrow)
-                self.logger.info(
-                    f"   Tomorrow: {len(discharge_tomorrow)} blocks in {len(groups)} period(s)"
-                )
+                if discharge_tomorrow:
+                    groups = self._group_consecutive_blocks_datetime(discharge_tomorrow)
+                    self.logger.info(
+                        f"   Tomorrow: {len(discharge_tomorrow)} blocks in {len(groups)} period(s)"
+                    )
                 for group in groups:
                     start = group[0][0]
                     end = group[-1][1]
@@ -2709,11 +2898,18 @@ class GrowattController(BaseModule):
         last_fetch_check = None
         last_pre_midnight_check = None
 
+        last_summary_hour = None  # Track last hour we logged summary
+
         while self._running:
             try:
                 await asyncio.sleep(60)  # Check every minute
 
                 now = self._get_local_now()
+
+                # Log periodic summary once per hour at SUMMARY level
+                if now.hour != last_summary_hour:
+                    last_summary_hour = now.hour
+                    await self._log_periodic_summary()
 
                 # Check if it's time to start fetching next day's prices
                 if now.hour == self.config.price_fetch_hour and now.minute == 0:
