@@ -2,10 +2,12 @@
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncGenerator, Dict, Optional
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -104,16 +106,29 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Manage application lifecycle."""
     global web_service
 
+    # Load environment variables
+    load_dotenv()
+
     # Startup
-    settings = Settings(influxdb_token="")
+    influxdb_token = os.getenv("INFLUXDB_TOKEN", "")
+    if not influxdb_token:
+        logger.warning("INFLUXDB_TOKEN not set in environment")
+
+    settings = Settings(influxdb_token=influxdb_token)
 
     # Initialize clients (shared with main application if running together)
     mqtt_client = AsyncMQTTClient(settings)
     influxdb_client = AsyncInfluxDBClient(settings)
 
-    # Start clients (they don't have start methods, they start on first use)
-    # await mqtt_client.start()
-    # await influxdb_client.start()
+    # Start clients - CRITICAL: InfluxDB client must be started to initialize connection pool
+    try:
+        await mqtt_client.connect()
+        logger.info("MQTT client connected for web service")
+    except Exception as e:
+        logger.warning(f"Failed to connect MQTT client: {e}")
+
+    await influxdb_client.start()
+    logger.info("InfluxDB client started with connection pool")
 
     # Initialize web service
     web_service = WebService(mqtt_client, influxdb_client, settings)
@@ -130,9 +145,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     if web_service:
         await web_service.stop()
 
-    # Clients don't have stop methods, they clean up on deletion
-    # await mqtt_client.stop()
-    # await influxdb_client.stop()
+    # Clean up clients properly
+    try:
+        await mqtt_client.disconnect()
+        logger.info("MQTT client disconnected")
+    except Exception as e:
+        logger.warning(f"Error disconnecting MQTT: {e}")
+
+    await influxdb_client.stop()
+    logger.info("InfluxDB client stopped")
 
 
 # Create FastAPI app
@@ -149,9 +170,13 @@ def configure_app() -> None:
 
     This is separated to allow initialization after Settings are available.
     """
+    # Load environment variables
+    load_dotenv()
+
     # Get settings for configuration
     try:
-        settings = Settings(influxdb_token="")
+        influxdb_token = os.getenv("INFLUXDB_TOKEN", "")
+        settings = Settings(influxdb_token=influxdb_token)
     except Exception:
         # If settings fail to load (e.g., in tests), use defaults
         from config.settings import WebServiceConfig
