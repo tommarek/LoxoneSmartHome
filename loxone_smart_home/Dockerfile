@@ -7,4 +7,5 @@ RUN pip install -r requirements.txt
 
 COPY . /app
 
-CMD ["python", "main.py"]
+# Use the integrated launcher that runs both main app and web service
+CMD ["python", "run_integrated.py"]
