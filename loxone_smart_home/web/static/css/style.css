@@ -294,7 +294,12 @@ body {
 }
 
 .chart-card {
-    min-height: 300px;
+    height: 400px;
+    position: relative;
+}
+
+.chart-card canvas {
+    max-height: 320px;
 }
 
 /* Schedule */

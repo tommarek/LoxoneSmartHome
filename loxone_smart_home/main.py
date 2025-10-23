@@ -26,7 +26,6 @@ from modules.growatt.api import create_growatt_api
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
-from web.app import WebService
 
 
 class LoxoneSmartHome:
@@ -49,8 +48,8 @@ class LoxoneSmartHome:
         self.growatt_controller: Optional[GrowattController] = None
         self.ote_collector: Optional[OTEPriceCollector] = None
 
-        # Web Service (new monitoring dashboard)
-        self.web_service: Optional[WebService] = None
+        # Web Service (new monitoring dashboard - runs in separate process)
+        self.web_service = None
         self.web_service_task: Optional[asyncio.Task[None]] = None
 
         # API server (legacy, will be replaced by web service)
@@ -113,14 +112,11 @@ class LoxoneSmartHome:
             self.ote_collector = OTEPriceCollector(self.influxdb_client, self.settings)
             logger.info("OTE Price Collector module initialized")
 
-        # Initialize Web Service if enabled
+        # Note: Web Service is run in a separate process by run_integrated.py
+        # We don't initialize it here to avoid duplicate connections
+        self.web_service = None
         if self.settings.web_service.enabled:
-            self.web_service = WebService(
-                mqtt_client=self.mqtt_client,
-                influxdb_client=self.influxdb_client,
-                settings=self.settings
-            )
-            logger.info("Web Service initialized")
+            logger.info("Web Service will be started in separate process")
 
         # NOW connect shared clients (after modules have pre-registered subscriptions)
         await self.mqtt_client.connect()
@@ -157,29 +153,13 @@ class LoxoneSmartHome:
         """Start the FastAPI web monitoring service."""
         logger = logging.getLogger(__name__)
 
-        if not self.web_service:
-            logger.warning("Web service not initialized, falling back to legacy API")
-            await self.start_api_server()
-            return
-
-        try:
-            # Start the web service background tasks
-            await self.web_service.start()
-
-            # Import the FastAPI app
-            from web.app import app, web_service
-
-            # Set the global web service instance
-            web_service = self.web_service
-
-            # Note: The FastAPI app will be served by uvicorn, which is handled separately
-            # The actual serving happens in a subprocess or via uvicorn command
-            logger.info(f"Web service initialized and ready on port {self.settings.web_service.port}")
-            logger.info("To access the dashboard, open: http://localhost:8080")
-
-        except Exception as e:
-            logger.error(f"Failed to start web service: {e}")
-            # Fallback to legacy API
+        # Web service is handled by run_integrated.py in a separate process
+        # No initialization needed here to avoid duplicate connections
+        if self.settings.web_service.enabled:
+            logger.info(f"Web monitoring service started on port {self.settings.web_service.port}")
+            logger.info(f"To access the dashboard, open: http://localhost:{self.settings.web_service.port}")
+        else:
+            logger.warning("Web service disabled, falling back to legacy API")
             await self.start_api_server()
 
     async def stop_api_server(self) -> None:
@@ -192,9 +172,9 @@ class LoxoneSmartHome:
             await self.api_app.cleanup()
 
     async def stop_web_service(self) -> None:
-        """Stop the web service."""
-        if self.web_service:
-            await self.web_service.stop()
+        """Stop the web service (handled by run_integrated.py)."""
+        # Web service is in separate process, nothing to stop here
+        pass
 
     async def start_modules(self) -> None:
         """Start all enabled modules."""
