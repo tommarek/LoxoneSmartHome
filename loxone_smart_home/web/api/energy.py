@@ -8,15 +8,14 @@ from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..models.responses import (
     BatteryStatusResponse,
-    EnergyFlowResponse,
-    EnergyHistoryResponse,
-    PowerStatsResponse
+    EnergyCurrentResponse,
+    EnergyHistoryResponse
 )
 
 router = APIRouter(prefix="/api/energy", tags=["energy"])
 
 
-@router.get("/current", response_model=EnergyFlowResponse)
+@router.get("/current", response_model=EnergyCurrentResponse)
 async def get_current_energy_flow(request: Request) -> Dict[str, Any]:
     """Get current energy flow data."""
     web_service = request.app.state.web_service
