@@ -105,7 +105,7 @@ class AsyncMQTTClient:
                     username=self.settings.mqtt.username,
                     password=self.settings.mqtt.password,
                     client_id=self.settings.mqtt.client_id,
-                    keepalive=30,  # Keep connection alive
+                    keepalive=60,  # Keep connection alive - increased from 30 to avoid conflicts
                 )
                 await self.client.connect()
                 self._connected = True
@@ -373,7 +373,7 @@ class AsyncMQTTClient:
         """Monitor connection health and reconnect if needed."""
         while self._running:
             try:
-                await asyncio.sleep(30)  # Check every 30 seconds
+                await asyncio.sleep(45)  # Check every 45 seconds (less than keepalive of 60s)
 
                 if not self._connected:
                     self.logger.info("Connection lost, attempting to reconnect...")
