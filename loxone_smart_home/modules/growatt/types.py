@@ -2,7 +2,29 @@
 
 from dataclasses import dataclass
 from datetime import time as dt_time
+from enum import Enum
 from typing import Any, Dict, Literal, Optional, Tuple
+
+
+class GrowattLogLevel(Enum):
+    """Logging levels for Growatt controller with progressive detail."""
+
+    SUMMARY = "SUMMARY"  # High-level state changes only
+    DETAIL = "DETAIL"    # Include price summaries and key decisions
+    VERBOSE = "VERBOSE"  # Full price tables and debug info (current behavior)
+    DEBUG = "DEBUG"      # All debug messages including raw data
+
+    def __ge__(self, other: "GrowattLogLevel") -> bool:
+        """Allow comparison of log levels."""
+        order = [GrowattLogLevel.SUMMARY, GrowattLogLevel.DETAIL,
+                 GrowattLogLevel.VERBOSE, GrowattLogLevel.DEBUG]
+        return order.index(self) >= order.index(other)
+
+    def __gt__(self, other: "GrowattLogLevel") -> bool:
+        """Allow comparison of log levels."""
+        order = [GrowattLogLevel.SUMMARY, GrowattLogLevel.DETAIL,
+                 GrowattLogLevel.VERBOSE, GrowattLogLevel.DEBUG]
+        return order.index(self) > order.index(other)
 
 
 # Type definitions

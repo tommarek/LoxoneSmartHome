@@ -4,7 +4,7 @@ import json
 import socket
 
 from config.settings import Settings
-from modules.base import BaseModule
+from .base import BaseModule
 from utils.async_mqtt_client import AsyncMQTTClient
 
 

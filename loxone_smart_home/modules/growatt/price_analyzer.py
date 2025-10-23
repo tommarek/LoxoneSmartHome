@@ -670,7 +670,7 @@ class PriceAnalyzer:
         prices: Dict[Tuple[str, str], float],
         discharge_periods: List[Tuple[str, str, float]],
         max_charge_blocks: int = 8
-    ) -> Tuple[List[Tuple[str, str, float]], Dict[str, List[Tuple[str, str, float]]]]:
+    ) -> Tuple[List[Tuple[str, str, float]], Dict[str, Dict[str, Any]]]:
         """Calculate pre-discharge charging schedule for all discharge periods.
 
         For each discharge period, find the cheapest blocks before it starts
