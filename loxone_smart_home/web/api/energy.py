@@ -1,10 +1,13 @@
 """Fixed Energy API endpoints with correct InfluxDB queries."""
 
 import json
+import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
+
+logger = logging.getLogger(__name__)
 
 from ..models.responses import (
     BatteryStatusResponse,
@@ -450,7 +453,8 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         result = await web_service.influxdb_client.query(query)
         schedule = _process_schedule_table(result, now)
     except Exception as e:
-        # Return demo schedule on error
+        # Log error and return demo schedule
+        logger.error(f"Failed to fetch price schedule from InfluxDB: {e}", exc_info=True)
         schedule = _generate_demo_schedule(now)
 
     # Cache for 5 minutes

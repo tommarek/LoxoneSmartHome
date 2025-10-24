@@ -356,11 +356,27 @@ async function fetchPriceForecast() {
 // Fetch schedule
 async function fetchSchedule() {
     try {
+        console.log('Fetching schedule from /api/energy/schedule...');
         const res = await fetch('/api/energy/schedule');
+
+        if (!res.ok) {
+            throw new Error(`HTTP error! status: ${res.status}`);
+        }
+
         const data = await res.json();
+        console.log('Schedule data received:', data);
 
         const container = document.getElementById('schedule-table-container');
-        if (!container || !data.days) return;
+        if (!container) {
+            console.error('Schedule container element not found!');
+            return;
+        }
+
+        if (!data.days || data.days.length === 0) {
+            console.warn('No schedule days in response:', data);
+            container.innerHTML = '<div class="error-message">No schedule data available.</div>';
+            return;
+        }
 
         // Build HTML for schedule table
         let html = '';
@@ -432,11 +448,12 @@ async function fetchSchedule() {
         });
 
         container.innerHTML = html;
+        console.log('Schedule table rendered successfully');
     } catch (error) {
         console.error('Error fetching schedule:', error);
         const container = document.getElementById('schedule-table-container');
         if (container) {
-            container.innerHTML = '<div class="error-message">Failed to load schedule. Retrying...</div>';
+            container.innerHTML = `<div class="error-message">Failed to load schedule: ${error.message}</div>`;
         }
     }
 }
