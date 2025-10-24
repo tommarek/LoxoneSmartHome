@@ -2025,14 +2025,15 @@ class GrowattController(BaseModule):
             self._cheapest_charging_blocks_today | self._pre_discharge_blocks_today
         )
 
-        if not suppress_print:
+        if not suppress_print or force_table:
             # Display comprehensive cross-day price table
             await self._log_cross_day_price_table(window, rate, force_display=force_table)
 
-            self.logger.info(
-                f"✅ Cross-day schedule updated: "
-                f"{len(self._combined_charging_blocks)} charging blocks active today"
-            )
+            if not suppress_print:
+                self.logger.info(
+                    f"✅ Cross-day schedule updated: "
+                    f"{len(self._combined_charging_blocks)} charging blocks active today"
+                )
 
     def _calculate_discharge_periods(
         self,
