@@ -25,7 +25,7 @@ async def get_current_price(request: Request) -> Dict[str, Any]:
 
         # Query current price from InfluxDB
         query = f'''
-        from(bucket: "ote_prices")
+        from(bucket: "loxone")
           |> range(start: -1h)
           |> filter(fn: (r) => r["_measurement"] == "electricity_price")
           |> last()
@@ -59,8 +59,8 @@ async def get_price_forecast(
     end_time = now + timedelta(hours=hours)
 
     query = f'''
-    from(bucket: "ote_prices")
-      |> range(start: {now.isoformat()}, stop: {end_time.isoformat()})
+    from(bucket: "loxone")
+      |> range(start: {now.isoformat()}Z, stop: {end_time.isoformat()}Z)
       |> filter(fn: (r) => r["_measurement"] == "electricity_price")
       |> sort(columns: ["_time"])
     '''
@@ -122,14 +122,14 @@ async def get_savings_summary(
 
     # Query historical prices and actual charging times
     prices_query = f'''
-    from(bucket: "electricity_prices")
-      |> range(start: {start.isoformat()}, stop: {end.isoformat()})
-      |> filter(fn: (r) => r["_measurement"] == "dam_prices")
+    from(bucket: "loxone")
+      |> range(start: {start.isoformat()}Z, stop: {end.isoformat()}Z)
+      |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
     '''
 
     charging_query = f'''
-    from(bucket: "solar")
-      |> range(start: {start.isoformat()}, stop: {end.isoformat()})
+    from(bucket: "loxone")
+      |> range(start: {start.isoformat()}Z, stop: {end.isoformat()}Z)
       |> filter(fn: (r) => r["_measurement"] == "battery" and r["_field"] == "charging")
       |> filter(fn: (r) => r["_value"] > 0)
     '''
@@ -162,16 +162,16 @@ async def get_price_comparison(request: Request) -> Dict[str, Any]:
 
         # Query today's prices
         today_query = f'''
-        from(bucket: "electricity_prices")
+        from(bucket: "loxone")
           |> range(start: {today.isoformat()}T00:00:00Z, stop: {today.isoformat()}T23:59:59Z)
-          |> filter(fn: (r) => r["_measurement"] == "dam_prices")
+          |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
         '''
 
         # Query tomorrow's prices
         tomorrow_query = f'''
-        from(bucket: "electricity_prices")
+        from(bucket: "loxone")
           |> range(start: {tomorrow.isoformat()}T00:00:00Z, stop: {tomorrow.isoformat()}T23:59:59Z)
-          |> filter(fn: (r) => r["_measurement"] == "dam_prices")
+          |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
         '''
 
         today_prices = await web_service.influxdb_client.query(today_query)
