@@ -2,14 +2,15 @@
 
 import json
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from ..models.responses import (
     BatteryStatusResponse,
     EnergyCurrentResponse,
-    EnergyHistoryResponse
+    EnergyHistoryResponse,
+    ScheduleTableResponse
 )
 
 router = APIRouter()
@@ -415,3 +416,239 @@ def _process_power_stats(result: Any, period: str) -> Dict[str, Any]:
     stats["savings"]["amount"] = stats["grid"]["export"] * czk_per_kwh
 
     return stats
+
+
+@router.get("/schedule", response_model=ScheduleTableResponse)
+async def get_energy_schedule(request: Request) -> Dict[str, Any]:
+    """Get energy schedule table showing prices and mode decisions for each 15-min block.
+
+    Returns a table similar to Growatt controller logs with:
+    - Prices for each 15-minute block
+    - Mode indicators (🔋=charge, 🔌=pre-discharge, ⚡=discharge)
+    - Today and tomorrow schedules
+    """
+    web_service = request.app.state.web_service
+
+    # Check cache
+    schedule = await web_service.cache.get("energy:schedule")
+    if schedule:
+        return schedule
+
+    try:
+        # Get price data from InfluxDB
+        now = datetime.now()
+        today = now.date()
+        tomorrow = today + timedelta(days=1)
+
+        # Query today and tomorrow prices
+        query = f'''from(bucket: "ote_prices")
+  |> range(start: {today.isoformat()}T00:00:00Z, stop: {tomorrow.isoformat()}T23:59:59Z)
+  |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
+  |> filter(fn: (r) => r["_field"] == "price_czk_kwh")
+  |> sort(columns: ["_time"])'''
+
+        result = await web_service.influxdb_client.query(query)
+        schedule = _process_schedule_table(result, now)
+    except Exception as e:
+        # Return demo schedule on error
+        schedule = _generate_demo_schedule(now)
+
+    # Cache for 5 minutes
+    await web_service.cache.set("energy:schedule", schedule, ttl=300)
+
+    return schedule
+
+
+def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
+    """Process InfluxDB result into schedule table format."""
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+
+    # Collect all price blocks
+    today_blocks = []
+    tomorrow_blocks = []
+
+    if result:
+        for table in result:
+            for record in table.records:
+                time = record["_time"]
+                price = float(record["_value"] or 0)
+
+                block_date = time.date()
+                if block_date == today:
+                    today_blocks.append((time, price))
+                elif block_date == tomorrow:
+                    tomorrow_blocks.append((time, price))
+
+    # Calculate thresholds for mode decisions (simplified version of Growatt logic)
+    all_prices = [p for _, p in today_blocks + tomorrow_blocks]
+    if all_prices:
+        sorted_prices = sorted(all_prices)
+        # Bottom 20% for charging
+        charge_threshold = sorted_prices[int(len(sorted_prices) * 0.2)] if len(sorted_prices) > 5 else min(all_prices)
+        # Top 20% for discharge
+        discharge_threshold = sorted_prices[int(len(sorted_prices) * 0.8)] if len(sorted_prices) > 5 else max(all_prices)
+    else:
+        charge_threshold = 2.0
+        discharge_threshold = 3.5
+
+    days = []
+
+    # Process today
+    if today_blocks:
+        today_schedule = _format_day_schedule(
+            today_blocks, today, "TODAY (remaining)", charge_threshold, discharge_threshold, now
+        )
+        days.append(today_schedule)
+
+    # Process tomorrow
+    if tomorrow_blocks:
+        tomorrow_schedule = _format_day_schedule(
+            tomorrow_blocks, tomorrow, "TOMORROW", charge_threshold, discharge_threshold, now
+        )
+        days.append(tomorrow_schedule)
+
+    # Build legend
+    legend = [
+        {"icon": "🔋", "label": "Regular charge", "color": "#4CAF50"},
+        {"icon": "🔌", "label": "Pre-discharge charge", "color": "#FF9800"},
+        {"icon": "⚡", "label": "Discharge", "color": "#F44336"},
+        {"icon": "-", "label": "Normal", "color": "#9E9E9E"}
+    ]
+
+    # Summary statistics
+    summary = {
+        "charge_blocks": sum(1 for day in days for hour in day["hours"] for block in hour["blocks"] if block["mode"] == "charge"),
+        "discharge_blocks": sum(1 for day in days for hour in day["hours"] for block in hour["blocks"] if block["mode"] == "discharge"),
+        "charge_threshold": round(charge_threshold, 3),
+        "discharge_threshold": round(discharge_threshold, 3)
+    }
+
+    return {
+        "days": days,
+        "legend": legend,
+        "summary": summary
+    }
+
+
+def _format_day_schedule(
+    blocks: List[Tuple[datetime, float]],
+    date: Any,
+    label: str,
+    charge_threshold: float,
+    discharge_threshold: float,
+    now: datetime
+) -> Dict[str, Any]:
+    """Format blocks into day schedule structure."""
+    hours_dict: Dict[int, List[Dict[str, Any]]] = {}
+
+    for time, price in blocks:
+        # Skip past blocks for "today"
+        if label.startswith("TODAY") and time < now:
+            continue
+
+        hour = time.hour
+        minute = time.minute
+
+        # Determine mode based on price thresholds
+        if price <= charge_threshold:
+            mode = "charge"
+            icon = "🔋"
+        elif price >= discharge_threshold:
+            mode = "discharge"
+            icon = "⚡"
+        else:
+            mode = "normal"
+            icon = "-"
+
+        # Format time block
+        time_str = f"{hour:02d}:{minute:02d}"
+        next_minute = (minute + 15) % 60
+        next_hour = hour if next_minute > minute else (hour + 1) % 24
+        time_block = f"{time_str}-{next_hour:02d}:{next_minute:02d}"
+
+        block_data = {
+            "time": time_block,
+            "price_czk_kwh": round(price, 3),
+            "mode": mode,
+            "icon": icon
+        }
+
+        if hour not in hours_dict:
+            hours_dict[hour] = []
+
+        hours_dict[hour].append(block_data)
+
+    # Convert to list of hours
+    hours = []
+    for hour in sorted(hours_dict.keys()):
+        hours.append({
+            "hour": hour,
+            "blocks": hours_dict[hour]
+        })
+
+    return {
+        "date": date.isoformat(),
+        "label": label,
+        "hours": hours
+    }
+
+
+def _generate_demo_schedule(now: datetime) -> Dict[str, Any]:
+    """Generate demo schedule data."""
+    today = now.date()
+
+    demo_prices = [0.58, 0.61, 0.75, 1.12, 1.45, 1.89,  # 00-05: night
+                   2.14, 2.35, 2.68, 3.12, 3.45, 3.68,  # 06-11: morning
+                   3.89, 4.12, 4.35, 4.58, 4.84, 4.35,  # 12-17: peak
+                   3.89, 3.12, 2.35, 1.68, 1.12, 0.75]  # 18-23: evening
+
+    charge_threshold = 1.5
+    discharge_threshold = 4.0
+
+    hours = []
+    for hour in range(24):
+        blocks = []
+        base_price = demo_prices[hour]
+
+        for quarter in range(4):
+            minute = quarter * 15
+            next_minute = (minute + 15) % 60
+            next_hour = hour if next_minute > minute else (hour + 1) % 24
+
+            price = base_price + (quarter * 0.05)  # Slight variation per quarter
+
+            if price <= charge_threshold:
+                mode, icon = "charge", "🔋"
+            elif price >= discharge_threshold:
+                mode, icon = "discharge", "⚡"
+            else:
+                mode, icon = "normal", "-"
+
+            blocks.append({
+                "time": f"{hour:02d}:{minute:02d}-{next_hour:02d}:{next_minute:02d}",
+                "price_czk_kwh": round(price, 3),
+                "mode": mode,
+                "icon": icon
+            })
+
+        hours.append({"hour": hour, "blocks": blocks})
+
+    return {
+        "days": [{
+            "date": today.isoformat(),
+            "label": "TODAY (demo data)",
+            "hours": hours
+        }],
+        "legend": [
+            {"icon": "🔋", "label": "Regular charge", "color": "#4CAF50"},
+            {"icon": "⚡", "label": "Discharge", "color": "#F44336"},
+            {"icon": "-", "label": "Normal", "color": "#9E9E9E"}
+        ],
+        "summary": {
+            "charge_blocks": 16,
+            "discharge_blocks": 12,
+            "charge_threshold": charge_threshold,
+            "discharge_threshold": discharge_threshold
+        }
+    }

@@ -1,7 +1,7 @@
 """Pydantic models for API responses."""
 
 from datetime import datetime
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -219,3 +219,44 @@ class Recommendation(BaseModel):
     description: str
     potential_savings: float
     implementation: str
+
+
+# Schedule models
+class ScheduleBlock(BaseModel):
+    """Single 15-minute schedule block."""
+
+    time: str = Field(description="Time block (e.g., '00:00-00:15')")
+    price_czk_kwh: float = Field(description="Price in CZK/kWh")
+    mode: str = Field(description="Mode: charge, pre_discharge, discharge, normal")
+    icon: str = Field(description="Icon: 🔋=charge, 🔌=pre-discharge, ⚡=discharge, -=normal")
+
+
+class ScheduleHour(BaseModel):
+    """Hour with 4 15-minute blocks."""
+
+    hour: int = Field(description="Hour (0-23)")
+    blocks: List[ScheduleBlock] = Field(description="4 blocks per hour")
+
+
+class ScheduleDay(BaseModel):
+    """Day schedule."""
+
+    date: str = Field(description="Date (YYYY-MM-DD)")
+    label: str = Field(description="Label: TODAY, TOMORROW, etc.")
+    hours: List[ScheduleHour]
+
+
+class ScheduleLegend(BaseModel):
+    """Legend for schedule icons."""
+
+    icon: str
+    label: str
+    color: Optional[str] = None
+
+
+class ScheduleTableResponse(BaseModel):
+    """Schedule table response."""
+
+    days: List[ScheduleDay]
+    legend: List[ScheduleLegend]
+    summary: Dict[str, Any] = Field(description="Summary statistics")
