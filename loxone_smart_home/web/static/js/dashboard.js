@@ -356,34 +356,88 @@ async function fetchPriceForecast() {
 // Fetch schedule
 async function fetchSchedule() {
     try {
-        const res = await fetch('/api/prices/schedule');
+        const res = await fetch('/api/energy/schedule');
         const data = await res.json();
 
-        // Update charging schedule
-        const chargingList = document.getElementById('charging-schedule');
-        if (chargingList && data.charging && data.charging.blocks) {
-            chargingList.innerHTML = data.charging.blocks.slice(0, 5).map(b => {
-                const time = new Date(b.timestamp);
-                return `<li>${time.toLocaleTimeString('en-US', {
-                    hour: '2-digit',
-                    minute: '2-digit'
-                })} - ${b.price_czk_kwh.toFixed(2)} CZK/kWh</li>`;
-            }).join('');
+        const container = document.getElementById('schedule-table-container');
+        if (!container || !data.days) return;
+
+        // Build HTML for schedule table
+        let html = '';
+
+        // Add legend
+        if (data.legend && data.legend.length > 0) {
+            html += '<div class="schedule-legend">';
+            data.legend.forEach(item => {
+                html += `<span class="legend-item">
+                    <span class="legend-icon">${item.icon}</span>
+                    <span class="legend-label">${item.label}</span>
+                </span>`;
+            });
+            html += '</div>';
         }
 
-        // Update discharge schedule
-        const dischargeList = document.getElementById('discharge-schedule');
-        if (dischargeList && data.discharging && data.discharging.blocks) {
-            dischargeList.innerHTML = data.discharging.blocks.slice(0, 5).map(b => {
-                const time = new Date(b.timestamp);
-                return `<li>${time.toLocaleTimeString('en-US', {
-                    hour: '2-digit',
-                    minute: '2-digit'
-                })} - ${b.price_czk_kwh.toFixed(2)} CZK/kWh</li>`;
-            }).join('');
+        // Add summary
+        if (data.summary) {
+            html += `<div class="schedule-summary">
+                <span>Charge blocks: <strong>${data.summary.charge_blocks || 0}</strong></span>
+                <span>Discharge blocks: <strong>${data.summary.discharge_blocks || 0}</strong></span>
+                <span>Charge threshold: <strong>${(data.summary.charge_threshold || 0).toFixed(2)} CZK/kWh</strong></span>
+                <span>Discharge threshold: <strong>${(data.summary.discharge_threshold || 0).toFixed(2)} CZK/kWh</strong></span>
+            </div>`;
         }
+
+        // Render each day
+        data.days.forEach(day => {
+            html += `<div class="schedule-day">
+                <h4 class="schedule-day-title">${day.label} (${day.date})</h4>
+                <div class="schedule-table-wrapper">
+                    <table class="schedule-table">
+                        <thead>
+                            <tr>
+                                <th>Hour</th>
+                                <th>:00-:15</th>
+                                <th>:15-:30</th>
+                                <th>:30-:45</th>
+                                <th>:45-:00</th>
+                            </tr>
+                        </thead>
+                        <tbody>`;
+
+            day.hours.forEach(hourData => {
+                html += `<tr>
+                    <td class="hour-cell">${String(hourData.hour).padStart(2, '0')}:00</td>`;
+
+                // Render 4 blocks per hour
+                for (let i = 0; i < 4; i++) {
+                    if (hourData.blocks[i]) {
+                        const block = hourData.blocks[i];
+                        const modeClass = `mode-${block.mode}`;
+                        html += `<td class="price-cell ${modeClass}">
+                            <span class="price-value">${block.price_czk_kwh.toFixed(2)}</span>
+                            <span class="mode-icon">${block.icon}</span>
+                        </td>`;
+                    } else {
+                        html += `<td class="price-cell">-</td>`;
+                    }
+                }
+
+                html += `</tr>`;
+            });
+
+            html += `</tbody>
+                    </table>
+                </div>
+            </div>`;
+        });
+
+        container.innerHTML = html;
     } catch (error) {
         console.error('Error fetching schedule:', error);
+        const container = document.getElementById('schedule-table-container');
+        if (container) {
+            container.innerHTML = '<div class="error-message">Failed to load schedule. Retrying...</div>';
+        }
     }
 }
 
