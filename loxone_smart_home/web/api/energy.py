@@ -451,7 +451,9 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
   |> sort(columns: ["_time"])'''
 
         result = await web_service.influxdb_client.query(query)
+        logger.info(f"Schedule query executed successfully")
         schedule = _process_schedule_table(result, now)
+        logger.info(f"Schedule processed: {len(schedule.get('days', []))} days, {sum(len(d['hours']) for d in schedule.get('days', []))} hours")
     except Exception as e:
         # Log error and return demo schedule
         logger.error(f"Failed to fetch price schedule from InfluxDB: {e}", exc_info=True)
@@ -483,6 +485,8 @@ def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
                     today_blocks.append((time, price))
                 elif block_date == tomorrow:
                     tomorrow_blocks.append((time, price))
+
+    logger.info(f"Collected {len(today_blocks)} blocks for today, {len(tomorrow_blocks)} blocks for tomorrow")
 
     # Calculate thresholds for mode decisions (simplified version of Growatt logic)
     all_prices = [p for _, p in today_blocks + tomorrow_blocks]
