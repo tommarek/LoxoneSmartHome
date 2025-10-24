@@ -125,7 +125,7 @@ class OTEConfig(BaseModel):
 
     # API endpoint
     base_url: str = "https://www.ote-cr.cz/cs/kratkodobe-trhy/elektrina/denni-trh/@@chart-data"
-    time_resolution: str = "PT60M"  # 60-minute resolution
+    time_resolution: str = "PT15M"  # 15-minute resolution (96 blocks per day)
 
     # Update schedule (smart retry starting at 2 PM, then hourly until data found)
     first_check_hour: int = Field(default=14, ge=0, le=23)  # Start checking at 2 PM
