@@ -27,6 +27,7 @@ class DataAggregator:
 
         # Start different aggregation tasks
         tasks = [
+            self._fetch_realtime_data(),  # Fetch current energy & battery data for WebSocket
             self._aggregate_15min_data(),
             self._aggregate_hourly_data(),
             self._aggregate_daily_data()
@@ -49,6 +50,86 @@ class DataAggregator:
                 task.cancel()
 
         await asyncio.gather(*self._aggregation_tasks, return_exceptions=True)
+
+    async def _fetch_realtime_data(self) -> None:
+        """Fetch current energy flow and battery status for WebSocket broadcasts."""
+        while self._running:
+            try:
+                # Fetch current energy flow from Growatt telemetry
+                energy_query = '''from(bucket: "solar")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r["_measurement"] == "solar")
+  |> last()'''
+
+                battery_query = '''from(bucket: "solar")
+  |> range(start: -10m)
+  |> filter(fn: (r) => r["_measurement"] == "solar")
+  |> filter(fn: (r) => r["_field"] == "SOC" or r["_field"] == "ChargePower" or
+            r["_field"] == "DischargePower" or r["_field"] == "BatteryVoltage" or
+            r["_field"] == "BatteryTemperature")
+  |> last()'''
+
+                # Fetch both in parallel
+                energy_result, battery_result = await asyncio.gather(
+                    self.influxdb_client.query(energy_query),
+                    self.influxdb_client.query(battery_query),
+                    return_exceptions=True
+                )
+
+                # Process and cache energy flow data
+                if not isinstance(energy_result, Exception) and energy_result:
+                    from ..api.energy import _process_current_flow
+                    energy_data = _process_current_flow(energy_result)
+                    await self.cache.set("energy:current", energy_data, ttl=10)
+
+                # Process and cache battery status
+                if not isinstance(battery_result, Exception) and battery_result:
+                    battery_data = {
+                        "soc": 0.0,
+                        "power": 0.0,
+                        "voltage": 0.0,
+                        "current": 0.0,
+                        "temperature": 0.0,
+                        "status": "unknown",
+                        "health": 100.0
+                    }
+
+                    charge_power = 0.0
+                    discharge_power = 0.0
+
+                    for table in battery_result:
+                        for record in table.records:
+                            field = record["_field"]
+                            value = float(record["_value"] or 0)
+
+                            if field == "SOC":
+                                battery_data["soc"] = value
+                            elif field == "ChargePower":
+                                charge_power = value
+                            elif field == "DischargePower":
+                                discharge_power = value
+                            elif field == "BatteryVoltage":
+                                battery_data["voltage"] = value
+                            elif field == "BatteryTemperature":
+                                battery_data["temperature"] = value
+
+                    # Calculate net power and status
+                    battery_data["power"] = charge_power - discharge_power
+                    if charge_power > 0:
+                        battery_data["status"] = "charging"
+                    elif discharge_power > 0:
+                        battery_data["status"] = "discharging"
+                    else:
+                        battery_data["status"] = "idle"
+
+                    await self.cache.set("battery:status", battery_data, ttl=10)
+
+                # Sleep for 5 seconds before next update
+                await asyncio.sleep(5)
+
+            except Exception as e:
+                logger.error(f"Error fetching realtime data: {e}")
+                await asyncio.sleep(5)
 
     async def _aggregate_15min_data(self) -> None:
         """Aggregate 15-minute data for real-time views."""
