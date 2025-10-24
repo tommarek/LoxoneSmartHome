@@ -391,3 +391,157 @@ body {
     from { opacity: 0; }
     to { opacity: 1; }
 }
+
+/* Schedule Table Styles */
+.full-width {
+    grid-column: 1 / -1;
+}
+
+.schedule-legend {
+    display: flex;
+    gap: 1.5rem;
+    padding: 1rem;
+    background-color: var(--background);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+}
+
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.legend-icon {
+    font-size: 1.25rem;
+}
+
+.legend-label {
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.schedule-summary {
+    display: flex;
+    gap: 2rem;
+    padding: 1rem;
+    background-color: var(--background);
+    border-radius: 8px;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+    font-size: 0.9rem;
+    color: var(--text-secondary);
+}
+
+.schedule-summary strong {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+
+.schedule-day {
+    margin-bottom: 2rem;
+}
+
+.schedule-day-title {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+    color: var(--text-primary);
+}
+
+.schedule-table-wrapper {
+    overflow-x: auto;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+}
+
+.schedule-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.85rem;
+    min-width: 600px;
+}
+
+.schedule-table thead {
+    background-color: var(--background);
+}
+
+.schedule-table th {
+    padding: 0.75rem 0.5rem;
+    text-align: center;
+    font-weight: 600;
+    color: var(--text-secondary);
+    border-bottom: 2px solid var(--border-color);
+}
+
+.schedule-table td {
+    padding: 0.5rem;
+    text-align: center;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.schedule-table tbody tr:hover {
+    background-color: var(--background);
+}
+
+.hour-cell {
+    font-weight: 600;
+    color: var(--text-primary);
+    background-color: var(--background);
+    text-align: left;
+    padding-left: 1rem !important;
+}
+
+.price-cell {
+    position: relative;
+    font-family: 'Courier New', monospace;
+}
+
+.price-value {
+    display: inline-block;
+    margin-right: 0.25rem;
+}
+
+.mode-icon {
+    font-size: 1.1rem;
+    position: relative;
+    top: 1px;
+}
+
+/* Mode colors */
+.mode-charge {
+    background-color: rgba(76, 175, 80, 0.15);
+}
+
+.mode-pre_discharge {
+    background-color: rgba(255, 152, 0, 0.15);
+}
+
+.mode-discharge {
+    background-color: rgba(244, 67, 54, 0.15);
+}
+
+.mode-normal {
+    /* No special background */
+}
+
+@media (prefers-color-scheme: dark) {
+    .mode-charge {
+        background-color: rgba(76, 175, 80, 0.25);
+    }
+
+    .mode-pre_discharge {
+        background-color: rgba(255, 152, 0, 0.25);
+    }
+
+    .mode-discharge {
+        background-color: rgba(244, 67, 54, 0.25);
+    }
+}
+
+.error-message {
+    padding: 1rem;
+    text-align: center;
+    color: var(--danger-color);
+}
