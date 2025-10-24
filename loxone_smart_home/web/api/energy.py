@@ -213,6 +213,10 @@ def _process_current_flow(result: Any) -> Dict[str, Any]:
         "timestamp": datetime.now().isoformat()
     }
 
+    # Temporary storage for charge/discharge values
+    charge_power = 0.0
+    discharge_power = 0.0
+
     # Process Growatt telemetry fields
     if result:
         for table in result:
@@ -232,24 +236,15 @@ def _process_current_flow(result: Any) -> Dict[str, Any]:
                 elif field_name == "ChargePower":
                     # Battery charging power
                     charge_power = value
-                    # Get discharge power if available (will be set in next iteration or default to 0)
-                    if not hasattr(data, "_discharge_power"):
-                        data["_discharge_power"] = 0
-                    # Net battery power: positive = charging, negative = discharging
-                    data["battery_power"] = charge_power - data.get("_discharge_power", 0)
                 elif field_name == "DischargePower":
                     # Battery discharging power
-                    data["_discharge_power"] = value
-                    # Recalculate net battery power
-                    charge_power = data.get("_charge_power", 0)
-                    data["battery_power"] = charge_power - value
+                    discharge_power = value
                 elif field_name == "SOC":
                     # Battery state of charge (%)
                     data["battery_soc"] = value
 
-    # Clean up temporary fields
-    data.pop("_charge_power", None)
-    data.pop("_discharge_power", None)
+    # Calculate net battery power: positive = charging, negative = discharging
+    data["battery_power"] = charge_power - discharge_power
 
     return data
 
