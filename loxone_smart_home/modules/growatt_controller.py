@@ -31,6 +31,7 @@ from .growatt.decision_engine import (
     GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
 )
 from .growatt.inverter_state import InverterState
+from utils.schedule_calculator import calculate_optimal_schedule
 from .growatt.command_queue import CommandQueue
 
 
@@ -1756,12 +1757,25 @@ class GrowattController(BaseModule):
         today = now.date()
         rate = self._eur_czk_rate or 25.0
 
-        # === STEP 1: Find globally cheapest charging blocks ===
+        # === STEP 1: Use shared scheduling logic to find optimal blocks ===
         charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
+        discharge_threshold_czk = self.config.discharge_price_min
 
-        # Sort all blocks by price and take cheapest N
-        sorted_by_price = sorted(window, key=lambda x: x[2])
-        cheapest_blocks = sorted_by_price[:charge_blocks_count]
+        # Convert window format for shared function: (start_dt, end_dt, price_eur) -> (start_dt, price_czk)
+        price_blocks_czk = [(start_dt, price_eur * rate / 1000) for start_dt, end_dt, price_eur in window]
+
+        # Call shared function to get charge/discharge timestamps
+        charge_times, discharge_times, charge_threshold_czk, _ = calculate_optimal_schedule(
+            price_blocks_czk,
+            charge_blocks_count=charge_blocks_count,
+            discharge_threshold_czk=discharge_threshold_czk
+        )
+
+        # Rebuild charging schedule in original format for compatibility with existing code
+        cheapest_blocks = [
+            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            if start_dt in charge_times
+        ]
         cheapest_sorted = sorted(cheapest_blocks, key=lambda x: x[0])  # Sort chronologically
 
         # Separate into today vs tomorrow
@@ -1828,14 +1842,13 @@ class GrowattController(BaseModule):
                             f"{price_czk:.3f} CZK/kWh"
                         )
 
-        # === STEP 2: Find discharge periods across entire window ===
-        discharge_threshold_czk = self.config.discharge_price_min
-        discharge_threshold_eur = discharge_threshold_czk * 1000 / rate
+        # === STEP 2: Use discharge times from shared function ===
+        # Already calculated above via calculate_optimal_schedule()
 
+        # Rebuild discharge schedule in original format for compatibility
         discharge_blocks = [
-            (start_dt, end_dt, price)
-            for start_dt, end_dt, price in window
-            if price >= discharge_threshold_eur
+            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            if start_dt in discharge_times
         ]
 
         discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
