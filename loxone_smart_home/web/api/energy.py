@@ -12,7 +12,7 @@ from ..models.responses import (
     EnergyHistoryResponse
 )
 
-router = APIRouter(prefix="/api/energy", tags=["energy"])
+router = APIRouter()
 
 
 @router.get("/current", response_model=EnergyCurrentResponse)
