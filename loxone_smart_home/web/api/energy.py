@@ -2,7 +2,7 @@
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -439,7 +439,7 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
 
     try:
         # Get price data from InfluxDB
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         today = now.date()
         tomorrow = today + timedelta(days=1)
 
