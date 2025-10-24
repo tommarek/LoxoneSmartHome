@@ -65,9 +65,11 @@ async def get_price_forecast(
     try:
         # Query from now to far future to get all available data
         # OTE publishes prices up to 60 days in advance
+        # Use 60 days into future as stop time to get all available prices
+        future_end = now + timedelta(days=60)
         query = f'''
         from(bucket: "ote_prices")
-          |> range(start: {now.isoformat()}Z)
+          |> range(start: {now.isoformat()}Z, stop: {future_end.isoformat()}Z)
           |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
           |> sort(columns: ["_time"])
           |> limit(n: {hours * 4 + 100})
