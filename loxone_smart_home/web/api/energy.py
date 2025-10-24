@@ -4,12 +4,16 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from utils.schedule_calculator import calculate_optimal_schedule, determine_block_mode
 
 logger = logging.getLogger(__name__)
+
+# Prague timezone for local time display
+PRAGUE_TZ = ZoneInfo("Europe/Prague")
 
 from ..models.responses import (
     BatteryStatusResponse,
@@ -440,8 +444,8 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         return schedule
 
     try:
-        # Get price data from InfluxDB
-        now = datetime.now(timezone.utc)
+        # Get price data from InfluxDB (use Prague local time like Growatt controller)
+        now = datetime.now(PRAGUE_TZ)
         today = now.date()
         tomorrow = today + timedelta(days=1)
 
@@ -482,9 +486,11 @@ def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
     if result:
         for table in result:
             for record in table.records:
-                time_dt = record["_time"]
+                time_dt_utc = record["_time"]
+                # Convert UTC timestamp to Prague local time
+                time_dt_local = time_dt_utc.astimezone(PRAGUE_TZ)
                 price_czk = float(record["_value"] or 0)
-                all_blocks.append((time_dt, price_czk))
+                all_blocks.append((time_dt_local, price_czk))
 
     logger.info(f"Collected {len(all_blocks)} total blocks from InfluxDB")
 
