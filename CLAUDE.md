@@ -6,6 +6,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is a consolidated Python service that combines multiple smart home automation services into a single async application. It integrates Loxone home automation with Growatt solar systems, weather data, and energy price optimization.
 
+## Development Environment
+
+**IMPORTANT**: The service runs on a remote server, not on the local development machine.
+
+- **Remote Service**: The loxone_smart_home Docker container runs on a separate server
+- **InfluxDB Access**: Available via SSH port forwarding on `localhost:8086`
+- **Web Interface**: Available via SSH port forwarding on `localhost:8080`
+- **Testing Changes**: After committing code changes, the user must restart the service on the remote server
+- **DO NOT** attempt to start/stop/restart Docker containers locally - this will fail
+- **DO** commit code changes and inform the user to restart the remote service
+
 ## Development Commands
 
 Before making any commits, run these commands to ensure code quality:
