@@ -801,7 +801,8 @@ class GrowattController(BaseModule):
         return groups
 
     async def _log_cross_day_price_table(
-        self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float
+        self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float,
+        force_display: bool = False
     ) -> None:
         """Log comprehensive cross-day price table showing all available blocks.
 
@@ -814,12 +815,13 @@ class GrowattController(BaseModule):
         Args:
             window: List of (start_dt, end_dt, price_eur) covering available price window
             eur_czk_rate: Exchange rate for EUR to CZK conversion
+            force_display: If True, always show table regardless of log level (for startup)
         """
         if not window:
             return
 
-        # Only show full table at VERBOSE level
-        if not self._should_log(GrowattLogLevel.VERBOSE):
+        # Only show full table at VERBOSE level (unless forced for startup)
+        if not force_display and not self._should_log(GrowattLogLevel.VERBOSE):
             # At DETAIL level, just show a summary
             if self._should_log(GrowattLogLevel.DETAIL):
                 all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
@@ -1479,7 +1481,11 @@ class GrowattController(BaseModule):
         will_fetch_tomorrow = now.hour >= fetch_hour and not self._next_day_prices_fetched
 
         # Fetch initial prices (suppress schedule print if we're about to fetch tomorrow's)
-        await self._fetch_prices(suppress_schedule_print=will_fetch_tomorrow)
+        # Always show full table at startup
+        await self._fetch_prices(
+            suppress_schedule_print=will_fetch_tomorrow,
+            force_table_display=True
+        )
 
         if will_fetch_tomorrow:
             self.logger.info(
@@ -1664,12 +1670,15 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
-    async def _fetch_prices(self, suppress_schedule_print: bool = False) -> None:
+    async def _fetch_prices(
+        self, suppress_schedule_print: bool = False, force_table_display: bool = False
+    ) -> None:
         """Fetch current energy prices and trigger evaluation.
 
         Args:
             suppress_schedule_print: If True, skip printing schedule (used at startup
                                      when we're about to fetch tomorrow's prices)
+            force_table_display: If True, always show full table regardless of log level
         """
         try:
             # Determine target date
@@ -1705,7 +1714,8 @@ class GrowattController(BaseModule):
                 # NEW: Use cross-day optimal scheduling
                 # This will find globally cheapest blocks across today+tomorrow window
                 await self._calculate_cross_day_optimal_schedule(
-                    suppress_print=suppress_schedule_print
+                    suppress_print=suppress_schedule_print,
+                    force_table=force_table_display
                 )
 
                 # Trigger re-evaluation with new prices
@@ -1716,7 +1726,9 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Error fetching prices: {e}", exc_info=True)
 
-    async def _calculate_cross_day_optimal_schedule(self, suppress_print: bool = False) -> None:
+    async def _calculate_cross_day_optimal_schedule(
+        self, suppress_print: bool = False, force_table: bool = False
+    ) -> None:
         """Calculate optimal charging/discharge schedule across entire available price window.
 
         This is the core cross-day optimization method that:
@@ -1729,6 +1741,7 @@ class GrowattController(BaseModule):
 
         Args:
             suppress_print: If True, skip printing schedule (used during startup)
+            force_table: If True, always show full table regardless of log level
 
         This replaces the old separate-day approach with true global optimization.
         """
@@ -2014,7 +2027,7 @@ class GrowattController(BaseModule):
 
         if not suppress_print:
             # Display comprehensive cross-day price table
-            await self._log_cross_day_price_table(window, rate)
+            await self._log_cross_day_price_table(window, rate, force_display=force_table)
 
             self.logger.info(
                 f"✅ Cross-day schedule updated: "
