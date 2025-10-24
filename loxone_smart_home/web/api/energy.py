@@ -70,17 +70,26 @@ async def get_energy_history(
     delta = period_map.get(period, timedelta(hours=24))
     start = now - delta
 
-    # Build query for solar bucket with Growatt telemetry
+    # Build query for solar bucket with Growatt telemetry - filter specific fields
     query = f'''from(bucket: "solar")
   |> range(start: {start.isoformat()}Z)
   |> filter(fn: (r) => r["_measurement"] == "solar")
+  |> filter(fn: (r) => r["_field"] == "InputPower" or r["_field"] == "ACPowerToGrid" or r["_field"] == "ACPowerToUser")
   |> aggregateWindow(every: {resolution}, fn: mean, createEmpty: false)'''
 
     try:
         result = await web_service.influxdb_client.query(query)
         history_data = _process_energy_history(result, resolution)
+
+        # Set the correct period
+        history_data["period"] = period
+
+        # If no data returned, fall back to demo data
+        if not history_data.get("data") or len(history_data.get("data", [])) == 0:
+            raise Exception("No data returned from query")
+
     except Exception as e:
-        # Return demo data on error
+        # Return demo data on error or empty result
         # Generate demo data points for the last 24 hours
         data_points = []
         for i in range(24):
@@ -246,37 +255,48 @@ def _process_current_flow(result: Any) -> Dict[str, Any]:
 
 
 def _process_energy_history(result: Any, resolution: str) -> Dict[str, Any]:
-    """Process historical energy data from Growatt telemetry."""
-    solar_data = {}
-    grid_data = {}
-    home_data = {}
+    """Process historical energy data from Growatt telemetry into chart format."""
+    # Collect data by timestamp
+    data_by_time = {}
 
     if result:
         for table in result:
             for record in table.records:
                 timestamp = record["_time"].isoformat()
                 field_name = record["_field"]
-                value = float(record["_value"] or 0)
+                value = float(record["_value"] or 0) / 1000.0  # Convert W to kW
+
+                if timestamp not in data_by_time:
+                    data_by_time[timestamp] = {
+                        "timestamp": timestamp,
+                        "production": 0,
+                        "consumption": 0,
+                        "grid_import": 0,
+                        "grid_export": 0
+                    }
 
                 if field_name == "InputPower":
-                    if timestamp not in solar_data:
-                        solar_data[timestamp] = {"time": timestamp, "value": 0}
-                    solar_data[timestamp]["value"] = value
-                elif field_name == "ACPowerToGrid":
-                    if timestamp not in grid_data:
-                        grid_data[timestamp] = {"time": timestamp, "value": 0}
-                    grid_data[timestamp]["value"] = value
+                    data_by_time[timestamp]["production"] = value
                 elif field_name == "ACPowerToUser":
-                    if timestamp not in home_data:
-                        home_data[timestamp] = {"time": timestamp, "value": 0}
-                    home_data[timestamp]["value"] = value
+                    data_by_time[timestamp]["consumption"] = value
+                elif field_name == "ACPowerToGrid":
+                    # Positive = export, negative = import
+                    if value > 0:
+                        data_by_time[timestamp]["grid_export"] = value
+                    else:
+                        data_by_time[timestamp]["grid_import"] = abs(value)
+
+    # Convert to sorted list
+    data_points = sorted(data_by_time.values(), key=lambda x: x["timestamp"])
 
     return {
+        "period": "custom",  # Will be overwritten by caller
         "resolution": resolution,
-        "solar": list(solar_data.values()),
-        "grid": list(grid_data.values()),
-        "home": list(home_data.values()),
-        "consumption": []  # Calculate from solar and grid if needed
+        "data": data_points,
+        # Also include separate arrays for compatibility
+        "solar": [{"time": p["timestamp"], "value": p["production"]} for p in data_points],
+        "grid": [{"time": p["timestamp"], "value": p.get("grid_export", 0) - p.get("grid_import", 0)} for p in data_points],
+        "home": [{"time": p["timestamp"], "value": p["consumption"]} for p in data_points]
     }
 
 
