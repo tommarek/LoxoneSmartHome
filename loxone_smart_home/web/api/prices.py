@@ -248,21 +248,37 @@ def _process_current_price(result: Any, now: datetime) -> Dict[str, Any]:
 
 def _process_price_forecast(result: Any, hours: int) -> Dict[str, Any]:
     """Process price forecast query result from InfluxDB."""
-    blocks = []
+    # Group data by timestamp since InfluxDB returns separate records for each field
+    blocks_by_time = {}
 
     # Process InfluxDB result - each price point is a 15-minute block
     if result:
         for table in result:
             for record in table.records:
-                timestamp = record["_time"]
-                price_eur_mwh = float(record["_value"] or 0)
+                timestamp = record["_time"].isoformat()
+                field_name = record["_field"]
+                value = float(record["_value"] or 0)
 
-                blocks.append({
-                    "timestamp": timestamp.isoformat(),
-                    "price_eur_mwh": price_eur_mwh,
-                    "price_czk_kwh": float(record.get("price_czk_kwh", price_eur_mwh * 25 / 1000)),
-                    "level": _get_price_level(price_eur_mwh)
-                })
+                # Initialize block for this timestamp if needed
+                if timestamp not in blocks_by_time:
+                    blocks_by_time[timestamp] = {
+                        "timestamp": timestamp,
+                        "price_eur_mwh": 0,
+                        "price_czk_kwh": 0
+                    }
+
+                # Store the appropriate field value
+                if field_name == "price":
+                    blocks_by_time[timestamp]["price_eur_mwh"] = value
+                elif field_name == "price_czk_kwh":
+                    blocks_by_time[timestamp]["price_czk_kwh"] = value
+
+    # Convert to list and add price level
+    blocks = []
+    for block_data in blocks_by_time.values():
+        # Use EUR price for level calculation
+        block_data["level"] = _get_price_level(block_data["price_eur_mwh"])
+        blocks.append(block_data)
 
     # Sort by timestamp to ensure chronological order
     blocks.sort(key=lambda x: x["timestamp"])
@@ -292,23 +308,58 @@ def _process_price_forecast(result: Any, hours: int) -> Dict[str, Any]:
 
 
 def _calculate_optimal_schedule(forecast: Dict[str, Any]) -> Dict[str, Any]:
-    """Calculate optimal charging/discharging schedule."""
-    # TODO: Implement actual optimization logic
-    blocks = forecast["blocks"]
+    """Calculate optimal charging/discharging schedule from real price data."""
+    blocks = forecast.get("blocks", [])
 
-    # Find cheapest blocks for charging
+    if not blocks:
+        # Return empty schedule if no price data
+        return {
+            "charging": {"blocks": [], "total_hours": 0, "avg_price": 0},
+            "discharging": {"blocks": [], "total_hours": 0, "avg_price": 0},
+            "estimated_savings": {"daily": 0, "monthly": 0}
+        }
+
+    # Find cheapest blocks for charging (aim for 2-4 hours)
     sorted_blocks = sorted(blocks, key=lambda x: x["price_czk_kwh"])
-    charging_blocks = sorted_blocks[:8]  # 2 hours of charging
+    num_charging_blocks = min(16, len(sorted_blocks))  # Up to 4 hours (16 x 15min blocks)
+    charging_blocks = sorted_blocks[:num_charging_blocks]
 
     # Find most expensive blocks for discharging
+    # Only discharge if price is significantly higher than charging price
+    avg_charging_price = (
+        sum(b["price_czk_kwh"] for b in charging_blocks) / len(charging_blocks)
+        if charging_blocks else 0
+    )
+    min_discharge_price = avg_charging_price * 1.3  # At least 30% higher
+
     expensive_blocks = sorted(blocks, key=lambda x: x["price_czk_kwh"], reverse=True)
-    discharge_blocks = [b for b in expensive_blocks[:12] if b["price_czk_kwh"] > 3.0]
+    discharge_blocks = [
+        b for b in expensive_blocks[:24]  # Up to 6 hours
+        if b["price_czk_kwh"] > min_discharge_price
+    ]
+
+    # Calculate estimated savings
+    # Assume 10 kWh battery capacity, 90% efficiency
+    battery_capacity = 10.0  # kWh
+    efficiency = 0.9
+
+    if charging_blocks and discharge_blocks:
+        charge_price = sum(b["price_czk_kwh"] for b in charging_blocks) / len(charging_blocks)
+        discharge_price = sum(b["price_czk_kwh"] for b in discharge_blocks) / len(discharge_blocks)
+        price_spread = discharge_price - charge_price
+
+        # Daily savings: battery_capacity * price_spread * efficiency
+        daily_savings = battery_capacity * price_spread * efficiency
+        monthly_savings = daily_savings * 30
+    else:
+        daily_savings = 0
+        monthly_savings = 0
 
     return {
         "charging": {
             "blocks": charging_blocks,
             "total_hours": len(charging_blocks) / 4,
-            "avg_price": sum(b["price_czk_kwh"] for b in charging_blocks) / len(charging_blocks)
+            "avg_price": avg_charging_price
         },
         "discharging": {
             "blocks": discharge_blocks,
@@ -319,8 +370,8 @@ def _calculate_optimal_schedule(forecast: Dict[str, Any]) -> Dict[str, Any]:
             )
         },
         "estimated_savings": {
-            "daily": 125.50,  # CZK
-            "monthly": 3765.00
+            "daily": round(daily_savings, 2),
+            "monthly": round(monthly_savings, 2)
         }
     }
 
