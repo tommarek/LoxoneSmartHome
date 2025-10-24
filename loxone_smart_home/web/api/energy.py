@@ -1,5 +1,6 @@
 """Fixed Energy API endpoints with correct InfluxDB queries."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
@@ -7,13 +8,16 @@ from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
+import pytz
 
 from utils.schedule_calculator import calculate_optimal_schedule, determine_block_mode
+from modules.growatt.price_analyzer import PriceAnalyzer
 
 logger = logging.getLogger(__name__)
 
 # Prague timezone for local time display
 PRAGUE_TZ = ZoneInfo("Europe/Prague")
+PRAGUE_TZ_PYTZ = pytz.timezone("Europe/Prague")
 
 from ..models.responses import (
     BatteryStatusResponse,
@@ -435,6 +439,8 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
     - Prices for each 15-minute block
     - Mode indicators (🔋=charge, 🔌=pre-discharge, ⚡=discharge)
     - Today and tomorrow schedules
+
+    Uses the SAME PriceAnalyzer logic as Growatt controller to ensure data consistency.
     """
     web_service = request.app.state.web_service
 
@@ -444,26 +450,55 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         return schedule
 
     try:
-        # Get price data from InfluxDB (use Prague local time like Growatt controller)
-        now = datetime.now(PRAGUE_TZ)
+        # Use PriceAnalyzer to fetch prices from OTE API (same as Growatt controller)
+        now = datetime.now(PRAGUE_TZ_PYTZ)
         today = now.date()
         tomorrow = today + timedelta(days=1)
 
-        # Query today and tomorrow prices
-        query = f'''from(bucket: "ote_prices")
-  |> range(start: {today.isoformat()}T00:00:00Z, stop: {tomorrow.isoformat()}T23:59:59Z)
-  |> filter(fn: (r) => r["_measurement"] == "electricity_prices")
-  |> filter(fn: (r) => r["_field"] == "price_czk_kwh")
-  |> sort(columns: ["_time"])'''
+        # Create PriceAnalyzer instance with same config as Growatt controller
+        price_analyzer = PriceAnalyzer(
+            logger=logger,
+            local_tz=PRAGUE_TZ_PYTZ,
+            optional_config={}
+        )
 
-        result = await web_service.influxdb_client.query(query)
-        logger.info(f"Schedule query executed successfully")
-        schedule = _process_schedule_table(result, now)
-        logger.info(f"Schedule processed: {len(schedule.get('days', []))} days, {sum(len(d['hours']) for d in schedule.get('days', []))} hours")
+        # Fetch prices for today and tomorrow from OTE API
+        today_str = today.strftime("%Y-%m-%d")
+        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+
+        logger.info(f"Fetching prices from OTE API for {today_str} and {tomorrow_str}")
+
+        # Fetch both days in parallel
+        today_result, tomorrow_result = await asyncio.gather(
+            price_analyzer.fetch_dam_energy_prices(date=today_str),
+            price_analyzer.fetch_dam_energy_prices(date=tomorrow_str),
+            return_exceptions=True
+        )
+
+        # Handle fetch results (fetch_dam_energy_prices returns Tuple[Dict, str])
+        today_prices_dict: Dict[Tuple[str, str], float] = {}
+        tomorrow_prices_dict: Dict[Tuple[str, str], float] = {}
+
+        if isinstance(today_result, tuple) and not isinstance(today_result, Exception):
+            today_prices_dict = today_result[0]
+        if isinstance(tomorrow_result, tuple) and not isinstance(tomorrow_result, Exception):
+            tomorrow_prices_dict = tomorrow_result[0]
+
+        logger.info(
+            f"Fetched {len(today_prices_dict)} blocks for today, "
+            f"{len(tomorrow_prices_dict)} blocks for tomorrow from OTE API"
+        )
+
+        # Convert to format expected by schedule processing
+        schedule = _process_schedule_from_ote(
+            today_prices_dict, tomorrow_prices_dict, today, tomorrow, now, web_service
+        )
+
     except Exception as e:
         # Log error and return demo schedule
-        logger.error(f"Failed to fetch price schedule from InfluxDB: {e}", exc_info=True)
-        schedule = _generate_demo_schedule(now)
+        logger.error(f"Failed to fetch price schedule from OTE API: {e}", exc_info=True)
+        now_fallback = datetime.now(PRAGUE_TZ)
+        schedule = _generate_demo_schedule(now_fallback)
 
     # Cache for 5 minutes
     await web_service.cache.set("energy:schedule", schedule, ttl=300)
@@ -471,8 +506,117 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
     return schedule
 
 
+def _process_schedule_from_ote(
+    today_prices_dict: Dict[Tuple[str, str], float],
+    tomorrow_prices_dict: Dict[Tuple[str, str], float],
+    today: Any,
+    tomorrow: Any,
+    now: datetime,
+    web_service: Any
+) -> Dict[str, Any]:
+    """Process OTE price data into schedule table format.
+
+    Uses the SAME conversion and logic as Growatt controller:
+    - Converts EUR/MWh to CZK/kWh
+    - Uses same EUR_CZK_RATE from settings
+    - Uses shared scheduling logic from utils.schedule_calculator
+    """
+    # Get EUR to CZK rate from settings
+    eur_czk_rate = web_service.settings.ote.eur_czk_rate  # Should be 25.0
+
+    # Convert OTE price format to (datetime, price_czk) format
+    all_blocks = []
+
+    # Process today's prices
+    for (start_time, end_time), price_eur_mwh in today_prices_dict.items():
+        # Parse time string "HH:MM"
+        hour, minute = map(int, start_time.split(':'))
+        # Create datetime in Prague timezone
+        dt = PRAGUE_TZ_PYTZ.localize(datetime(today.year, today.month, today.day, hour, minute))
+        # Convert EUR/MWh to CZK/kWh (same as Growatt controller)
+        price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+        all_blocks.append((dt, price_czk_kwh))
+
+    # Process tomorrow's prices
+    for (start_time, end_time), price_eur_mwh in tomorrow_prices_dict.items():
+        # Parse time string "HH:MM"
+        hour, minute = map(int, start_time.split(':'))
+        # Create datetime in Prague timezone
+        dt = PRAGUE_TZ_PYTZ.localize(datetime(tomorrow.year, tomorrow.month, tomorrow.day, hour, minute))
+        # Convert EUR/MWh to CZK/kWh
+        price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+        all_blocks.append((dt, price_czk_kwh))
+
+    logger.info(f"Converted {len(all_blocks)} total blocks from OTE format to schedule format")
+
+    if not all_blocks:
+        return {"days": [], "legend": [], "summary": {}}
+
+    # Use shared scheduling logic (same as Growatt controller)
+    CHARGE_BLOCKS_COUNT = getattr(web_service.settings.growatt, 'battery_charge_blocks', 8)
+    DISCHARGE_THRESHOLD_CZK = getattr(web_service.settings.growatt, 'discharge_price_min', 3.0)
+
+    charge_times, discharge_times, charge_threshold, discharge_threshold = calculate_optimal_schedule(
+        all_blocks,
+        charge_blocks_count=CHARGE_BLOCKS_COUNT,
+        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK
+    )
+
+    logger.info(
+        f"Schedule logic: {len(charge_times)} charge blocks (threshold: {charge_threshold:.3f} CZK/kWh), "
+        f"{len(discharge_times)} discharge blocks (threshold: {discharge_threshold:.1f} CZK/kWh)"
+    )
+
+    # Separate blocks by day and format schedule
+    today_blocks = [(t, p) for t, p in all_blocks if t.date() == today]
+    tomorrow_blocks = [(t, p) for t, p in all_blocks if t.date() == tomorrow]
+
+    days = []
+
+    # Process today
+    if today_blocks:
+        today_schedule = _format_day_schedule_with_modes(
+            today_blocks, today, "TODAY (remaining)",
+            charge_times, discharge_times, now
+        )
+        days.append(today_schedule)
+
+    # Process tomorrow
+    if tomorrow_blocks:
+        tomorrow_schedule = _format_day_schedule_with_modes(
+            tomorrow_blocks, tomorrow, "TOMORROW",
+            charge_times, discharge_times, now
+        )
+        days.append(tomorrow_schedule)
+
+    # Build legend
+    legend = [
+        {"icon": "🔋", "label": "Regular charge", "color": "#4CAF50"},
+        {"icon": "🔌", "label": "Pre-discharge charge", "color": "#FF9800"},
+        {"icon": "⚡", "label": "Discharge", "color": "#F44336"},
+        {"icon": "-", "label": "Normal", "color": "#9E9E9E"}
+    ]
+
+    # Summary statistics
+    summary = {
+        "charge_blocks": len(charge_times),
+        "discharge_blocks": len(discharge_times),
+        "charge_threshold": round(charge_threshold, 3),
+        "discharge_threshold": discharge_threshold
+    }
+
+    return {
+        "days": days,
+        "legend": legend,
+        "summary": summary
+    }
+
+
 def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
     """Process InfluxDB result into schedule table format.
+
+    DEPRECATED: This function is no longer used. Web API now fetches directly from OTE API
+    using PriceAnalyzer to match Growatt controller's data source.
 
     Uses shared scheduling logic from utils.schedule_calculator that matches
     the Growatt controller's optimization algorithm.
