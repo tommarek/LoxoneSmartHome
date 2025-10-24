@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
+from utils.schedule_calculator import calculate_optimal_schedule, determine_block_mode
+
 logger = logging.getLogger(__name__)
 
 from ..models.responses import (
@@ -466,53 +468,63 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
 
 
 def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
-    """Process InfluxDB result into schedule table format."""
+    """Process InfluxDB result into schedule table format.
+
+    Uses shared scheduling logic from utils.schedule_calculator that matches
+    the Growatt controller's optimization algorithm.
+    """
     today = now.date()
     tomorrow = today + timedelta(days=1)
 
-    # Collect all price blocks
-    today_blocks = []
-    tomorrow_blocks = []
+    # Collect all price blocks with timestamps
+    all_blocks = []
 
     if result:
         for table in result:
             for record in table.records:
-                time = record["_time"]
-                price = float(record["_value"] or 0)
+                time_dt = record["_time"]
+                price_czk = float(record["_value"] or 0)
+                all_blocks.append((time_dt, price_czk))
 
-                block_date = time.date()
-                if block_date == today:
-                    today_blocks.append((time, price))
-                elif block_date == tomorrow:
-                    tomorrow_blocks.append((time, price))
+    logger.info(f"Collected {len(all_blocks)} total blocks from InfluxDB")
 
-    logger.info(f"Collected {len(today_blocks)} blocks for today, {len(tomorrow_blocks)} blocks for tomorrow")
+    if not all_blocks:
+        return {"days": [], "legend": [], "summary": {}}
 
-    # Calculate thresholds for mode decisions (simplified version of Growatt logic)
-    all_prices = [p for _, p in today_blocks + tomorrow_blocks]
-    if all_prices:
-        sorted_prices = sorted(all_prices)
-        # Bottom 20% for charging
-        charge_threshold = sorted_prices[int(len(sorted_prices) * 0.2)] if len(sorted_prices) > 5 else min(all_prices)
-        # Top 20% for discharge
-        discharge_threshold = sorted_prices[int(len(sorted_prices) * 0.8)] if len(sorted_prices) > 5 else max(all_prices)
-    else:
-        charge_threshold = 2.0
-        discharge_threshold = 3.5
+    # Use shared scheduling logic (reused by Growatt controller)
+    CHARGE_BLOCKS_COUNT = 8  # Default battery_charge_blocks from settings
+    DISCHARGE_THRESHOLD_CZK = 3.0  # Default discharge_price_min from settings
+
+    charge_times, discharge_times, charge_threshold, discharge_threshold = calculate_optimal_schedule(
+        all_blocks,
+        charge_blocks_count=CHARGE_BLOCKS_COUNT,
+        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK
+    )
+
+    logger.info(
+        f"Schedule logic: {len(charge_times)} charge blocks (threshold: {charge_threshold:.3f} CZK/kWh), "
+        f"{len(discharge_times)} discharge blocks (threshold: {discharge_threshold:.1f} CZK/kWh)"
+    )
+
+    # === STEP 3: Separate blocks by day and format schedule ===
+    today_blocks = [(t, p) for t, p in all_blocks if t.date() == today]
+    tomorrow_blocks = [(t, p) for t, p in all_blocks if t.date() == tomorrow]
 
     days = []
 
     # Process today
     if today_blocks:
-        today_schedule = _format_day_schedule(
-            today_blocks, today, "TODAY (remaining)", charge_threshold, discharge_threshold, now
+        today_schedule = _format_day_schedule_with_modes(
+            today_blocks, today, "TODAY (remaining)",
+            charge_times, discharge_times, now
         )
         days.append(today_schedule)
 
     # Process tomorrow
     if tomorrow_blocks:
-        tomorrow_schedule = _format_day_schedule(
-            tomorrow_blocks, tomorrow, "TOMORROW", charge_threshold, discharge_threshold, now
+        tomorrow_schedule = _format_day_schedule_with_modes(
+            tomorrow_blocks, tomorrow, "TOMORROW",
+            charge_times, discharge_times, now
         )
         days.append(tomorrow_schedule)
 
@@ -526,10 +538,10 @@ def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
 
     # Summary statistics
     summary = {
-        "charge_blocks": sum(1 for day in days for hour in day["hours"] for block in hour["blocks"] if block["mode"] == "charge"),
-        "discharge_blocks": sum(1 for day in days for hour in day["hours"] for block in hour["blocks"] if block["mode"] == "discharge"),
+        "charge_blocks": len(charge_times),
+        "discharge_blocks": len(discharge_times),
         "charge_threshold": round(charge_threshold, 3),
-        "discharge_threshold": round(discharge_threshold, 3)
+        "discharge_threshold": discharge_threshold
     }
 
     return {
@@ -539,15 +551,15 @@ def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
     }
 
 
-def _format_day_schedule(
+def _format_day_schedule_with_modes(
     blocks: List[Tuple[datetime, float]],
     date: Any,
     label: str,
-    charge_threshold: float,
-    discharge_threshold: float,
+    charge_block_times: set,
+    discharge_block_times: set,
     now: datetime
 ) -> Dict[str, Any]:
-    """Format blocks into day schedule structure."""
+    """Format blocks into day schedule structure using Growatt controller logic."""
     hours_dict: Dict[int, List[Dict[str, Any]]] = {}
 
     for time, price in blocks:
@@ -558,16 +570,8 @@ def _format_day_schedule(
         hour = time.hour
         minute = time.minute
 
-        # Determine mode based on price thresholds
-        if price <= charge_threshold:
-            mode = "charge"
-            icon = "🔋"
-        elif price >= discharge_threshold:
-            mode = "discharge"
-            icon = "⚡"
-        else:
-            mode = "normal"
-            icon = "-"
+        # Determine mode using shared utility function
+        mode, icon = determine_block_mode(time, price, charge_block_times, discharge_block_times)
 
         # Format time block
         time_str = f"{hour:02d}:{minute:02d}"
