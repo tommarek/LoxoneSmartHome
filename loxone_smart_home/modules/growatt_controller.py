@@ -2087,6 +2087,54 @@ class GrowattController(BaseModule):
 
         return discharge_periods
 
+    def get_schedule_table_data(self) -> Dict[str, Any]:
+        """Get schedule table data for web API display.
+
+        Returns the EXACT same data that's shown in logs, ensuring 100% consistency
+        between what's logged and what's displayed in the web interface.
+
+        Returns:
+            Dictionary containing:
+            - today_prices: Dict of (start, end) -> price_eur for today
+            - tomorrow_prices: Dict of (start, end) -> price_eur for tomorrow
+            - today_date: ISO date string for today
+            - tomorrow_date: ISO date string for tomorrow (or None)
+            - charging_blocks_today: Set of (start, end) time tuples
+            - charging_blocks_tomorrow: Set of (start, end) time tuples
+            - pre_discharge_blocks_today: Set of (start, end) time tuples
+            - pre_discharge_blocks_tomorrow: Set of (start, end) time tuples
+            - discharge_periods_today: Set of (start, end) time tuples
+            - discharge_periods_tomorrow: Set of (start, end) time tuples
+            - eur_czk_rate: Current EUR to CZK exchange rate
+        """
+        now = self._get_local_now()
+        today_date = now.date().isoformat()
+        tomorrow_date = (now.date() + timedelta(days=1)).isoformat()
+
+        # Return current schedule state
+        return {
+            # Price data (in EUR/MWh, same as stored internally)
+            "today_prices": self._current_prices.copy() if self._current_prices else {},
+            "tomorrow_prices": self._next_day_prices.copy() if self._next_day_prices else {},
+            "today_date": self._prices_date or today_date,
+            "tomorrow_date": self._next_day_prices_date or tomorrow_date,
+
+            # Schedule blocks (all in HH:MM format)
+            "charging_blocks_today": self._cheapest_charging_blocks_today.copy(),
+            "charging_blocks_tomorrow": self._cheapest_charging_blocks_tomorrow.copy(),
+            "pre_discharge_blocks_today": self._pre_discharge_blocks_today.copy(),
+            "pre_discharge_blocks_tomorrow": self._pre_discharge_blocks_tomorrow.copy(),
+            "discharge_periods_today": self._discharge_periods_today.copy(),
+            "discharge_periods_tomorrow": self._discharge_periods_tomorrow.copy(),
+
+            # Exchange rate
+            "eur_czk_rate": self._eur_czk_rate or 25.0,
+
+            # Additional metadata
+            "prices_fetched": bool(self._current_prices),
+            "next_day_prices_fetched": self._next_day_prices_fetched,
+        }
+
     async def _log_price_analysis(
         self,
         prices: Dict[Tuple[str, str], float],
@@ -2948,6 +2996,9 @@ class GrowattController(BaseModule):
                                 f"✅ 23:55 - Pre-midnight check: Next-day prices already "
                                 f"available for {self._next_day_prices_date}"
                             )
+                            # Display schedule table for tomorrow
+                            self.logger.info("📋 Displaying tomorrow's schedule:")
+                            await self._calculate_cross_day_optimal_schedule()
 
                 # Check for midnight - update date display
                 if now.hour == 0 and now.minute == 0:
