@@ -519,7 +519,7 @@ def _format_schedule_from_controller(
         today_schedule = _format_day_schedule_from_controller(
             today_prices,
             today,
-            "TODAY (remaining)",
+            "TODAY",
             charge_today,
             pre_discharge_today,
             discharge_today,
@@ -605,11 +605,7 @@ def _format_day_schedule_from_controller(
         hour = int(start_str.split(':')[0])
         minute = int(start_str.split(':')[1])
 
-        # Skip past blocks for "today"
-        if label.startswith("TODAY"):
-            block_time = datetime.combine(date, dt_time(hour, minute))
-            if block_time < now:
-                continue
+        # Show ALL prices (no filtering of past blocks) - same as controller logs
 
         # Determine mode (exact same logic as controller logs)
         if (start_str, end_str) in pre_discharge_blocks:
