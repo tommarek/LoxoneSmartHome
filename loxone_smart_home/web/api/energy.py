@@ -199,24 +199,41 @@ async def get_power_statistics(
     else:
         start = now - timedelta(days=365)
 
-    # Query Growatt energy counters (not instantaneous power)
-    # Look for TodayEnergy, TotalEnergy fields which are actual energy values
-    query = f'''from(bucket: "solar")
-  |> range(start: {start.isoformat()}Z)
-  |> filter(fn: (r) => r["_measurement"] == "solar")
-  |> filter(fn: (r) => r["_field"] =~ /Energy|energy/)
-  |> last()'''
-
+    # Try to query actual data from Loxone measurements
+    # The field names depend on what Loxone sends via UDP listener
     try:
-        result = await web_service.influxdb_client.query(query)
-        if result and len(list(result)) > 0:
-            stats = _process_power_stats(result, period)
-        else:
-            logger.warning(f"No energy counter data found for period {period}, using estimates")
-            # Return sensible demo stats - not millions of kWh!
-            stats = _get_demo_stats(period)
+        # Query to find what measurements/fields are available
+        schema_query = f'''from(bucket: "loxone")
+  |> range(start: {start.isoformat()}Z)
+  |> limit(n: 10)'''
+
+        result = await web_service.influxdb_client.query(schema_query)
+
+        if result:
+            # Log available measurements and fields for debugging
+            measurements_found = set()
+            fields_found = set()
+            for table in result:
+                for record in table.records:
+                    # Access measurement and field from record (dictionary-style)
+                    try:
+                        measurements_found.add(record["_measurement"])
+                        fields_found.add(record["_field"])
+                    except (KeyError, TypeError):
+                        pass  # Skip if fields not available
+
+            logger.info(
+                f"Available in loxone bucket: "
+                f"measurements={list(measurements_found)[:5]}, "
+                f"fields={list(fields_found)[:10]}"
+            )
+
+        # For now, return demo stats until we know the actual field names
+        logger.info(f"Returning demo statistics for period: {period}")
+        stats = _get_demo_stats(period)
+
     except Exception as e:
-        logger.warning(f"Failed to query statistics: {e}")
+        logger.warning(f"Failed to query Loxone data: {e}")
         stats = _get_demo_stats(period)
 
     return stats
