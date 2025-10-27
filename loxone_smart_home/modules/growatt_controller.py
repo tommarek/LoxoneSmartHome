@@ -2058,8 +2058,6 @@ class GrowattController(BaseModule):
 
         try:
             import json
-            from influxdb_client import Point
-            from influxdb_client.client.write_api import SYNCHRONOUS
 
             # Get schedule data
             schedule_data = self.get_schedule_table_data()
@@ -2081,13 +2079,13 @@ class GrowattController(BaseModule):
                 "next_day_prices_fetched": schedule_data["next_day_prices_fetched"],
             }
 
-            # Create InfluxDB point with schedule as JSON string
-            point = Point("growatt_schedule") \
-                .tag("source", "growatt_controller") \
-                .field("schedule_json", json.dumps(schedule_json))
-
-            # Write to InfluxDB (use solar bucket since web service reads from there)
-            await self.influxdb_client.write("solar", [point])
+            # Write to InfluxDB using write_point method
+            await self.influxdb_client.write_point(
+                bucket="solar",
+                measurement="growatt_schedule",
+                fields={"schedule_json": json.dumps(schedule_json)},
+                tags={"source": "growatt_controller"}
+            )
             self.logger.debug("Stored schedule data to InfluxDB bucket=solar measurement=growatt_schedule")
 
         except Exception as e:
