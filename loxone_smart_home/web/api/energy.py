@@ -143,6 +143,26 @@ async def get_battery_status(request: Request) -> Dict[str, Any]:
   |> last()'''
             result = await web_service.influxdb_client.query(query)
             battery_data = _process_battery_status(result)
+
+            # Query current mode from Growatt controller status
+            mode_query = '''from(bucket: "solar")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r["_measurement"] == "growatt_status")
+  |> filter(fn: (r) => r["_field"] == "current_mode")
+  |> last()'''
+            mode_result = await web_service.influxdb_client.query(mode_query)
+
+            # Extract mode from result
+            current_mode = "unknown"
+            if mode_result:
+                for table in mode_result:
+                    for record in table.records:
+                        if record["_field"] == "current_mode":
+                            current_mode = record["_value"]
+                            break
+
+            battery_data["mode"] = current_mode
+
         except Exception as e:
             # Return demo battery data if query fails
             battery_data = {
@@ -152,7 +172,8 @@ async def get_battery_status(request: Request) -> Dict[str, Any]:
                 "voltage": 52.0,
                 "current": 20.0,
                 "temperature": 28.0,
-                "health": 95
+                "health": 95,
+                "mode": "unknown"
             }
         await web_service.cache.set("battery:status", battery_data, ttl=30)
 
@@ -178,43 +199,77 @@ async def get_power_statistics(
     else:
         start = now - timedelta(days=365)
 
-    # Query Growatt telemetry with aggregation
+    # Query Growatt energy counters (not instantaneous power)
+    # Look for TodayEnergy, TotalEnergy fields which are actual energy values
     query = f'''from(bucket: "solar")
   |> range(start: {start.isoformat()}Z)
   |> filter(fn: (r) => r["_measurement"] == "solar")
-  |> sum()'''
+  |> filter(fn: (r) => r["_field"] =~ /Energy|energy/)
+  |> last()'''
 
     try:
         result = await web_service.influxdb_client.query(query)
-        stats = _process_power_stats(result, period)
+        if result and len(list(result)) > 0:
+            stats = _process_power_stats(result, period)
+        else:
+            logger.warning(f"No energy counter data found for period {period}, using estimates")
+            # Return sensible demo stats - not millions of kWh!
+            stats = _get_demo_stats(period)
     except Exception as e:
-        # Return demo stats in the format expected by the frontend
-        stats = {
-            "period": period,
-            "production": {
-                "total": 24.5,  # kWh
-                "peak": 3.8,
-                "average": 2.1
-            },
-            "consumption": {
-                "total": 18.3,
-                "peak": 4.2,
-                "average": 1.8
-            },
-            "grid": {
-                "import": 3.2,  # Named 'import' but accessed via 'grid.import'
-                "export": 9.4,
-                "net": -6.2
-            },
-            "self_sufficiency": 82,
-            "self_consumption": 75,
-            "savings": {
-                "amount": 145.50,  # CZK
-                "co2_avoided": 12.3  # kg
-            }
-        }
+        logger.warning(f"Failed to query statistics: {e}")
+        stats = _get_demo_stats(period)
 
     return stats
+
+
+def _get_demo_stats(period: str) -> Dict[str, Any]:
+    """Get demo statistics with sensible values based on period."""
+    # Scale values based on period
+    if period == "today":
+        production_total = 24.5
+        consumption_total = 18.3
+        grid_import = 3.2
+        grid_export = 9.4
+    elif period == "week":
+        production_total = 171.5
+        consumption_total = 128.1
+        grid_import = 22.4
+        grid_export = 65.8
+    elif period == "month":
+        production_total = 735.0
+        consumption_total = 549.0
+        grid_import = 96.0
+        grid_export = 282.0
+    else:  # year
+        production_total = 8820.0
+        consumption_total = 6588.0
+        grid_import = 1152.0
+        grid_export = 3384.0
+
+    return {
+        "period": period,
+        "production": {
+            "total": production_total,
+            "peak": production_total * 0.15,
+            "average": production_total * 0.085
+        },
+        "consumption": {
+            "total": consumption_total,
+            "peak": consumption_total * 0.17,
+            "average": consumption_total * 0.098
+        },
+        "grid": {
+            "import": grid_import,
+            "export": grid_export,
+            "net": grid_export - grid_import
+        },
+        "self_sufficiency": 82,
+        "self_consumption": 75,
+        "savings": {
+            "amount": consumption_total * 5.8,  # ~5.8 CZK per kWh saved
+            "co2_avoided": production_total * 0.5  # ~0.5 kg CO2 per kWh
+        }
+    }
 
 
 def _process_current_flow(result: Any) -> Dict[str, Any]:

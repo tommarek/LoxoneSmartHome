@@ -2086,10 +2086,23 @@ class GrowattController(BaseModule):
                 fields={"schedule_json": json.dumps(schedule_json)},
                 tags={"source": "growatt_controller"}
             )
+
+            # Also write current mode separately for easy access
+            await self.influxdb_client.write_point(
+                bucket="solar",
+                measurement="growatt_status",
+                fields={
+                    "current_mode": self._current_mode or "unknown",
+                    "battery_soc": self._battery_soc
+                },
+                tags={"source": "growatt_controller"}
+            )
+
             self.logger.info(
                 f"✅ Stored schedule data to InfluxDB: "
                 f"{len(schedule_data.get('today_prices', {}))} today prices, "
-                f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow prices"
+                f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow prices, "
+                f"mode={self._current_mode}"
             )
 
         except Exception as e:
