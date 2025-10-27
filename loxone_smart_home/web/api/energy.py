@@ -452,47 +452,70 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         return schedule
 
     try:
-        # Get schedule data from cache (populated via MQTT from Growatt controller)
-        schedule_data = await web_service.cache.get("growatt:schedule")
+        # Get schedule data from InfluxDB (written by Growatt controller)
+        query = '''from(bucket: "solar")
+  |> range(start: -5m)
+  |> filter(fn: (r) => r["_measurement"] == "growatt_schedule")
+  |> last()'''
+
+        result = await web_service.influxdb_client.query(query)
+        schedule_data = None
+
+        # Parse InfluxDB result
+        if result:
+            for table in result:
+                for record in table.records:
+                    if record["_field"] == "schedule_json":
+                        import json
+                        schedule_json = json.loads(record["_value"])
+
+                        # Convert back to the format expected by formatter
+                        # Convert string keys back to tuples
+                        today_prices = {}
+                        for k, v in schedule_json.get("today_prices", {}).items():
+                            parts = k.split('-')
+                            today_prices[(parts[0], parts[1])] = v
+
+                        tomorrow_prices = {}
+                        for k, v in schedule_json.get("tomorrow_prices", {}).items():
+                            parts = k.split('-')
+                            tomorrow_prices[(parts[0], parts[1])] = v
+
+                        # Convert lists back to sets
+                        schedule_data = {
+                            "today_prices": today_prices,
+                            "tomorrow_prices": tomorrow_prices,
+                            "today_date": schedule_json.get("today_date"),
+                            "tomorrow_date": schedule_json.get("tomorrow_date"),
+                            "charging_blocks_today": {tuple(item) for item in schedule_json.get("charging_blocks_today", [])},
+                            "charging_blocks_tomorrow": {tuple(item) for item in schedule_json.get("charging_blocks_tomorrow", [])},
+                            "pre_discharge_blocks_today": {tuple(item) for item in schedule_json.get("pre_discharge_blocks_today", [])},
+                            "pre_discharge_blocks_tomorrow": {tuple(item) for item in schedule_json.get("pre_discharge_blocks_tomorrow", [])},
+                            "discharge_periods_today": {tuple(item) for item in schedule_json.get("discharge_periods_today", [])},
+                            "discharge_periods_tomorrow": {tuple(item) for item in schedule_json.get("discharge_periods_tomorrow", [])},
+                            "eur_czk_rate": schedule_json.get("eur_czk_rate", 25.0),
+                            "prices_fetched": schedule_json.get("prices_fetched", False),
+                            "next_day_prices_fetched": schedule_json.get("next_day_prices_fetched", False),
+                        }
+                        break
 
         if not schedule_data:
-            # Cache miss - request schedule from Growatt controller via MQTT
-            logger.info("Schedule not in cache, requesting from Growatt controller...")
-
-            if web_service.mqtt_client:
-                try:
-                    # Publish request
-                    await web_service.mqtt_client.publish("energy/schedule/request", "")
-
-                    # Wait briefly for the response (with retries)
-                    for attempt in range(3):
-                        await asyncio.sleep(0.5)  # Wait 500ms
-                        schedule_data = await web_service.cache.get("growatt:schedule")
-                        if schedule_data:
-                            logger.info("Received schedule data from Growatt controller")
-                            break
-
-                    if not schedule_data:
-                        logger.warning("No response from Growatt controller after 1.5s, using demo schedule")
-                        raise Exception("Schedule data not available after request")
-
-                except Exception as e:
-                    logger.warning(f"Failed to request schedule: {e}")
-                    raise Exception("Schedule data not available")
+            logger.warning("No schedule data in InfluxDB, using demo schedule")
+            raise Exception("Schedule data not available")
 
         # Convert to web API format
         now = datetime.now(PRAGUE_TZ)
         schedule = _format_schedule_from_controller(schedule_data, now)
 
         logger.info(
-            f"Fetched schedule from cache: "
+            f"Fetched schedule from InfluxDB: "
             f"{len(schedule_data.get('today_prices', {}))} today blocks, "
             f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow blocks"
         )
 
     except Exception as e:
         # Log error and return demo schedule
-        logger.error(f"Failed to get schedule from Growatt controller: {e}", exc_info=True)
+        logger.error(f"Failed to get schedule from InfluxDB: {e}", exc_info=True)
         now_fallback = datetime.now(PRAGUE_TZ)
         schedule = _generate_demo_schedule(now_fallback)
 
