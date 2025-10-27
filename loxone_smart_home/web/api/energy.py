@@ -453,13 +453,17 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
 
     try:
         # Get schedule data from InfluxDB (written by Growatt controller)
+        # Look back 24 hours to ensure we find the schedule
         query = '''from(bucket: "solar")
-  |> range(start: -5m)
+  |> range(start: -24h)
   |> filter(fn: (r) => r["_measurement"] == "growatt_schedule")
+  |> filter(fn: (r) => r["_field"] == "schedule_json")
   |> last()'''
 
         result = await web_service.influxdb_client.query(query)
         schedule_data = None
+
+        logger.debug(f"Querying InfluxDB for schedule data, result: {result}")
 
         # Parse InfluxDB result
         if result:
@@ -500,7 +504,11 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
                         break
 
         if not schedule_data:
-            logger.warning("No schedule data in InfluxDB, using demo schedule")
+            logger.warning(
+                f"No schedule data found in InfluxDB. "
+                f"Query returned {len(result) if result else 0} tables. "
+                f"Check if Growatt controller is writing schedule data."
+            )
             raise Exception("Schedule data not available")
 
         # Convert to web API format
