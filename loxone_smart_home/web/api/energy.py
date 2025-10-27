@@ -456,8 +456,29 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         schedule_data = await web_service.cache.get("growatt:schedule")
 
         if not schedule_data:
-            logger.warning("No schedule data in cache, returning demo schedule")
-            raise Exception("Schedule data not available")
+            # Cache miss - request schedule from Growatt controller via MQTT
+            logger.info("Schedule not in cache, requesting from Growatt controller...")
+
+            if web_service.mqtt_client:
+                try:
+                    # Publish request
+                    await web_service.mqtt_client.publish("energy/schedule/request", "")
+
+                    # Wait briefly for the response (with retries)
+                    for attempt in range(3):
+                        await asyncio.sleep(0.5)  # Wait 500ms
+                        schedule_data = await web_service.cache.get("growatt:schedule")
+                        if schedule_data:
+                            logger.info("Received schedule data from Growatt controller")
+                            break
+
+                    if not schedule_data:
+                        logger.warning("No response from Growatt controller after 1.5s, using demo schedule")
+                        raise Exception("Schedule data not available after request")
+
+                except Exception as e:
+                    logger.warning(f"Failed to request schedule: {e}")
+                    raise Exception("Schedule data not available")
 
         # Convert to web API format
         now = datetime.now(PRAGUE_TZ)

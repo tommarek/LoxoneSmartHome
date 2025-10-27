@@ -255,6 +255,10 @@ class GrowattController(BaseModule):
                 f"Pre-registered subscription for home status: {self._home_status_topic}"
             )
 
+            # Subscribe to schedule requests from web service
+            self.mqtt_client.register_subscription("energy/schedule/request", self._on_schedule_request)
+            self.logger.info("Pre-registered subscription for schedule requests: energy/schedule/request")
+
     def _should_log(self, level: GrowattLogLevel) -> bool:
         """Check if we should log at given level."""
         return self._log_level >= level
@@ -1550,6 +1554,19 @@ class GrowattController(BaseModule):
             self.logger.error(f"Error during shutdown reset: {e}", exc_info=True)
 
         self.logger.info("Growatt controller stopped")
+
+    async def _on_schedule_request(self, _topic: str, payload: Any) -> None:
+        """Handle schedule data requests from web service.
+
+        When web service requests schedule data (e.g., after missing the initial publish
+        or when cache expires), immediately publish the current schedule.
+
+        Args:
+            topic: The MQTT topic (energy/schedule/request)
+            payload: Request payload (not used, any message triggers response)
+        """
+        self.logger.info("Received schedule request from web service, publishing current schedule")
+        await self._publish_schedule_to_mqtt()
 
     async def _on_home_status(self, _topic: str, payload: Any) -> None:
         """Handle home status updates from UDP listener.
