@@ -143,6 +143,26 @@ async def get_battery_status(request: Request) -> Dict[str, Any]:
   |> last()'''
             result = await web_service.influxdb_client.query(query)
             battery_data = _process_battery_status(result)
+
+            # Query current mode from Growatt controller status
+            mode_query = '''from(bucket: "solar")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r["_measurement"] == "growatt_status")
+  |> filter(fn: (r) => r["_field"] == "current_mode")
+  |> last()'''
+            mode_result = await web_service.influxdb_client.query(mode_query)
+
+            # Extract mode from result
+            current_mode = "unknown"
+            if mode_result:
+                for table in mode_result:
+                    for record in table.records:
+                        if record["_field"] == "current_mode":
+                            current_mode = record["_value"]
+                            break
+
+            battery_data["mode"] = current_mode
+
         except Exception as e:
             # Return demo battery data if query fails
             battery_data = {
@@ -152,7 +172,8 @@ async def get_battery_status(request: Request) -> Dict[str, Any]:
                 "voltage": 52.0,
                 "current": 20.0,
                 "temperature": 28.0,
-                "health": 95
+                "health": 95,
+                "mode": "unknown"
             }
         await web_service.cache.set("battery:status", battery_data, ttl=30)
 
