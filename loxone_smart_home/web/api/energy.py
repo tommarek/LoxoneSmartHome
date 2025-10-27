@@ -452,27 +452,19 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         return schedule
 
     try:
-        # Get Growatt controller from web service
-        growatt_controller = None
-        if hasattr(web_service, 'modules'):
-            for module in web_service.modules:
-                if module.__class__.__name__ == 'GrowattController':
-                    growatt_controller = module
-                    break
+        # Get schedule data from cache (populated via MQTT from Growatt controller)
+        schedule_data = await web_service.cache.get("growatt:schedule")
 
-        if not growatt_controller:
-            logger.warning("Growatt controller not available, returning demo schedule")
-            raise Exception("Growatt controller not found")
-
-        # Get schedule data directly from controller (EXACT same data as logs)
-        schedule_data = growatt_controller.get_schedule_table_data()
+        if not schedule_data:
+            logger.warning("No schedule data in cache, returning demo schedule")
+            raise Exception("Schedule data not available")
 
         # Convert to web API format
         now = datetime.now(PRAGUE_TZ)
         schedule = _format_schedule_from_controller(schedule_data, now)
 
         logger.info(
-            f"Fetched schedule from Growatt controller: "
+            f"Fetched schedule from cache: "
             f"{len(schedule_data.get('today_prices', {}))} today blocks, "
             f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow blocks"
         )
