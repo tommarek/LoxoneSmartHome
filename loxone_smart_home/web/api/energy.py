@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 from datetime import datetime, timedelta, timezone
+from datetime import time as dt_time
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -435,75 +436,230 @@ def _process_power_stats(result: Any, period: str) -> Dict[str, Any]:
 async def get_energy_schedule(request: Request) -> Dict[str, Any]:
     """Get energy schedule table showing prices and mode decisions for each 15-min block.
 
-    Returns a table similar to Growatt controller logs with:
+    Returns a table that is an EXACT COPY of what's shown in Growatt controller logs:
     - Prices for each 15-minute block
     - Mode indicators (🔋=charge, 🔌=pre-discharge, ⚡=discharge)
     - Today and tomorrow schedules
 
-    Uses the SAME PriceAnalyzer logic as Growatt controller to ensure data consistency.
+    Uses the Growatt controller's current state directly - no recalculation, no duplicate
+    API calls. This ensures 100% consistency between logs and web UI.
     """
     web_service = request.app.state.web_service
 
-    # Check cache
+    # Check cache (very short TTL so updates show immediately)
     schedule = await web_service.cache.get("energy:schedule")
     if schedule:
         return schedule
 
     try:
-        # Use PriceAnalyzer to fetch prices from OTE API (same as Growatt controller)
-        now = datetime.now(PRAGUE_TZ_PYTZ)
-        today = now.date()
-        tomorrow = today + timedelta(days=1)
+        # Get Growatt controller from web service
+        growatt_controller = None
+        if hasattr(web_service, 'modules'):
+            for module in web_service.modules:
+                if module.__class__.__name__ == 'GrowattController':
+                    growatt_controller = module
+                    break
 
-        # Create PriceAnalyzer instance with same config as Growatt controller
-        price_analyzer = PriceAnalyzer(
-            logger=logger,
-            local_tz=PRAGUE_TZ_PYTZ,
-            optional_config={}
-        )
+        if not growatt_controller:
+            logger.warning("Growatt controller not available, returning demo schedule")
+            raise Exception("Growatt controller not found")
 
-        # Fetch prices for today and tomorrow from OTE API
-        today_str = today.strftime("%Y-%m-%d")
-        tomorrow_str = tomorrow.strftime("%Y-%m-%d")
+        # Get schedule data directly from controller (EXACT same data as logs)
+        schedule_data = growatt_controller.get_schedule_table_data()
 
-        logger.info(f"Fetching prices from OTE API for {today_str} and {tomorrow_str}")
-
-        # Fetch both days in parallel
-        today_result, tomorrow_result = await asyncio.gather(
-            price_analyzer.fetch_dam_energy_prices(date=today_str),
-            price_analyzer.fetch_dam_energy_prices(date=tomorrow_str),
-            return_exceptions=True
-        )
-
-        # Handle fetch results (fetch_dam_energy_prices returns Tuple[Dict, str])
-        today_prices_dict: Dict[Tuple[str, str], float] = {}
-        tomorrow_prices_dict: Dict[Tuple[str, str], float] = {}
-
-        if isinstance(today_result, tuple) and not isinstance(today_result, Exception):
-            today_prices_dict = today_result[0]
-        if isinstance(tomorrow_result, tuple) and not isinstance(tomorrow_result, Exception):
-            tomorrow_prices_dict = tomorrow_result[0]
+        # Convert to web API format
+        now = datetime.now(PRAGUE_TZ)
+        schedule = _format_schedule_from_controller(schedule_data, now)
 
         logger.info(
-            f"Fetched {len(today_prices_dict)} blocks for today, "
-            f"{len(tomorrow_prices_dict)} blocks for tomorrow from OTE API"
-        )
-
-        # Convert to format expected by schedule processing
-        schedule = _process_schedule_from_ote(
-            today_prices_dict, tomorrow_prices_dict, today, tomorrow, now, web_service
+            f"Fetched schedule from Growatt controller: "
+            f"{len(schedule_data.get('today_prices', {}))} today blocks, "
+            f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow blocks"
         )
 
     except Exception as e:
         # Log error and return demo schedule
-        logger.error(f"Failed to fetch price schedule from OTE API: {e}", exc_info=True)
+        logger.error(f"Failed to get schedule from Growatt controller: {e}", exc_info=True)
         now_fallback = datetime.now(PRAGUE_TZ)
         schedule = _generate_demo_schedule(now_fallback)
 
-    # Cache for 5 minutes
-    await web_service.cache.set("energy:schedule", schedule, ttl=300)
+    # Cache for 30 seconds (short TTL so updates show quickly)
+    await web_service.cache.set("energy:schedule", schedule, ttl=30)
 
     return schedule
+
+
+def _format_schedule_from_controller(
+    schedule_data: Dict[str, Any],
+    now: datetime
+) -> Dict[str, Any]:
+    """Format schedule data from Growatt controller for web API response.
+
+    This uses the EXACT data from the controller's state - the same data shown in logs.
+
+    Args:
+        schedule_data: Data from controller's get_schedule_table_data()
+        now: Current time
+
+    Returns:
+        Formatted schedule for web API response
+    """
+    today = now.date()
+    tomorrow = today + timedelta(days=1)
+
+    # Extract data from controller state
+    today_prices = schedule_data.get("today_prices", {})
+    tomorrow_prices = schedule_data.get("tomorrow_prices", {})
+    eur_czk_rate = schedule_data.get("eur_czk_rate", 25.0)
+
+    # Get schedule blocks (these are sets of (start, end) tuples)
+    charge_today = schedule_data.get("charging_blocks_today", set())
+    charge_tomorrow = schedule_data.get("charging_blocks_tomorrow", set())
+    pre_discharge_today = schedule_data.get("pre_discharge_blocks_today", set())
+    pre_discharge_tomorrow = schedule_data.get("pre_discharge_blocks_tomorrow", set())
+    discharge_today = schedule_data.get("discharge_periods_today", set())
+    discharge_tomorrow = schedule_data.get("discharge_periods_tomorrow", set())
+
+    days = []
+
+    # Format today's schedule
+    if today_prices:
+        today_schedule = _format_day_schedule_from_controller(
+            today_prices,
+            today,
+            "TODAY (remaining)",
+            charge_today,
+            pre_discharge_today,
+            discharge_today,
+            eur_czk_rate,
+            now
+        )
+        days.append(today_schedule)
+
+    # Format tomorrow's schedule
+    if tomorrow_prices:
+        tomorrow_schedule = _format_day_schedule_from_controller(
+            tomorrow_prices,
+            tomorrow,
+            "TOMORROW",
+            charge_tomorrow,
+            pre_discharge_tomorrow,
+            discharge_tomorrow,
+            eur_czk_rate,
+            now
+        )
+        days.append(tomorrow_schedule)
+
+    # Build legend
+    legend = [
+        {"icon": "🔋", "label": "Regular charge", "color": "#4CAF50"},
+        {"icon": "🔌", "label": "Pre-discharge charge", "color": "#FF9800"},
+        {"icon": "⚡", "label": "Discharge", "color": "#F44336"},
+        {"icon": "-", "label": "Normal", "color": "#9E9E9E"}
+    ]
+
+    # Summary statistics
+    total_charge = len(charge_today) + len(charge_tomorrow)
+    total_pre_discharge = len(pre_discharge_today) + len(pre_discharge_tomorrow)
+    total_discharge = len(discharge_today) + len(discharge_tomorrow)
+
+    summary = {
+        "charge_blocks": total_charge,
+        "pre_discharge_blocks": total_pre_discharge,
+        "discharge_blocks": total_discharge,
+        "prices_fetched": schedule_data.get("prices_fetched", False),
+        "next_day_prices_fetched": schedule_data.get("next_day_prices_fetched", False)
+    }
+
+    return {
+        "days": days,
+        "legend": legend,
+        "summary": summary
+    }
+
+
+def _format_day_schedule_from_controller(
+    prices: Dict[Tuple[str, str], float],
+    date: Any,
+    label: str,
+    charge_blocks: set,
+    pre_discharge_blocks: set,
+    discharge_blocks: set,
+    eur_czk_rate: float,
+    now: datetime
+) -> Dict[str, Any]:
+    """Format a single day's schedule from controller data.
+
+    Args:
+        prices: Dict of (start, end) -> price_eur
+        date: Date object for this day
+        label: Label for the day (e.g., "TODAY", "TOMORROW")
+        charge_blocks: Set of (start, end) tuples for charging
+        pre_discharge_blocks: Set of (start, end) tuples for pre-discharge charging
+        discharge_blocks: Set of (start, end) tuples for discharge
+        eur_czk_rate: EUR to CZK conversion rate
+        now: Current datetime
+
+    Returns:
+        Formatted day schedule dict
+    """
+    hours_dict: Dict[int, List[Dict[str, Any]]] = {}
+
+    # Sort price blocks by time
+    sorted_blocks = sorted(prices.items(), key=lambda x: x[0][0])
+
+    for (start_str, end_str), price_eur in sorted_blocks:
+        # Parse time "HH:MM"
+        hour = int(start_str.split(':')[0])
+        minute = int(start_str.split(':')[1])
+
+        # Skip past blocks for "today"
+        if label.startswith("TODAY"):
+            block_time = datetime.combine(date, dt_time(hour, minute))
+            if block_time < now:
+                continue
+
+        # Determine mode (exact same logic as controller logs)
+        if (start_str, end_str) in pre_discharge_blocks:
+            mode, icon = "pre-discharge", "🔌"
+        elif (start_str, end_str) in charge_blocks:
+            mode, icon = "charge", "🔋"
+        elif (start_str, end_str) in discharge_blocks:
+            mode, icon = "discharge", "⚡"
+        else:
+            mode, icon = "normal", "-"
+
+        # Convert price EUR/MWh to CZK/kWh (same as controller)
+        price_czk_kwh = price_eur * eur_czk_rate / 1000
+
+        # Format time block
+        time_block = f"{start_str}-{end_str}"
+
+        block_data = {
+            "time": time_block,
+            "price_czk_kwh": round(price_czk_kwh, 3),
+            "mode": mode,
+            "icon": icon
+        }
+
+        if hour not in hours_dict:
+            hours_dict[hour] = []
+
+        hours_dict[hour].append(block_data)
+
+    # Convert to list of hours
+    hours = []
+    for hour in sorted(hours_dict.keys()):
+        hours.append({
+            "hour": hour,
+            "blocks": hours_dict[hour]
+        })
+
+    return {
+        "date": date.isoformat(),
+        "label": label,
+        "hours": hours
+    }
 
 
 def _process_schedule_from_ote(
