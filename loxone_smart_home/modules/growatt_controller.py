@@ -2086,7 +2086,11 @@ class GrowattController(BaseModule):
                 fields={"schedule_json": json.dumps(schedule_json)},
                 tags={"source": "growatt_controller"}
             )
-            self.logger.debug("Stored schedule data to InfluxDB bucket=solar measurement=growatt_schedule")
+            self.logger.info(
+                f"✅ Stored schedule data to InfluxDB: "
+                f"{len(schedule_data.get('today_prices', {}))} today prices, "
+                f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow prices"
+            )
 
         except Exception as e:
             self.logger.error(f"Failed to store schedule to InfluxDB: {e}", exc_info=True)
