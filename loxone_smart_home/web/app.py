@@ -68,52 +68,6 @@ class WebService:
 
         logger.info("Web service started")
 
-    async def subscribe_to_schedule_updates(self) -> None:
-        """Subscribe to schedule updates from Growatt controller via MQTT."""
-        if not self.mqtt_client:
-            logger.warning("MQTT client not available, schedule updates disabled")
-            return
-
-        async def handle_schedule_update(topic: str, payload: bytes) -> None:
-            """Handle incoming schedule data from MQTT."""
-            try:
-                import json
-                schedule_data = json.loads(payload.decode())
-
-                # Convert back to the format expected by the API
-                # Convert string keys back to tuples
-                if "today_prices" in schedule_data:
-                    today_prices = {}
-                    for k, v in schedule_data["today_prices"].items():
-                        parts = k.split('-')
-                        today_prices[(parts[0], parts[1])] = v
-                    schedule_data["today_prices"] = today_prices
-
-                if "tomorrow_prices" in schedule_data:
-                    tomorrow_prices = {}
-                    for k, v in schedule_data["tomorrow_prices"].items():
-                        parts = k.split('-')
-                        tomorrow_prices[(parts[0], parts[1])] = v
-                    schedule_data["tomorrow_prices"] = tomorrow_prices
-
-                # Convert lists back to sets
-                for key in ["charging_blocks_today", "charging_blocks_tomorrow",
-                           "pre_discharge_blocks_today", "pre_discharge_blocks_tomorrow",
-                           "discharge_periods_today", "discharge_periods_tomorrow"]:
-                    if key in schedule_data:
-                        schedule_data[key] = {tuple(item) for item in schedule_data[key]}
-
-                # Store in cache
-                await self.cache.set("growatt:schedule", schedule_data, ttl=3600)  # 1 hour TTL
-                logger.info("Received and cached schedule update from Growatt controller")
-
-            except Exception as e:
-                logger.error(f"Failed to process schedule update: {e}", exc_info=True)
-
-        # Subscribe to the schedule topic
-        await self.mqtt_client.subscribe("energy/schedule", handle_schedule_update)
-        logger.info("Subscribed to energy/schedule topic")
-
     async def stop(self) -> None:
         """Stop background services."""
         # Cancel background tasks
@@ -163,13 +117,9 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     settings = Settings(influxdb_token=influxdb_token)
 
     # Initialize clients
-    # Web service needs MQTT to receive schedule updates from Growatt controller
-    mqtt_client = AsyncMQTTClient(settings)
+    # Web service doesn't need MQTT - it reads from InfluxDB
+    mqtt_client = None
     influxdb_client = AsyncInfluxDBClient(settings)
-
-    # Start MQTT client and subscribe to schedule updates
-    await mqtt_client.connect()
-    logger.info("MQTT client connected")
 
     # Start InfluxDB client - CRITICAL: Must be started to initialize connection pool
     await influxdb_client.start()
@@ -178,9 +128,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Initialize web service
     web_service = WebService(mqtt_client, influxdb_client, settings)
     await web_service.start()
-
-    # Subscribe to schedule updates from Growatt controller
-    await web_service.subscribe_to_schedule_updates()
 
     # Store in app state for access in endpoints
     app.state.web_service = web_service
@@ -192,11 +139,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     # Shutdown
     if web_service:
         await web_service.stop()
-
-    # Clean up MQTT client
-    if mqtt_client:
-        await mqtt_client.disconnect()
-        logger.info("MQTT client disconnected")
 
     # Clean up InfluxDB client
     await influxdb_client.stop()
