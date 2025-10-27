@@ -2048,6 +2048,47 @@ class GrowattController(BaseModule):
                     f"{len(self._combined_charging_blocks)} charging blocks active today"
                 )
 
+        # Publish schedule data to MQTT for web API consumption
+        await self._publish_schedule_to_mqtt()
+
+    async def _publish_schedule_to_mqtt(self) -> None:
+        """Publish current schedule data to MQTT for web service consumption."""
+        if not self.mqtt_client:
+            return
+
+        try:
+            import json
+            # Get schedule data
+            schedule_data = self.get_schedule_table_data()
+
+            # Convert sets to lists for JSON serialization
+            schedule_json = {
+                "today_prices": {f"{k[0]}-{k[1]}": v for k, v in schedule_data["today_prices"].items()},
+                "tomorrow_prices": {f"{k[0]}-{k[1]}": v for k, v in schedule_data["tomorrow_prices"].items()},
+                "today_date": schedule_data["today_date"],
+                "tomorrow_date": schedule_data["tomorrow_date"],
+                "charging_blocks_today": [list(t) for t in schedule_data["charging_blocks_today"]],
+                "charging_blocks_tomorrow": [list(t) for t in schedule_data["charging_blocks_tomorrow"]],
+                "pre_discharge_blocks_today": [list(t) for t in schedule_data["pre_discharge_blocks_today"]],
+                "pre_discharge_blocks_tomorrow": [list(t) for t in schedule_data["pre_discharge_blocks_tomorrow"]],
+                "discharge_periods_today": [list(t) for t in schedule_data["discharge_periods_today"]],
+                "discharge_periods_tomorrow": [list(t) for t in schedule_data["discharge_periods_tomorrow"]],
+                "eur_czk_rate": schedule_data["eur_czk_rate"],
+                "prices_fetched": schedule_data["prices_fetched"],
+                "next_day_prices_fetched": schedule_data["next_day_prices_fetched"],
+            }
+
+            # Publish to MQTT
+            await self.mqtt_client.publish(
+                "energy/schedule",
+                json.dumps(schedule_json),
+                retain=True  # Retain so web service can get latest on startup
+            )
+            self.logger.debug("Published schedule data to MQTT topic energy/schedule")
+
+        except Exception as e:
+            self.logger.error(f"Failed to publish schedule to MQTT: {e}", exc_info=True)
+
     def _calculate_discharge_periods(
         self,
         prices: Dict[Tuple[str, str], float],

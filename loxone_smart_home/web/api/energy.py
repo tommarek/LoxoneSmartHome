@@ -452,27 +452,19 @@ async def get_energy_schedule(request: Request) -> Dict[str, Any]:
         return schedule
 
     try:
-        # Get Growatt controller from web service
-        growatt_controller = None
-        if hasattr(web_service, 'modules'):
-            for module in web_service.modules:
-                if module.__class__.__name__ == 'GrowattController':
-                    growatt_controller = module
-                    break
+        # Get schedule data from cache (populated via MQTT from Growatt controller)
+        schedule_data = await web_service.cache.get("growatt:schedule")
 
-        if not growatt_controller:
-            logger.warning("Growatt controller not available, returning demo schedule")
-            raise Exception("Growatt controller not found")
-
-        # Get schedule data directly from controller (EXACT same data as logs)
-        schedule_data = growatt_controller.get_schedule_table_data()
+        if not schedule_data:
+            logger.warning("No schedule data in cache, returning demo schedule")
+            raise Exception("Schedule data not available")
 
         # Convert to web API format
         now = datetime.now(PRAGUE_TZ)
         schedule = _format_schedule_from_controller(schedule_data, now)
 
         logger.info(
-            f"Fetched schedule from Growatt controller: "
+            f"Fetched schedule from cache: "
             f"{len(schedule_data.get('today_prices', {}))} today blocks, "
             f"{len(schedule_data.get('tomorrow_prices', {}))} tomorrow blocks"
         )
@@ -527,7 +519,7 @@ def _format_schedule_from_controller(
         today_schedule = _format_day_schedule_from_controller(
             today_prices,
             today,
-            "TODAY (remaining)",
+            "TODAY",
             charge_today,
             pre_discharge_today,
             discharge_today,
@@ -613,11 +605,7 @@ def _format_day_schedule_from_controller(
         hour = int(start_str.split(':')[0])
         minute = int(start_str.split(':')[1])
 
-        # Skip past blocks for "today"
-        if label.startswith("TODAY"):
-            block_time = datetime.combine(date, dt_time(hour, minute))
-            if block_time < now:
-                continue
+        # Show ALL prices (no filtering of past blocks) - same as controller logs
 
         # Determine mode (exact same logic as controller logs)
         if (start_str, end_str) in pre_discharge_blocks:
