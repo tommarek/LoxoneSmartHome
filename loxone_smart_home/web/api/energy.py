@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta, timezone
 from datetime import time as dt_time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, HTTPException, Query, Request
@@ -199,44 +199,72 @@ async def get_power_statistics(
     else:
         start = now - timedelta(days=365)
 
-    # Try to query actual data from Loxone measurements
-    # The field names depend on what Loxone sends via UDP listener
+    # Query actual data from Loxone measurements
+    # Try different possible measurement types that Loxone might send
     try:
-        # Query to find what measurements/fields are available
-        schema_query = f'''from(bucket: "loxone")
+        # First, discover what measurements exist in the loxone bucket
+        discovery_query = f'''
+import "influxdata/influxdb/schema"
+schema.measurements(bucket: "loxone")
+'''
+
+        # Alternative: sample recent data to find measurements
+        sample_query = f'''from(bucket: "loxone")
   |> range(start: {start.isoformat()}Z)
-  |> limit(n: 10)'''
+  |> limit(n: 100)
+  |> group(columns: ["_measurement", "_field"])
+  |> distinct(column: "_measurement")'''
 
-        result = await web_service.influxdb_client.query(schema_query)
+        result = await web_service.influxdb_client.query(sample_query)
 
+        measurements_found: Dict[str, Set[str]] = {}  # measurement -> [fields]
         if result:
-            # Log available measurements and fields for debugging
-            measurements_found = set()
-            fields_found = set()
             for table in result:
                 for record in table.records:
-                    # Access measurement and field from record (dictionary-style)
                     try:
-                        measurements_found.add(record["_measurement"])
-                        fields_found.add(record["_field"])
+                        meas = record["_measurement"]
+                        field = record["_field"]
+                        if meas not in measurements_found:
+                            measurements_found[meas] = set()
+                        measurements_found[meas].add(field)
                     except (KeyError, TypeError):
-                        pass  # Skip if fields not available
+                        pass
 
             logger.info(
-                f"Available in loxone bucket: "
-                f"measurements={list(measurements_found)[:5]}, "
-                f"fields={list(fields_found)[:10]}"
+                f"Loxone bucket contains {len(measurements_found)} measurements: "
+                f"{dict((k, list(v)[:5]) for k, v in list(measurements_found.items())[:5])}"
             )
 
-        # For now, return demo stats until we know the actual field names
-        logger.info(f"Returning demo statistics for period: {period}")
-        stats = _get_demo_stats(period)
+            # Try to calculate real stats from available data
+            stats = await _calculate_real_stats(
+                web_service, start, period, measurements_found
+            )
+            return stats
+
+        else:
+            logger.warning(f"No data found in loxone bucket for period {period}")
+            stats = _get_demo_stats(period)
 
     except Exception as e:
-        logger.warning(f"Failed to query Loxone data: {e}")
+        logger.warning(f"Failed to query Loxone data: {e}", exc_info=True)
         stats = _get_demo_stats(period)
 
     return stats
+
+
+async def _calculate_real_stats(
+    web_service: Any,
+    start: datetime,
+    period: str,
+    measurements_found: Dict[str, Set[str]]
+) -> Dict[str, Any]:
+    """Try to calculate real statistics from available Loxone data."""
+    # TODO: Implement actual calculation based on discovered measurements/fields
+    # For now, log what we found and return demo data
+    logger.info(
+        f"Would calculate stats from measurements: {list(measurements_found.keys())}"
+    )
+    return _get_demo_stats(period)
 
 
 def _get_demo_stats(period: str) -> Dict[str, Any]:
