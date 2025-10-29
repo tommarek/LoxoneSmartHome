@@ -403,8 +403,15 @@ async function fetchSchedule() {
             </div>`;
         }
 
+        // Get current time for highlighting
+        const now = new Date();
+        const currentHour = now.getHours();
+        const currentMinute = now.getMinutes();
+
         // Render each day
         data.days.forEach(day => {
+            const isToday = day.label === 'Today';
+
             html += `<div class="schedule-day">
                 <h4 class="schedule-day-title">${day.label} (${day.date})</h4>
                 <div class="schedule-table-wrapper">
@@ -429,7 +436,21 @@ async function fetchSchedule() {
                     if (hourData.blocks[i]) {
                         const block = hourData.blocks[i];
                         const modeClass = `mode-${block.mode}`;
-                        html += `<td class="price-cell ${modeClass}">
+
+                        // Check if this is the current time block
+                        let isCurrentBlock = false;
+                        if (isToday && hourData.hour === currentHour) {
+                            // Block 0: :00-:15 (minutes 0-14)
+                            // Block 1: :15-:30 (minutes 15-29)
+                            // Block 2: :30-:45 (minutes 30-44)
+                            // Block 3: :45-:00 (minutes 45-59)
+                            const blockStartMinute = i * 15;
+                            const blockEndMinute = (i + 1) * 15;
+                            isCurrentBlock = (currentMinute >= blockStartMinute && currentMinute < blockEndMinute);
+                        }
+
+                        const currentClass = isCurrentBlock ? 'current-time' : '';
+                        html += `<td class="price-cell ${modeClass} ${currentClass}">
                             <span class="price-value">${block.price_czk_kwh.toFixed(2)}</span>
                             <span class="mode-icon">${block.icon}</span>
                         </td>`;
