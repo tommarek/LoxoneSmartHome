@@ -1,0 +1,7 @@
+# Environment files with secrets
+.env filter=git-crypt diff=git-crypt
+.env.production filter=git-crypt diff=git-crypt
+conf/*.env filter=git-crypt diff=git-crypt
+conf/influxdb.conf filter=git-crypt diff=git-crypt
+loxone_smart_home/.env filter=git-crypt diff=git-crypt
+loxone_smart_home/.env.production filter=git-crypt diff=git-crypt
