@@ -1,136 +1,26 @@
-version: '3'
+version: "3.8"
+
 services:
-  influxdb:
-    image: influxdb:latest
-    container_name: influxdb
-    restart: unless-stopped
-    ports:
-      - "8083:8083"
-      - "8086:8086"
-      - "8090:8090"
-      - "2003:2003"
-    user: '1026:65537'
-    env_file:
-      - ./conf/influxdb.env
-    volumes:
-      - ./influxdb/influxdb/:/var/lib/influxdb/:rw
-      - ./influxdb/influxdb2/:/var/lib/influxdb2/:rw
-      - ./conf/influxdb.conf:/etc/influxdb/influxdb.conf:ro
-
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    restart: unless-stopped
-    ports:
-      - "3000:3000"
-    user: '1026:65537'
-    env_file:
-      - ./conf/common.env
-      - ./conf/grafana.env
-    links:
-      - influxdb
-    depends_on:
-      - influxdb
-    volumes:
-      - ./grafana:/var/lib/grafana
-
-  # Consolidated Loxone Smart Home service
+  # =============================================================================
+  # Loxone Smart Home - Data collector for Loxone Miniserver
+  # Bridges Loxone UDP, MQTT, weather data, and solar inverter to InfluxDB
+  # =============================================================================
   loxone_smart_home:
     build: ./loxone_smart_home
     container_name: loxone_smart_home
     restart: unless-stopped
     ports:
-      - "2000:2000/udp"  # UDP listener port
-      - "8080:8080"      # API server port
-    user: '1026:65537'
+      - "2000:2000/udp"
+      - "8080:8080"
     env_file:
-      - ./conf/common.env
-      - ./conf/influxdb.env
-      - ./conf/loxone_smart_home.env
-    links:
-      - influxdb
-      - mosquitto
-    depends_on:
-      - influxdb
-      - mosquitto
-    volumes:
-      - ./loxone_smart_home:/app:ro  # Read-only for security
-      - ./loxone_smart_home/.env:/app/.env:ro  # Environment file
-
-  mosquitto:
-    image: eclipse-mosquitto:2
-    hostname: mosquitto
-    container_name: mosquitto
-    restart: unless-stopped
-    command: mosquitto -c /mosquitto-no-auth.conf
-    ports:
-      - 1883:1883
-      - 9001:9001
-    user: '1026:65537'
-    env_file:
-      - ./conf/common.env
-    links:
-      - grafana
-    volumes:
-      - ./mosquitto/:/mosquitto/:rw
-      - ./mosquitto/data/:/mosquitto/data/:rw
-      - ./mosquitto/log/:/mosquitto/log/:rw
-
-  telegraf:
-    image: telegraf:latest
-    hostname: telegraf
-    container_name: telegraf
-    restart: unless-stopped
-    user: '1026:65537'
-    volumes:
-    - ./telegraf/config/telegraf.conf:/etc/telegraf/telegraf.conf:ro
-    depends_on:
-      - influxdb
-      - mosquitto
-    links:
-      - influxdb
-      - mosquitto
-    ports:
-    - '8125:8125/udp'
-
-  teslamate:
-    image: teslamate/teslamate:edge
-    container_name: teslamate
-    restart: always
+      - ./loxone_smart_home/.env
     environment:
-      - ENCRYPTION_KEY=b2Vsdm5yZHF2cGFrc2w5ZGVucm9xbGVyZXVjYXB1ZWpyYQ== # Replace with your generated key
-      - DATABASE_USER=teslamate
-      - DATABASE_PASS=adminadmin
-      - DATABASE_NAME=teslamate
-      - DATABASE_HOST=database
-      - MQTT_HOST=mosquitto
-      - TZ=Europe/Prague  # Set your timezone
-    ports:
-      - 4000:4000
-    volumes:
-      - ./import:/opt/app/import
-    cap_drop:
-      - all
-    depends_on:
-      - database
-      - mosquitto
+      # Override to use services from selfhosted repo via caddy_net
+      - INFLUXDB_HOST=http://influxdb:8086
+      - MQTT_BROKER=mosquitto
+    networks:
+      - caddy_net
 
-  database:
-    image: postgres:16
-    container_name: teslamate-db
-    restart: always
-    environment:
-      - POSTGRES_USER=teslamate
-      - POSTGRES_PASSWORD=adminadmin
-      - POSTGRES_DB=teslamate
-    volumes:
-      - teslamate-db:/var/lib/postgresql/data
-
-volumes:
-  cargo-cache:
-  teslamate-db:
-#  teslamate-grafana-data:
-  mosquitto-conf:
-  mosquitto-data:
-  mosquitto-log:
-
+networks:
+  caddy_net:
+    external: true
