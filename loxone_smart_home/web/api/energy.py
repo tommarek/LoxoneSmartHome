@@ -902,11 +902,13 @@ def _process_schedule_from_ote(
     # Use shared scheduling logic (same as Growatt controller)
     CHARGE_BLOCKS_COUNT = getattr(web_service.settings.growatt, 'battery_charge_blocks', 8)
     DISCHARGE_THRESHOLD_CZK = getattr(web_service.settings.growatt, 'discharge_price_min', 3.0)
+    DISCHARGE_PROFIT_MARGIN = getattr(web_service.settings.growatt, 'discharge_profit_margin', 4.0)
 
     charge_times, discharge_times, charge_threshold, discharge_threshold = calculate_optimal_schedule(
         all_blocks,
         charge_blocks_count=CHARGE_BLOCKS_COUNT,
-        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK
+        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK,
+        discharge_profit_margin=DISCHARGE_PROFIT_MARGIN
     )
 
     logger.info(
@@ -991,11 +993,13 @@ def _process_schedule_table(result: Any, now: datetime) -> Dict[str, Any]:
     # Use shared scheduling logic (reused by Growatt controller)
     CHARGE_BLOCKS_COUNT = 8  # Default battery_charge_blocks from settings
     DISCHARGE_THRESHOLD_CZK = 3.0  # Default discharge_price_min from settings
+    DISCHARGE_PROFIT_MARGIN = 4.0  # Default discharge_profit_margin from settings
 
     charge_times, discharge_times, charge_threshold, discharge_threshold = calculate_optimal_schedule(
         all_blocks,
         charge_blocks_count=CHARGE_BLOCKS_COUNT,
-        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK
+        discharge_threshold_czk=DISCHARGE_THRESHOLD_CZK,
+        discharge_profit_margin=DISCHARGE_PROFIT_MARGIN
     )
 
     logger.info(

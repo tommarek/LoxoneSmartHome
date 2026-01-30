@@ -691,7 +691,7 @@ class GrowattController(BaseModule):
         sunrise = sunrise.replace(hour=hour, minute=minute, second=0, microsecond=0)
         return sunrise.time()
 
-    def _get_combined_price_window(self) -> List[Tuple[datetime, datetime, float]]:
+    def _get_combined_price_window(self, include_past: bool = False) -> List[Tuple[datetime, datetime, float]]:
         """Merge remaining today + tomorrow prices into single chronological window.
 
         This creates a unified view of all available price data with absolute timestamps,
@@ -723,7 +723,7 @@ class GrowattController(BaseModule):
 
                 # Only include blocks that haven't started yet (or are in progress)
                 # Use end time for comparison to include current block
-                if end_dt > now:
+                if include_past or end_dt > now:
                     window.append((start_dt, end_dt, price))
             except Exception as e:
                 self.logger.warning(f"Error parsing today's price block {start_str}-{end_str}: {e}")
@@ -821,6 +821,12 @@ class GrowattController(BaseModule):
         if not window:
             return
 
+        # When force_display, re-fetch window with past blocks included
+        if force_display:
+            full_window = self._get_combined_price_window(include_past=True)
+            if full_window:
+                window = full_window
+
         # Only show full table at VERBOSE level (unless forced for startup)
         if not force_display and not self._should_log(GrowattLogLevel.VERBOSE):
             # At DETAIL level, just show a summary
@@ -866,7 +872,7 @@ class GrowattController(BaseModule):
                 charging_today,
                 pre_discharge_today,
                 discharge_today,
-                "TODAY (remaining hours)"
+                "TODAY"
             )
 
         # Display tomorrow's prices (if available)
@@ -1764,11 +1770,14 @@ class GrowattController(BaseModule):
         # Convert window format for shared function: (start_dt, end_dt, price_eur) -> (start_dt, price_czk)
         price_blocks_czk = [(start_dt, price_eur * rate / 1000) for start_dt, end_dt, price_eur in window]
 
+        discharge_profit_margin = self.config.discharge_profit_margin
+
         # Call shared function to get charge/discharge timestamps
-        charge_times, discharge_times, charge_threshold_czk, _ = calculate_optimal_schedule(
+        charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
             price_blocks_czk,
             charge_blocks_count=charge_blocks_count,
-            discharge_threshold_czk=discharge_threshold_czk
+            discharge_threshold_czk=discharge_threshold_czk,
+            discharge_profit_margin=discharge_profit_margin
         )
 
         # Rebuild charging schedule in original format for compatibility with existing code
@@ -1782,26 +1791,35 @@ class GrowattController(BaseModule):
         charging_today = [(s, e, p) for s, e, p in cheapest_sorted if s.date() == today]
         charging_tomorrow = [(s, e, p) for s, e, p in cheapest_sorted if s.date() > today]
 
-        if not suppress_print:
+        if not suppress_print or force_table:
             # Always show basic info at SUMMARY level or higher
-            if self._should_log(GrowattLogLevel.SUMMARY):
+            if self._should_log(GrowattLogLevel.SUMMARY) or force_table:
                 self.logger.info(
                     f"🎯 Schedule: {len(cheapest_blocks)} charge blocks "
                     f"({len(charging_today)} today, {len(charging_tomorrow)} tomorrow)"
                 )
 
-            # Show compact summary at DETAIL level
-            if (self._should_log(GrowattLogLevel.DETAIL) and
-                    not self._should_log(GrowattLogLevel.VERBOSE)):
-                # Just show compact summaries
-                if charging_today or charging_tomorrow:
-                    self.logger.info("📊 Charging Schedule:")
-                    if charging_today:
-                        summary = self._format_price_summary(charging_today, rate)
-                        self.logger.info(f"  Today: {summary}")
-                    if charging_tomorrow:
-                        summary = self._format_price_summary(charging_tomorrow, rate)
-                        self.logger.info(f"  Tomorrow: {summary}")
+            # Show individual block times
+            if charging_today or charging_tomorrow:
+                self.logger.info("📊 Charging Schedule:")
+                if charging_today:
+                    summary = self._format_price_summary(charging_today, rate)
+                    self.logger.info(f"  Today: {summary}")
+                    for start_dt, end_dt, price in charging_today:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
+                if charging_tomorrow:
+                    summary = self._format_price_summary(charging_tomorrow, rate)
+                    self.logger.info(f"  Tomorrow: {summary}")
+                    for start_dt, end_dt, price in charging_tomorrow:
+                        price_czk = price * rate / 1000
+                        self.logger.info(
+                            f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
+                            f"{price_czk:.3f} CZK/kWh"
+                        )
 
             # Show full details at VERBOSE level
             if self._should_log(GrowattLogLevel.VERBOSE):
@@ -1854,30 +1872,25 @@ class GrowattController(BaseModule):
         discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
         discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
 
-        if not suppress_print and discharge_blocks:
-            # SUMMARY level - just count
-            if self._should_log(GrowattLogLevel.SUMMARY):
-                self.logger.info(
-                    f"⚡ Discharge: {len(discharge_blocks)} blocks "
-                    f"({len(discharge_today)} today, {len(discharge_tomorrow)} tomorrow)"
-                )
-
-            # DETAIL level - compact summary
-            if (self._should_log(GrowattLogLevel.DETAIL) and
-                    not self._should_log(GrowattLogLevel.VERBOSE)):
-                if discharge_today:
-                    summary = self._format_price_summary(discharge_today, rate)
-                    self.logger.info(f"  Discharge today: {summary}")
-                if discharge_tomorrow:
-                    summary = self._format_price_summary(discharge_tomorrow, rate)
-                    self.logger.info(f"  Discharge tomorrow: {summary}")
+        if (not suppress_print or force_table) and discharge_blocks:
+            self.logger.info(
+                f"⚡ Discharge: {len(discharge_blocks)} blocks "
+                f"({len(discharge_today)} today, {len(discharge_tomorrow)} tomorrow), "
+                f"threshold: {effective_discharge_threshold:.2f} CZK/kWh"
+            )
+            if discharge_today:
+                summary = self._format_price_summary(discharge_today, rate)
+                self.logger.info(f"  Discharge today: {summary}")
+            if discharge_tomorrow:
+                summary = self._format_price_summary(discharge_tomorrow, rate)
+                self.logger.info(f"  Discharge tomorrow: {summary}")
 
             # VERBOSE level - full details
             if self._should_log(GrowattLogLevel.VERBOSE):
                 self.logger.info("")
                 self.logger.info(
                     f"⚡ DISCHARGE SCHEDULE ({len(discharge_blocks)} blocks total, "
-                    f"threshold: {discharge_threshold_czk:.2f} CZK/kWh)"
+                    f"threshold: {effective_discharge_threshold:.2f} CZK/kWh)"
                 )
 
                 if discharge_today:
@@ -2542,7 +2555,7 @@ class GrowattController(BaseModule):
 
                 # NEW: Recalculate cross-day optimal schedule with tomorrow's data
                 # This will find globally optimal blocks across remaining today + full tomorrow
-                await self._calculate_cross_day_optimal_schedule()
+                await self._calculate_cross_day_optimal_schedule(force_table=True)
 
                 # Trigger re-evaluation with the updated schedule
                 await self._on_price_update()
@@ -3058,7 +3071,7 @@ class GrowattController(BaseModule):
                             )
                             # Display schedule table for tomorrow
                             self.logger.info("📋 Displaying tomorrow's schedule:")
-                            await self._calculate_cross_day_optimal_schedule()
+                            await self._calculate_cross_day_optimal_schedule(force_table=True)
 
                 # Check for midnight - update date display
                 if now.hour == 0 and now.minute == 0:
@@ -3146,6 +3159,12 @@ class GrowattController(BaseModule):
                                 f"{len(self._combined_charging_blocks)} charging blocks "
                                 f"active today"
                             )
+
+                            # Print full schedule table for the new day
+                            window = self._get_combined_price_window()
+                            if window:
+                                rate = self._eur_czk_rate or 25.0
+                                await self._log_cross_day_price_table(window, rate, force_display=True)
 
                             # Trigger re-evaluation with shifted schedule
                             # Note: We don't recalculate here because we don't have new
