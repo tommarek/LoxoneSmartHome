@@ -2637,6 +2637,35 @@ class GrowattController(BaseModule):
                 else:
                     self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
 
+                # Always re-evaluate export state based on current price,
+                # even when mode hasn't changed
+                if self._current_inverter_state and context.price_thresholds:
+                    if context.current_block_key in context.prices_15min:
+                        current_price_czk = context.current_price * 25 / 1000
+                        should_export = current_price_czk >= context.price_thresholds.export_price_min
+                        if should_export != self._current_inverter_state.export_enabled:
+                            if should_export:
+                                await self._mode_manager.enable_export()
+                            else:
+                                await self._mode_manager.disable_export()
+                            # Update tracked state (InverterState is frozen, must recreate)
+                            self._current_inverter_state = InverterState(
+                                inverter_mode=self._current_inverter_state.inverter_mode,
+                                stop_soc=self._current_inverter_state.stop_soc,
+                                power_rate=self._current_inverter_state.power_rate,
+                                time_start=self._current_inverter_state.time_start,
+                                time_stop=self._current_inverter_state.time_stop,
+                                ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
+                                export_enabled=should_export,
+                                timestamp=self._get_local_now(),
+                                source="export_price_update"
+                            )
+                            state_str = "ENABLED" if should_export else "DISABLED"
+                            self.logger.info(
+                                f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
+                                f"threshold: {context.price_thresholds.export_price_min:.2f})"
+                            )
+
             except Exception as e:
                 self.logger.error(f"Failed to evaluate conditions: {e}", exc_info=True)
                 # Don't change mode on error
@@ -2782,7 +2811,7 @@ class GrowattController(BaseModule):
         export_enabled = True  # Default
         try:
             context = await self._build_decision_context()
-            if context.price_thresholds and context.current_price > 0:
+            if context.price_thresholds and context.current_block_key in context.prices_15min:
                 current_price_czk = context.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:

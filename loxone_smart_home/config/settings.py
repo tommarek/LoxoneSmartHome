@@ -185,7 +185,7 @@ class GrowattConfig(BaseSettings):
         description="Export solar production when price above this (CZK/kWh)"
     )
     discharge_price_min: float = Field(
-        default=3.0, gt=0,
+        default=5.0, gt=0,
         description="Discharge battery to grid when price above this (CZK/kWh)"
     )
     discharge_profit_margin: float = Field(
