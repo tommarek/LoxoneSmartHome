@@ -964,7 +964,7 @@ class GrowattController(BaseModule):
                     if next_minute < 60:
                         end_str = f"{hour:02d}:{next_minute:02d}"
                     else:
-                        end_str = f"{hour + 1:02d}:00"
+                        end_str = f"{(hour + 1) % 24:02d}:00"
 
                     # Find matching block
                     block_key = (start_str, end_str)
