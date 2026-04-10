@@ -33,6 +33,8 @@ from .growatt.decision_engine import (
 )
 from .growatt.inverter_state import InverterState
 from .growatt.solar_forecast import SolarForecast
+from .growatt.consumption_forecast import ConsumptionForecast
+from .growatt.optimizer import BatteryOptimizer
 from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
 
@@ -198,6 +200,18 @@ class GrowattController(BaseModule):
                 f"Solar forecast enabled: {len(self._solar_forecast.arrays)} arrays, "
                 f"total {sum(a.kwp for a in self._solar_forecast.arrays):.1f} kWp"
             )
+
+        # Consumption forecast (Phase 3.1)
+        self._consumption_forecast: Optional[ConsumptionForecast] = None
+        if getattr(self.config, 'consumption_forecast_enabled', False):
+            self._consumption_forecast = ConsumptionForecast(self.logger)
+            self.logger.info("Consumption forecast enabled (model will build on startup)")
+
+        # Greedy optimizer (Phase 3.2)
+        self._optimizer: Optional[BatteryOptimizer] = None
+        if getattr(self.config, 'optimizer_enabled', False):
+            self._optimizer = BatteryOptimizer(self.logger)
+            self.logger.info("Battery optimizer enabled")
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
@@ -1518,6 +1532,18 @@ class GrowattController(BaseModule):
         if self._solar_forecast:
             await self._update_solar_forecast()
 
+        # Build consumption model from historical data
+        if self._consumption_forecast:
+            success = await self._consumption_forecast.build_model(
+                self.influxdb_client, self.settings
+            )
+            if success:
+                summary = self._consumption_forecast.get_model_summary()
+                self.logger.info(
+                    f"📊 Consumption model: {summary['data_points']} data points, "
+                    f"{summary['bins']} bins, range {summary['date_range']}"
+                )
+
         # Start periodic evaluation loop
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
@@ -1948,13 +1974,88 @@ from(bucket: "{bucket}")
 
         discharge_profit_margin = self.config.discharge_profit_margin
 
-        # Call shared function to get charge/discharge timestamps
-        charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
-            price_blocks_czk,
-            charge_blocks_count=charge_blocks_count,
-            discharge_threshold_czk=discharge_threshold_czk,
-            discharge_profit_margin=discharge_profit_margin
-        )
+        # Use optimizer if enabled, otherwise fall back to rule-based scheduling
+        if self._optimizer and self._solar_forecast:
+            from .growatt.decision_engine import GrowattDecisionEngine
+            solar_hourly = self._solar_forecast.get_hourly_production(
+                today + timedelta(days=1)
+            ) if self._solar_forecast else {}
+            # Merge today's remaining + tomorrow's solar
+            today_solar = self._solar_forecast.get_hourly_production(today) if self._solar_forecast else {}
+            for h, kwh in today_solar.items():
+                if h > now.hour:
+                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
+
+            consumption_hourly: Dict[int, float] = {}
+            if self._consumption_forecast and self._consumption_forecast.model:
+                # Get forecast temperatures from weather data
+                forecast_temps = {h: 10.0 for h in range(24)}  # Default
+                try:
+                    weather_data = await self._get_weather_radiation_data()
+                    if weather_data:
+                        for entry in weather_data.get("hourly", []):
+                            t_str = entry.get("time", "")
+                            temp = entry.get("temperature_2m")
+                            if t_str and temp is not None:
+                                dt = datetime.fromisoformat(t_str)
+                                forecast_temps[dt.hour] = temp
+                except Exception:
+                    pass
+                consumption_hourly = self._consumption_forecast.predict_hourly(
+                    forecast_temps, today + timedelta(days=1)
+                )
+
+            dist_thresholds = PriceThresholds(
+                charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
+                export_price_min=getattr(self.config, 'export_price_min', 1.0),
+                discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
+                discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
+                battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+                summer_charge_price_max=getattr(self.config, 'summer_charge_price_max', 0.0),
+                distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
+                distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
+                low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
+            )
+            dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
+                h, dist_thresholds
+            )
+
+            charge_times, discharge_times, decisions = self._optimizer.optimize(
+                blocks=price_blocks_czk,
+                solar_hourly=solar_hourly,
+                consumption_hourly=consumption_hourly,
+                distribution_func=dist_func,
+                battery_capacity_kwh=self.config.battery_capacity,
+                current_soc=self._battery_soc,
+                min_soc=self.config.min_soc,
+                max_soc=self.config.max_soc,
+                discharge_power_pct=self.config.discharge_power_rate,
+                efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+            )
+            summary = self._optimizer.summarize(decisions)
+            self.logger.info(
+                f"🧠 Optimizer: {summary['charge_blocks']} charge, "
+                f"{summary['discharge_blocks']} discharge, "
+                f"{summary['hold_blocks']} hold blocks "
+                f"(avg charge: {summary['avg_charge_price']:.2f}, "
+                f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
+            )
+            # Compute thresholds for compatibility
+            charge_threshold_czk = max(
+                (b.price_czk for b in decisions if b.action == "charge"), default=0.0
+            )
+            effective_discharge_threshold = min(
+                (b.price_czk for b in decisions if b.action == "discharge"),
+                default=discharge_threshold_czk,
+            )
+        else:
+            # Rule-based scheduling (default)
+            charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
+                price_blocks_czk,
+                charge_blocks_count=charge_blocks_count,
+                discharge_threshold_czk=discharge_threshold_czk,
+                discharge_profit_margin=discharge_profit_margin
+            )
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
@@ -3235,6 +3336,15 @@ from(bucket: "{bucket}")
                             await self._update_solar_forecast()
                         except Exception as e:
                             self.logger.warning(f"Solar forecast refresh failed: {e}")
+
+                # Rebuild consumption model if needed (weekly)
+                if self._consumption_forecast and self._consumption_forecast.needs_rebuild():
+                    try:
+                        await self._consumption_forecast.build_model(
+                            self.influxdb_client, self.settings
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Consumption model rebuild failed: {e}")
 
                 # Check if it's time to start fetching next day's prices
                 if now.hour == self.config.price_fetch_hour and now.minute == 0:

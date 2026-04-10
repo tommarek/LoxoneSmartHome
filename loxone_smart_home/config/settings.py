@@ -285,6 +285,18 @@ class GrowattConfig(BaseSettings):
         description="Hours between forecast.solar API updates"
     )
 
+    # Consumption forecast
+    consumption_forecast_enabled: bool = Field(
+        default=False,
+        description="Enable temperature-aware consumption forecasting from historical data"
+    )
+
+    # Optimizer
+    optimizer_enabled: bool = Field(
+        default=False,
+        description="Enable greedy optimizer (replaces rule-based scheduling when active)"
+    )
+
     # Distribution tariff (Czech high/low tariff)
     distribution_tariff_high: float = Field(
         default=1.5, ge=0,
