@@ -199,6 +199,20 @@ class GrowattConfig(BaseSettings):
         description="Number of 15-minute blocks to charge battery (8 = 2 hours, non-consecutive)"
     )
 
+    # Dynamic charge block count
+    dynamic_charge_blocks: bool = Field(
+        default=True,
+        description="Auto-adjust charge block count based on price spread"
+    )
+    min_charge_blocks: int = Field(
+        default=4, ge=0, le=96,
+        description="Minimum 15-min charge blocks (4 = 1 hour floor)"
+    )
+    max_charge_blocks: int = Field(
+        default=16, ge=1, le=96,
+        description="Maximum 15-min charge blocks (16 = 4 hours ceiling)"
+    )
+
     # Pre-discharge charging parameters
     pre_discharge_charge_blocks: int = Field(
         default=8, ge=1, le=96,
@@ -248,6 +262,42 @@ class GrowattConfig(BaseSettings):
     # Season detection parameters
     summer_temp_threshold: float = Field(default=15.0, ge=-20, le=40)  # °C
     temperature_avg_days: int = Field(default=3, ge=1, le=7)  # Days for temperature average
+    summer_charge_price_max: float = Field(
+        default=0.0, ge=-100, le=100,
+        description="Max price (CZK/kWh) to charge from grid in summer. 0 = only free/negative prices"
+    )
+
+    # Solar forecast
+    solar_forecast_enabled: bool = Field(
+        default=False,
+        description="Enable solar production forecast for smarter charging"
+    )
+    solar_arrays: str = Field(
+        default='[{"name":"terasa","declination":35,"azimuth":234,"kwp":7.0},{"name":"ulice","declination":35,"azimuth":134,"kwp":6.5}]',
+        description="JSON array of solar panel arrays [{name, declination, azimuth, kwp}]"
+    )
+    solar_forecast_confidence: float = Field(
+        default=0.7, gt=0, le=1.0,
+        description="Discount factor for forecast uncertainty (0.7 = use 70% of predicted)"
+    )
+    solar_forecast_update_hours: int = Field(
+        default=6, ge=1, le=24,
+        description="Hours between forecast.solar API updates"
+    )
+
+    # Distribution tariff (Czech high/low tariff)
+    distribution_tariff_high: float = Field(
+        default=1.5, ge=0,
+        description="High tariff distribution cost (CZK/kWh)"
+    )
+    distribution_tariff_low: float = Field(
+        default=0.5, ge=0,
+        description="Low tariff distribution cost (CZK/kWh)"
+    )
+    low_tariff_hours: str = Field(
+        default="0-6,22-24",
+        description="Low tariff hour ranges (comma-separated, e.g. '0-6,22-24')"
+    )
 
     # Currency conversion
     eur_czk_rate: float = Field(default=25.0, gt=0)  # EUR to CZK exchange rate

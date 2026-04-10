@@ -31,6 +31,10 @@ class PriceThresholds:
     discharge_profit_margin: float  # Required profit margin (e.g., 1.5 = 50% profit)
     battery_efficiency: float  # Battery round-trip efficiency
     target_soc: float = 100.0  # Target SOC when charging from grid
+    summer_charge_price_max: float = 0.0  # Max CZK/kWh to charge in summer (0 = only negative)
+    distribution_tariff_high: float = 1.5  # High tariff distribution cost CZK/kWh
+    distribution_tariff_low: float = 0.5  # Low tariff distribution cost CZK/kWh
+    low_tariff_hours: str = "0-6,22-24"  # Comma-separated hour ranges for low tariff
 
 
 @dataclass
@@ -79,9 +83,19 @@ class DecisionContext:
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        # Summer mode: NO AC charging at all
         if self.is_summer_mode:
-            self.is_battery_charging_scheduled = False
+            # Summer: only charge from grid when price is below summer threshold
+            # (e.g., negative prices = get paid to consume)
+            if self.current_block_key and self.cheapest_blocks:
+                in_cheapest = self.current_block_key in self.cheapest_blocks
+                current_czk = self.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
+                max_price = (
+                    self.price_thresholds.summer_charge_price_max
+                    if self.price_thresholds else 0.0
+                )
+                self.is_battery_charging_scheduled = in_cheapest and current_czk <= max_price
+            else:
+                self.is_battery_charging_scheduled = False
         # Check if current block is in the cheapest charging blocks
         elif self.current_block_key and self.cheapest_blocks:
             self.is_battery_charging_scheduled = (
@@ -411,6 +425,26 @@ class GrowattDecisionEngine:
 
     # Price-aware decision helper methods
 
+    @staticmethod
+    def _get_distribution_tariff(hour: int, thresholds: PriceThresholds) -> float:
+        """Get the distribution tariff for a given hour based on low/high tariff schedule.
+
+        Args:
+            hour: Hour of day (0-23)
+            thresholds: Price thresholds containing tariff config
+
+        Returns:
+            Distribution tariff in CZK/kWh
+        """
+        for range_str in thresholds.low_tariff_hours.split(","):
+            range_str = range_str.strip()
+            if "-" in range_str:
+                parts = range_str.split("-")
+                start_h, end_h = int(parts[0]), int(parts[1])
+                if start_h <= hour < end_h:
+                    return thresholds.distribution_tariff_low
+        return thresholds.distribution_tariff_high
+
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on simple price thresholds.
 
@@ -454,10 +488,20 @@ class GrowattDecisionEngine:
         # Calculate required price based on profit margin
         required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
 
-        # Effective threshold is the higher of absolute minimum or margin-based requirement
+        # Self-consumption opportunity cost: if we discharge now, we need to
+        # recharge later (at cheapest price + its distribution tariff) and we
+        # lose the distribution tariff savings from self-consuming now
+        current_hour = context.current_time.hour
+        current_dist = self._get_distribution_tariff(current_hour, context.price_thresholds)
+        # Cost to recharge 1 kWh (accounting for round-trip efficiency)
+        recharge_cost = cheapest_block_czk / context.price_thresholds.battery_efficiency
+        self_consumption_floor = recharge_cost + current_dist
+
+        # Effective threshold is the highest of all requirements
         effective_threshold = max(
             context.price_thresholds.discharge_price_min,
-            required_by_margin
+            required_by_margin,
+            self_consumption_floor
         )
 
         if current_price_czk >= effective_threshold:
@@ -465,17 +509,19 @@ class GrowattDecisionEngine:
                 f"Discharge profitable: {current_price_czk:.2f} CZK/kWh ≥ "
                 f"{effective_threshold:.2f} CZK/kWh "
                 f"(absolute min: {context.price_thresholds.discharge_price_min:.2f}, "
-                f"cheapest block: {cheapest_block_czk:.2f} × "
+                f"margin: {cheapest_block_czk:.2f} × "
                 f"{context.price_thresholds.discharge_profit_margin:.1f} = "
-                f"{required_by_margin:.2f})"
+                f"{required_by_margin:.2f}, "
+                f"self-consumption: {self_consumption_floor:.2f} "
+                f"[recharge {recharge_cost:.2f} + dist {current_dist:.2f}])"
             )
             return True
         else:
             self.logger.debug(
                 f"No discharge: {current_price_czk:.2f} CZK/kWh < "
                 f"{effective_threshold:.2f} CZK/kWh required "
-                f"(cheapest 15min block: {cheapest_block_czk:.2f} × "
-                f"{context.price_thresholds.discharge_profit_margin:.1f})"
+                f"(margin: {required_by_margin:.2f}, "
+                f"self-consumption: {self_consumption_floor:.2f})"
             )
             return False
 

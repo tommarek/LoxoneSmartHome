@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import math
 import zoneinfo
 from datetime import datetime
 from datetime import date as date_type
@@ -31,7 +32,8 @@ from .growatt.decision_engine import (
     GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
 )
 from .growatt.inverter_state import InverterState
-from utils.schedule_calculator import calculate_optimal_schedule
+from .growatt.solar_forecast import SolarForecast
+from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
 
 
@@ -187,6 +189,15 @@ class GrowattController(BaseModule):
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
         self._mode_manager = ModeManager(self)
         self._decision_engine = GrowattDecisionEngine(self.logger)
+
+        # Solar forecast (Phase 2)
+        self._solar_forecast: Optional[SolarForecast] = None
+        if getattr(self.config, 'solar_forecast_enabled', False):
+            self._solar_forecast = SolarForecast.from_config(self.config, self.logger)
+            self.logger.info(
+                f"Solar forecast enabled: {len(self._solar_forecast.arrays)} arrays, "
+                f"total {sum(a.kwp for a in self._solar_forecast.arrays):.1f} kWp"
+            )
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
@@ -1503,6 +1514,10 @@ class GrowattController(BaseModule):
                 self._fetch_next_day_prices_task()
             )
 
+        # Fetch initial solar forecast
+        if self._solar_forecast:
+            await self._update_solar_forecast()
+
         # Start periodic evaluation loop
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
@@ -1677,6 +1692,104 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
+    async def _update_solar_forecast(self) -> None:
+        """Fetch and update solar production forecast from all sources."""
+        if not self._solar_forecast:
+            return
+
+        try:
+            # Source 1: forecast.solar API
+            await self._solar_forecast.fetch_api_forecast()
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch forecast.solar API: {e}")
+
+        try:
+            # Source 2: Weather-based calculation from InfluxDB
+            weather_data = await self._get_weather_radiation_data()
+            if weather_data:
+                self._solar_forecast.calculate_from_weather(weather_data)
+        except Exception as e:
+            self.logger.warning(f"Failed to calculate weather-based solar forecast: {e}")
+
+        # Build consensus from available sources
+        self._solar_forecast.build_consensus()
+
+        # Log summary
+        now = self._get_local_now()
+        today_kwh = self._solar_forecast.get_expected_production_kwh(now.date())
+        tomorrow_kwh = self._solar_forecast.get_expected_production_kwh(
+            now.date() + timedelta(days=1)
+        )
+        self.logger.info(
+            f"☀️ Solar forecast: today {today_kwh:.1f} kWh, "
+            f"tomorrow {tomorrow_kwh:.1f} kWh "
+            f"(after {self._solar_forecast.confidence:.0%} confidence discount)"
+        )
+
+        # Store to InfluxDB
+        await self._store_solar_forecast_to_influxdb()
+
+    async def _get_weather_radiation_data(self) -> Optional[Dict]:
+        """Query weather radiation forecast from InfluxDB."""
+        if not self.influxdb_client:
+            return None
+
+        try:
+            bucket = self.settings.influxdb.bucket_weather
+            query = f'''
+from(bucket: "{bucket}")
+  |> range(start: -1h, stop: 48h)
+  |> filter(fn: (r) => r._measurement == "weather_forecast")
+  |> filter(fn: (r) => r._field == "shortwave_radiation")
+  |> filter(fn: (r) => r.type == "hour")
+  |> filter(fn: (r) => r.source == "openmeteo")
+  |> sort(columns: ["_time"])
+'''
+            result = await self.influxdb_client.query(query)
+            if not result:
+                return None
+
+            hourly = []
+            for table in result:
+                for record in table.records:
+                    hourly.append({
+                        "time": record.get_time().isoformat(),
+                        "shortwave_radiation": record.get_value(),
+                    })
+
+            return {"hourly": hourly} if hourly else None
+
+        except Exception as e:
+            self.logger.debug(f"Could not query weather radiation: {e}")
+            return None
+
+    async def _store_solar_forecast_to_influxdb(self) -> None:
+        """Store solar forecast data to InfluxDB for Grafana visualization."""
+        if not self.influxdb_client or not self._solar_forecast:
+            return
+
+        try:
+            now = self._get_local_now()
+            summary = self._solar_forecast.get_forecast_summary()
+
+            for date_str, forecast_info in summary.get("forecasts", {}).items():
+                await self.influxdb_client.write_point(
+                    bucket=self.settings.influxdb.bucket_solar,
+                    measurement="solar_forecast",
+                    fields={
+                        "total_kwh": float(forecast_info["total_kwh"]),
+                        "discounted_kwh": float(forecast_info["discounted_kwh"]),
+                        "peak_kwh": float(forecast_info.get("peak_kwh", 0)),
+                    },
+                    tags={
+                        "source": forecast_info["source"],
+                        "date": date_str,
+                    },
+                    timestamp=now,
+                )
+        except Exception as e:
+            self.logger.debug(f"Failed to store solar forecast to InfluxDB: {e}")
+
     async def _fetch_prices(
         self, suppress_schedule_print: bool = False, force_table_display: bool = False
     ) -> None:
@@ -1764,11 +1877,63 @@ class GrowattController(BaseModule):
         rate = self._eur_czk_rate or 25.0
 
         # === STEP 1: Use shared scheduling logic to find optimal blocks ===
-        charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
         discharge_threshold_czk = self.config.discharge_price_min
 
         # Convert window format for shared function: (start_dt, end_dt, price_eur) -> (start_dt, price_czk)
         price_blocks_czk = [(start_dt, price_eur * rate / 1000) for start_dt, end_dt, price_eur in window]
+
+        # Determine charge block count (dynamic or fixed)
+        if getattr(self.config, 'dynamic_charge_blocks', True):
+            all_prices = [price for _, price in price_blocks_czk]
+            # Average self-consumption value: median price + average distribution tariff
+            sorted_p = sorted(all_prices)
+            median_price = sorted_p[len(sorted_p) // 2] if sorted_p else 2.0
+            avg_dist = (
+                getattr(self.config, 'distribution_tariff_high', 1.5)
+                + getattr(self.config, 'distribution_tariff_low', 0.5)
+            ) / 2
+            self_consumption_value = median_price + avg_dist
+            charge_blocks_count = calculate_dynamic_block_count(
+                prices_czk=all_prices,
+                min_blocks=getattr(self.config, 'min_charge_blocks', 4),
+                max_blocks=getattr(self.config, 'max_charge_blocks', 16),
+                self_consumption_value=self_consumption_value,
+                battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+            )
+            self.logger.info(
+                f"Dynamic charging: {charge_blocks_count} blocks "
+                f"(self-consumption value: {self_consumption_value:.2f} CZK/kWh, "
+                f"range: {getattr(self.config, 'min_charge_blocks', 4)}-"
+                f"{getattr(self.config, 'max_charge_blocks', 16)})"
+            )
+        else:
+            charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
+
+        # Solar forecast adjustment: reduce grid charging when solar will fill battery
+        if self._solar_forecast:
+            expected_solar = self._solar_forecast.get_expected_production_kwh(today)
+            if expected_solar > 0:
+                battery_headroom = (
+                    (self.config.max_soc - self._battery_soc) / 100
+                    * self.config.battery_capacity
+                )
+                efficiency = getattr(self.config, 'battery_efficiency', 0.85)
+                grid_needed_kwh = max(0, battery_headroom - expected_solar * efficiency)
+                # Each 15-min block charges roughly capacity/4 * charge_rate
+                # Conservative estimate: ~0.625 kWh per block for a 10kWh battery
+                kwh_per_block = self.config.battery_capacity / 16
+                solar_adjusted = max(
+                    getattr(self.config, 'min_charge_blocks', 4),
+                    min(charge_blocks_count, math.ceil(grid_needed_kwh / kwh_per_block))
+                )
+                if solar_adjusted < charge_blocks_count:
+                    self.logger.info(
+                        f"☀️ Solar adjustment: {charge_blocks_count} → {solar_adjusted} blocks "
+                        f"(expected solar: {expected_solar:.1f} kWh, "
+                        f"battery headroom: {battery_headroom:.1f} kWh, "
+                        f"grid needed: {grid_needed_kwh:.1f} kWh)"
+                    )
+                    charge_blocks_count = solar_adjusted
 
         discharge_profit_margin = self.config.discharge_profit_margin
 
@@ -2707,7 +2872,11 @@ class GrowattController(BaseModule):
             export_price_min=getattr(self.config, 'export_price_min', 1.0),
             discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
             discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
-            battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85)
+            battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+            summer_charge_price_max=getattr(self.config, 'summer_charge_price_max', 0.0),
+            distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
+            distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
+            low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
         )
 
         # Calculate price ranking for current 15-minute block
@@ -3026,6 +3195,7 @@ class GrowattController(BaseModule):
         last_midnight_check = None
         last_fetch_check = None
         last_pre_midnight_check = None
+        last_solar_forecast_update: Optional[datetime] = None
 
         last_summary_hour = None  # Track last hour we logged summary
 
@@ -3039,6 +3209,21 @@ class GrowattController(BaseModule):
                 if now.hour != last_summary_hour:
                     last_summary_hour = now.hour
                     await self._log_periodic_summary()
+
+                # Refresh solar forecast periodically
+                if self._solar_forecast:
+                    update_interval = getattr(
+                        self.config, 'solar_forecast_update_hours', 6
+                    ) * 3600
+                    if (
+                        last_solar_forecast_update is None
+                        or (now - last_solar_forecast_update).total_seconds() >= update_interval
+                    ):
+                        last_solar_forecast_update = now
+                        try:
+                            await self._update_solar_forecast()
+                        except Exception as e:
+                            self.logger.warning(f"Solar forecast refresh failed: {e}")
 
                 # Check if it's time to start fetching next day's prices
                 if now.hour == self.config.price_fetch_hour and now.minute == 0:
