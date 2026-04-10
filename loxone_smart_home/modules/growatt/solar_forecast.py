@@ -118,7 +118,8 @@ class SolarForecast:
                             continue
 
                         data = await resp.json()
-                        watt_hours = data.get("result", {}).get("watt_hours", {})
+                        # Use watt_hours_period (per-hour), NOT watt_hours (cumulative)
+                        watt_hours = data.get("result", {}).get("watt_hours_period", {})
 
                         for timestamp_str, wh in watt_hours.items():
                             # Format: "YYYY-MM-DD HH:MM:SS"
