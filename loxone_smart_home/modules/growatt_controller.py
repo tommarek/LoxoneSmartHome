@@ -1910,15 +1910,26 @@ from(bucket: "{bucket}")
             charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
 
         # Solar forecast adjustment: reduce grid charging when solar will fill battery
+        # Only count FUTURE solar production (hours that haven't happened yet)
         if self._solar_forecast:
-            expected_solar = self._solar_forecast.get_expected_production_kwh(today)
-            if expected_solar > 0:
+            current_hour = now.hour
+            # Sum future solar: remaining hours today + all of tomorrow
+            future_solar = 0.0
+            today_hourly = self._solar_forecast.get_hourly_production(today)
+            for hour, kwh in today_hourly.items():
+                if hour > current_hour:
+                    future_solar += kwh
+            tomorrow = today + timedelta(days=1)
+            tomorrow_hourly = self._solar_forecast.get_hourly_production(tomorrow)
+            future_solar += sum(tomorrow_hourly.values())
+
+            if future_solar > 0:
                 battery_headroom = (
                     (self.config.max_soc - self._battery_soc) / 100
                     * self.config.battery_capacity
                 )
                 efficiency = getattr(self.config, 'battery_efficiency', 0.85)
-                grid_needed_kwh = max(0, battery_headroom - expected_solar * efficiency)
+                grid_needed_kwh = max(0, battery_headroom - future_solar * efficiency)
                 # Each 15-min block charges roughly capacity/4 * charge_rate
                 # Conservative estimate: ~0.625 kWh per block for a 10kWh battery
                 kwh_per_block = self.config.battery_capacity / 16
@@ -1929,7 +1940,7 @@ from(bucket: "{bucket}")
                 if solar_adjusted < charge_blocks_count:
                     self.logger.info(
                         f"☀️ Solar adjustment: {charge_blocks_count} → {solar_adjusted} blocks "
-                        f"(expected solar: {expected_solar:.1f} kWh, "
+                        f"(future solar: {future_solar:.1f} kWh, "
                         f"battery headroom: {battery_headroom:.1f} kWh, "
                         f"grid needed: {grid_needed_kwh:.1f} kWh)"
                     )
