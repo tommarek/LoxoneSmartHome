@@ -289,6 +289,103 @@ class SolarForecast:
         self._consensus = result
         return result
 
+    # --- Calibration from actuals ---
+
+    async def calibrate_from_actuals(
+        self,
+        influxdb_client: Any,
+        bucket: str,
+        days: int = 7,
+    ) -> None:
+        """Auto-tune confidence factor by comparing past forecasts with actual production.
+
+        Queries actual solar production (InputPower) from InfluxDB for recent days
+        and compares with what forecast.solar would have predicted. Updates
+        self.confidence to reflect real-world accuracy.
+
+        Args:
+            influxdb_client: Async InfluxDB client
+            bucket: Solar InfluxDB bucket name
+            days: Number of past days to compare (default 7)
+        """
+        try:
+            # Get actual daily production from InputPower (W averaged per hour → kWh)
+            query = f'''
+from(bucket: "{bucket}")
+  |> range(start: -{days}d, stop: -0d)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> filter(fn: (r) => r._value > 10)
+'''
+            result = await influxdb_client.query(query)
+            if not result:
+                self.logger.debug("No actual solar data for calibration")
+                return
+
+            # Sum hourly production by day
+            actual_by_day: Dict[str, float] = {}
+            for table in result:
+                for record in table.records:
+                    day = record.get_time().strftime("%Y-%m-%d")
+                    kwh = record.get_value() / 1000.0  # W average for 1h → kWh
+                    actual_by_day[day] = actual_by_day.get(day, 0) + kwh
+
+            if not actual_by_day:
+                return
+
+            # Compare with stored forecasts (if we have any for those days)
+            # Use the raw API forecast total (before confidence discount)
+            ratios: list = []
+            for day_str, actual_kwh in actual_by_day.items():
+                forecast = self._api_forecast.get(day_str)
+                if forecast and forecast.total_kwh > 1.0:
+                    ratio = actual_kwh / forecast.total_kwh
+                    # Clamp to reasonable range (0.3 - 1.5)
+                    ratio = max(0.3, min(1.5, ratio))
+                    ratios.append(ratio)
+                    self.logger.debug(
+                        f"Calibration {day_str}: actual={actual_kwh:.1f} kWh, "
+                        f"forecast={forecast.total_kwh:.1f} kWh, ratio={ratio:.2f}"
+                    )
+
+            if not ratios:
+                # No matching forecasts — use actuals vs total_kwp * typical hours
+                # Estimate: on a decent day, each kWp produces ~4 kWh
+                total_kwp = sum(a.kwp for a in self.arrays)
+                if total_kwp > 0:
+                    avg_actual = sum(actual_by_day.values()) / len(actual_by_day)
+                    typical_max = total_kwp * 5  # ~5 kWh/kWp on a good day
+                    estimated_confidence = min(1.0, avg_actual / typical_max)
+                    self.confidence = max(0.3, estimated_confidence)
+                    self.logger.info(
+                        f"☀️ Calibration (no forecast history): confidence={self.confidence:.2f} "
+                        f"(avg actual: {avg_actual:.1f} kWh, typical max: {typical_max:.0f} kWh)"
+                    )
+                return
+
+            # Weighted average: recent days count more
+            # Last day weight=days, first day weight=1
+            weighted_sum = 0.0
+            weight_total = 0.0
+            for i, ratio in enumerate(ratios):
+                weight = i + 1  # Older=1, newer=len
+                weighted_sum += ratio * weight
+                weight_total += weight
+
+            new_confidence = weighted_sum / weight_total if weight_total > 0 else 0.7
+            # Clamp to reasonable range
+            new_confidence = max(0.3, min(1.2, new_confidence))
+
+            old_confidence = self.confidence
+            self.confidence = new_confidence
+            self.logger.info(
+                f"☀️ Calibration: confidence {old_confidence:.2f} → {new_confidence:.2f} "
+                f"(from {len(ratios)} days of actual vs forecast data)"
+            )
+
+        except Exception as e:
+            self.logger.warning(f"Solar calibration failed: {e}")
+
     # --- Public interface ---
 
     def get_expected_production_kwh(self, target_date: date) -> float:

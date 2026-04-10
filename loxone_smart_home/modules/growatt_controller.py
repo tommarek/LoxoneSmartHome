@@ -1737,6 +1737,16 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.warning(f"Failed to calculate weather-based solar forecast: {e}")
 
+        # Calibrate confidence from actual production data
+        try:
+            await self._solar_forecast.calibrate_from_actuals(
+                self.influxdb_client,
+                self.settings.influxdb.bucket_solar,
+                days=7,
+            )
+        except Exception as e:
+            self.logger.warning(f"Solar calibration failed: {e}")
+
         # Build consensus from available sources
         self._solar_forecast.build_consensus()
 
