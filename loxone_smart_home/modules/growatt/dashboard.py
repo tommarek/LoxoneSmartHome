@@ -181,14 +181,42 @@ async def api_prices(request: web.Request) -> web.Response:
         return web.json_response({"prices": []})
 
     rate = ctrl._eur_czk_rate or 25.0
+    now = ctrl._get_local_now()
+    block_min = (now.minute // 15) * 15
+    block_start = now.replace(minute=block_min, second=0, microsecond=0)
+    from datetime import timedelta
+    block_end = block_start + timedelta(minutes=15)
+    cur_start = block_start.strftime("%H:%M")
+    cur_end = "24:00" if block_end.date() != block_start.date() else block_end.strftime("%H:%M")
+
+    pre_discharge = getattr(ctrl, '_pre_discharge_blocks_today', set())
+    discharge = getattr(ctrl, '_discharge_periods_today', set())
+
     prices = []
     for (start, end), price_eur in sorted(ctrl._current_prices.items()):
+        is_current = (start == cur_start and end == cur_end)
+        is_charging = (start, end) in ctrl._combined_charging_blocks
+        is_pre_discharge = (start, end) in pre_discharge
+        is_discharge = (start, end) in discharge
+
+        status = "normal"
+        if is_charging and is_pre_discharge:
+            status = "pre_discharge_charge"
+        elif is_charging:
+            status = "charging"
+        elif is_discharge:
+            status = "discharge"
+
         prices.append({
             "start": start,
             "end": end,
             "eur_mwh": round(price_eur, 2),
             "czk_kwh": round(price_eur * rate / 1000, 2),
-            "is_charging": (start, end) in ctrl._combined_charging_blocks,
+            "is_charging": is_charging,
+            "is_pre_discharge": is_pre_discharge,
+            "is_discharge": is_discharge,
+            "is_current": is_current,
+            "status": status,
         })
     return web.json_response({"prices": prices})
 
@@ -415,13 +443,42 @@ body {
   position: relative;
   transition: opacity 0.2s;
 }
-.price-bar:hover { opacity: 0.8; }
+.price-bar:hover { opacity: 0.8; cursor: pointer; }
 .price-bar.charging { background: var(--green) !important; }
+.price-bar.pre-discharge { background: #c084fc !important; }
+.price-bar.discharge { background: var(--red) !important; }
 .price-bar.current { outline: 2px solid var(--accent); outline-offset: -1px; }
 .price-bar.negative { background: #22c55e44; }
 .price-bar.cheap { background: #4f8cff44; }
 .price-bar.mid { background: #eab30844; }
 .price-bar.expensive { background: #ef444444; }
+
+.chart-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 200;
+  background: #1e2130;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 12px;
+  line-height: 1.6;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+  pointer-events: none;
+  max-width: 260px;
+}
+.chart-tooltip .tt-time { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
+.chart-tooltip .tt-price { font-size: 18px; font-weight: 700; }
+.chart-tooltip .tt-price.neg { color: var(--green); }
+.chart-tooltip .tt-price.pos { color: var(--text); }
+.chart-tooltip .tt-price.high { color: var(--red); }
+.chart-tooltip .tt-row { display: flex; justify-content: space-between; gap: 12px; }
+.chart-tooltip .tt-label { color: var(--muted); }
+.chart-tooltip .tt-status { margin-top: 4px; padding: 2px 8px; border-radius: 4px; display: inline-block; font-weight: 600; font-size: 11px; }
+.chart-tooltip .tt-charging { background: #164e2f; color: var(--green); }
+.chart-tooltip .tt-discharge { background: #4a1d1d; color: var(--red); }
+.chart-tooltip .tt-pre-discharge { background: #2d1b4e; color: #c084fc; }
+.chart-tooltip .tt-current { background: #1e3a5f; color: var(--accent); }
 
 .log-box {
   background: #0d0f14;
@@ -584,6 +641,7 @@ select, input {
     <h2>Today's Prices (15-min blocks)</h2>
     <div class="price-chart" id="priceChart"></div>
   </div>
+  <div class="chart-tooltip" id="chartTooltip"></div>
 
   <!-- Override Controls -->
   <div class="card" style="margin-bottom:12px">
@@ -700,30 +758,81 @@ async function fetchPrices() {
   } catch (e) {}
 }
 
+let priceData = [];
+
 function renderPriceChart(prices) {
+  priceData = prices;
   const chart = document.getElementById('priceChart');
   if (!prices.length) { chart.innerHTML = '<div style="color:var(--muted)">No price data</div>'; return; }
 
   const vals = prices.map(p => p.czk_kwh);
   const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
-  const now = lastData?.current_price?.block;
 
   let html = '';
-  prices.forEach(p => {
+  prices.forEach((p, i) => {
     const v = p.czk_kwh;
     const h = Math.abs(v) / maxAbs * 100;
     const isNeg = v < 0;
     let cls = v < 0 ? 'negative' : v < 1.5 ? 'cheap' : v < 3 ? 'mid' : 'expensive';
-    if (p.is_charging) cls = 'charging';
-    if (now && p.start === now[0] && p.end === now[1]) cls += ' current';
+    if (p.status === 'pre_discharge_charge') cls = 'pre-discharge';
+    else if (p.is_charging) cls = 'charging';
+    else if (p.is_discharge) cls = 'discharge';
+    if (p.is_current) cls += ' current';
 
     if (isNeg) {
-      html += '<div class="price-bar ' + cls + '" style="height:' + h + '%;align-self:flex-start;opacity:0.7" title="' + p.start + ': ' + v.toFixed(2) + ' CZK/kWh"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + h + '%;align-self:flex-start;opacity:0.7"></div>';
     } else {
-      html += '<div class="price-bar ' + cls + '" style="height:' + Math.max(h, 3) + '%" title="' + p.start + ': ' + v.toFixed(2) + ' CZK/kWh"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + Math.max(h, 3) + '%"></div>';
     }
   });
   chart.innerHTML = html;
+
+  // Attach tooltip events
+  const tooltip = document.getElementById('chartTooltip');
+  chart.querySelectorAll('.price-bar').forEach(bar => {
+    bar.addEventListener('mouseenter', (e) => showTooltip(e, bar, tooltip));
+    bar.addEventListener('mousemove', (e) => moveTooltip(e, tooltip));
+    bar.addEventListener('mouseleave', () => tooltip.style.display = 'none');
+    bar.addEventListener('touchstart', (e) => { e.preventDefault(); showTooltip(e.touches[0], bar, tooltip); });
+  });
+  document.addEventListener('touchstart', (e) => {
+    if (!e.target.classList.contains('price-bar')) tooltip.style.display = 'none';
+  });
+}
+
+function showTooltip(e, bar, tooltip) {
+  const idx = parseInt(bar.dataset.idx);
+  const p = priceData[idx];
+  if (!p) return;
+
+  const v = p.czk_kwh;
+  const priceClass = v < 0 ? 'neg' : v > 3 ? 'high' : 'pos';
+
+  let statusHtml = '';
+  if (p.is_current) statusHtml += '<span class="tt-status tt-current">NOW</span> ';
+  if (p.status === 'charging') statusHtml += '<span class="tt-status tt-charging">CHARGING</span>';
+  else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
+  else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
+
+  tooltip.innerHTML =
+    '<div class="tt-time">' + p.start + ' - ' + p.end + '</div>' +
+    '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh</div>' +
+    '<div class="tt-row"><span class="tt-label">EUR/MWh</span><span>' + p.eur_mwh.toFixed(1) + '</span></div>' +
+    '<div class="tt-row"><span class="tt-label">Rank</span><span>' + (idx + 1) + ' / ' + priceData.length + '</span></div>' +
+    (statusHtml ? '<div style="margin-top:6px">' + statusHtml + '</div>' : '');
+
+  tooltip.style.display = 'block';
+  moveTooltip(e, tooltip);
+}
+
+function moveTooltip(e, tooltip) {
+  const x = (e.clientX || e.pageX) + 12;
+  const y = (e.clientY || e.pageY) - 10;
+  const rect = tooltip.getBoundingClientRect();
+  const maxX = window.innerWidth - 270;
+  const maxY = window.innerHeight - rect.height - 10;
+  tooltip.style.left = Math.min(x, maxX) + 'px';
+  tooltip.style.top = Math.min(y, maxY) + 'px';
 }
 
 // Logs
