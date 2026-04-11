@@ -78,6 +78,13 @@ class BatteryOptimizer:
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
         discharge_kwh_per_block = discharge_rate_kw * (discharge_power_pct / 100) * 0.25
 
+        # Night reserve: keep enough battery for overnight self-consumption
+        # (non-heating loads only — heating triggers high load protection
+        # which disables battery discharge anyway)
+        night_reserve_kwh = 5.0  # ~5 kWh covers lights, fridge, standby overnight
+        night_reserve_soc = min_soc + (night_reserve_kwh / battery_capacity_kwh) * 100
+        effective_min_soc = min(max_soc - 10, max(min_soc, night_reserve_soc))
+
         # Pre-compute block values
         prices = [p for _, p in blocks]
         sorted_prices = sorted(prices)
@@ -111,7 +118,7 @@ class BatteryOptimizer:
             # Current battery energy
             battery_kwh = battery_capacity_kwh * soc / 100
             max_battery_kwh = battery_capacity_kwh * max_soc / 100
-            min_battery_kwh = battery_capacity_kwh * min_soc / 100
+            min_battery_kwh = battery_capacity_kwh * effective_min_soc / 100
 
             # Score each action
             # Self-consumption value = price + distribution (what we save by using battery)
@@ -173,7 +180,7 @@ class BatteryOptimizer:
                     action = "discharge"
                     net_value = discharge_value
                     soc -= (discharge_kwh_per_block / battery_capacity_kwh) * 100
-                    soc = max(min_soc, soc)
+                    soc = max(effective_min_soc, soc)
 
             # Apply solar charging in hold/charge modes
             if action != "discharge" and net_solar > 0:
@@ -193,7 +200,7 @@ class BatteryOptimizer:
                 )
                 if draw_kwh > 0:
                     soc -= (draw_kwh / battery_capacity_kwh) * 100
-                    soc = max(min_soc, soc)
+                    soc = max(effective_min_soc, soc)
 
             decision = BlockDecision(
                 timestamp=timestamp,
