@@ -8,7 +8,7 @@ minimize total electricity cost.
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 @dataclass
@@ -35,6 +35,74 @@ class BatteryOptimizer:
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
+        # Data-driven night reserve (updated daily from InfluxDB)
+        self._night_reserve_kwh: float = 5.0  # Default, updated by calibrate_night_reserve
+        self._night_reserve_updated: Optional[datetime] = None
+
+    async def calibrate_night_reserve(
+        self, influxdb_client: Any, solar_bucket: str, days: int = 90
+    ) -> float:
+        """Calculate overnight base load from historical data.
+
+        Queries last N days of INVPowerToLocalLoad during night hours (18-07),
+        caps at 500W/hr to exclude heating (which disables battery discharge),
+        and computes the average overnight energy need.
+
+        Args:
+            influxdb_client: Async InfluxDB client
+            solar_bucket: Solar InfluxDB bucket name
+            days: Days of history to analyze
+
+        Returns:
+            Overnight reserve in kWh
+        """
+        try:
+            query = f'''
+from(bucket: "{solar_bucket}")
+  |> range(start: -{days}d)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> filter(fn: (r) => r._value > 0 and r._value < 2000)
+'''
+            result = await influxdb_client.query(query)
+            if not result:
+                return self._night_reserve_kwh
+
+            # Sum night hours (18-07), capped at 500W to exclude heating
+            night_watts: Dict[int, List[float]] = {}
+            for table in result:
+                for record in table.records:
+                    h = record.get_time().hour
+                    if h >= 18 or h < 7:
+                        w = min(record.get_value(), 500)  # Cap at 500W (non-heating)
+                        if h not in night_watts:
+                            night_watts[h] = []
+                        night_watts[h].append(w)
+
+            if not night_watts:
+                return self._night_reserve_kwh
+
+            # Average kWh per night hour, sum across 13 night hours
+            total_kwh = 0
+            for h, watts_list in night_watts.items():
+                avg_w = sum(watts_list) / len(watts_list)
+                total_kwh += avg_w / 1000  # W -> kWh for 1 hour
+
+            # Clamp to reasonable range
+            reserve = max(3.0, min(8.0, total_kwh))
+            old = self._night_reserve_kwh
+            self._night_reserve_kwh = reserve
+            self._night_reserve_updated = datetime.now()
+
+            self.logger.info(
+                f"Night reserve calibrated: {reserve:.1f} kWh "
+                f"(was {old:.1f}, from {days}d of overnight base load data)"
+            )
+            return reserve
+
+        except Exception as e:
+            self.logger.warning(f"Night reserve calibration failed: {e}")
+            return self._night_reserve_kwh
 
     def optimize(
         self,
@@ -79,9 +147,8 @@ class BatteryOptimizer:
         discharge_kwh_per_block = discharge_rate_kw * (discharge_power_pct / 100) * 0.25
 
         # Night reserve: keep enough battery for overnight self-consumption
-        # (non-heating loads only — heating triggers high load protection
-        # which disables battery discharge anyway)
-        night_reserve_kwh = 5.0  # ~5 kWh covers lights, fridge, standby overnight
+        # Calibrated from historical data (non-heating base load 18:00-07:00)
+        night_reserve_kwh = self._night_reserve_kwh
         night_reserve_soc = min_soc + (night_reserve_kwh / battery_capacity_kwh) * 100
         effective_min_soc = min(max_soc - 10, max(min_soc, night_reserve_soc))
 

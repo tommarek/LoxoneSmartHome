@@ -1567,6 +1567,12 @@ class GrowattController(BaseModule):
                     f"{summary['bins']} bins, range {summary['date_range']}"
                 )
 
+        # Calibrate optimizer night reserve from historical overnight base load
+        if self._optimizer:
+            await self._optimizer.calibrate_night_reserve(
+                self.influxdb_client, self.settings.influxdb.bucket_solar
+            )
+
         # Start periodic evaluation loop
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
@@ -3630,6 +3636,16 @@ from(bucket: "{bucket}")
                                     )
                                 except Exception as e:
                                     self.logger.warning(f"Daily solar calibration failed: {e}")
+
+                            # Daily night reserve recalibration
+                            if self._optimizer:
+                                try:
+                                    await self._optimizer.calibrate_night_reserve(
+                                        self.influxdb_client,
+                                        self.settings.influxdb.bucket_solar,
+                                    )
+                                except Exception as e:
+                                    self.logger.warning(f"Night reserve calibration failed: {e}")
 
                             # Start background fetch for NEW next day's prices (non-blocking)
                             # This task will retry indefinitely with smart time-based backoff

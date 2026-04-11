@@ -247,12 +247,14 @@ async def api_status(request: web.Request) -> web.Response:
     if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
         discharge_today = getattr(ctrl, '_discharge_periods_today', set())
         charge_today = getattr(ctrl, '_combined_charging_blocks', set())
+        night_reserve = getattr(ctrl._optimizer, '_night_reserve_kwh', 5.0)
         optimizer_info = {
             "enabled": True,
             "charge_blocks_today": len(charge_today),
             "discharge_blocks_today": len(discharge_today),
             "charge_blocks": sorted(list(charge_today)),
             "discharge_blocks": sorted(list(discharge_today)),
+            "night_reserve_kwh": round(night_reserve, 1),
         }
 
     # Consumption forecast
@@ -990,7 +992,8 @@ function updateUI(d) {
     const opt = d.optimizer;
     document.getElementById('optimizerSummary').innerHTML =
       '<span style="color:var(--green)">' + opt.charge_blocks_today + ' charge</span> + ' +
-      '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span> blocks today';
+      '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span> blocks today' +
+      '<br><span style="color:var(--muted);font-size:11px">Night reserve: ' + (opt.night_reserve_kwh || '?') + ' kWh (min SOC ~' + Math.round(20 + (opt.night_reserve_kwh || 5) * 10) + '%)</span>';
   } else {
     document.getElementById('optimizerSummary').textContent = 'Optimizer disabled';
   }
