@@ -299,7 +299,10 @@ async def api_override_clear(request: web.Request) -> web.Response:
 
 async def dashboard_page(request: web.Request) -> web.Response:
     """Serve the main dashboard HTML page."""
-    return web.Response(text=DASHBOARD_HTML, content_type="text/html")
+    return web.Response(
+        text=DASHBOARD_HTML, content_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
 
 
 # --- Dashboard Setup ---
@@ -771,7 +774,7 @@ async function fetchPrices() {
     const res = await fetch('/api/prices');
     const data = await res.json();
     renderPriceChart(data.prices || []);
-  } catch (e) {}
+  } catch (e) { console.error('fetchPrices error:', e); }
 }
 
 let priceData = [];
