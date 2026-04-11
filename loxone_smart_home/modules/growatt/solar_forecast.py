@@ -423,6 +423,88 @@ from(bucket: "{bucket}")
             return {}
         return {h: kwh * self.confidence for h, kwh in forecast.hourly.items()}
 
+    # --- Persistence ---
+
+    async def save_to_influxdb(self, influxdb_client: Any, bucket: str) -> None:
+        """Persist current API forecast to InfluxDB so it survives restarts."""
+        if not self._api_forecast or not influxdb_client:
+            return
+
+        try:
+            for date_str, forecast in self._api_forecast.items():
+                # Store hourly data as a JSON string field
+                hourly_json = json.dumps({str(h): round(kwh, 3) for h, kwh in forecast.hourly.items()})
+                await influxdb_client.write_point(
+                    bucket=bucket,
+                    measurement="solar_forecast_cache",
+                    fields={
+                        "total_kwh": forecast.total_kwh,
+                        "hourly_json": hourly_json,
+                        "source": forecast.source,
+                    },
+                    tags={"forecast_date": date_str},
+                )
+            self.logger.debug(f"Saved {len(self._api_forecast)} forecast days to InfluxDB")
+        except Exception as e:
+            self.logger.warning(f"Failed to persist forecast: {e}")
+
+    async def load_from_influxdb(self, influxdb_client: Any, bucket: str) -> bool:
+        """Load cached forecast from InfluxDB (used on startup when API is rate-limited)."""
+        if not influxdb_client:
+            return False
+
+        try:
+            query = f'''
+from(bucket: "{bucket}")
+  |> range(start: -2d)
+  |> filter(fn: (r) => r._measurement == "solar_forecast_cache")
+  |> last()
+'''
+            result = await influxdb_client.query(query)
+            if not result:
+                return False
+
+            # Parse results grouped by forecast_date tag
+            by_date: Dict[str, Dict[str, Any]] = {}
+            for table in result:
+                for record in table.records:
+                    date_tag = record.values.get("forecast_date", "")
+                    if not date_tag:
+                        continue
+                    if date_tag not in by_date:
+                        by_date[date_tag] = {}
+                    field = record.get_field()
+                    by_date[date_tag][field] = record.get_value()
+
+            loaded = 0
+            for date_str, fields in by_date.items():
+                total = fields.get("total_kwh", 0)
+                hourly_json = fields.get("hourly_json", "{}")
+                if not total or total < 1:
+                    continue
+                try:
+                    hourly_raw = json.loads(hourly_json) if isinstance(hourly_json, str) else {}
+                    hourly = {int(h): float(kwh) for h, kwh in hourly_raw.items()}
+                except (json.JSONDecodeError, ValueError):
+                    hourly = {}
+
+                self._api_forecast[date_str] = DailyForecast(
+                    date=datetime.strptime(date_str, "%Y-%m-%d").date(),
+                    total_kwh=float(total),
+                    hourly=hourly,
+                    source="cached",
+                )
+                loaded += 1
+
+            if loaded > 0:
+                self.logger.info(f"Loaded {loaded} cached forecast days from InfluxDB")
+                return True
+            return False
+
+        except Exception as e:
+            self.logger.debug(f"Could not load cached forecast: {e}")
+            return False
+
     def get_forecast_summary(self) -> Dict[str, Any]:
         """Get a summary of current forecast state for logging/API."""
         summary: Dict[str, Any] = {

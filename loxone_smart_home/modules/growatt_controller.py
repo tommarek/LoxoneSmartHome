@@ -1725,9 +1725,23 @@ class GrowattController(BaseModule):
 
         try:
             # Source 1: forecast.solar API
-            await self._solar_forecast.fetch_api_forecast()
+            result = await self._solar_forecast.fetch_api_forecast()
+            if result:
+                # Persist to InfluxDB so it survives restarts
+                await self._solar_forecast.save_to_influxdb(
+                    self.influxdb_client, self.settings.influxdb.bucket_solar
+                )
         except Exception as e:
             self.logger.warning(f"Failed to fetch forecast.solar API: {e}")
+
+        # If API failed or was rate-limited, try loading from InfluxDB cache
+        if not self._solar_forecast._api_forecast:
+            try:
+                await self._solar_forecast.load_from_influxdb(
+                    self.influxdb_client, self.settings.influxdb.bucket_solar
+                )
+            except Exception as e:
+                self.logger.debug(f"Could not load cached forecast: {e}")
 
         try:
             # Source 2: Weather-based calculation from InfluxDB
