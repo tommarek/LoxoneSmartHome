@@ -46,28 +46,28 @@ class DailyForecast:
 class SolarProductionModel:
     """Learned solar production model trained on historical data.
 
-    Bins actual production by (radiation_bucket, clear_sky_bucket, sun_elev_bucket, hour).
-    Uses 75th percentile for prediction — represents panel POTENTIAL.
+    Bins actual production by physics-based features:
+    - radiation_bucket: GHI in 50 W/m² steps (primary energy driver)
+    - clear_sky_bucket: direct/(direct+diffuse) ratio (cloud type)
+    - sun_azimuth_bucket: sun compass direction in 30° steps (which array gets light)
+    - sun_altitude_bucket: sun height angle in 10° steps (angle of incidence)
+    - temp_bucket: outdoor temperature in 5°C steps (panel efficiency derating)
 
-    Features:
-    - radiation_bucket: GHI in 50 W/m² steps (primary driver)
-    - clear_sky_bucket: direct/(direct+diffuse) ratio in 20% steps (cloud cover proxy)
-    - sun_elev_bucket: max sun elevation in 10° steps (seasonal angle effect)
-    - hour: hour of day (captures which array peaks when)
-
-    Two-pass training: first pass builds rough model, second pass filters
-    curtailed hours (SOC >= 90% + low production).
+    Uses p75 for prediction — represents panel POTENTIAL on a good day.
+    Two-pass training filters curtailed hours (SOC >= 90% + low output).
     """
-    # Raw bins: (radiation_bucket, clear_sky_bucket, sun_elev_bucket, hour) -> [actual_kwh]
-    bins: Dict[Tuple[int, int, int, int], List[float]] = field(default_factory=dict)
-    # After build: percentile values for prediction
-    medians: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
-    p75: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
-    # Simpler fallback bins: (radiation_bucket, hour) for sparse 4D bins
+    # Primary 5D bins: (rad, clear_sky, azimuth, altitude, temp) -> [kwh]
+    bins: Dict[Tuple[int, int, int, int, int], List[float]] = field(default_factory=dict)
+    p75: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
+    medians: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
+    # 3D fallback: (rad, azimuth, altitude) -> [kwh]
+    mid_bins: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
+    mid_p75: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
+    # 2D fallback: (rad, altitude) -> [kwh]
     simple_bins: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
     simple_p75: Dict[Tuple[int, int], float] = field(default_factory=dict)
-    # Fallbacks
-    hourly_fallback: Dict[int, float] = field(default_factory=dict)
+    # 1D fallback: altitude -> median
+    altitude_fallback: Dict[int, float] = field(default_factory=dict)
     global_median: float = 0.0
     # Metadata
     data_points: int = 0
@@ -77,7 +77,7 @@ class SolarProductionModel:
 
     @staticmethod
     def radiation_to_bucket(ghi: float) -> int:
-        """GHI W/m² → bucket (50 W/m² steps, max 20 = 1000+)."""
+        """GHI W/m² → bucket (50 W/m² steps, 0-20)."""
         return min(20, max(0, int(ghi / 50)))
 
     @staticmethod
@@ -86,13 +86,22 @@ class SolarProductionModel:
         total = direct + diffuse
         if total <= 0:
             return 0
-        ratio = direct / total
-        return min(4, int(ratio / 0.2))
+        return min(4, int((direct / total) / 0.2))
 
     @staticmethod
-    def sun_elevation_to_bucket(max_elevation_deg: float) -> int:
-        """Max sun elevation → bucket (10° steps, 0-7)."""
-        return min(7, max(0, int(max_elevation_deg / 10)))
+    def azimuth_to_bucket(azimuth_deg: float) -> int:
+        """Sun azimuth → bucket (30° steps, 0-11). 0=North, 3=East, 6=South, 9=West."""
+        return int((azimuth_deg % 360) / 30)
+
+    @staticmethod
+    def altitude_to_bucket(altitude_deg: float) -> int:
+        """Sun altitude → bucket (10° steps, 0-9). 0=horizon, 6=60°."""
+        return min(9, max(0, int(altitude_deg / 10)))
+
+    @staticmethod
+    def temp_to_bucket(temp_c: float) -> int:
+        """Temperature → bucket (5°C steps, clamped -4 to 8 = -20°C to 40°C)."""
+        return min(12, max(0, int((temp_c + 20) / 5)))
 
     @staticmethod
     def _compute_p75(values: List[float]) -> Tuple[float, float]:
@@ -113,13 +122,15 @@ class SolarProductionModel:
         return med, filtered[p75_idx]
 
     def build(self) -> None:
-        """Compute percentiles from raw bins (4D + 2D fallback)."""
-        self.medians = {}
+        """Compute percentiles from all bin levels (5D → 3D → 2D → 1D)."""
         self.p75 = {}
+        self.medians = {}
+        self.mid_p75 = {}
         self.simple_p75 = {}
-        hourly_all: Dict[int, List[float]] = {}
+        self.altitude_fallback = {}
+        alt_all: Dict[int, List[float]] = {}
 
-        # Build 4D bins
+        # 5D bins
         for key, values in self.bins.items():
             if not values:
                 continue
@@ -127,80 +138,108 @@ class SolarProductionModel:
             self.medians[key] = med
             self.p75[key] = p75
 
-            hour = key[3]  # (rad, clear, elev, hour)
-            if hour not in hourly_all:
-                hourly_all[hour] = []
-            hourly_all[hour].append(p75)
+        # 3D bins (rad, azimuth, altitude)
+        for key, values in self.mid_bins.items():
+            if not values:
+                continue
+            _, p75 = self._compute_p75(values)
+            self.mid_p75[key] = p75
+            alt_bucket = key[2]  # altitude
+            if alt_bucket not in alt_all:
+                alt_all[alt_bucket] = []
+            alt_all[alt_bucket].append(p75)
 
-        # Build 2D fallback bins (radiation, hour)
+        # 2D bins (rad, altitude)
         for key, values in self.simple_bins.items():
             if not values:
                 continue
             _, p75 = self._compute_p75(values)
             self.simple_p75[key] = p75
 
-        for hour, vals in hourly_all.items():
-            self.hourly_fallback[hour] = statistics.median(vals) if vals else 0.0
+        # 1D altitude fallback
+        for alt_b, vals in alt_all.items():
+            self.altitude_fallback[alt_b] = statistics.median(vals) if vals else 0.0
 
         all_p75 = [v for v in self.p75.values() if v > 0]
+        if not all_p75:
+            all_p75 = [v for v in self.mid_p75.values() if v > 0]
         self.global_median = statistics.median(all_p75) if all_p75 else 0.0
         self.built_at = datetime.now()
 
     def predict(
-        self, ghi: float, hour: int,
+        self, ghi: float,
+        sun_azimuth: float = 180, sun_altitude: float = 45,
         direct_radiation: float = 0, diffuse_radiation: float = 0,
-        max_sun_elevation: float = 45,
+        temperature: float = 15,
     ) -> float:
         """Predict potential kWh production for given conditions.
 
-        Uses 75th percentile. Fallback chain:
-        4D exact → 4D adjacent radiation → 2D (radiation, hour) → hourly → global.
+        Fallback chain: 5D → 3D (rad, azimuth, alt) → 2D (rad, alt) → 1D (alt) → global.
 
         Args:
             ghi: Global Horizontal Irradiance (W/m²)
-            hour: Hour of day (0-23)
-            direct_radiation: Direct radiation (W/m²) for clear sky ratio
+            sun_azimuth: Sun compass direction (degrees, 0=N, 90=E, 180=S, 270=W)
+            sun_altitude: Sun height above horizon (degrees)
+            direct_radiation: Direct radiation (W/m²)
             diffuse_radiation: Diffuse radiation (W/m²)
-            max_sun_elevation: Max sun elevation for the day (degrees)
+            temperature: Outdoor temperature (°C)
         """
-        if ghi <= 0:
+        if ghi <= 0 or sun_altitude <= 0:
             return 0.0
 
         rad_b = self.radiation_to_bucket(ghi)
         clear_b = self.clear_sky_to_bucket(direct_radiation, diffuse_radiation)
-        elev_b = self.sun_elevation_to_bucket(max_sun_elevation)
-        key = (rad_b, clear_b, elev_b, hour)
+        az_b = self.azimuth_to_bucket(sun_azimuth)
+        alt_b = self.altitude_to_bucket(sun_altitude)
+        temp_b = self.temp_to_bucket(temperature)
 
-        # Exact 4D match
+        # 5D exact match
+        key = (rad_b, clear_b, az_b, alt_b, temp_b)
         if key in self.p75:
             return self.p75[key]
 
-        # Try adjacent radiation in 4D
-        for delta in [1, -1, 2, -2]:
-            adj = (rad_b + delta, clear_b, elev_b, hour)
+        # 5D: try adjacent temperature
+        for dt in [1, -1, 2, -2]:
+            adj = (rad_b, clear_b, az_b, alt_b, temp_b + dt)
             if adj in self.p75:
                 return self.p75[adj]
 
-        # Try adjacent clear sky
-        for delta in [1, -1]:
-            adj = (rad_b, clear_b + delta, elev_b, hour)
+        # 5D: try adjacent radiation
+        for dr in [1, -1, 2, -2]:
+            adj = (rad_b + dr, clear_b, az_b, alt_b, temp_b)
             if adj in self.p75:
                 return self.p75[adj]
 
-        # Fallback to 2D (radiation, hour)
-        simple_key = (rad_b, hour)
+        # 3D fallback (rad, azimuth, altitude) — ignores clear sky and temp
+        mid_key = (rad_b, az_b, alt_b)
+        if mid_key in self.mid_p75:
+            return self.mid_p75[mid_key]
+
+        # 3D: adjacent radiation
+        for dr in [1, -1, 2, -2]:
+            adj = (rad_b + dr, az_b, alt_b)
+            if adj in self.mid_p75:
+                return self.mid_p75[adj]
+
+        # 3D: adjacent azimuth (±30°)
+        for da in [1, -1]:
+            adj = (rad_b, (az_b + da) % 12, alt_b)
+            if adj in self.mid_p75:
+                return self.mid_p75[adj]
+
+        # 2D fallback (rad, altitude)
+        simple_key = (rad_b, alt_b)
         if simple_key in self.simple_p75:
             return self.simple_p75[simple_key]
 
-        # Adjacent radiation in 2D
-        for delta in [1, -1, 2, -2]:
-            adj = (rad_b + delta, hour)
+        for dr in [1, -1, 2, -2]:
+            adj = (rad_b + dr, alt_b)
             if adj in self.simple_p75:
                 return self.simple_p75[adj]
 
-        # Hourly fallback
-        if hour in self.hourly_fallback:
-            return self.hourly_fallback[hour]
+        # 1D altitude fallback
+        if alt_b in self.altitude_fallback:
+            return self.altitude_fallback[alt_b]
 
         return self.global_median
 
@@ -415,7 +454,7 @@ class SolarForecast:
             loc = LocationInfo("home", "", "Europe/Prague", self.latitude, self.longitude)
             max_sun_elev_by_date: Dict[str, float] = {}
             base_date = datetime.now().date()
-            for days_ago in range(365):
+            for days_ago in range(730):
                 d = base_date - timedelta(days=days_ago)
                 try:
                     s = sun(loc.observer, date=d)
@@ -434,32 +473,32 @@ class SolarForecast:
             # Query hourly solar production
             solar_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
-  |> range(start: -365d)
+  |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
             # Query hourly SOC (for curtailment detection)
             soc_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
-  |> range(start: -365d)
+  |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
             # Query hourly GHI + direct + diffuse radiation
-            weather_query = f'''
-from(bucket: "{settings.influxdb.bucket_weather}")
-  |> range(start: -365d)
-  |> filter(fn: (r) => r._measurement == "weather_forecast")
-  |> filter(fn: (r) => r._field == "shortwave_radiation" or r._field == "direct_radiation" or r._field == "diffuse_radiation")
-  |> filter(fn: (r) => r.type == "hour")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-'''
+            # Query weather fields separately (much faster than combined OR query)
+            weather_bucket = settings.influxdb.bucket_weather
+            weather_fields = {
+                "shortwave_radiation": "ghi",
+                "direct_radiation": "direct",
+                "diffuse_radiation": "diffuse",
+                "temperature_2m": "temp",
+            }
+
             solar_result = await influxdb_client.query(solar_query)
             soc_result = await influxdb_client.query(soc_query)
-            weather_result = await influxdb_client.query(weather_query)
 
-            if not solar_result or not weather_result:
-                self.logger.warning("Insufficient data for production model")
+            if not solar_result:
+                self.logger.warning("No solar production data found")
                 return False
 
             # Parse solar data
@@ -476,53 +515,117 @@ from(bucket: "{settings.influxdb.bucket_weather}")
                         key = record.get_time().strftime("%Y-%m-%d-%H")
                         soc_by_hour[key] = record.get_value()
 
-            # Parse weather: GHI, direct, diffuse per hour
+            # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
             direct_by_hour: Dict[str, float] = {}
             diffuse_by_hour: Dict[str, float] = {}
-            for table in weather_result:
-                for record in table.records:
-                    key = record.get_time().strftime("%Y-%m-%d-%H")
-                    field = record.get_field()
-                    val = record.get_value() or 0
-                    if field == "shortwave_radiation":
-                        if key not in ghi_by_hour or val > ghi_by_hour[key]:
-                            ghi_by_hour[key] = val
-                    elif field == "direct_radiation":
-                        if key not in direct_by_hour or val > direct_by_hour[key]:
-                            direct_by_hour[key] = val
-                    elif field == "diffuse_radiation":
-                        if key not in diffuse_by_hour or val > diffuse_by_hour[key]:
-                            diffuse_by_hour[key] = val
+            temp_by_hour: Dict[str, float] = {}
 
-            # Helper to add a data point to model bins
+            field_targets = {
+                "shortwave_radiation": ghi_by_hour,
+                "direct_radiation": direct_by_hour,
+                "diffuse_radiation": diffuse_by_hour,
+                "temperature_2m": temp_by_hour,
+            }
+
+            for field_name, target_dict in field_targets.items():
+                try:
+                    q = f'''
+from(bucket: "{weather_bucket}")
+  |> range(start: -730d)
+  |> filter(fn: (r) => r._measurement == "weather_forecast")
+  |> filter(fn: (r) => r._field == "{field_name}")
+  |> filter(fn: (r) => r.type == "hour")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+                    result = await influxdb_client.query(q)
+                    if result:
+                        for table in result:
+                            for record in table.records:
+                                key = record.get_time().strftime("%Y-%m-%d-%H")
+                                val = record.get_value() or 0
+                                if key not in target_dict or val > target_dict[key]:
+                                    target_dict[key] = val
+                        self.logger.debug(f"Weather {field_name}: {len(target_dict)} hours loaded")
+                except Exception as e:
+                    self.logger.warning(f"Failed to load weather {field_name}: {e}")
+
+            if not ghi_by_hour:
+                self.logger.warning("No weather radiation data found")
+                return False
+
+            # Pre-compute sun position for each hour using astronomy
+            import math as _math
+            import zoneinfo
+            local_tz = zoneinfo.ZoneInfo("Europe/Prague")
+
+            def _sun_position(year: int, month: int, day: int, hour: int) -> Tuple[float, float]:
+                """Compute sun azimuth and altitude for a given datetime.
+                Returns (azimuth_degrees, altitude_degrees)."""
+                try:
+                    dt = datetime(year, month, day, hour, 30, tzinfo=local_tz)  # mid-hour
+                    day_of_year = dt.timetuple().tm_yday
+                    # Solar declination
+                    decl = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
+                    # Hour angle (15° per hour from solar noon)
+                    # Solar noon ≈ 12:00 local standard time (approximate)
+                    hour_angle = (hour + 0.5 - 12) * 15
+                    lat_rad = _math.radians(self.latitude)
+                    decl_rad = _math.radians(decl)
+                    ha_rad = _math.radians(hour_angle)
+                    # Altitude
+                    sin_alt = (_math.sin(lat_rad) * _math.sin(decl_rad) +
+                               _math.cos(lat_rad) * _math.cos(decl_rad) * _math.cos(ha_rad))
+                    altitude = _math.degrees(_math.asin(max(-1, min(1, sin_alt))))
+                    # Azimuth
+                    cos_az = ((_math.sin(decl_rad) - _math.sin(lat_rad) * sin_alt) /
+                              (max(0.001, _math.cos(lat_rad) * _math.cos(_math.asin(max(-1, min(1, sin_alt)))))))
+                    azimuth = _math.degrees(_math.acos(max(-1, min(1, cos_az))))
+                    if hour_angle > 0:
+                        azimuth = 360 - azimuth
+                    return azimuth, max(0, altitude)
+                except Exception:
+                    return 180.0, 30.0
+
+            # Helper to add a data point to all bin levels
             def _add_to_model(m: SolarProductionModel, hour_key: str, kwh: float) -> None:
                 ghi = ghi_by_hour.get(hour_key, 0)
                 if ghi <= 0:
                     return
                 parts = hour_key.split("-")
-                hour = int(parts[3])
-                date_str = f"{parts[0]}-{parts[1]}-{parts[2]}"
+                year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
                 direct = direct_by_hour.get(hour_key, 0)
                 diffuse = diffuse_by_hour.get(hour_key, 0)
-                max_elev = max_sun_elev_by_date.get(date_str, 45.0)
+                temp = temp_by_hour.get(hour_key, 15.0)
+                azimuth, altitude = _sun_position(year, month, day, hour)
+
+                if altitude <= 0:
+                    return  # Sun below horizon
 
                 rad_b = SolarProductionModel.radiation_to_bucket(ghi)
                 clear_b = SolarProductionModel.clear_sky_to_bucket(direct, diffuse)
-                elev_b = SolarProductionModel.sun_elevation_to_bucket(max_elev)
+                az_b = SolarProductionModel.azimuth_to_bucket(azimuth)
+                alt_b = SolarProductionModel.altitude_to_bucket(altitude)
+                temp_b = SolarProductionModel.temp_to_bucket(temp)
 
-                # 4D bin
-                bin_key = (rad_b, clear_b, elev_b, hour)
-                if bin_key not in m.bins:
-                    m.bins[bin_key] = []
-                m.bins[bin_key].append(kwh)
+                # 5D bin
+                key5 = (rad_b, clear_b, az_b, alt_b, temp_b)
+                if key5 not in m.bins:
+                    m.bins[key5] = []
+                m.bins[key5].append(kwh)
 
-                # 2D fallback bin
-                simple_key = (rad_b, hour)
-                if simple_key not in m.simple_bins:
-                    m.simple_bins[simple_key] = []
-                m.simple_bins[simple_key].append(kwh)
+                # 3D fallback (rad, azimuth, altitude)
+                key3 = (rad_b, az_b, alt_b)
+                if key3 not in m.mid_bins:
+                    m.mid_bins[key3] = []
+                m.mid_bins[key3].append(kwh)
+
+                # 2D fallback (rad, altitude)
+                key2 = (rad_b, alt_b)
+                if key2 not in m.simple_bins:
+                    m.simple_bins[key2] = []
+                m.simple_bins[key2].append(kwh)
 
             # PASS 1: Build rough model from all matched data
             model = SolarProductionModel()
@@ -553,19 +656,21 @@ from(bucket: "{settings.influxdb.bucket_weather}")
 
                 kwh = watts / 1000.0
                 parts = hour_key.split("-")
-                hour = int(parts[3])
-                date_str = f"{parts[0]}-{parts[1]}-{parts[2]}"
+                year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
                 direct = direct_by_hour.get(hour_key, 0)
                 diffuse = diffuse_by_hour.get(hour_key, 0)
-                max_elev = max_sun_elev_by_date.get(date_str, 45.0)
+                temp = temp_by_hour.get(hour_key, 15.0)
+                azimuth, altitude = _sun_position(year, month, day, hour)
 
                 soc = soc_by_hour.get(hour_key, 50.0)
                 expected = model.predict(
-                    ghi, hour,
+                    ghi,
+                    sun_azimuth=azimuth,
+                    sun_altitude=altitude,
                     direct_radiation=direct,
                     diffuse_radiation=diffuse,
-                    max_sun_elevation=max_elev,
+                    temperature=temp,
                 )
 
                 if soc >= 90 and expected > 0 and kwh < expected * 0.6:
@@ -623,6 +728,7 @@ from(bucket: "{settings.influxdb.bucket_weather}")
             ghi = entry.get("shortwave_radiation", 0)
             direct = entry.get("direct_radiation", 0)
             diffuse = entry.get("diffuse_radiation", 0)
+            temp = entry.get("temperature_2m", 15)
 
             if not time_str:
                 continue
@@ -635,21 +741,34 @@ from(bucket: "{settings.influxdb.bucket_weather}")
             date_str = dt.strftime("%Y-%m-%d")
             hour = dt.hour
 
-            # Compute max sun elevation for this date (cached)
-            if date_str not in max_elev_cache:
-                try:
-                    import math as _math
-                    day_of_year = dt.timetuple().tm_yday
-                    declination = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
-                    max_elev_cache[date_str] = 90 - abs(self.latitude - declination)
-                except Exception:
-                    max_elev_cache[date_str] = 45.0
+            # Compute sun position for this specific hour
+            try:
+                import math as _math
+                day_of_year = dt.timetuple().tm_yday
+                decl = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
+                hour_angle = (hour + 0.5 - 12) * 15
+                lat_rad = _math.radians(self.latitude)
+                decl_rad = _math.radians(decl)
+                ha_rad = _math.radians(hour_angle)
+                sin_alt = (_math.sin(lat_rad) * _math.sin(decl_rad) +
+                           _math.cos(lat_rad) * _math.cos(decl_rad) * _math.cos(ha_rad))
+                altitude = _math.degrees(_math.asin(max(-1, min(1, sin_alt))))
+                cos_az = ((_math.sin(decl_rad) - _math.sin(lat_rad) * sin_alt) /
+                          max(0.001, _math.cos(lat_rad) * _math.cos(_math.asin(max(-1, min(1, sin_alt))))))
+                azimuth = _math.degrees(_math.acos(max(-1, min(1, cos_az))))
+                if hour_angle > 0:
+                    azimuth = 360 - azimuth
+                altitude = max(0, altitude)
+            except Exception:
+                azimuth, altitude = 180.0, 30.0
 
             predicted_kwh = self._production_model.predict(
-                ghi, hour,
+                ghi,
+                sun_azimuth=azimuth,
+                sun_altitude=altitude,
                 direct_radiation=direct,
                 diffuse_radiation=diffuse,
-                max_sun_elevation=max_elev_cache[date_str],
+                temperature=temp or 15,
             )
 
             if date_str not in daily_hourly:

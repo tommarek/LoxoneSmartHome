@@ -1782,7 +1782,7 @@ class GrowattController(BaseModule):
                     f"https://api.open-meteo.com/v1/forecast"
                     f"?latitude={self._solar_forecast.latitude}"
                     f"&longitude={self._solar_forecast.longitude}"
-                    f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation"
+                    f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation,temperature_2m"
                     f"&forecast_days=2&timezone=auto"
                 )
                 async with aiohttp.ClientSession() as session:
@@ -1794,18 +1794,21 @@ class GrowattController(BaseModule):
                             ghi = hourly.get("shortwave_radiation", [])
                             direct = hourly.get("direct_radiation", [])
                             diffuse = hourly.get("diffuse_radiation", [])
+                            temps = hourly.get("temperature_2m", [])
                             weather_hours = [
                                 {
                                     "time": t,
                                     "shortwave_radiation": g or 0,
                                     "direct_radiation": d or 0,
                                     "diffuse_radiation": df or 0,
+                                    "temperature_2m": tp or 15,
                                 }
-                                for t, g, d, df in zip(
+                                for t, g, d, df, tp in zip(
                                     times,
                                     ghi,
                                     direct or [0] * len(times),
                                     diffuse or [0] * len(times),
+                                    temps or [15] * len(times),
                                 )
                             ]
                             model_result = self._solar_forecast.predict_from_model(weather_hours)
