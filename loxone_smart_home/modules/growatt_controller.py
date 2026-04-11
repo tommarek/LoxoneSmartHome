@@ -1528,6 +1528,22 @@ class GrowattController(BaseModule):
                 self._fetch_next_day_prices_task()
             )
 
+        # Build solar production model from historical data (one-time, 365 days)
+        if self._solar_forecast:
+            try:
+                success = await self._solar_forecast.build_production_model(
+                    self.influxdb_client, self.settings
+                )
+                if success and self._solar_forecast._production_model:
+                    m = self._solar_forecast._production_model
+                    self.logger.info(
+                        f"Solar production model: {m.data_points} hours, "
+                        f"{m.curtailed_filtered} curtailed filtered, "
+                        f"{len(m.medians)} bins"
+                    )
+            except Exception as e:
+                self.logger.warning(f"Failed to build solar production model: {e}")
+
         # Fetch initial solar forecast
         if self._solar_forecast:
             await self._update_solar_forecast()
@@ -1751,6 +1767,38 @@ class GrowattController(BaseModule):
             except Exception as e:
                 self.logger.debug(f"OpenMeteo fallback failed: {e}")
 
+        # Use learned model with OpenMeteo weather forecast for predictions
+        if self._solar_forecast._production_model:
+            try:
+                # Fetch fresh 48h weather forecast from OpenMeteo
+                url = (
+                    f"https://api.open-meteo.com/v1/forecast"
+                    f"?latitude={self._solar_forecast.latitude}"
+                    f"&longitude={self._solar_forecast.longitude}"
+                    f"&hourly=shortwave_radiation"
+                    f"&forecast_days=2&timezone=auto"
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            hourly = data.get("hourly", {})
+                            times = hourly.get("time", [])
+                            radiation = hourly.get("shortwave_radiation", [])
+                            weather_hours = [
+                                {"time": t, "shortwave_radiation": r or 0}
+                                for t, r in zip(times, radiation)
+                            ]
+                            model_result = self._solar_forecast.predict_from_model(weather_hours)
+                            if model_result:
+                                total = sum(f.total_kwh for f in model_result.values())
+                                self.logger.info(
+                                    f"Solar model prediction: {total:.1f} kWh "
+                                    f"across {len(model_result)} days (from learned model)"
+                                )
+            except Exception as e:
+                self.logger.debug(f"Model prediction failed: {e}")
+
         # Calibrate confidence from actual production data (full year on startup)
         try:
             await self._solar_forecast.calibrate_from_actuals(
@@ -1772,11 +1820,16 @@ class GrowattController(BaseModule):
         )
         reliable = self._solar_forecast.has_reliable_forecast()
         reliability_tag = "" if reliable else " [UNRELIABLE - will not adjust charging]"
+        # Determine source for logging
+        today_str = now.date().strftime("%Y-%m-%d")
+        today_fc = self._solar_forecast._consensus.get(today_str)
+        source_info = today_fc.source if today_fc else "none"
+        has_model = source_info.startswith("model")
+        discount_info = "(from learned model)" if has_model else f"(after {self._solar_forecast.confidence:.0%} confidence discount)"
         self.logger.info(
             f"☀️ Solar forecast: today {today_kwh:.1f} kWh, "
             f"tomorrow {tomorrow_kwh:.1f} kWh "
-            f"(after {self._solar_forecast.confidence:.0%} confidence discount)"
-            f"{reliability_tag}"
+            f"{discount_info}{reliability_tag}"
         )
 
         # Store to InfluxDB
