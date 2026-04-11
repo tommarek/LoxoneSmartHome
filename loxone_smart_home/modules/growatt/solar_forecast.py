@@ -411,7 +411,9 @@ from(bucket: "{bucket}")
                     avg_actual = sum(actual_by_day.values()) / len(actual_by_day)
                     typical_max = total_kwp * 5  # ~5 kWh/kWp on a good day
                     estimated_confidence = min(1.0, avg_actual / typical_max)
-                    self.confidence = max(0.5, estimated_confidence)
+                    # Floor at 0.65 — avg includes cloudy days but scheduling
+                    # decisions should be optimistic enough for sunny ones
+                    self.confidence = max(0.65, estimated_confidence)
                     self.logger.info(
                         f"☀️ Calibration (insufficient forecast history, {len(ratios)} days): "
                         f"confidence={self.confidence:.2f} "

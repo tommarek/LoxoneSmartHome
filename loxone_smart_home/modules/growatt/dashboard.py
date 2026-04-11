@@ -814,11 +814,17 @@ function showTooltip(e, bar, tooltip) {
   else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
   else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
 
+  // Calculate actual price rank (1 = cheapest)
+  const sortedPrices = [...priceData].sort((a, b) => a.czk_kwh - b.czk_kwh);
+  const priceRank = sortedPrices.findIndex(sp => sp.start === p.start && sp.end === p.end) + 1;
+  const percentile = Math.round(priceRank / priceData.length * 100);
+  const rankLabel = percentile <= 25 ? 'Cheapest quarter' : percentile <= 50 ? 'Below average' : percentile <= 75 ? 'Above average' : 'Most expensive quarter';
+
   tooltip.innerHTML =
     '<div class="tt-time">' + p.start + ' - ' + p.end + '</div>' +
     '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh</div>' +
     '<div class="tt-row"><span class="tt-label">EUR/MWh</span><span>' + p.eur_mwh.toFixed(1) + '</span></div>' +
-    '<div class="tt-row"><span class="tt-label">Rank</span><span>' + (idx + 1) + ' / ' + priceData.length + '</span></div>' +
+    '<div class="tt-row"><span class="tt-label">Price rank</span><span>#' + priceRank + ' of ' + priceData.length + ' (' + rankLabel + ')</span></div>' +
     (statusHtml ? '<div style="margin-top:6px">' + statusHtml + '</div>' : '');
 
   tooltip.style.display = 'block';
