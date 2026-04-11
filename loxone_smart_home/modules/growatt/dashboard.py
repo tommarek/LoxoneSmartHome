@@ -65,6 +65,17 @@ def _get_controller(request: web.Request):
     return request.app.get("controller")
 
 
+def _get_live_soc() -> Optional[float]:
+    """Get live battery SOC from the Growatt API telemetry cache."""
+    try:
+        from modules.growatt.api import _telemetry_cache
+        if _telemetry_cache:
+            return _telemetry_cache.get("SOC")
+    except Exception:
+        pass
+    return None
+
+
 # --- API Endpoints ---
 
 async def api_status(request: web.Request) -> web.Response:
@@ -146,7 +157,7 @@ async def api_status(request: web.Request) -> web.Response:
     return web.json_response({
         "timestamp": now.isoformat(),
         "mode": ctrl._current_mode,
-        "battery_soc": ctrl._battery_soc,
+        "battery_soc": _get_live_soc() or ctrl._battery_soc,
         "current_price": {
             "eur_mwh": round(current_price_eur, 2),
             "czk_kwh": round(current_price_czk, 2),
