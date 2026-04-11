@@ -309,14 +309,12 @@ class SolarForecast:
             days: Number of past days to compare (default 7)
         """
         try:
-            # Get actual daily production from InputPower (W averaged per hour → kWh)
-            # Use TodayGenerateEnergy (daily max) as the primary source since it's
-            # the inverter's own daily total — more accurate than aggregating InputPower.
-            # InputPower can undercount when production is curtailed (export disabled,
-            # battery full, low prices) since the inverter throttles panels.
+            # Get actual daily production using TodayGenerateEnergy (inverter's own
+            # daily total). Exclude today (-1d stop) to avoid comparing a partial
+            # day's actual against a full day's forecast.
             query = f'''
 from(bucket: "{bucket}")
-  |> range(start: -{days}d, stop: -0d)
+  |> range(start: -{days}d, stop: -1d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "TodayGenerateEnergy")
   |> aggregateWindow(every: 1d, fn: max, createEmpty: false)
   |> filter(fn: (r) => r._value > 1)
@@ -327,11 +325,14 @@ from(bucket: "{bucket}")
                 return
 
             # Daily production totals (already in kWh from inverter)
+            # Use max() in case of multiple entries per day
             actual_by_day: Dict[str, float] = {}
             for table in result:
                 for record in table.records:
                     day = record.get_time().strftime("%Y-%m-%d")
-                    actual_by_day[day] = record.get_value()
+                    val = record.get_value()
+                    if day not in actual_by_day or val > actual_by_day[day]:
+                        actual_by_day[day] = val
 
             if not actual_by_day:
                 return
@@ -351,17 +352,18 @@ from(bucket: "{bucket}")
                         f"forecast={forecast.total_kwh:.1f} kWh, ratio={ratio:.2f}"
                     )
 
-            if not ratios:
-                # No matching forecasts — use actuals vs total_kwp * typical hours
-                # Estimate: on a decent day, each kWp produces ~4 kWh
+            if len(ratios) < 3:
+                # Not enough forecast history for reliable calibration.
+                # Use actuals vs theoretical max as a conservative estimate.
                 total_kwp = sum(a.kwp for a in self.arrays)
-                if total_kwp > 0:
+                if total_kwp > 0 and actual_by_day:
                     avg_actual = sum(actual_by_day.values()) / len(actual_by_day)
                     typical_max = total_kwp * 5  # ~5 kWh/kWp on a good day
                     estimated_confidence = min(1.0, avg_actual / typical_max)
-                    self.confidence = max(0.3, estimated_confidence)
+                    self.confidence = max(0.5, estimated_confidence)
                     self.logger.info(
-                        f"☀️ Calibration (no forecast history): confidence={self.confidence:.2f} "
+                        f"☀️ Calibration (insufficient forecast history, {len(ratios)} days): "
+                        f"confidence={self.confidence:.2f} "
                         f"(avg actual: {avg_actual:.1f} kWh, typical max: {typical_max:.0f} kWh)"
                     )
                 return
