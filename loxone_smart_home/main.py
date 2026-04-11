@@ -23,6 +23,7 @@ from modules.ote_price_collector import OTEPriceCollector
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
 from modules.growatt.api import create_growatt_api
+from modules.growatt.dashboard import start_dashboard
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
@@ -218,6 +219,14 @@ class LoxoneSmartHome:
             # Fallback to legacy API if web service is disabled
             await self.start_api_server()
             logger.info("Legacy API server started on port 8080")
+
+        # Start monitoring dashboard on port 5555
+        if self.growatt_controller:
+            try:
+                await start_dashboard(self.growatt_controller, port=5555)
+                logger.info("Monitoring dashboard started on port 5555")
+            except Exception as e:
+                logger.warning(f"Failed to start dashboard: {e}")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""
