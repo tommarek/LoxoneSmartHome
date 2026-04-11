@@ -128,10 +128,20 @@ async def api_status(request: web.Request) -> web.Response:
         tomorrow_kwh = ctrl._solar_forecast.get_expected_production_kwh(
             now.date() + td(days=1)
         )
+        # Determine forecast source
+        today_str = now.date().strftime("%Y-%m-%d")
+        today_fc = ctrl._solar_forecast._consensus.get(today_str)
+        source = today_fc.source if today_fc else "none"
+        has_model = source.startswith("model") if source else False
+
         solar = {
             "today_kwh": round(today_kwh, 1),
             "tomorrow_kwh": round(tomorrow_kwh, 1),
-            "confidence": ctrl._solar_forecast.confidence,
+            "confidence": 1.0 if has_model else ctrl._solar_forecast.confidence,
+            "source": source,
+            "has_model": has_model,
+            "model_trained": ctrl._solar_forecast._production_model is not None,
+            "model_bins": len(ctrl._solar_forecast._production_model.medians) if ctrl._solar_forecast._production_model else 0,
             "arrays": [
                 {"name": a.name, "kwp": a.kwp, "azimuth": a.azimuth}
                 for a in ctrl._solar_forecast.arrays
@@ -731,8 +741,14 @@ function updateUI(d) {
   if (d.solar_forecast) {
     document.getElementById('solarToday').textContent = d.solar_forecast.today_kwh + ' kWh';
     document.getElementById('solarTomorrow').textContent = d.solar_forecast.tomorrow_kwh + ' kWh';
-    document.getElementById('solarConf').textContent =
-      'Confidence: ' + (d.solar_forecast.confidence * 100).toFixed(0) + '%';
+    const sf = d.solar_forecast;
+    let confText = '';
+    if (sf.has_model) {
+      confText = 'Source: Learned model (' + sf.model_bins + ' bins)';
+    } else {
+      confText = 'Confidence: ' + (sf.confidence * 100).toFixed(0) + '% (no model)';
+    }
+    document.getElementById('solarConf').textContent = confText;
   }
 
   // Schedule
