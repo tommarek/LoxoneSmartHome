@@ -273,7 +273,7 @@ class GrowattConfig(BaseSettings):
         description="Enable solar production forecast for smarter charging"
     )
     solar_arrays: str = Field(
-        default='[{"name":"terasa","declination":35,"azimuth":234,"kwp":7.0},{"name":"ulice","declination":35,"azimuth":134,"kwp":6.5}]',
+        default='[{"name":"terasa","declination":35,"azimuth":226,"kwp":7.0},{"name":"ulice","declination":35,"azimuth":136,"kwp":6.5}]',
         description="JSON array of solar panel arrays [{name, declination, azimuth, kwp}]"
     )
     solar_forecast_confidence: float = Field(
