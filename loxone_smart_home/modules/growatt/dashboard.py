@@ -167,6 +167,54 @@ async def api_status(request: web.Request) -> web.Response:
     # Last evaluation
     last_eval = getattr(ctrl, '_last_evaluation_reason', 'N/A')
 
+    # Decision explanation
+    decision = {}
+    if hasattr(ctrl, '_decision_engine') and ctrl._decision_engine:
+        try:
+            decision = ctrl._decision_engine.explain_decision()
+        except Exception:
+            decision = {"reason": "unavailable"}
+
+    # Optimizer summary
+    optimizer_info = None
+    if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
+        discharge_today = getattr(ctrl, '_discharge_periods_today', set())
+        charge_today = getattr(ctrl, '_combined_charging_blocks', set())
+        optimizer_info = {
+            "enabled": True,
+            "charge_blocks_today": len(charge_today),
+            "discharge_blocks_today": len(discharge_today),
+            "charge_blocks": sorted(list(charge_today)),
+            "discharge_blocks": sorted(list(discharge_today)),
+        }
+
+    # Consumption forecast
+    consumption_info = None
+    if hasattr(ctrl, '_consumption_forecast') and ctrl._consumption_forecast and ctrl._consumption_forecast.model:
+        m = ctrl._consumption_forecast.model
+        # Predict today's consumption at current temperature
+        try:
+            from modules.growatt.api import _telemetry_cache
+            temp = _telemetry_cache.get("InverterTemperature", 10)  # rough proxy
+        except Exception:
+            temp = 10
+        daily = ctrl._consumption_forecast.predict_daily(temp, now.date())
+        consumption_info = {
+            "predicted_today_kwh": round(daily, 1),
+            "model_bins": len(m.medians),
+            "model_data_points": m.data_points,
+        }
+
+    # Next scheduled action
+    next_action = None
+    if charge_today or discharge_today if optimizer_info else False:
+        current_block_str = f"{now.hour:02d}:{(now.minute // 15) * 15:02d}"
+        all_blocks = [(b, "charge") for b in sorted(charge_today)] + [(b, "discharge") for b in sorted(discharge_today)]
+        for (start, end), action_type in sorted(all_blocks):
+            if start > current_block_str:
+                next_action = {"time": f"{start}-{end}", "action": action_type}
+                break
+
     return web.json_response({
         "timestamp": now.isoformat(),
         "mode": ctrl._current_mode,
@@ -183,6 +231,10 @@ async def api_status(request: web.Request) -> web.Response:
         "schedule": schedule,
         "manual_override": override,
         "last_evaluation": last_eval,
+        "decision": decision,
+        "optimizer": optimizer_info,
+        "consumption": consumption_info,
+        "next_action": next_action,
         "simulation_mode": getattr(ctrl.config, 'simulation_mode', False),
     })
 
@@ -646,8 +698,34 @@ select, input {
         <div class="stat-value small" id="chargeBlocks">--</div>
       </div>
       <div class="stat">
-        <div class="stat-label">Evaluation reason</div>
-        <div class="stat-value small" style="font-size:13px;color:var(--muted)" id="lastEval">--</div>
+        <div class="stat-label">Evaluation trigger</div>
+        <div style="font-size:13px;color:var(--muted)" id="lastEval">--</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Decision Reasoning -->
+  <div class="grid" style="grid-template-columns: 1fr 1fr;">
+    <div class="card">
+      <h2>Decision Reasoning</h2>
+      <div id="decisionReason" style="font-size:13px;line-height:1.8">
+        <div class="stat-label">Why this mode?</div>
+        <div id="decisionWhy" style="margin-bottom:8px">--</div>
+        <div class="stat-label">Decision priority</div>
+        <div id="decisionPriority" style="margin-bottom:8px">--</div>
+        <div class="stat-label">Next scheduled action</div>
+        <div id="nextAction" style="font-weight:600">--</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Optimizer & Forecast</h2>
+      <div id="optimizerInfo" style="font-size:13px;line-height:1.8">
+        <div class="stat-label">Optimizer schedule</div>
+        <div id="optimizerSummary" style="margin-bottom:8px">--</div>
+        <div class="stat-label">Consumption forecast</div>
+        <div id="consumptionInfo" style="margin-bottom:8px">--</div>
+        <div class="stat-label">Solar model</div>
+        <div id="solarModelInfo">--</div>
       </div>
     </div>
   </div>
@@ -760,6 +838,52 @@ function updateUI(d) {
   // Schedule
   document.getElementById('chargeBlocks').textContent = (d.schedule?.charging_blocks || 0) + ' blocks';
   document.getElementById('lastEval').textContent = d.last_evaluation || '--';
+
+  // Decision reasoning
+  if (d.decision) {
+    const dec = d.decision;
+    document.getElementById('decisionWhy').innerHTML =
+      '<span style="color:var(--accent);font-weight:600">' + (dec.reason || 'unknown') + '</span>';
+    const prio = dec.priority;
+    document.getElementById('decisionPriority').textContent =
+      prio ? prio.name + ' (level ' + prio.level + ')' : '--';
+  }
+
+  // Next action
+  if (d.next_action) {
+    const na = d.next_action;
+    const actionColor = na.action === 'charge' ? 'var(--green)' : 'var(--red)';
+    document.getElementById('nextAction').innerHTML =
+      '<span style="color:' + actionColor + '">' + na.action.toUpperCase() + '</span> at ' + na.time;
+  } else {
+    document.getElementById('nextAction').textContent = 'No upcoming actions today';
+  }
+
+  // Optimizer
+  if (d.optimizer) {
+    const opt = d.optimizer;
+    document.getElementById('optimizerSummary').innerHTML =
+      '<span style="color:var(--green)">' + opt.charge_blocks_today + ' charge</span> + ' +
+      '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span> blocks today';
+  } else {
+    document.getElementById('optimizerSummary').textContent = 'Optimizer disabled';
+  }
+
+  // Consumption forecast
+  if (d.consumption) {
+    document.getElementById('consumptionInfo').textContent =
+      'Predicted today: ' + d.consumption.predicted_today_kwh + ' kWh (' + d.consumption.model_bins + ' bins)';
+  } else {
+    document.getElementById('consumptionInfo').textContent = 'Not available';
+  }
+
+  // Solar model
+  if (d.solar_forecast?.has_model) {
+    document.getElementById('solarModelInfo').textContent =
+      'Learned model: ' + d.solar_forecast.model_bins + ' bins (trained on real data)';
+  } else {
+    document.getElementById('solarModelInfo').textContent = 'API-based forecast';
+  }
 
   // Override
   const ov = d.manual_override || {};
