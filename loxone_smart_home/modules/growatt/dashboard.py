@@ -23,13 +23,30 @@ _sse_clients: List[asyncio.Queue] = []
 
 
 class DashboardLogHandler(logging.Handler):
-    """Captures GROWATT log messages for the dashboard."""
+    """Captures GROWATT log messages for the dashboard.
+
+    Deduplicates messages that arrive within the same second (caused by
+    multiple log handlers/formatters in the logging chain).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._last_msg: str = ""
+        self._last_time: str = ""
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
             msg = self.format(record)
+            now = datetime.now().strftime("%H:%M:%S")
+
+            # Deduplicate: skip if same message in the same second
+            if msg == self._last_msg and now == self._last_time:
+                return
+            self._last_msg = msg
+            self._last_time = now
+
             entry = {
-                "time": datetime.now().strftime("%H:%M:%S"),
+                "time": now,
                 "level": record.levelname,
                 "message": msg,
             }
