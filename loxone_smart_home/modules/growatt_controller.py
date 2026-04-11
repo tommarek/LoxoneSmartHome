@@ -1782,7 +1782,7 @@ class GrowattController(BaseModule):
                     f"https://api.open-meteo.com/v1/forecast"
                     f"?latitude={self._solar_forecast.latitude}"
                     f"&longitude={self._solar_forecast.longitude}"
-                    f"&hourly=shortwave_radiation"
+                    f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation"
                     f"&forecast_days=2&timezone=auto"
                 )
                 async with aiohttp.ClientSession() as session:
@@ -1791,10 +1791,22 @@ class GrowattController(BaseModule):
                             data = await resp.json()
                             hourly = data.get("hourly", {})
                             times = hourly.get("time", [])
-                            radiation = hourly.get("shortwave_radiation", [])
+                            ghi = hourly.get("shortwave_radiation", [])
+                            direct = hourly.get("direct_radiation", [])
+                            diffuse = hourly.get("diffuse_radiation", [])
                             weather_hours = [
-                                {"time": t, "shortwave_radiation": r or 0}
-                                for t, r in zip(times, radiation)
+                                {
+                                    "time": t,
+                                    "shortwave_radiation": g or 0,
+                                    "direct_radiation": d or 0,
+                                    "diffuse_radiation": df or 0,
+                                }
+                                for t, g, d, df in zip(
+                                    times,
+                                    ghi,
+                                    direct or [0] * len(times),
+                                    diffuse or [0] * len(times),
+                                )
                             ]
                             model_result = self._solar_forecast.predict_from_model(weather_hours)
                             if model_result:
