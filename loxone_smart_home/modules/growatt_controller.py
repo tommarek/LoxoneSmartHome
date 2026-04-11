@@ -3111,6 +3111,10 @@ from(bucket: "{bucket}")
             cheapest_blocks=self._combined_charging_blocks.copy(),  # Combined charging blocks
             price_thresholds=price_thresholds,
             price_ranking=price_ranking,  # Include price ranking
+            # Optimizer discharge blocks (when optimizer is enabled)
+            optimizer_discharge_blocks=(
+                self._discharge_periods_today.copy() if self._optimizer else set()
+            ),
             # Solar schedule
             sunrise=sunrise,
             sunset=sunset,

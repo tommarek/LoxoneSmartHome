@@ -80,6 +80,9 @@ class DecisionContext:
     sunset: Optional[time] = None
     is_summer_mode: bool = False
     is_battery_charging_scheduled: bool = False
+    # Optimizer-scheduled discharge blocks
+    optimizer_discharge_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_discharge_scheduled: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
@@ -104,6 +107,12 @@ class DecisionContext:
         # No fallback to price threshold - only charge during cheapest blocks
         else:
             self.is_battery_charging_scheduled = False
+
+        # Check if optimizer scheduled discharge for this block
+        if self.current_block_key and self.optimizer_discharge_blocks:
+            self.is_optimizer_discharge_scheduled = (
+                self.current_block_key in self.optimizer_discharge_blocks
+            )
 
 
 @dataclass
@@ -250,7 +259,24 @@ class GrowattDecisionEngine:
                 )
             ),
 
-            # Priority 4: Check for battery discharge opportunity
+            # Priority 4A: Optimizer-scheduled discharge
+            DecisionNode(
+                name="Optimizer Scheduled Discharge",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_discharge_scheduled
+                    and ctx.battery_soc > 20
+                    and not ctx.high_loads_active
+                ),
+                action="discharge_to_grid",
+                explanation=lambda ctx: (
+                    f"Optimizer scheduled discharge: "
+                    f"{ctx.current_price:.1f} EUR/MWh, "
+                    f"discharging at 25% power"
+                )
+            ),
+
+            # Priority 4B: Price-based battery discharge (fallback when no optimizer)
             DecisionNode(
                 name="Battery Discharge Control",
                 priority=Priority.SCHEDULED_MODE,
