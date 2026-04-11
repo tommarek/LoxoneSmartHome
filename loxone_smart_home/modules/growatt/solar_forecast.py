@@ -295,7 +295,7 @@ class SolarForecast:
         self,
         influxdb_client: Any,
         bucket: str,
-        days: int = 7,
+        days: int = 30,
     ) -> None:
         """Auto-tune confidence factor by comparing past forecasts with actual production.
 
@@ -310,25 +310,28 @@ class SolarForecast:
         """
         try:
             # Get actual daily production from InputPower (W averaged per hour → kWh)
+            # Use TodayGenerateEnergy (daily max) as the primary source since it's
+            # the inverter's own daily total — more accurate than aggregating InputPower.
+            # InputPower can undercount when production is curtailed (export disabled,
+            # battery full, low prices) since the inverter throttles panels.
             query = f'''
 from(bucket: "{bucket}")
   |> range(start: -{days}d, stop: -0d)
-  |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-  |> filter(fn: (r) => r._value > 10)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "TodayGenerateEnergy")
+  |> aggregateWindow(every: 1d, fn: max, createEmpty: false)
+  |> filter(fn: (r) => r._value > 1)
 '''
             result = await influxdb_client.query(query)
             if not result:
                 self.logger.debug("No actual solar data for calibration")
                 return
 
-            # Sum hourly production by day
+            # Daily production totals (already in kWh from inverter)
             actual_by_day: Dict[str, float] = {}
             for table in result:
                 for record in table.records:
                     day = record.get_time().strftime("%Y-%m-%d")
-                    kwh = record.get_value() / 1000.0  # W average for 1h → kWh
-                    actual_by_day[day] = actual_by_day.get(day, 0) + kwh
+                    actual_by_day[day] = record.get_value()
 
             if not actual_by_day:
                 return
