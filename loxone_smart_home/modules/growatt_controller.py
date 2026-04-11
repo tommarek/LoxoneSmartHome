@@ -1734,8 +1734,9 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.warning(f"Failed to fetch forecast.solar API: {e}")
 
-        # If API failed or was rate-limited, try loading from InfluxDB cache
+        # If API failed or was rate-limited, try fallbacks in order
         if not self._solar_forecast._api_forecast:
+            # Fallback 1: Load from InfluxDB cache
             try:
                 await self._solar_forecast.load_from_influxdb(
                     self.influxdb_client, self.settings.influxdb.bucket_solar
@@ -1743,13 +1744,12 @@ class GrowattController(BaseModule):
             except Exception as e:
                 self.logger.debug(f"Could not load cached forecast: {e}")
 
-        try:
-            # Source 2: Weather-based calculation from InfluxDB
-            weather_data = await self._get_weather_radiation_data()
-            if weather_data:
-                self._solar_forecast.calculate_from_weather(weather_data)
-        except Exception as e:
-            self.logger.warning(f"Failed to calculate weather-based solar forecast: {e}")
+        if not self._solar_forecast._api_forecast:
+            # Fallback 2: OpenMeteo radiation API (no rate limit)
+            try:
+                await self._solar_forecast.fetch_openmeteo_radiation()
+            except Exception as e:
+                self.logger.debug(f"OpenMeteo fallback failed: {e}")
 
         # Calibrate confidence from actual production data (full year on startup)
         try:
@@ -1770,10 +1770,13 @@ class GrowattController(BaseModule):
         tomorrow_kwh = self._solar_forecast.get_expected_production_kwh(
             now.date() + timedelta(days=1)
         )
+        reliable = self._solar_forecast.has_reliable_forecast()
+        reliability_tag = "" if reliable else " [UNRELIABLE - will not adjust charging]"
         self.logger.info(
             f"☀️ Solar forecast: today {today_kwh:.1f} kWh, "
             f"tomorrow {tomorrow_kwh:.1f} kWh "
             f"(after {self._solar_forecast.confidence:.0%} confidence discount)"
+            f"{reliability_tag}"
         )
 
         # Store to InfluxDB
@@ -1961,7 +1964,8 @@ from(bucket: "{bucket}")
 
         # Solar forecast adjustment: reduce grid charging when solar will fill battery
         # Only count FUTURE solar production (hours that haven't happened yet)
-        if self._solar_forecast:
+        # SKIP adjustment entirely if forecast data is unreliable
+        if self._solar_forecast and self._solar_forecast.has_reliable_forecast():
             current_hour = now.hour
             # Sum future solar: remaining hours today + all of tomorrow
             future_solar = 0.0
@@ -1995,6 +1999,10 @@ from(bucket: "{bucket}")
                         f"grid needed: {grid_needed_kwh:.1f} kWh)"
                     )
                     charge_blocks_count = solar_adjusted
+        elif self._solar_forecast and not self._solar_forecast.has_reliable_forecast():
+            self.logger.info(
+                "☀️ Solar forecast unreliable — skipping adjustment, using default charging"
+            )
 
         discharge_profit_margin = self.config.discharge_profit_margin
 

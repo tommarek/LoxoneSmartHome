@@ -168,6 +168,57 @@ class SolarForecast:
 
     # --- Weather-based calculation ---
 
+    async def fetch_openmeteo_radiation(self) -> Dict[str, DailyForecast]:
+        """Fetch solar radiation forecast directly from OpenMeteo API.
+
+        This is a fallback when forecast.solar is rate-limited. OpenMeteo
+        provides hourly shortwave_radiation forecasts for free with no rate limit.
+
+        Returns:
+            Dict mapping date string to DailyForecast
+        """
+        url = (
+            f"https://api.open-meteo.com/v1/forecast"
+            f"?latitude={self.latitude}&longitude={self.longitude}"
+            f"&hourly=shortwave_radiation"
+            f"&forecast_days=2"
+            f"&timezone=auto"
+        )
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    if resp.status != 200:
+                        self.logger.warning(f"OpenMeteo API returned {resp.status}")
+                        return {}
+
+                    data = await resp.json()
+                    hourly = data.get("hourly", {})
+                    times = hourly.get("time", [])
+                    radiation = hourly.get("shortwave_radiation", [])
+
+                    if not times or not radiation:
+                        return {}
+
+                    weather_data = {"hourly": []}
+                    for t, ghi in zip(times, radiation):
+                        weather_data["hourly"].append({
+                            "time": t,
+                            "shortwave_radiation": ghi or 0,
+                        })
+
+                    result = self.calculate_from_weather(weather_data)
+                    if result:
+                        self.logger.info(
+                            f"OpenMeteo radiation forecast: "
+                            f"{sum(f.total_kwh for f in result.values()):.1f} kWh "
+                            f"across {len(result)} days"
+                        )
+                    return result
+
+        except Exception as e:
+            self.logger.warning(f"OpenMeteo radiation fetch failed: {e}")
+            return {}
+
     def calculate_from_weather(
         self, weather_data: Dict[str, Any]
     ) -> Dict[str, DailyForecast]:
@@ -390,6 +441,26 @@ from(bucket: "{bucket}")
 
         except Exception as e:
             self.logger.warning(f"Solar calibration failed: {e}")
+
+    # --- Reliability check ---
+
+    def has_reliable_forecast(self) -> bool:
+        """Check if we have a reliable solar forecast to base decisions on.
+
+        Returns False if:
+        - No forecast data at all (API rate-limited + no cache + no weather)
+        - Total kWp > 5 but forecast < 5 kWh for a day (suspiciously low)
+        """
+        if not self._consensus:
+            return False
+
+        total_kwp = sum(a.kwp for a in self.arrays)
+        for forecast in self._consensus.values():
+            # A 13.5 kWp system should produce > 5 kWh on almost any day
+            if total_kwp > 5 and forecast.total_kwh < 5:
+                return False
+
+        return True
 
     # --- Public interface ---
 
