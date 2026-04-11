@@ -247,14 +247,17 @@ async def api_status(request: web.Request) -> web.Response:
     if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
         discharge_today = getattr(ctrl, '_discharge_periods_today', set())
         charge_today = getattr(ctrl, '_combined_charging_blocks', set())
-        night_reserve = getattr(ctrl._optimizer, '_night_reserve_kwh', 5.0)
+        profile = getattr(ctrl._optimizer, '_base_load_profile', None)
+        profile_summary = profile.summary() if profile else "Not built"
+        reserve_info = getattr(ctrl._optimizer, '_last_reserve_info', {})
         optimizer_info = {
             "enabled": True,
             "charge_blocks_today": len(charge_today),
             "discharge_blocks_today": len(discharge_today),
             "charge_blocks": sorted(list(charge_today)),
             "discharge_blocks": sorted(list(discharge_today)),
-            "night_reserve_kwh": round(night_reserve, 1),
+            "base_load_profile": profile_summary,
+            "reserve": reserve_info,
         }
 
     # Consumption forecast
@@ -344,6 +347,7 @@ async def api_prices(request: web.Request) -> web.Response:
         prices.append({
             "start": start,
             "end": end,
+            "day": "today",
             "eur_mwh": round(price_eur, 2),
             "czk_kwh": round(price_eur * rate / 1000, 2),
             "is_charging": is_charging,
@@ -352,7 +356,72 @@ async def api_prices(request: web.Request) -> web.Response:
             "is_current": is_current,
             "status": status,
         })
-    return web.json_response({"prices": prices})
+
+    # Tomorrow's prices (if available)
+    tomorrow_prices = []
+    next_day = getattr(ctrl, '_next_day_prices', {})
+    if next_day:
+        charge_tmrw = getattr(ctrl, '_cheapest_charging_blocks_tomorrow', set())
+        pre_dis_tmrw = getattr(ctrl, '_pre_discharge_blocks_tomorrow', set())
+        dis_tmrw = getattr(ctrl, '_discharge_periods_tomorrow', set())
+
+        for (start, end), price_eur in sorted(next_day.items()):
+            is_charging = (start, end) in charge_tmrw
+            is_pre_discharge = (start, end) in pre_dis_tmrw
+            is_discharge = (start, end) in dis_tmrw
+
+            status = "normal"
+            if is_charging and is_pre_discharge:
+                status = "pre_discharge_charge"
+            elif is_charging:
+                status = "charging"
+            elif is_discharge:
+                status = "discharge"
+
+            tomorrow_prices.append({
+                "start": start,
+                "end": end,
+                "day": "tomorrow",
+                "eur_mwh": round(price_eur, 2),
+                "czk_kwh": round(price_eur * rate / 1000, 2),
+                "is_charging": is_charging,
+                "is_pre_discharge": is_pre_discharge,
+                "is_discharge": is_discharge,
+                "is_current": False,
+                "status": status,
+            })
+
+    return web.json_response({
+        "prices": prices,
+        "tomorrow": tomorrow_prices,
+        "has_tomorrow": len(tomorrow_prices) > 0,
+    })
+
+
+async def api_projection(request: web.Request) -> web.Response:
+    """Get projected battery SOC timeline from optimizer decisions."""
+    ctrl = _get_controller(request)
+    if not ctrl or not hasattr(ctrl, '_optimizer') or not ctrl._optimizer:
+        return web.json_response({"timeline": []})
+
+    decisions = getattr(ctrl._optimizer, '_last_decisions', [])
+    if not decisions:
+        return web.json_response({"timeline": []})
+
+    battery_capacity = getattr(ctrl.config, 'battery_capacity', 10.0)
+    timeline = []
+    for d in decisions:
+        kwh = battery_capacity * d.soc_after / 100
+        timeline.append({
+            "time": d.timestamp.strftime("%H:%M"),
+            "day": "tomorrow" if hasattr(d.timestamp, 'date') and decisions[0].timestamp.date() != d.timestamp.date() else "today",
+            "soc": round(d.soc_after, 1),
+            "kwh": round(kwh, 1),
+            "action": d.action,
+            "price": round(d.price_czk, 2),
+        })
+
+    return web.json_response({"timeline": timeline})
 
 
 async def api_logs(request: web.Request) -> web.Response:
@@ -441,6 +510,7 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/prices", api_prices)
+    app.router.add_get("/api/projection", api_projection)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
@@ -860,10 +930,18 @@ select, input {
 
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
-    <h2>Today's Prices (15-min blocks)</h2>
+    <h2 id="priceChartTitle">Today's Prices (15-min blocks)</h2>
     <div class="price-chart" id="priceChart"></div>
   </div>
   <div class="chart-tooltip" id="chartTooltip"></div>
+
+  <!-- Battery Projection -->
+  <div class="card" style="margin-bottom:12px">
+    <h2>Battery Projection (SOC over time)</h2>
+    <div id="projectionChart" style="height:100px;display:flex;align-items:flex-end;gap:1px;position:relative">
+      <div style="color:var(--muted);text-align:center;width:100%">Loading projection...</div>
+    </div>
+  </div>
 
   <!-- Override Controls -->
   <div class="card" style="margin-bottom:12px">
@@ -990,10 +1068,27 @@ function updateUI(d) {
   // Optimizer
   if (d.optimizer) {
     const opt = d.optimizer;
+    const res = opt.reserve || {};
+    let reserveHtml = '';
+    if (res.next_recharge_ts) {
+      const rechargeTime = new Date(res.next_recharge_ts).toLocaleTimeString('en-GB', {hour:'2-digit', minute:'2-digit'});
+      const incoming = res.incoming_charge_kwh || 0;
+      const gross = res.gross_reserve_kwh || res.net_reserve_kwh || 0;
+      const net = res.net_reserve_kwh || 0;
+      let reserveCalc = net + ' kWh';
+      if (incoming > 0) {
+        reserveCalc = gross + ' - ' + incoming + ' incoming = ' + net + ' kWh';
+      }
+      reserveHtml = '<br><span style="color:var(--accent)">Next recharge: ' + rechargeTime + '</span> (' + res.next_recharge_reason + ', ' + res.hours_until_recharge + 'h)' +
+        '<br>Reserve: ' + reserveCalc + ' → min SOC ' + res.effective_min_soc + '%';
+    } else {
+      reserveHtml = '<br>No recharge found in schedule';
+    }
     document.getElementById('optimizerSummary').innerHTML =
       '<span style="color:var(--green)">' + opt.charge_blocks_today + ' charge</span> + ' +
       '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span> blocks today' +
-      '<br><span style="color:var(--muted);font-size:11px">Night reserve: ' + (opt.night_reserve_kwh || '?') + ' kWh (min SOC ~' + Math.round(20 + (opt.night_reserve_kwh || 5) * 10) + '%)</span>';
+      '<span style="font-size:11px;color:var(--muted)">' + reserveHtml + '</span>' +
+      '<br><span style="color:var(--muted);font-size:10px">' + (opt.base_load_profile || '') + '</span>';
   } else {
     document.getElementById('optimizerSummary').textContent = 'Optimizer disabled';
   }
@@ -1029,7 +1124,14 @@ async function fetchPrices() {
   try {
     const res = await fetch('/api/prices');
     const data = await res.json();
-    renderPriceChart(data.prices || []);
+    const allPrices = [...(data.prices || []), ...(data.tomorrow || [])];
+    const title = document.getElementById('priceChartTitle');
+    if (data.has_tomorrow) {
+      title.textContent = 'Today + Tomorrow Prices (15-min blocks)';
+    } else {
+      title.textContent = "Today's Prices (15-min blocks)";
+    }
+    renderPriceChart(allPrices);
   } catch (e) { console.error('fetchPrices error:', e); }
 }
 
@@ -1044,7 +1146,14 @@ function renderPriceChart(prices) {
   const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
 
   let html = '';
+  let prevDay = null;
   prices.forEach((p, i) => {
+    // Day separator
+    if (prevDay && p.day !== prevDay) {
+      html += '<div style="width:3px;flex-shrink:0;background:var(--accent);border-radius:2px;opacity:0.5;align-self:stretch" title="Tomorrow"></div>';
+    }
+    prevDay = p.day;
+
     const v = p.czk_kwh;
     const h = Math.abs(v) / maxAbs * 100;
     const isNeg = v < 0;
@@ -1054,10 +1163,11 @@ function renderPriceChart(prices) {
     else if (p.is_discharge) cls = 'discharge';
     if (p.is_current) cls += ' current';
 
+    const tmrwOpacity = p.day === 'tomorrow' ? 'opacity:0.6;' : '';
     if (isNeg) {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + h + '%;align-self:flex-start;opacity:0.7"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + h + '%;align-self:flex-start;opacity:0.5;' + tmrwOpacity + '"></div>';
     } else {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + Math.max(h, 3) + '%"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '"></div>';
     }
   });
   chart.innerHTML = html;
@@ -1089,17 +1199,19 @@ function showTooltip(e, bar, tooltip) {
   else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
   else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
 
-  // Calculate actual price rank (1 = cheapest)
-  const sortedPrices = [...priceData].sort((a, b) => a.czk_kwh - b.czk_kwh);
+  // Calculate actual price rank (1 = cheapest) within same day
+  const sameDayPrices = priceData.filter(pp => pp.day === p.day);
+  const sortedPrices = [...sameDayPrices].sort((a, b) => a.czk_kwh - b.czk_kwh);
   const priceRank = sortedPrices.findIndex(sp => sp.start === p.start && sp.end === p.end) + 1;
-  const percentile = Math.round(priceRank / priceData.length * 100);
+  const percentile = Math.round(priceRank / sameDayPrices.length * 100);
   const rankLabel = percentile <= 25 ? 'Cheapest quarter' : percentile <= 50 ? 'Below average' : percentile <= 75 ? 'Above average' : 'Most expensive quarter';
+  const dayLabel = p.day === 'tomorrow' ? ' (Tomorrow)' : '';
 
   tooltip.innerHTML =
-    '<div class="tt-time">' + p.start + ' - ' + p.end + '</div>' +
+    '<div class="tt-time">' + p.start + ' - ' + p.end + dayLabel + '</div>' +
     '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh</div>' +
     '<div class="tt-row"><span class="tt-label">EUR/MWh</span><span>' + p.eur_mwh.toFixed(1) + '</span></div>' +
-    '<div class="tt-row"><span class="tt-label">Price rank</span><span>#' + priceRank + ' of ' + priceData.length + ' (' + rankLabel + ')</span></div>' +
+    '<div class="tt-row"><span class="tt-label">Price rank</span><span>#' + priceRank + ' of ' + sameDayPrices.length + ' (' + rankLabel + ')</span></div>' +
     (statusHtml ? '<div style="margin-top:6px">' + statusHtml + '</div>' : '');
 
   tooltip.style.display = 'block';
@@ -1256,14 +1368,46 @@ async function fetchLive() {
   } catch (e) { console.error('fetchLive error:', e); }
 }
 
+// Battery projection chart
+async function fetchProjection() {
+  try {
+    const res = await fetch('/api/projection');
+    const data = await res.json();
+    renderProjection(data.timeline || []);
+  } catch (e) { console.error('fetchProjection:', e); }
+}
+
+function renderProjection(timeline) {
+  const chart = document.getElementById('projectionChart');
+  if (!timeline.length) { chart.innerHTML = '<div style="color:var(--muted);text-align:center;width:100%">No projection data</div>'; return; }
+
+  let html = '';
+  let prevDay = null;
+  timeline.forEach((t, i) => {
+    if (prevDay && t.day !== prevDay) {
+      html += '<div style="width:2px;flex-shrink:0;background:var(--accent);opacity:0.4;align-self:stretch"></div>';
+    }
+    prevDay = t.day;
+
+    const h = t.soc;
+    const color = t.action === 'charge' ? 'var(--green)' : t.action === 'discharge' ? 'var(--red)' : 'var(--accent)';
+    const opacity = t.day === 'tomorrow' ? '0.6' : '0.9';
+    html += '<div style="flex:1;min-width:1px;background:' + color + ';height:' + h + '%;border-radius:1px 1px 0 0;opacity:' + opacity + '" ' +
+      'title="' + t.time + ' (' + t.day + '): ' + t.soc + '% (' + t.kwh + ' kWh) ' + t.action + ' @ ' + t.price + ' CZK"></div>';
+  });
+  chart.innerHTML = html;
+}
+
 fetchStatus();
 fetchLive();
 fetchPrices();
+fetchProjection();
 fetchLogs();
 connectSSE();
 setInterval(fetchStatus, 5000);
 setInterval(fetchLive, 3000);
 setInterval(fetchPrices, 60000);
+setInterval(fetchProjection, 60000);
 </script>
 </body>
 </html>

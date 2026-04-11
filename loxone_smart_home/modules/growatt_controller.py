@@ -1567,10 +1567,12 @@ class GrowattController(BaseModule):
                     f"{summary['bins']} bins, range {summary['date_range']}"
                 )
 
-        # Calibrate optimizer night reserve from historical overnight base load
+        # Build optimizer base load profile from historical non-heating consumption
         if self._optimizer:
-            await self._optimizer.calibrate_night_reserve(
-                self.influxdb_client, self.settings.influxdb.bucket_solar
+            await self._optimizer.build_base_load_profile(
+                self.influxdb_client,
+                self.settings.influxdb.bucket_solar,
+                self.settings.influxdb.bucket_loxone,
             )
 
         # Start periodic evaluation loop
@@ -3637,15 +3639,16 @@ from(bucket: "{bucket}")
                                 except Exception as e:
                                     self.logger.warning(f"Daily solar calibration failed: {e}")
 
-                            # Daily night reserve recalibration
+                            # Daily base load profile update with yesterday's data
                             if self._optimizer:
                                 try:
-                                    await self._optimizer.calibrate_night_reserve(
+                                    await self._optimizer.update_profile_with_yesterday(
                                         self.influxdb_client,
                                         self.settings.influxdb.bucket_solar,
+                                        self.settings.influxdb.bucket_loxone,
                                     )
                                 except Exception as e:
-                                    self.logger.warning(f"Night reserve calibration failed: {e}")
+                                    self.logger.warning(f"Base load profile update failed: {e}")
 
                             # Start background fetch for NEW next day's prices (non-blocking)
                             # This task will retry indefinitely with smart time-based backoff
