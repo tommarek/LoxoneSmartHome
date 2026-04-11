@@ -25,25 +25,28 @@ _sse_clients: List[asyncio.Queue] = []
 class DashboardLogHandler(logging.Handler):
     """Captures GROWATT log messages for the dashboard.
 
-    Deduplicates messages that arrive within the same second (caused by
-    multiple log handlers/formatters in the logging chain).
+    Uses LogRecord ID to deduplicate — each log event has a unique record
+    object, but propagation causes the same record to hit multiple handlers.
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._last_msg: str = ""
-        self._last_time: str = ""
+        self._seen_ids: collections.OrderedDict = collections.OrderedDict()
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            # Use record creation time + message as unique ID
+            # (record.created is a float timestamp, unique per log call)
+            record_id = (record.created, record.getMessage())
+            if record_id in self._seen_ids:
+                return
+            self._seen_ids[record_id] = True
+            # Keep only last 1000 IDs to prevent memory leak
+            while len(self._seen_ids) > 1000:
+                self._seen_ids.popitem(last=False)
+
             msg = self.format(record)
             now = datetime.now().strftime("%H:%M:%S")
-
-            # Deduplicate: skip if same message in the same second
-            if msg == self._last_msg and now == self._last_time:
-                return
-            self._last_msg = msg
-            self._last_time = now
 
             entry = {
                 "time": now,
@@ -880,18 +883,40 @@ function escapeHtml(t) {
   return t.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// SSE for live logs
+// SSE for live logs — single connection with dedup
+let _sseConnection = null;
+const _seenLogIds = new Set();
+
 function connectSSE() {
+  // Close existing connection to prevent duplicates
+  if (_sseConnection) {
+    _sseConnection.close();
+    _sseConnection = null;
+  }
+
   const es = new EventSource('/api/logs/stream');
+  _sseConnection = es;
+
   es.onmessage = function(e) {
     const entry = JSON.parse(e.data);
+    // Deduplicate by time+message
+    const logId = entry.time + '|' + entry.message;
+    if (_seenLogIds.has(logId)) return;
+    _seenLogIds.add(logId);
+    // Keep set bounded
+    if (_seenLogIds.size > 500) {
+      const first = _seenLogIds.values().next().value;
+      _seenLogIds.delete(first);
+    }
+
     const box = document.getElementById('logBox');
     box.innerHTML += formatLog(entry);
-    // Keep last 200 entries in DOM
     while (box.children.length > 200) box.removeChild(box.firstChild);
     box.scrollTop = box.scrollHeight;
   };
   es.onerror = function() {
+    es.close();
+    _sseConnection = null;
     setTimeout(connectSSE, 5000);
   };
 }
