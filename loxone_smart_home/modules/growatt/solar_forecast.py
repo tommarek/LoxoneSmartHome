@@ -46,16 +46,20 @@ class DailyForecast:
 class SolarProductionModel:
     """Learned solar production model trained on historical data.
 
-    Bins actual production by (radiation_bucket, hour, month) and uses
-    medians for prediction. Two-pass training: first pass builds rough
-    model, second pass filters curtailed hours (high SOC + low production).
+    Bins actual production by (radiation_bucket, hour, month). Uses 75th
+    percentile for prediction — represents panel POTENTIAL (what they produce
+    on a good day under these conditions), not curtailed average.
+
+    Two-pass training: first pass builds rough model, second pass filters
+    curtailed hours (SOC >= 90% + low production).
     """
     # Raw bins: (radiation_bucket, hour, month) -> [actual_kwh]
     bins: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
-    # After build: (radiation_bucket, hour, month) -> median_kwh
+    # After build: percentile values for prediction
     medians: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
+    p75: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
     # Fallbacks
-    hourly_fallback: Dict[int, float] = field(default_factory=dict)  # hour -> median
+    hourly_fallback: Dict[int, float] = field(default_factory=dict)  # hour -> p75
     global_median: float = 0.0
     # Metadata
     data_points: int = 0
@@ -71,15 +75,23 @@ class SolarProductionModel:
         return min(20, max(0, int(ghi / 50)))
 
     def build(self) -> None:
-        """Compute medians from raw bins with IQR outlier removal."""
+        """Compute percentiles from raw bins with IQR outlier removal.
+
+        Stores both median (for conservative estimates) and p75 (for
+        potential/optimistic estimates). Predictions use p75 to represent
+        what the panels CAN produce, not the curtailed average.
+        """
         self.medians = {}
+        self.p75 = {}
         hourly_all: Dict[int, List[float]] = {}
 
         for key, values in self.bins.items():
             if not values:
                 continue
             if len(values) < 3:
-                self.medians[key] = statistics.median(values)
+                med = statistics.median(values)
+                self.medians[key] = med
+                self.p75[key] = max(values)  # With few samples, use max
             else:
                 sorted_vals = sorted(values)
                 q1 = sorted_vals[len(sorted_vals) // 4]
@@ -88,22 +100,33 @@ class SolarProductionModel:
                 lower = q1 - 1.5 * iqr
                 upper = q3 + 1.5 * iqr
                 filtered = [v for v in values if lower <= v <= upper]
-                self.medians[key] = statistics.median(filtered) if filtered else statistics.median(values)
+                if filtered:
+                    self.medians[key] = statistics.median(filtered)
+                    # 75th percentile: what the panels produce on a good day
+                    p75_idx = int(len(filtered) * 0.75)
+                    self.p75[key] = filtered[min(p75_idx, len(filtered) - 1)]
+                else:
+                    self.medians[key] = statistics.median(values)
+                    self.p75[key] = self.medians[key]
 
             _, hour, _ = key
             if hour not in hourly_all:
                 hourly_all[hour] = []
-            hourly_all[hour].append(self.medians[key])
+            hourly_all[hour].append(self.p75[key])
 
         for hour, vals in hourly_all.items():
             self.hourly_fallback[hour] = statistics.median(vals) if vals else 0.0
 
-        all_medians = [v for v in self.medians.values() if v > 0]
-        self.global_median = statistics.median(all_medians) if all_medians else 0.0
+        all_p75 = [v for v in self.p75.values() if v > 0]
+        self.global_median = statistics.median(all_p75) if all_p75 else 0.0
         self.built_at = datetime.now()
 
     def predict(self, ghi: float, hour: int, month: int) -> float:
-        """Predict kWh production for given conditions.
+        """Predict potential kWh production for given conditions.
+
+        Uses 75th percentile — what the panels produce on a good day under
+        these weather conditions. This represents available energy potential,
+        not curtailed average.
 
         Fallback chain: exact bin → adjacent radiation → adjacent month →
         same hour any conditions → global median.
@@ -111,20 +134,20 @@ class SolarProductionModel:
         bucket = self.radiation_to_bucket(ghi)
         key = (bucket, hour, month)
 
-        if key in self.medians:
-            return self.medians[key]
+        if key in self.p75:
+            return self.p75[key]
 
         # Try adjacent radiation buckets
         for delta in [1, -1, 2, -2]:
             adj = (bucket + delta, hour, month)
-            if adj in self.medians:
-                return self.medians[adj]
+            if adj in self.p75:
+                return self.p75[adj]
 
         # Try adjacent months
         for m_delta in [1, -1]:
             adj = (bucket, hour, ((month - 1 + m_delta) % 12) + 1)
-            if adj in self.medians:
-                return self.medians[adj]
+            if adj in self.p75:
+                return self.p75[adj]
 
         # Hourly fallback
         if hour in self.hourly_fallback:
@@ -455,7 +478,7 @@ from(bucket: "{settings.influxdb.bucket_weather}")
                 soc = soc_by_hour.get(hour_key, 50.0)
                 expected = model.predict(ghi, hour, month)
 
-                if soc >= 95 and expected > 0 and kwh < expected * 0.5:
+                if soc >= 90 and expected > 0 and kwh < expected * 0.6:
                     curtailed += 1
                     continue  # Skip curtailed hour
 
