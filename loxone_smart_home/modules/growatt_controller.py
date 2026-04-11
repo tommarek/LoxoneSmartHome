@@ -916,12 +916,19 @@ class GrowattController(BaseModule):
         # Display legend
         self.logger.info("")
         legend_items = []
-        if charging_today or charging_tomorrow:
-            legend_items.append("🔋=Regular charge")
-        if pre_discharge_today or pre_discharge_tomorrow:
-            legend_items.append("🔌=Pre-discharge charge")
-        if discharge_today or discharge_tomorrow:
-            legend_items.append("⚡=Discharge")
+        if self._optimizer:
+            # Optimizer mode: simplified labels
+            if charging_today or charging_tomorrow:
+                legend_items.append("🔋=Charge (optimizer)")
+            if discharge_today or discharge_tomorrow:
+                legend_items.append("⚡=Discharge (optimizer)")
+        else:
+            if charging_today or charging_tomorrow:
+                legend_items.append("🔋=Regular charge")
+            if pre_discharge_today or pre_discharge_tomorrow:
+                legend_items.append("🔌=Pre-discharge charge")
+            if discharge_today or discharge_tomorrow:
+                legend_items.append("⚡=Discharge")
         if legend_items:
             self.logger.info(f"Legend: {', '.join(legend_items)}")
 
@@ -2418,9 +2425,12 @@ from(bucket: "{bucket}")
             await self._log_cross_day_price_table(window, rate, force_display=force_table)
 
             if not suppress_print:
+                discharge_count = len(self._discharge_periods_today)
+                source = "optimizer" if self._optimizer else "rule-based"
                 self.logger.info(
-                    f"✅ Cross-day schedule updated: "
-                    f"{len(self._combined_charging_blocks)} charging blocks active today"
+                    f"✅ Cross-day schedule updated ({source}): "
+                    f"{len(self._combined_charging_blocks)} charge + "
+                    f"{discharge_count} discharge blocks today"
                 )
 
         # Store schedule data to InfluxDB for web API consumption
