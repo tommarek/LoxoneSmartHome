@@ -68,18 +68,85 @@ def _get_controller(request: web.Request):
     return request.app.get("controller")
 
 
-def _get_live_soc() -> Optional[float]:
-    """Get live battery SOC from the Growatt API telemetry cache."""
+def _get_live_telemetry() -> Dict[str, Any]:
+    """Get live inverter telemetry from the Growatt API cache."""
     try:
         from modules.growatt.api import _telemetry_cache
         if _telemetry_cache:
-            return _telemetry_cache.get("SOC")
+            return dict(_telemetry_cache)
     except Exception:
         pass
-    return None
+    return {}
+
+
+def _get_live_soc() -> Optional[float]:
+    """Get live battery SOC from the Growatt API telemetry cache."""
+    t = _get_live_telemetry()
+    return t.get("SOC") if t else None
 
 
 # --- API Endpoints ---
+
+async def api_live(request: web.Request) -> web.Response:
+    """Get real-time power flow data from inverter telemetry."""
+    telemetry = _get_live_telemetry()
+    ctrl = _get_controller(request)
+
+    solar_w = telemetry.get("InputPower", 0) or 0
+    battery_w = telemetry.get("ChargePower", 0) or 0
+    discharge_w = telemetry.get("DischargePower", 0) or 0
+    grid_export_w = telemetry.get("ACPowerToGrid", 0) or 0
+    grid_import_w = 0  # Derived: if load > solar + battery discharge
+    load_w = telemetry.get("INVPowerToLocalLoad", 0) or 0
+    soc = telemetry.get("SOC", 0) or 0
+
+    # Energy totals today (kWh)
+    solar_today = telemetry.get("TodayGenerateEnergy", 0) or 0
+    export_today = telemetry.get("EnergyToGridToday", 0) or 0
+    import_today = telemetry.get("EnergyToUserToday", 0) or 0
+    load_today = telemetry.get("LocalLoadEnergyToday", 0) or 0
+    charge_today = telemetry.get("ChargeEnergyToday", 0) or 0
+    discharge_today = telemetry.get("DischargeEnergyToday", 0) or 0
+
+    # Self-consumption rate
+    self_consumed = solar_today - export_today if solar_today > export_today else 0
+    self_consumption_rate = (self_consumed / solar_today * 100) if solar_today > 0 else 0
+
+    # Current price info
+    rate = 25.0
+    if ctrl:
+        rate = ctrl._eur_czk_rate or 25.0
+
+    # Estimated savings today (very rough: self-consumed * avg price avoided)
+    now = None
+    avg_price = 0
+    if ctrl:
+        now = ctrl._get_local_now()
+        if ctrl._current_prices:
+            prices = list(ctrl._current_prices.values())
+            avg_price = sum(p * rate / 1000 for p in prices) / len(prices) if prices else 0
+
+    return web.json_response({
+        "power": {
+            "solar_w": round(solar_w),
+            "battery_charge_w": round(battery_w),
+            "battery_discharge_w": round(discharge_w),
+            "grid_export_w": round(grid_export_w),
+            "load_w": round(load_w),
+            "soc": round(soc),
+        },
+        "energy_today": {
+            "solar_kwh": round(solar_today, 1),
+            "export_kwh": round(export_today, 1),
+            "import_kwh": round(import_today, 1),
+            "load_kwh": round(load_today, 1),
+            "charge_kwh": round(charge_today, 1),
+            "discharge_kwh": round(discharge_today, 1),
+            "self_consumed_kwh": round(self_consumed, 1),
+            "self_consumption_pct": round(self_consumption_rate, 1),
+        },
+        "has_data": bool(telemetry),
+    })
 
 async def api_status(request: web.Request) -> web.Response:
     """Get comprehensive system status."""
@@ -370,6 +437,7 @@ def create_dashboard_app(controller=None) -> web.Application:
 
     app.router.add_get("/", dashboard_page)
     app.router.add_get("/api/status", api_status)
+    app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/prices", api_prices)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
@@ -649,6 +717,64 @@ select, input {
 </div>
 
 <div class="container">
+  <!-- Live Power Flow -->
+  <div class="card" style="margin-bottom:12px">
+    <h2>Live Power Flow</h2>
+    <div id="powerFlowNoData" style="color:var(--muted);text-align:center;padding:20px;display:none">Waiting for inverter telemetry...</div>
+    <div id="powerFlowGrid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;text-align:center">
+      <div>
+        <div style="font-size:24px">&#9728;&#65039;</div>
+        <div class="stat-label">Solar</div>
+        <div class="stat-value small" id="pwSolar" style="color:var(--yellow)">-- W</div>
+      </div>
+      <div>
+        <div style="font-size:24px">&#128267;</div>
+        <div class="stat-label">Battery <span id="pwSocBadge" style="font-size:11px;color:var(--muted)">--%</span></div>
+        <div class="stat-value small" id="pwBattery" style="color:var(--green)">-- W</div>
+        <div class="soc-bar" style="margin-top:4px"><div class="soc-fill" id="pwSocBar" style="width:50%">50%</div></div>
+      </div>
+      <div>
+        <div style="font-size:24px">&#127968;</div>
+        <div class="stat-label">Home Load</div>
+        <div class="stat-value small" id="pwLoad" style="color:var(--accent)">-- W</div>
+      </div>
+      <div>
+        <div style="font-size:24px">&#9889;</div>
+        <div class="stat-label">Grid</div>
+        <div class="stat-value small" id="pwGrid" style="color:var(--muted)">-- W</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Energy Today -->
+  <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(120px, 1fr));margin-bottom:12px">
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Solar Today</div>
+      <div class="stat-value small" style="color:var(--yellow)" id="enSolar">-- kWh</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Self-Consumed</div>
+      <div class="stat-value small" style="color:var(--green)" id="enSelfConsumed">-- kWh</div>
+      <div class="stat-label" id="enSelfRate">--%</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Exported</div>
+      <div class="stat-value small" style="color:var(--accent)" id="enExport">-- kWh</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Imported</div>
+      <div class="stat-value small" style="color:var(--red)" id="enImport">-- kWh</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Home Load</div>
+      <div class="stat-value small" id="enLoad">-- kWh</div>
+    </div>
+    <div class="card" style="text-align:center">
+      <div class="stat-label">Batt Charged</div>
+      <div class="stat-value small" style="color:var(--green)" id="enCharge">-- kWh</div>
+    </div>
+  </div>
+
   <div class="grid">
     <!-- Battery & Mode -->
     <div class="card">
@@ -1069,11 +1195,71 @@ async function clearOverride() {
 }
 
 // Init
+// Live power flow
+async function fetchLive() {
+  try {
+    const res = await fetch('/api/live');
+    const d = await res.json();
+    if (!d.has_data) {
+      document.getElementById('powerFlowNoData').style.display = 'block';
+      document.getElementById('powerFlowGrid').style.opacity = '0.3';
+      return;
+    }
+    document.getElementById('powerFlowNoData').style.display = 'none';
+    document.getElementById('powerFlowGrid').style.opacity = '1';
+
+    const pw = d.power;
+    document.getElementById('pwSolar').textContent = pw.solar_w + ' W';
+    document.getElementById('pwLoad').textContent = pw.load_w + ' W';
+
+    // Battery: show charge or discharge
+    if (pw.battery_charge_w > 0) {
+      document.getElementById('pwBattery').textContent = '+' + pw.battery_charge_w + ' W';
+      document.getElementById('pwBattery').style.color = 'var(--green)';
+    } else if (pw.battery_discharge_w > 0) {
+      document.getElementById('pwBattery').textContent = '-' + pw.battery_discharge_w + ' W';
+      document.getElementById('pwBattery').style.color = 'var(--red)';
+    } else {
+      document.getElementById('pwBattery').textContent = '0 W';
+      document.getElementById('pwBattery').style.color = 'var(--muted)';
+    }
+
+    // SOC bar
+    const soc = pw.soc;
+    const socFill = document.getElementById('pwSocBar');
+    socFill.style.width = soc + '%';
+    socFill.textContent = soc + '%';
+    socFill.style.background = soc > 60 ? 'var(--green)' : soc > 30 ? 'var(--yellow)' : 'var(--red)';
+    document.getElementById('pwSocBadge').textContent = soc + '%';
+
+    // Grid: export or import
+    if (pw.grid_export_w > 0) {
+      document.getElementById('pwGrid').textContent = pw.grid_export_w + ' W';
+      document.getElementById('pwGrid').style.color = 'var(--green)';
+    } else {
+      document.getElementById('pwGrid').textContent = '0 W';
+      document.getElementById('pwGrid').style.color = 'var(--muted)';
+    }
+
+    // Energy today
+    const en = d.energy_today;
+    document.getElementById('enSolar').textContent = en.solar_kwh + ' kWh';
+    document.getElementById('enSelfConsumed').textContent = en.self_consumed_kwh + ' kWh';
+    document.getElementById('enSelfRate').textContent = en.self_consumption_pct + '% self-consumed';
+    document.getElementById('enExport').textContent = en.export_kwh + ' kWh';
+    document.getElementById('enImport').textContent = en.import_kwh + ' kWh';
+    document.getElementById('enLoad').textContent = en.load_kwh + ' kWh';
+    document.getElementById('enCharge').textContent = en.charge_kwh + ' kWh';
+  } catch (e) { console.error('fetchLive error:', e); }
+}
+
 fetchStatus();
+fetchLive();
 fetchPrices();
 fetchLogs();
 connectSSE();
 setInterval(fetchStatus, 5000);
+setInterval(fetchLive, 3000);
 setInterval(fetchPrices, 60000);
 </script>
 </body>
