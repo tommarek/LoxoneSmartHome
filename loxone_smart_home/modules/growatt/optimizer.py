@@ -121,11 +121,13 @@ class BatteryOptimizer:
             future_cheapest = future_min_price[i] if i < n else sorted_prices[0]
 
             # --- CHARGE value ---
-            # Worth charging if we can use/sell the energy later at higher value
+            # Worth charging if future self-consumption value exceeds charge cost
             charge_cost = price_czk + dist  # Cost to charge now
-            # Conservative: assume we'll self-consume later at median price
+            # Median price as estimate of future self-consumption value
+            median_price = sorted_prices[n // 2] if n > 0 else 0
+            future_value = (median_price + dist) * efficiency
             charge_possible = min(kwh_per_block, (max_battery_kwh - battery_kwh))
-            charge_value = -charge_cost if charge_possible > 0 else float('-inf')
+            charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
             # --- DISCHARGE value ---
             # Worth discharging if current price exceeds opportunity cost

@@ -1316,3 +1316,144 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     decision = decision_engine.decide(context)
     # Should NOT discharge: 2.2 >= 2.0 threshold BUT 2.2 < 1.9*3 = 5.7
     assert decision == "regular"  # No discharge on flat days
+
+
+# ===== Phase 1 Tests: Summer Mode, Distribution Tariff =====
+
+
+class TestSummerModeCharging:
+    """Tests for summer mode with price-gated charging (Phase 1.1)."""
+
+    def _make_context(self, price_eur_mwh: float, is_summer: bool,
+                      in_cheapest: bool = True) -> DecisionContext:
+        block_key = ("13:00", "13:15")
+        cheapest = {block_key} if in_cheapest else set()
+        return DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=50.0,
+            current_time=datetime(2026, 7, 15, 13, 0),
+            current_price=price_eur_mwh,
+            current_block_key=block_key,
+            cheapest_blocks=cheapest,
+            is_summer_mode=is_summer,
+            price_thresholds=PriceThresholds(
+                charge_price_max=1.5,
+                export_price_min=1.0,
+                discharge_price_min=5.0,
+                discharge_profit_margin=4.0,
+                battery_efficiency=0.85,
+                summer_charge_price_max=0.0,
+            ),
+        )
+
+    def test_summer_negative_price_charges(self) -> None:
+        """Summer + negative price + in cheapest → should charge."""
+        ctx = self._make_context(price_eur_mwh=-40.0, is_summer=True)
+        # -40 EUR/MWh * 25/1000 = -1.0 CZK/kWh < 0.0 threshold
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_summer_positive_price_no_charge(self) -> None:
+        """Summer + positive price → should NOT charge."""
+        ctx = self._make_context(price_eur_mwh=80.0, is_summer=True)
+        # 80 EUR/MWh * 25/1000 = 2.0 CZK/kWh > 0.0 threshold
+        assert ctx.is_battery_charging_scheduled is False
+
+    def test_summer_zero_price_charges(self) -> None:
+        """Summer + exactly 0 price → should charge (≤ threshold)."""
+        ctx = self._make_context(price_eur_mwh=0.0, is_summer=True)
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_summer_not_in_cheapest_no_charge(self) -> None:
+        """Summer + negative price but NOT in cheapest blocks → no charge."""
+        ctx = self._make_context(price_eur_mwh=-40.0, is_summer=True, in_cheapest=False)
+        assert ctx.is_battery_charging_scheduled is False
+
+    def test_winter_cheapest_block_charges(self) -> None:
+        """Winter mode: in cheapest blocks → charges (regression test)."""
+        ctx = self._make_context(price_eur_mwh=80.0, is_summer=False)
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_winter_not_in_cheapest_no_charge(self) -> None:
+        """Winter mode: not in cheapest → no charge (regression test)."""
+        ctx = self._make_context(price_eur_mwh=80.0, is_summer=False, in_cheapest=False)
+        assert ctx.is_battery_charging_scheduled is False
+
+
+class TestDistributionTariff:
+    """Tests for distribution tariff logic (Phase 1.2)."""
+
+    def _make_thresholds(self) -> PriceThresholds:
+        return PriceThresholds(
+            charge_price_max=1.5,
+            export_price_min=1.0,
+            discharge_price_min=5.0,
+            discharge_profit_margin=4.0,
+            battery_efficiency=0.85,
+            distribution_tariff_high=1.5,
+            distribution_tariff_low=0.5,
+            low_tariff_hours="0-6,22-24",
+        )
+
+    def test_low_tariff_during_night(self) -> None:
+        thresholds = self._make_thresholds()
+        for hour in [0, 1, 3, 5, 22, 23]:
+            rate = GrowattDecisionEngine._get_distribution_tariff(hour, thresholds)
+            assert rate == 0.5, f"Hour {hour} should be low tariff"
+
+    def test_high_tariff_during_day(self) -> None:
+        thresholds = self._make_thresholds()
+        for hour in [6, 7, 12, 18, 21]:
+            rate = GrowattDecisionEngine._get_distribution_tariff(hour, thresholds)
+            assert rate == 1.5, f"Hour {hour} should be high tariff"
+
+    def test_discharge_blocked_by_self_consumption_value(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Discharge should be blocked when self-consumption value exceeds spot price."""
+        # Spot: 4.0 CZK/kWh, cheapest: 1.0, margin threshold: 4.0
+        # Self-consumption floor: 1.0/0.85 + 1.5 = 2.68
+        # All thresholds: max(5.0, 4.0, 2.68) = 5.0
+        # Current 4.0 < 5.0 → no discharge
+        prices = create_15min_prices({h: 40.0 for h in range(24)})  # 1.0 CZK/kWh base
+        prices[("18:00", "18:15")] = 160.0  # 4.0 CZK/kWh for current block
+
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=80.0,
+            current_time=datetime(2026, 4, 11, 18, 0),
+            current_price=160.0,
+            current_block_key=("18:00", "18:15"),
+            prices_15min=prices,
+            price_thresholds=self._make_thresholds(),
+        )
+
+        decision = decision_engine.decide(ctx)
+        assert decision == "regular"  # 4.0 < 5.0, no discharge
+
+    def test_discharge_allowed_above_all_thresholds(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Discharge allowed when price exceeds ALL thresholds including self-consumption."""
+        # Spot: 7.0 CZK/kWh, cheapest: 1.0
+        # margin: 1.0 * 4.0 = 4.0
+        # self-consumption: 1.0/0.85 + 1.5 = 2.68
+        # effective: max(5.0, 4.0, 2.68) = 5.0
+        # 7.0 >= 5.0 → discharge
+        prices = create_15min_prices({h: 40.0 for h in range(24)})
+        prices[("18:00", "18:15")] = 280.0  # 7.0 CZK/kWh
+
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=80.0,
+            current_time=datetime(2026, 4, 11, 18, 0),
+            current_price=280.0,
+            current_block_key=("18:00", "18:15"),
+            prices_15min=prices,
+            price_thresholds=self._make_thresholds(),
+        )
+
+        decision = decision_engine.decide(ctx)
+        assert decision == "discharge_to_grid"
