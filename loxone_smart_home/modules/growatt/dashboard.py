@@ -283,15 +283,26 @@ def create_dashboard_app(controller=None) -> web.Application:
     return app
 
 
+_dashboard_handler_installed = False
+
+
 async def start_dashboard(controller, port: int = 5555) -> None:
     """Start the dashboard web server."""
+    global _dashboard_handler_installed
     logger = logging.getLogger(__name__)
 
-    # Install log handler to capture GROWATT logs
-    growatt_logger = logging.getLogger("modules.base.GrowattController")
-    handler = DashboardLogHandler()
-    handler.setFormatter(logging.Formatter("%(message)s"))
-    growatt_logger.addHandler(handler)
+    # Install log handler only once (prevents duplicates on restart)
+    if not _dashboard_handler_installed:
+        growatt_logger = logging.getLogger("modules.base.GrowattController")
+        # Remove any existing DashboardLogHandlers first
+        growatt_logger.handlers = [
+            h for h in growatt_logger.handlers
+            if not isinstance(h, DashboardLogHandler)
+        ]
+        handler = DashboardLogHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        growatt_logger.addHandler(handler)
+        _dashboard_handler_installed = True
 
     app = create_dashboard_app(controller)
     runner = web.AppRunner(app, access_log=None)
