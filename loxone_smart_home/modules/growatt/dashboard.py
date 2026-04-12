@@ -211,7 +211,7 @@ async def api_status(request: web.Request) -> web.Response:
             "source": source,
             "has_model": has_model,
             "model_trained": ctrl._solar_forecast._production_model is not None,
-            "model_bins": len(ctrl._solar_forecast._production_model.medians) if ctrl._solar_forecast._production_model else 0,
+            "model_bins": len(ctrl._solar_forecast._production_model.median_2d) if ctrl._solar_forecast._production_model else 0,
             "arrays": [
                 {"name": a.name, "kwp": a.kwp, "azimuth": a.azimuth}
                 for a in ctrl._solar_forecast.arrays

@@ -1546,7 +1546,7 @@ class GrowattController(BaseModule):
                     self.logger.info(
                         f"Solar production model: {m.data_points} hours, "
                         f"{m.curtailed_filtered} curtailed filtered, "
-                        f"{len(m.medians)} bins"
+                        f"{len(m.median_2d)} bins"
                     )
             except Exception as e:
                 self.logger.warning(f"Failed to build solar production model: {e}")
@@ -1797,7 +1797,7 @@ class GrowattController(BaseModule):
                     f"https://api.open-meteo.com/v1/forecast"
                     f"?latitude={self._solar_forecast.latitude}"
                     f"&longitude={self._solar_forecast.longitude}"
-                    f"&hourly=shortwave_radiation,direct_radiation,diffuse_radiation,temperature_2m"
+                    f"&hourly=shortwave_radiation,cloudcover,temperature_2m"
                     f"&forecast_days=2&timezone=auto"
                 )
                 async with aiohttp.ClientSession() as session:
@@ -1807,22 +1807,19 @@ class GrowattController(BaseModule):
                             hourly = data.get("hourly", {})
                             times = hourly.get("time", [])
                             ghi = hourly.get("shortwave_radiation", [])
-                            direct = hourly.get("direct_radiation", [])
-                            diffuse = hourly.get("diffuse_radiation", [])
+                            cloud_covers = hourly.get("cloudcover", [])
                             temps = hourly.get("temperature_2m", [])
                             weather_hours = [
                                 {
                                     "time": t,
                                     "shortwave_radiation": g or 0,
-                                    "direct_radiation": d or 0,
-                                    "diffuse_radiation": df or 0,
+                                    "cloudcover": c or 50,
                                     "temperature_2m": tp or 15,
                                 }
-                                for t, g, d, df, tp in zip(
+                                for t, g, c, tp in zip(
                                     times,
                                     ghi,
-                                    direct or [0] * len(times),
-                                    diffuse or [0] * len(times),
+                                    cloud_covers or [50] * len(times),
                                     temps or [15] * len(times),
                                 )
                             ]

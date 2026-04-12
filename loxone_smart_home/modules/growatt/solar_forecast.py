@@ -16,6 +16,32 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 
+def _sun_position(latitude: float, year: int, month: int, day: int, hour: int) -> Tuple[float, float]:
+    """Compute sun azimuth and altitude for a given hour (mid-hour).
+
+    Returns:
+        (azimuth_degrees, altitude_degrees) where altitude <= 0 means below horizon.
+    """
+    try:
+        day_of_year = datetime(year, month, day).timetuple().tm_yday
+        decl = 23.45 * math.sin(math.radians(360 / 365 * (day_of_year - 81)))
+        hour_angle = (hour + 0.5 - 12) * 15
+        lat_rad = math.radians(latitude)
+        decl_rad = math.radians(decl)
+        ha_rad = math.radians(hour_angle)
+        sin_alt = (math.sin(lat_rad) * math.sin(decl_rad) +
+                   math.cos(lat_rad) * math.cos(decl_rad) * math.cos(ha_rad))
+        altitude = math.degrees(math.asin(max(-1, min(1, sin_alt))))
+        cos_az = ((math.sin(decl_rad) - math.sin(lat_rad) * sin_alt) /
+                  max(0.001, math.cos(lat_rad) * math.cos(math.asin(max(-1, min(1, sin_alt))))))
+        azimuth = math.degrees(math.acos(max(-1, min(1, cos_az))))
+        if hour_angle > 0:
+            azimuth = 360 - azimuth
+        return azimuth, max(0, altitude)
+    except Exception:
+        return 180.0, 30.0
+
+
 @dataclass
 class SolarArray:
     """Configuration for a single solar panel array."""
@@ -54,22 +80,23 @@ class SolarProductionModel:
     - Temperature: 5°C steps (13 buckets) — panel efficiency derating
 
     Cloud cover is ALWAYS included in predictions — never dropped in fallbacks.
-    Uses p75 for prediction, physics cap as safety net.
+    Uses p50 (median) for prediction, physics cap as safety net.
     """
     # 5D bins: (rad, cloud, az, alt, temp) -> [kwh]
     bins_5d: Dict[Tuple[int, int, int, int, int], List[float]] = field(default_factory=dict)
-    p75_5d: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
+    median_5d: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
     # 4D bins: (rad, cloud, az, alt) -> [kwh] (drop temp)
     bins_4d: Dict[Tuple[int, int, int, int], List[float]] = field(default_factory=dict)
-    p75_4d: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
+    median_4d: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
     # 3D bins: (rad, cloud, alt) -> [kwh] (drop azimuth)
     bins_3d: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
-    p75_3d: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
+    median_3d: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
     # 2D bins: (rad, cloud) -> [kwh] (minimum — always includes cloud!)
     bins_2d: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
-    p75_2d: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    median_2d: Dict[Tuple[int, int], float] = field(default_factory=dict)
     global_median: float = 0.0
     # Metadata
+    total_kwp: float = 13.5
     data_points: int = 0
     curtailed_filtered: int = 0
     date_range: str = ""
@@ -101,12 +128,12 @@ class SolarProductionModel:
         return min(12, max(0, int((temp_c + 20) / 5)))
 
     @staticmethod
-    def _compute_p75(values: List[float]) -> Tuple[float, float]:
-        """Compute median and p75 with IQR outlier removal."""
+    def _compute_median(values: List[float]) -> float:
+        """Compute median with IQR outlier removal."""
         if not values:
-            return 0.0, 0.0
+            return 0.0
         if len(values) < 3:
-            return statistics.median(values), max(values)
+            return statistics.median(values)
         sorted_vals = sorted(values)
         q1 = sorted_vals[len(sorted_vals) // 4]
         q3 = sorted_vals[3 * len(sorted_vals) // 4]
@@ -114,9 +141,7 @@ class SolarProductionModel:
         filtered = [v for v in values if (q1 - 1.5 * iqr) <= v <= (q3 + 1.5 * iqr)]
         if not filtered:
             filtered = values
-        med = statistics.median(filtered)
-        p75_idx = min(int(len(filtered) * 0.75), len(filtered) - 1)
-        return med, filtered[p75_idx]
+        return statistics.median(filtered)
 
     def add_sample(self, rad_b: int, cloud_b: int, az_b: int, alt_b: int,
                    temp_b: int, kwh: float) -> None:
@@ -132,39 +157,55 @@ class SolarProductionModel:
             bins[key].append(kwh)
 
     def build(self) -> None:
-        """Compute p75 for all bin levels."""
-        for bins, p75_dict in [
-            (self.bins_5d, self.p75_5d), (self.bins_4d, self.p75_4d),
-            (self.bins_3d, self.p75_3d), (self.bins_2d, self.p75_2d),
+        """Compute median for all bin levels."""
+        for bins, median_dict in [
+            (self.bins_5d, self.median_5d), (self.bins_4d, self.median_4d),
+            (self.bins_3d, self.median_3d), (self.bins_2d, self.median_2d),
         ]:
-            p75_dict.clear()
+            median_dict.clear()
             for key, values in bins.items():
                 if values:
-                    _, p75 = self._compute_p75(values)
-                    p75_dict[key] = p75
+                    med = self._compute_median(values)
+                    median_dict[key] = med
 
-        all_p75 = [v for v in self.p75_2d.values() if v > 0]
-        self.global_median = statistics.median(all_p75) if all_p75 else 0.0
+        all_medians = [v for v in self.median_2d.values() if v > 0]
+        self.global_median = statistics.median(all_medians) if all_medians else 0.0
         self.built_at = datetime.now()
 
     def _interpolate_2d(self, rad_b: int, cloud_b: int) -> Optional[float]:
-        """Interpolate between nearest populated 2D bins on radiation axis."""
-        # Find nearest lower and upper radiation bins with same cloud cover
+        """Interpolate between nearest populated 2D bins."""
+        # Try radiation axis first (same cloud cover)
         lower_rad, lower_val = None, None
         upper_rad, upper_val = None, None
         for dr in range(1, 10):
-            if lower_val is None and (rad_b - dr, cloud_b) in self.p75_2d:
-                lower_rad, lower_val = rad_b - dr, self.p75_2d[(rad_b - dr, cloud_b)]
-            if upper_val is None and (rad_b + dr, cloud_b) in self.p75_2d:
-                upper_rad, upper_val = rad_b + dr, self.p75_2d[(rad_b + dr, cloud_b)]
+            if lower_val is None and (rad_b - dr, cloud_b) in self.median_2d:
+                lower_rad, lower_val = rad_b - dr, self.median_2d[(rad_b - dr, cloud_b)]
+            if upper_val is None and (rad_b + dr, cloud_b) in self.median_2d:
+                upper_rad, upper_val = rad_b + dr, self.median_2d[(rad_b + dr, cloud_b)]
             if lower_val is not None and upper_val is not None:
                 break
         if lower_val is not None and upper_val is not None:
-            # Linear interpolation
             span = upper_rad - lower_rad
             weight = (rad_b - lower_rad) / span if span > 0 else 0.5
             return lower_val + (upper_val - lower_val) * weight
-        return lower_val or upper_val  # One-sided if only one exists
+        if lower_val is not None or upper_val is not None:
+            return lower_val or upper_val
+
+        # Try cloud axis (same radiation bucket)
+        lower_cloud, lower_cval = None, None
+        upper_cloud, upper_cval = None, None
+        for dc in range(1, 6):
+            if lower_cval is None and (rad_b, cloud_b - dc) in self.median_2d:
+                lower_cloud, lower_cval = cloud_b - dc, self.median_2d[(rad_b, cloud_b - dc)]
+            if upper_cval is None and (rad_b, cloud_b + dc) in self.median_2d:
+                upper_cloud, upper_cval = cloud_b + dc, self.median_2d[(rad_b, cloud_b + dc)]
+            if lower_cval is not None and upper_cval is not None:
+                break
+        if lower_cval is not None and upper_cval is not None:
+            span = upper_cloud - lower_cloud
+            weight = (cloud_b - lower_cloud) / span if span > 0 else 0.5
+            return lower_cval + (upper_cval - lower_cval) * weight
+        return lower_cval or upper_cval
 
     def predict(
         self, ghi: float,
@@ -184,43 +225,36 @@ class SolarProductionModel:
         alt_b = self.altitude_to_bucket(sun_altitude)
         temp_b = self.temp_to_bucket(temperature)
 
-        # Physics cap
-        total_kwp = 13.5
-        physics_max = ghi * total_kwp * 0.85 / 1000 / 4.0
+        # Physics cap: can't exceed nameplate capacity per hour
+        physics_max = self.total_kwp
 
         def _cap(v: float) -> float:
             return min(v, physics_max)
 
         # 5D exact (all features)
         k = (rad_b, cloud_b, az_b, alt_b, temp_b)
-        if k in self.p75_5d:
-            return _cap(self.p75_5d[k])
+        if k in self.median_5d:
+            return _cap(self.median_5d[k])
 
         # 4D (drop temp — least important)
         k = (rad_b, cloud_b, az_b, alt_b)
-        if k in self.p75_4d:
-            return _cap(self.p75_4d[k])
+        if k in self.median_4d:
+            return _cap(self.median_4d[k])
 
         # 3D (drop azimuth)
         k = (rad_b, cloud_b, alt_b)
-        if k in self.p75_3d:
-            return _cap(self.p75_3d[k])
+        if k in self.median_3d:
+            return _cap(self.median_3d[k])
 
         # 2D exact (rad, cloud) — core prediction, always has cloud
         k = (rad_b, cloud_b)
-        if k in self.p75_2d:
-            return _cap(self.p75_2d[k])
+        if k in self.median_2d:
+            return _cap(self.median_2d[k])
 
-        # 2D interpolation — find nearest on radiation axis at same cloud level
+        # 2D interpolation — find nearest on radiation/cloud axes
         interp = self._interpolate_2d(rad_b, cloud_b)
         if interp is not None:
             return _cap(interp)
-
-        # Adjacent cloud bucket at same radiation
-        for dc in [1, -1, 2, -2]:
-            adj = (rad_b, cloud_b + dc)
-            if adj in self.p75_2d:
-                return _cap(self.p75_2d[adj])
 
         return _cap(self.global_median)
 
@@ -369,7 +403,7 @@ class SolarForecast:
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={self.latitude}&longitude={self.longitude}"
-            f"&hourly=shortwave_radiation"
+            f"&hourly=shortwave_radiation,cloudcover,temperature_2m"
             f"&forecast_days=2"
             f"&timezone=auto"
         )
@@ -384,15 +418,19 @@ class SolarForecast:
                     hourly = data.get("hourly", {})
                     times = hourly.get("time", [])
                     radiation = hourly.get("shortwave_radiation", [])
+                    cloud_covers = hourly.get("cloudcover", [])
+                    temperatures = hourly.get("temperature_2m", [])
 
                     if not times or not radiation:
                         return {}
 
                     weather_data = {"hourly": []}
-                    for t, ghi in zip(times, radiation):
+                    for i, t in enumerate(times):
                         weather_data["hourly"].append({
                             "time": t,
-                            "shortwave_radiation": ghi or 0,
+                            "shortwave_radiation": radiation[i] if i < len(radiation) else 0,
+                            "cloudcover": cloud_covers[i] if i < len(cloud_covers) else 50,
+                            "temperature_2m": temperatures[i] if i < len(temperatures) else 15,
                         })
 
                     result = self.calculate_from_weather(weather_data)
@@ -429,28 +467,6 @@ class SolarForecast:
         try:
             self.logger.info("Building solar production model from historical data...")
 
-            # Calculate max sun elevation per date using astral
-            from astral import LocationInfo
-            from astral.sun import sun
-            loc = LocationInfo("home", "", "Europe/Prague", self.latitude, self.longitude)
-            max_sun_elev_by_date: Dict[str, float] = {}
-            base_date = datetime.now().date()
-            for days_ago in range(730):
-                d = base_date - timedelta(days=days_ago)
-                try:
-                    s = sun(loc.observer, date=d)
-                    # Max elevation at solar noon
-                    noon = s["noon"]
-                    # Sun elevation = 90 - zenith. At noon, elevation is max.
-                    # Approximate: latitude-based max elevation for date
-                    import math as _math
-                    day_of_year = d.timetuple().tm_yday
-                    declination = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
-                    max_elev = 90 - abs(self.latitude - declination)
-                    max_sun_elev_by_date[d.strftime("%Y-%m-%d")] = max_elev
-                except Exception:
-                    max_sun_elev_by_date[d.strftime("%Y-%m-%d")] = 45.0
-
             # Query hourly solar production
             solar_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
@@ -465,15 +481,8 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
-            # Query hourly GHI + direct + diffuse radiation
             # Query weather fields separately (much faster than combined OR query)
             weather_bucket = settings.influxdb.bucket_weather
-            weather_fields = {
-                "shortwave_radiation": "ghi",
-                "direct_radiation": "direct",
-                "diffuse_radiation": "diffuse",
-                "temperature_2m": "temp",
-            }
 
             solar_result = await influxdb_client.query(solar_query)
             soc_result = await influxdb_client.query(soc_query)
@@ -498,14 +507,12 @@ from(bucket: "{settings.influxdb.bucket_solar}")
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
-            direct_by_hour: Dict[str, float] = {}
-            diffuse_by_hour: Dict[str, float] = {}
+            cloud_by_hour: Dict[str, float] = {}
             temp_by_hour: Dict[str, float] = {}
 
             field_targets = {
                 "shortwave_radiation": ghi_by_hour,
-                "direct_radiation": direct_by_hour,
-                "diffuse_radiation": diffuse_by_hour,
+                "cloudcover": cloud_by_hour,
                 "temperature_2m": temp_by_hour,
             }
 
@@ -535,39 +542,6 @@ from(bucket: "{weather_bucket}")
                 self.logger.warning("No weather radiation data found")
                 return False
 
-            # Pre-compute sun position for each hour using astronomy
-            import math as _math
-            import zoneinfo
-            local_tz = zoneinfo.ZoneInfo("Europe/Prague")
-
-            def _sun_position(year: int, month: int, day: int, hour: int) -> Tuple[float, float]:
-                """Compute sun azimuth and altitude for a given datetime.
-                Returns (azimuth_degrees, altitude_degrees)."""
-                try:
-                    dt = datetime(year, month, day, hour, 30, tzinfo=local_tz)  # mid-hour
-                    day_of_year = dt.timetuple().tm_yday
-                    # Solar declination
-                    decl = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
-                    # Hour angle (15° per hour from solar noon)
-                    # Solar noon ≈ 12:00 local standard time (approximate)
-                    hour_angle = (hour + 0.5 - 12) * 15
-                    lat_rad = _math.radians(self.latitude)
-                    decl_rad = _math.radians(decl)
-                    ha_rad = _math.radians(hour_angle)
-                    # Altitude
-                    sin_alt = (_math.sin(lat_rad) * _math.sin(decl_rad) +
-                               _math.cos(lat_rad) * _math.cos(decl_rad) * _math.cos(ha_rad))
-                    altitude = _math.degrees(_math.asin(max(-1, min(1, sin_alt))))
-                    # Azimuth
-                    cos_az = ((_math.sin(decl_rad) - _math.sin(lat_rad) * sin_alt) /
-                              (max(0.001, _math.cos(lat_rad) * _math.cos(_math.asin(max(-1, min(1, sin_alt)))))))
-                    azimuth = _math.degrees(_math.acos(max(-1, min(1, cos_az))))
-                    if hour_angle > 0:
-                        azimuth = 360 - azimuth
-                    return azimuth, max(0, altitude)
-                except Exception:
-                    return 180.0, 30.0
-
             # Helper to add a data point to all bin levels
             def _add_to_model(m: SolarProductionModel, hour_key: str, kwh: float) -> None:
                 ghi = ghi_by_hour.get(hour_key, 0)
@@ -576,40 +550,24 @@ from(bucket: "{weather_bucket}")
                 parts = hour_key.split("-")
                 year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
-                direct = direct_by_hour.get(hour_key, 0)
-                diffuse = diffuse_by_hour.get(hour_key, 0)
+                cloud = cloud_by_hour.get(hour_key, 50.0)
                 temp = temp_by_hour.get(hour_key, 15.0)
-                azimuth, altitude = _sun_position(year, month, day, hour)
+                azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
                 if altitude <= 0:
                     return  # Sun below horizon
 
                 rad_b = SolarProductionModel.radiation_to_bucket(ghi)
-                clear_b = SolarProductionModel.clear_sky_to_bucket(direct, diffuse)
+                cloud_b = SolarProductionModel.cloud_to_bucket(cloud)
                 az_b = SolarProductionModel.azimuth_to_bucket(azimuth)
                 alt_b = SolarProductionModel.altitude_to_bucket(altitude)
                 temp_b = SolarProductionModel.temp_to_bucket(temp)
 
-                # 5D bin
-                key5 = (rad_b, clear_b, az_b, alt_b, temp_b)
-                if key5 not in m.bins:
-                    m.bins[key5] = []
-                m.bins[key5].append(kwh)
-
-                # 3D fallback (rad, azimuth, altitude)
-                key3 = (rad_b, az_b, alt_b)
-                if key3 not in m.mid_bins:
-                    m.mid_bins[key3] = []
-                m.mid_bins[key3].append(kwh)
-
-                # 2D fallback (rad, altitude)
-                key2 = (rad_b, alt_b)
-                if key2 not in m.simple_bins:
-                    m.simple_bins[key2] = []
-                m.simple_bins[key2].append(kwh)
+                m.add_sample(rad_b, cloud_b, az_b, alt_b, temp_b, kwh)
 
             # PASS 1: Build rough model from all matched data
-            model = SolarProductionModel()
+            total_kwp = sum(a.kwp for a in self.arrays)
+            model = SolarProductionModel(total_kwp=total_kwp)
             matched = 0
             for hour_key, watts in solar_by_hour.items():
                 if hour_key not in ghi_by_hour or watts <= 0:
@@ -626,7 +584,7 @@ from(bucket: "{weather_bucket}")
             model.build()
 
             # PASS 2: Filter curtailed hours and rebuild
-            model2 = SolarProductionModel()
+            model2 = SolarProductionModel(total_kwp=total_kwp)
             curtailed = 0
             for hour_key, watts in solar_by_hour.items():
                 if hour_key not in ghi_by_hour or watts <= 0:
@@ -639,22 +597,20 @@ from(bucket: "{weather_bucket}")
                 parts = hour_key.split("-")
                 year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
-                direct = direct_by_hour.get(hour_key, 0)
-                diffuse = diffuse_by_hour.get(hour_key, 0)
+                cloud = cloud_by_hour.get(hour_key, 50.0)
                 temp = temp_by_hour.get(hour_key, 15.0)
-                azimuth, altitude = _sun_position(year, month, day, hour)
+                azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
                 soc = soc_by_hour.get(hour_key, 50.0)
                 expected = model.predict(
                     ghi,
                     sun_azimuth=azimuth,
                     sun_altitude=altitude,
-                    direct_radiation=direct,
-                    diffuse_radiation=diffuse,
+                    cloud_cover=cloud,
                     temperature=temp,
                 )
 
-                if soc >= 90 and expected > 0 and kwh < expected * 0.6:
+                if soc >= 100 and expected > 0 and kwh < expected * 0.6:
                     curtailed += 1
                     continue
 
@@ -673,7 +629,7 @@ from(bucket: "{weather_bucket}")
             self.logger.info(
                 f"Solar production model built: {model2.data_points} hours "
                 f"({curtailed} curtailed filtered), "
-                f"{len(model2.medians)} bins, "
+                f"{len(model2.median_2d)} bins, "
                 f"range {model2.date_range}"
             )
             return True
@@ -689,7 +645,7 @@ from(bucket: "{weather_bucket}")
 
         Args:
             weather_hourly: List of dicts with "time", "shortwave_radiation",
-                optionally "direct_radiation", "diffuse_radiation"
+                "cloudcover", "temperature_2m"
 
         Returns:
             Dict of date_str -> DailyForecast
@@ -697,18 +653,12 @@ from(bucket: "{weather_bucket}")
         if not self._production_model:
             return {}
 
-        # Pre-compute max sun elevation per date
-        from astral import LocationInfo
-        from astral.sun import sun as astral_sun
-        max_elev_cache: Dict[str, float] = {}
-
         daily_hourly: Dict[str, Dict[int, float]] = {}
 
         for entry in weather_hourly:
             time_str = entry.get("time", "")
             ghi = entry.get("shortwave_radiation", 0)
-            direct = entry.get("direct_radiation", 0)
-            diffuse = entry.get("diffuse_radiation", 0)
+            cloud_cover = entry.get("cloudcover", 50)
             temp = entry.get("temperature_2m", 15)
 
             if not time_str:
@@ -722,33 +672,13 @@ from(bucket: "{weather_bucket}")
             date_str = dt.strftime("%Y-%m-%d")
             hour = dt.hour
 
-            # Compute sun position for this specific hour
-            try:
-                import math as _math
-                day_of_year = dt.timetuple().tm_yday
-                decl = 23.45 * _math.sin(_math.radians(360 / 365 * (day_of_year - 81)))
-                hour_angle = (hour + 0.5 - 12) * 15
-                lat_rad = _math.radians(self.latitude)
-                decl_rad = _math.radians(decl)
-                ha_rad = _math.radians(hour_angle)
-                sin_alt = (_math.sin(lat_rad) * _math.sin(decl_rad) +
-                           _math.cos(lat_rad) * _math.cos(decl_rad) * _math.cos(ha_rad))
-                altitude = _math.degrees(_math.asin(max(-1, min(1, sin_alt))))
-                cos_az = ((_math.sin(decl_rad) - _math.sin(lat_rad) * sin_alt) /
-                          max(0.001, _math.cos(lat_rad) * _math.cos(_math.asin(max(-1, min(1, sin_alt))))))
-                azimuth = _math.degrees(_math.acos(max(-1, min(1, cos_az))))
-                if hour_angle > 0:
-                    azimuth = 360 - azimuth
-                altitude = max(0, altitude)
-            except Exception:
-                azimuth, altitude = 180.0, 30.0
+            azimuth, altitude = _sun_position(self.latitude, dt.year, dt.month, dt.day, hour)
 
             predicted_kwh = self._production_model.predict(
                 ghi,
                 sun_azimuth=azimuth,
                 sun_altitude=altitude,
-                direct_radiation=direct,
-                diffuse_radiation=diffuse,
+                cloud_cover=cloud_cover,
                 temperature=temp or 15,
             )
 
@@ -984,10 +914,14 @@ from(bucket: "{bucket}")
                 return
 
             # Compare with stored forecasts (if we have any for those days)
-            # Use the raw API forecast total (before confidence discount)
+            # Try consensus (actual prediction path) first, then model, then API
             ratios: list = []
             for day_str, actual_kwh in actual_by_day.items():
-                forecast = self._api_forecast.get(day_str)
+                forecast = (
+                    self._consensus.get(day_str)
+                    or self._model_forecast.get(day_str)
+                    or self._api_forecast.get(day_str)
+                )
                 if forecast and forecast.total_kwh > 1.0:
                     ratio = actual_kwh / forecast.total_kwh
                     # Clamp to reasonable range (0.3 - 1.5)
@@ -995,7 +929,8 @@ from(bucket: "{bucket}")
                     ratios.append(ratio)
                     self.logger.debug(
                         f"Calibration {day_str}: actual={actual_kwh:.1f} kWh, "
-                        f"forecast={forecast.total_kwh:.1f} kWh, ratio={ratio:.2f}"
+                        f"forecast={forecast.total_kwh:.1f} kWh ({forecast.source}), "
+                        f"ratio={ratio:.2f}"
                     )
 
             if len(ratios) < 3:

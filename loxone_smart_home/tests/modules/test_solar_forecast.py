@@ -114,8 +114,8 @@ class TestConsensus:
         assert day.hourly[10] == pytest.approx(5.25, abs=0.01)
         assert day.source == "consensus"
 
-    def test_sources_diverge_uses_conservative(self, forecast) -> None:
-        """When sources diverge >20%, use the lower value."""
+    def test_sources_diverge_uses_average(self, forecast) -> None:
+        """When sources diverge and no model available, use average."""
         forecast._api_forecast = {
             "2026-04-11": DailyForecast(
                 date=date(2026, 4, 11), total_kwh=50.0,
@@ -129,8 +129,8 @@ class TestConsensus:
             )
         }
         result = forecast.build_consensus()
-        # Divergence = |10-5| / 7.5 = 66% > 20% → conservative (min)
-        assert result["2026-04-11"].hourly[12] == 5.0
+        # No model available → average all sources
+        assert result["2026-04-11"].hourly[12] == pytest.approx(7.5, abs=0.01)
 
     def test_single_source_used_directly(self, forecast) -> None:
         forecast._api_forecast = {
@@ -177,7 +177,7 @@ class TestCalibration:
     @pytest.mark.asyncio
     async def test_calibration_adjusts_confidence(self, forecast) -> None:
         """Calibrate from actuals when forecast history exists."""
-        # Set up API forecast history for comparison
+        # Set up API forecast history for comparison (need 3+ days for weighted avg)
         forecast._api_forecast = {
             "2026-04-10": DailyForecast(
                 date=date(2026, 4, 10), total_kwh=50.0, hourly={}, source="api",
@@ -185,27 +185,34 @@ class TestCalibration:
             "2026-04-09": DailyForecast(
                 date=date(2026, 4, 9), total_kwh=45.0, hourly={}, source="api",
             ),
+            "2026-04-08": DailyForecast(
+                date=date(2026, 4, 8), total_kwh=40.0, hourly={}, source="api",
+            ),
         }
 
         # Mock InfluxDB returning actual production
         mock_client = AsyncMock()
         mock_record_1 = MagicMock()
         mock_record_1.get_time.return_value = datetime(2026, 4, 10)
-        mock_record_1.get_value.return_value = 48.0  # Close to forecast
+        mock_record_1.get_value.return_value = 48.0
 
         mock_record_2 = MagicMock()
         mock_record_2.get_time.return_value = datetime(2026, 4, 9)
         mock_record_2.get_value.return_value = 40.0
 
+        mock_record_3 = MagicMock()
+        mock_record_3.get_time.return_value = datetime(2026, 4, 8)
+        mock_record_3.get_value.return_value = 36.0
+
         mock_table = MagicMock()
-        mock_table.records = [mock_record_1, mock_record_2]
+        mock_table.records = [mock_record_1, mock_record_2, mock_record_3]
         mock_client.query = AsyncMock(return_value=[mock_table])
 
         await forecast.calibrate_from_actuals(mock_client, "solar", days=7)
 
         # Confidence should be adjusted (not still 0.7)
-        # Day 1: 40/45 = 0.89, Day 2: 48/50 = 0.96
-        # Weighted: (0.89*1 + 0.96*2) / 3 = 0.937
+        # Day 1: 36/40 = 0.90, Day 2: 40/45 = 0.89, Day 3: 48/50 = 0.96
+        # Weighted: (0.90*1 + 0.89*2 + 0.96*3) / 6 = 0.924
         assert forecast.confidence != 0.7
         assert 0.8 < forecast.confidence < 1.0
 
