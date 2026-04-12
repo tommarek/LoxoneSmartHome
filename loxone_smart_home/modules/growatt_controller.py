@@ -1575,6 +1575,30 @@ class GrowattController(BaseModule):
                 self.settings.influxdb.bucket_loxone,
             )
 
+        # Initialize battery SOC from InfluxDB before running optimizer
+        # (telemetry hasn't arrived yet at startup, default is 50%)
+        if self.influxdb_client:
+            try:
+                soc_query = f'''
+from(bucket: "{self.settings.influxdb.bucket_solar}")
+  |> range(start: -1d)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
+  |> last()
+'''
+                soc_result = await self.influxdb_client.query(soc_query)
+                if soc_result:
+                    for table in soc_result:
+                        for record in table.records:
+                            val = record.get_value()
+                            if isinstance(val, (int, float)) and 0 <= val <= 100:
+                                self._battery_soc = float(val)
+                                self._last_battery_soc = float(val)
+                                self.logger.info(
+                                    f"🔋 Initial battery SOC from InfluxDB: {val:.0f}%"
+                                )
+            except Exception as e:
+                self.logger.debug(f"Could not load initial SOC: {e}")
+
         # Re-run optimizer schedule now that ALL models are ready
         # (solar forecast, consumption model, base load profile)
         # The initial schedule calculation during price fetch ran before models were built

@@ -474,11 +474,17 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
-            # Query hourly SOC (for curtailment detection)
+            # Query hourly SOC and load (for curtailment detection)
             soc_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+            load_query = f'''
+from(bucket: "{settings.influxdb.bucket_solar}")
+  |> range(start: -730d)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
             # Query weather fields separately (much faster than combined OR query)
@@ -486,6 +492,7 @@ from(bucket: "{settings.influxdb.bucket_solar}")
 
             solar_result = await influxdb_client.query(solar_query)
             soc_result = await influxdb_client.query(soc_query)
+            load_result = await influxdb_client.query(load_query)
 
             if not solar_result:
                 self.logger.warning("No solar production data found")
@@ -504,6 +511,13 @@ from(bucket: "{settings.influxdb.bucket_solar}")
                     for record in table.records:
                         key = record.get_time().strftime("%Y-%m-%d-%H")
                         soc_by_hour[key] = record.get_value()
+
+            load_by_hour: Dict[str, float] = {}
+            if load_result:
+                for table in load_result:
+                    for record in table.records:
+                        key = record.get_time().strftime("%Y-%m-%d-%H")
+                        load_by_hour[key] = record.get_value()
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
@@ -602,6 +616,7 @@ from(bucket: "{weather_bucket}")
                 azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
                 soc = soc_by_hour.get(hour_key, 50.0)
+                load = load_by_hour.get(hour_key, 0)
                 expected = model.predict(
                     ghi,
                     sun_azimuth=azimuth,
@@ -610,7 +625,12 @@ from(bucket: "{weather_bucket}")
                     temperature=temp,
                 )
 
-                if soc >= 100 and expected > 0 and kwh < expected * 0.6:
+                # Only filter as curtailed when battery is full AND load is low.
+                # When load is high, the inverter produces at full capacity to serve
+                # the load even at 100% SOC — this is real production data.
+                load_kwh = load / 1000.0
+                if (soc >= 100 and expected > 0 and kwh < expected * 0.6
+                        and load_kwh < expected * 0.5):
                     curtailed += 1
                     continue
 
