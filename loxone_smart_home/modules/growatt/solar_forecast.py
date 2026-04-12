@@ -46,28 +46,28 @@ class DailyForecast:
 class SolarProductionModel:
     """Learned solar production model trained on historical data.
 
-    Bins actual production by physics-based features:
-    - radiation_bucket: GHI in 50 W/m² steps (primary energy driver)
-    - clear_sky_bucket: direct/(direct+diffuse) ratio (cloud type)
-    - sun_azimuth_bucket: sun compass direction in 30° steps (which array gets light)
-    - sun_altitude_bucket: sun height angle in 10° steps (angle of incidence)
-    - temp_bucket: outdoor temperature in 5°C steps (panel efficiency derating)
+    Features (finer granularity for better accuracy):
+    - GHI radiation: 25 W/m² steps (41 buckets)
+    - Cloud cover: 10% steps (11 buckets) — direct weather parameter
+    - Sun azimuth: 15° steps (24 buckets) — which array gets light
+    - Sun altitude: 5° steps (19 buckets) — angle of incidence
+    - Temperature: 5°C steps (13 buckets) — panel efficiency derating
 
-    Uses p75 for prediction — represents panel POTENTIAL on a good day.
-    Two-pass training filters curtailed hours (SOC >= 90% + low output).
+    Cloud cover is ALWAYS included in predictions — never dropped in fallbacks.
+    Uses p75 for prediction, physics cap as safety net.
     """
-    # Primary 5D bins: (rad, clear_sky, azimuth, altitude, temp) -> [kwh]
-    bins: Dict[Tuple[int, int, int, int, int], List[float]] = field(default_factory=dict)
-    p75: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
-    medians: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
-    # 3D fallback: (rad, azimuth, altitude) -> [kwh]
-    mid_bins: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
-    mid_p75: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
-    # 2D fallback: (rad, altitude) -> [kwh]
-    simple_bins: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
-    simple_p75: Dict[Tuple[int, int], float] = field(default_factory=dict)
-    # 1D fallback: altitude -> median
-    altitude_fallback: Dict[int, float] = field(default_factory=dict)
+    # 5D bins: (rad, cloud, az, alt, temp) -> [kwh]
+    bins_5d: Dict[Tuple[int, int, int, int, int], List[float]] = field(default_factory=dict)
+    p75_5d: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
+    # 4D bins: (rad, cloud, az, alt) -> [kwh] (drop temp)
+    bins_4d: Dict[Tuple[int, int, int, int], List[float]] = field(default_factory=dict)
+    p75_4d: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
+    # 3D bins: (rad, cloud, alt) -> [kwh] (drop azimuth)
+    bins_3d: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
+    p75_3d: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
+    # 2D bins: (rad, cloud) -> [kwh] (minimum — always includes cloud!)
+    bins_2d: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
+    p75_2d: Dict[Tuple[int, int], float] = field(default_factory=dict)
     global_median: float = 0.0
     # Metadata
     data_points: int = 0
@@ -77,35 +77,32 @@ class SolarProductionModel:
 
     @staticmethod
     def radiation_to_bucket(ghi: float) -> int:
-        """GHI W/m² → bucket (50 W/m² steps, 0-20)."""
-        return min(20, max(0, int(ghi / 50)))
+        """GHI W/m² → bucket (25 W/m² steps, 0-40)."""
+        return min(40, max(0, int(ghi / 25)))
 
     @staticmethod
-    def clear_sky_to_bucket(direct: float, diffuse: float) -> int:
-        """Clear sky ratio → bucket (0-4, 20% steps). 4 = fully clear."""
-        total = direct + diffuse
-        if total <= 0:
-            return 0
-        return min(4, int((direct / total) / 0.2))
+    def cloud_to_bucket(cloud_pct: float) -> int:
+        """Cloud cover % → bucket (10% steps, 0-10). 0=clear, 10=overcast."""
+        return min(10, max(0, int(cloud_pct / 10)))
 
     @staticmethod
     def azimuth_to_bucket(azimuth_deg: float) -> int:
-        """Sun azimuth → bucket (30° steps, 0-11). 0=North, 3=East, 6=South, 9=West."""
-        return int((azimuth_deg % 360) / 30)
+        """Sun azimuth → bucket (15° steps, 0-23)."""
+        return int((azimuth_deg % 360) / 15)
 
     @staticmethod
     def altitude_to_bucket(altitude_deg: float) -> int:
-        """Sun altitude → bucket (10° steps, 0-9). 0=horizon, 6=60°."""
-        return min(9, max(0, int(altitude_deg / 10)))
+        """Sun altitude → bucket (5° steps, 0-18)."""
+        return min(18, max(0, int(altitude_deg / 5)))
 
     @staticmethod
     def temp_to_bucket(temp_c: float) -> int:
-        """Temperature → bucket (5°C steps, clamped -4 to 8 = -20°C to 40°C)."""
+        """Temperature → bucket (5°C steps)."""
         return min(12, max(0, int((temp_c + 20) / 5)))
 
     @staticmethod
     def _compute_p75(values: List[float]) -> Tuple[float, float]:
-        """Compute median and p75 from a list of values with IQR outlier removal."""
+        """Compute median and p75 with IQR outlier removal."""
         if not values:
             return 0.0, 0.0
         if len(values) < 3:
@@ -121,125 +118,111 @@ class SolarProductionModel:
         p75_idx = min(int(len(filtered) * 0.75), len(filtered) - 1)
         return med, filtered[p75_idx]
 
+    def add_sample(self, rad_b: int, cloud_b: int, az_b: int, alt_b: int,
+                   temp_b: int, kwh: float) -> None:
+        """Add a training sample to all bin levels."""
+        k5 = (rad_b, cloud_b, az_b, alt_b, temp_b)
+        k4 = (rad_b, cloud_b, az_b, alt_b)
+        k3 = (rad_b, cloud_b, alt_b)
+        k2 = (rad_b, cloud_b)
+        for bins, key in [(self.bins_5d, k5), (self.bins_4d, k4),
+                          (self.bins_3d, k3), (self.bins_2d, k2)]:
+            if key not in bins:
+                bins[key] = []
+            bins[key].append(kwh)
+
     def build(self) -> None:
-        """Compute percentiles from all bin levels (5D → 3D → 2D → 1D)."""
-        self.p75 = {}
-        self.medians = {}
-        self.mid_p75 = {}
-        self.simple_p75 = {}
-        self.altitude_fallback = {}
-        alt_all: Dict[int, List[float]] = {}
+        """Compute p75 for all bin levels."""
+        for bins, p75_dict in [
+            (self.bins_5d, self.p75_5d), (self.bins_4d, self.p75_4d),
+            (self.bins_3d, self.p75_3d), (self.bins_2d, self.p75_2d),
+        ]:
+            p75_dict.clear()
+            for key, values in bins.items():
+                if values:
+                    _, p75 = self._compute_p75(values)
+                    p75_dict[key] = p75
 
-        # 5D bins
-        for key, values in self.bins.items():
-            if not values:
-                continue
-            med, p75 = self._compute_p75(values)
-            self.medians[key] = med
-            self.p75[key] = p75
-
-        # 3D bins (rad, azimuth, altitude)
-        for key, values in self.mid_bins.items():
-            if not values:
-                continue
-            _, p75 = self._compute_p75(values)
-            self.mid_p75[key] = p75
-            alt_bucket = key[2]  # altitude
-            if alt_bucket not in alt_all:
-                alt_all[alt_bucket] = []
-            alt_all[alt_bucket].append(p75)
-
-        # 2D bins (rad, altitude)
-        for key, values in self.simple_bins.items():
-            if not values:
-                continue
-            _, p75 = self._compute_p75(values)
-            self.simple_p75[key] = p75
-
-        # 1D altitude fallback
-        for alt_b, vals in alt_all.items():
-            self.altitude_fallback[alt_b] = statistics.median(vals) if vals else 0.0
-
-        all_p75 = [v for v in self.p75.values() if v > 0]
-        if not all_p75:
-            all_p75 = [v for v in self.mid_p75.values() if v > 0]
+        all_p75 = [v for v in self.p75_2d.values() if v > 0]
         self.global_median = statistics.median(all_p75) if all_p75 else 0.0
         self.built_at = datetime.now()
+
+    def _interpolate_2d(self, rad_b: int, cloud_b: int) -> Optional[float]:
+        """Interpolate between nearest populated 2D bins on radiation axis."""
+        # Find nearest lower and upper radiation bins with same cloud cover
+        lower_rad, lower_val = None, None
+        upper_rad, upper_val = None, None
+        for dr in range(1, 10):
+            if lower_val is None and (rad_b - dr, cloud_b) in self.p75_2d:
+                lower_rad, lower_val = rad_b - dr, self.p75_2d[(rad_b - dr, cloud_b)]
+            if upper_val is None and (rad_b + dr, cloud_b) in self.p75_2d:
+                upper_rad, upper_val = rad_b + dr, self.p75_2d[(rad_b + dr, cloud_b)]
+            if lower_val is not None and upper_val is not None:
+                break
+        if lower_val is not None and upper_val is not None:
+            # Linear interpolation
+            span = upper_rad - lower_rad
+            weight = (rad_b - lower_rad) / span if span > 0 else 0.5
+            return lower_val + (upper_val - lower_val) * weight
+        return lower_val or upper_val  # One-sided if only one exists
 
     def predict(
         self, ghi: float,
         sun_azimuth: float = 180, sun_altitude: float = 45,
-        direct_radiation: float = 0, diffuse_radiation: float = 0,
-        temperature: float = 15,
+        cloud_cover: float = 50, temperature: float = 15,
     ) -> float:
-        """Predict potential kWh production for given conditions.
+        """Predict kWh production. Cloud cover is ALWAYS used.
 
-        Fallback chain: 5D → 3D (rad, azimuth, alt) → 2D (rad, alt) → 1D (alt) → global.
-
-        Args:
-            ghi: Global Horizontal Irradiance (W/m²)
-            sun_azimuth: Sun compass direction (degrees, 0=N, 90=E, 180=S, 270=W)
-            sun_altitude: Sun height above horizon (degrees)
-            direct_radiation: Direct radiation (W/m²)
-            diffuse_radiation: Diffuse radiation (W/m²)
-            temperature: Outdoor temperature (°C)
+        Fallback: 5D → 4D (drop temp) → 3D (drop az) → 2D (rad, cloud) → interpolate.
         """
         if ghi <= 0 or sun_altitude <= 0:
             return 0.0
 
         rad_b = self.radiation_to_bucket(ghi)
-        clear_b = self.clear_sky_to_bucket(direct_radiation, diffuse_radiation)
+        cloud_b = self.cloud_to_bucket(cloud_cover)
         az_b = self.azimuth_to_bucket(sun_azimuth)
         alt_b = self.altitude_to_bucket(sun_altitude)
         temp_b = self.temp_to_bucket(temperature)
 
-        # Physics cap: can't produce more than GHI × kWp × perf_ratio
-        # This prevents garbage predictions from sparse bins
-        total_kwp = 13.5  # TODO: get from config
-        physics_max = ghi * total_kwp * 0.85 / 1000 / 4.0  # kWh per 15-min block
+        # Physics cap
+        total_kwp = 13.5
+        physics_max = ghi * total_kwp * 0.85 / 1000 / 4.0
 
-        def _capped(val: float) -> float:
-            return min(val, physics_max)
+        def _cap(v: float) -> float:
+            return min(v, physics_max)
 
-        # 5D exact match
-        key = (rad_b, clear_b, az_b, alt_b, temp_b)
-        if key in self.p75:
-            return _capped(self.p75[key])
+        # 5D exact (all features)
+        k = (rad_b, cloud_b, az_b, alt_b, temp_b)
+        if k in self.p75_5d:
+            return _cap(self.p75_5d[k])
 
-        # 5D: try adjacent temperature first (least impact on production)
-        for dt in [1, -1, 2, -2]:
-            adj = (rad_b, clear_b, az_b, alt_b, temp_b + dt)
-            if adj in self.p75:
-                return _capped(self.p75[adj])
+        # 4D (drop temp — least important)
+        k = (rad_b, cloud_b, az_b, alt_b)
+        if k in self.p75_4d:
+            return _cap(self.p75_4d[k])
 
-        # 5D: try adjacent clear sky BEFORE radiation
-        # (clear sky ratio matters more — overcast vs clear at same GHI is huge)
-        for dc in [1, -1]:
-            adj = (rad_b, clear_b + dc, az_b, alt_b, temp_b)
-            if adj in self.p75:
-                return _capped(self.p75[adj])
+        # 3D (drop azimuth)
+        k = (rad_b, cloud_b, alt_b)
+        if k in self.p75_3d:
+            return _cap(self.p75_3d[k])
 
-        # 5D: try adjacent radiation (same clear sky)
-        for dr in [1, -1]:
-            adj = (rad_b + dr, clear_b, az_b, alt_b, temp_b)
-            if adj in self.p75:
-                return _capped(self.p75[adj])
+        # 2D exact (rad, cloud) — core prediction, always has cloud
+        k = (rad_b, cloud_b)
+        if k in self.p75_2d:
+            return _cap(self.p75_2d[k])
 
-        # 2D fallback (rad, altitude) — simple but reliable
-        simple_key = (rad_b, alt_b)
-        if simple_key in self.simple_p75:
-            return _capped(self.simple_p75[simple_key])
+        # 2D interpolation — find nearest on radiation axis at same cloud level
+        interp = self._interpolate_2d(rad_b, cloud_b)
+        if interp is not None:
+            return _cap(interp)
 
-        for dr in [1, -1, 2, -2]:
-            adj = (rad_b + dr, alt_b)
-            if adj in self.simple_p75:
-                return _capped(self.simple_p75[adj])
+        # Adjacent cloud bucket at same radiation
+        for dc in [1, -1, 2, -2]:
+            adj = (rad_b, cloud_b + dc)
+            if adj in self.p75_2d:
+                return _cap(self.p75_2d[adj])
 
-        # 1D altitude fallback
-        if alt_b in self.altitude_fallback:
-            return _capped(self.altitude_fallback[alt_b])
-
-        return _capped(self.global_median)
+        return _cap(self.global_median)
 
 
 class SolarForecast:
@@ -430,11 +413,11 @@ class SolarForecast:
     async def build_production_model(
         self, influxdb_client: Any, settings: Any
     ) -> bool:
-        """Train solar production model from historical data (365 days).
+        """Train solar production model from ALL historical data.
 
-        Two-pass approach:
-        1. Build rough model from all matched solar+weather hours
-        2. Filter curtailed hours (high SOC + low production) and rebuild
+        Queries data in monthly chunks to avoid InfluxDB timeout.
+        Uses cloud cover (%) instead of derived clear sky ratio.
+        Two-pass: build rough model, filter curtailed hours, rebuild.
 
         Args:
             influxdb_client: Async InfluxDB client
