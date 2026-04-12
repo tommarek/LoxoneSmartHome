@@ -531,6 +531,29 @@ from(bucket: "{solar_bucket}")
             running_max = max(running_max, dv)
             future_max_discharge_value[i] = running_max
 
+        # Future self-consumption value: for each block, what's the best
+        # self-consumption savings available in remaining blocks? Used to
+        # prevent discharging battery when retaining it for expensive
+        # self-consumption hours saves more money.
+        # Only counts hours where consumption > solar (battery needed).
+        # Also tracks cumulative kWh of future battery-needed consumption
+        # so we know when the battery has excess beyond self-consumption needs.
+        future_sc_value = [0.0] * n
+        future_sc_kwh = [0.0] * n  # Cumulative kWh needing battery from block i onward
+        running_best_sc = 0.0
+        running_sc_kwh = 0.0
+        for i in range(n - 1, -1, -1):
+            h_i = blocks[i][0].hour
+            solar_i = solar_hourly.get(h_i, 0) / 4.0
+            cons_i = consumption_hourly.get(h_i, 0) / 4.0
+            net_cons = max(0, cons_i - solar_i)
+            if net_cons > 0:
+                sc_val = prices[i] + distribution_func(h_i)
+                running_best_sc = max(running_best_sc, sc_val)
+                running_sc_kwh += net_cons
+            future_sc_value[i] = running_best_sc
+            future_sc_kwh[i] = running_sc_kwh
+
         # Pre-select charge blocks: pick cheapest N blocks where charging is
         # profitable vs buying from grid later. Don't charge at 1.28 CZK when
         # -2.0 blocks are available — better to sit at min SOC and buy from grid.
@@ -570,8 +593,9 @@ from(bucket: "{solar_bucket}")
             distribution_func, battery_capacity_kwh, current_soc, min_soc,
             max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
             effective_min_socs, future_min_price, future_min_price_hour,
-            future_max_discharge_value, sorted_prices, sell_fee_czk,
-            battery_amortisation_czk, first_block_ts,
+            future_max_discharge_value, future_sc_value, future_sc_kwh,
+            sorted_prices, sell_fee_czk, battery_amortisation_czk,
+            first_block_ts,
         )
 
         # Pass 2: refine charge block selection using actual SOC trajectory
@@ -589,8 +613,9 @@ from(bucket: "{solar_bucket}")
                 distribution_func, battery_capacity_kwh, current_soc, min_soc,
                 max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
                 effective_min_socs, future_min_price, future_min_price_hour,
-                future_max_discharge_value, sorted_prices, sell_fee_czk,
-                battery_amortisation_czk, first_block_ts,
+                future_max_discharge_value, future_sc_value, future_sc_kwh,
+                sorted_prices, sell_fee_czk, battery_amortisation_czk,
+                first_block_ts,
             )
 
         self._last_decisions = decisions
@@ -657,6 +682,8 @@ from(bucket: "{solar_bucket}")
         future_min_price: List[float],
         future_min_price_hour: List[int],
         future_max_discharge_value: List[float],
+        future_sc_value: List[float],
+        future_sc_kwh: List[float],
         sorted_prices: List[float],
         sell_fee_czk: float,
         battery_amortisation_czk: float,
@@ -717,6 +744,18 @@ from(bucket: "{solar_bucket}")
             if net_solar > 0 and battery_kwh < max_battery_kwh:
                 solar_charge = min(net_solar, max_battery_kwh - battery_kwh)
                 hold_value += solar_charge * self_consumption_value * efficiency
+
+            # Value of retaining battery for future self-consumption:
+            # each kWh kept now can offset a future grid purchase at the best
+            # upcoming price. Only applies when battery energy above reserve
+            # is NEEDED for future consumption (not excess that could be sold).
+            usable_kwh = battery_kwh - min_battery_kwh
+            if usable_kwh > 0 and i < n:
+                best_future_sc = future_sc_value[i]
+                sc_kwh_needed = future_sc_kwh[i] / efficiency  # Account for losses
+                if best_future_sc > recharge_cost and usable_kwh <= sc_kwh_needed:
+                    # Battery is fully needed for self-consumption — don't discharge
+                    hold_value = max(hold_value, best_future_sc - recharge_cost)
 
             # Pick best action
             soc_before = soc
