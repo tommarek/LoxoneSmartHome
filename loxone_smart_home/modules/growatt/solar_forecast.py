@@ -193,55 +193,53 @@ class SolarProductionModel:
         alt_b = self.altitude_to_bucket(sun_altitude)
         temp_b = self.temp_to_bucket(temperature)
 
+        # Physics cap: can't produce more than GHI × kWp × perf_ratio
+        # This prevents garbage predictions from sparse bins
+        total_kwp = 13.5  # TODO: get from config
+        physics_max = ghi * total_kwp * 0.85 / 1000 / 4.0  # kWh per 15-min block
+
+        def _capped(val: float) -> float:
+            return min(val, physics_max)
+
         # 5D exact match
         key = (rad_b, clear_b, az_b, alt_b, temp_b)
         if key in self.p75:
-            return self.p75[key]
+            return _capped(self.p75[key])
 
-        # 5D: try adjacent temperature
+        # 5D: try adjacent temperature first (least impact on production)
         for dt in [1, -1, 2, -2]:
             adj = (rad_b, clear_b, az_b, alt_b, temp_b + dt)
             if adj in self.p75:
-                return self.p75[adj]
+                return _capped(self.p75[adj])
 
-        # 5D: try adjacent radiation
-        for dr in [1, -1, 2, -2]:
+        # 5D: try adjacent clear sky BEFORE radiation
+        # (clear sky ratio matters more — overcast vs clear at same GHI is huge)
+        for dc in [1, -1]:
+            adj = (rad_b, clear_b + dc, az_b, alt_b, temp_b)
+            if adj in self.p75:
+                return _capped(self.p75[adj])
+
+        # 5D: try adjacent radiation (same clear sky)
+        for dr in [1, -1]:
             adj = (rad_b + dr, clear_b, az_b, alt_b, temp_b)
             if adj in self.p75:
-                return self.p75[adj]
+                return _capped(self.p75[adj])
 
-        # 3D fallback (rad, azimuth, altitude) — ignores clear sky and temp
-        mid_key = (rad_b, az_b, alt_b)
-        if mid_key in self.mid_p75:
-            return self.mid_p75[mid_key]
-
-        # 3D: adjacent radiation
-        for dr in [1, -1, 2, -2]:
-            adj = (rad_b + dr, az_b, alt_b)
-            if adj in self.mid_p75:
-                return self.mid_p75[adj]
-
-        # 3D: adjacent azimuth (±30°)
-        for da in [1, -1]:
-            adj = (rad_b, (az_b + da) % 12, alt_b)
-            if adj in self.mid_p75:
-                return self.mid_p75[adj]
-
-        # 2D fallback (rad, altitude)
+        # 2D fallback (rad, altitude) — simple but reliable
         simple_key = (rad_b, alt_b)
         if simple_key in self.simple_p75:
-            return self.simple_p75[simple_key]
+            return _capped(self.simple_p75[simple_key])
 
         for dr in [1, -1, 2, -2]:
             adj = (rad_b + dr, alt_b)
             if adj in self.simple_p75:
-                return self.simple_p75[adj]
+                return _capped(self.simple_p75[adj])
 
         # 1D altitude fallback
         if alt_b in self.altitude_fallback:
-            return self.altitude_fallback[alt_b]
+            return _capped(self.altitude_fallback[alt_b])
 
-        return self.global_median
+        return _capped(self.global_median)
 
 
 class SolarForecast:

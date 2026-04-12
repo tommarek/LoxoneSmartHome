@@ -297,18 +297,28 @@ class GrowattConfig(BaseSettings):
         description="Enable greedy optimizer (replaces rule-based scheduling when active)"
     )
 
+    # Sell economics
+    sell_fee_czk: float = Field(
+        default=0.5, ge=0,
+        description="Fixed fee per kWh when selling to grid (CZK/kWh)"
+    )
+    battery_amortisation_czk: float = Field(
+        default=2.0, ge=0,
+        description="Battery wear cost per kWh discharged (CZK/kWh)"
+    )
+
     # Distribution tariff (Czech high/low tariff)
     distribution_tariff_high: float = Field(
-        default=1.5, ge=0,
-        description="High tariff distribution cost (CZK/kWh)"
+        default=0.913, ge=0,
+        description="High tariff (VT) distribution cost (CZK/kWh)"
     )
     distribution_tariff_low: float = Field(
-        default=0.5, ge=0,
-        description="Low tariff distribution cost (CZK/kWh)"
+        default=0.116, ge=0,
+        description="Low tariff (NT) distribution cost (CZK/kWh)"
     )
     low_tariff_hours: str = Field(
-        default="0-6,22-24",
-        description="Low tariff hour ranges (comma-separated, e.g. '0-6,22-24')"
+        default="0-10,11-12,13-14,15-17,18-24",
+        description="Low tariff (NT) hour ranges (comma-separated, e.g. '0-10,11-12,13-14,15-17,18-24' for D57d)"
     )
 
     # Currency conversion

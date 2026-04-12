@@ -1575,6 +1575,13 @@ class GrowattController(BaseModule):
                 self.settings.influxdb.bucket_loxone,
             )
 
+        # Re-run optimizer schedule now that ALL models are ready
+        # (solar forecast, consumption model, base load profile)
+        # The initial schedule calculation during price fetch ran before models were built
+        if self._optimizer and self._current_prices:
+            self.logger.info("Recalculating optimizer schedule with all models ready...")
+            await self._calculate_cross_day_optimal_schedule()
+
         # Start periodic evaluation loop
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
@@ -2101,24 +2108,13 @@ from(bucket: "{bucket}")
                 if h > now.hour:
                     solar_hourly[h] = solar_hourly.get(h, 0) + kwh
 
+            # Use base load profile for consumption (non-heating hours only,
+            # since heating triggers high load protection which disables discharge)
             consumption_hourly: Dict[int, float] = {}
-            if self._consumption_forecast and self._consumption_forecast.model:
-                # Get forecast temperatures from weather data
-                forecast_temps = {h: 10.0 for h in range(24)}  # Default
-                try:
-                    weather_data = await self._get_weather_radiation_data()
-                    if weather_data:
-                        for entry in weather_data.get("hourly", []):
-                            t_str = entry.get("time", "")
-                            temp = entry.get("temperature_2m")
-                            if t_str and temp is not None:
-                                dt = datetime.fromisoformat(t_str)
-                                forecast_temps[dt.hour] = temp
-                except Exception:
-                    pass
-                consumption_hourly = self._consumption_forecast.predict_hourly(
-                    forecast_temps, today + timedelta(days=1)
-                )
+            if self._optimizer and self._optimizer._base_load_profile.profile:
+                is_weekend = now.weekday() >= 5
+                for h in range(24):
+                    consumption_hourly[h] = self._optimizer._base_load_profile.get(h, is_weekend)
 
             dist_thresholds = PriceThresholds(
                 charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
@@ -2146,6 +2142,8 @@ from(bucket: "{bucket}")
                 max_soc=self.config.max_soc,
                 discharge_power_pct=self.config.discharge_power_rate,
                 efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+                sell_fee_czk=getattr(self.config, 'sell_fee_czk', 0.5),
+                battery_amortisation_czk=getattr(self.config, 'battery_amortisation_czk', 2.0),
             )
             summary = self._optimizer.summarize(decisions)
             self.logger.info(
@@ -3623,10 +3621,11 @@ from(bucket: "{bucket}")
                                 rate = self._eur_czk_rate or 25.0
                                 await self._log_cross_day_price_table(window, rate, force_display=True)
 
-                            # Trigger re-evaluation with shifted schedule
-                            # Note: We don't recalculate here because we don't have new
-                            # tomorrow prices yet. The background fetch will recalculate
-                            # when new tomorrow data arrives.
+                            # Recalculate schedule with today's prices (optimizer needs this)
+                            if self._current_prices:
+                                await self._calculate_cross_day_optimal_schedule()
+
+                            # Trigger re-evaluation with recalculated schedule
                             await self._on_price_update()
 
                             # Daily solar calibration: recalibrate from yesterday's actuals
@@ -3693,6 +3692,14 @@ from(bucket: "{bucket}")
                 current_block = (now.hour, now.minute // 15)
                 if self._last_evaluation_block != current_block:
                     self._last_evaluation_block = current_block
+
+                    # Re-run optimizer if schedule is empty (no charge/discharge blocks)
+                    if (self._optimizer and self._current_prices
+                            and not self._combined_charging_blocks
+                            and not self._discharge_periods_today):
+                        self.logger.info("Optimizer schedule empty — recalculating")
+                        await self._calculate_cross_day_optimal_schedule()
+
                     await self._evaluate_conditions("15min_block_change")
 
                 # Check for battery SOC change (>5%)

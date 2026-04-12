@@ -132,17 +132,32 @@ from(bucket: "{loxone_bucket}")
   |> filter(fn: (r) => r._value == 1)
   |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
 '''
+            # Query EV charging: which hours had EV charging active
+            ev_query = f'''
+from(bucket: "{loxone_bucket}")
+  |> range(start: -{days}d)
+  |> filter(fn: (r) => r._measurement == "ev" and r._field == "ev_charging")
+  |> filter(fn: (r) => r._value == 1)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+'''
             heating_result = await influxdb_client.query(heating_query)
+            ev_result = await influxdb_client.query(ev_query)
 
-            # Build set of hours where heating was active
-            heating_hours: set = set()  # "YYYY-MM-DD-HH" keys
+            # Build set of hours where heating OR EV charging was active
+            high_load_hours: set = set()  # "YYYY-MM-DD-HH" keys
             if heating_result:
                 for table in heating_result:
                     for record in table.records:
-                        key = record.get_time().strftime("%Y-%m-%d-%H")
-                        heating_hours.add(key)
+                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+            heating_count = len(high_load_hours)
 
-            self.logger.debug(f"Found {len(heating_hours)} hours with heating active")
+            if ev_result:
+                for table in ev_result:
+                    for record in table.records:
+                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+            ev_count = len(high_load_hours) - heating_count
+
+            self.logger.debug(f"Found {heating_count} heating + {ev_count} EV hours to exclude")
 
             # Query house load
             load_query = f'''
@@ -170,7 +185,7 @@ from(bucket: "{solar_bucket}")
                     key = t.strftime("%Y-%m-%d-%H")
 
                     # Skip hours where heating was active
-                    if key in heating_hours:
+                    if key in high_load_hours:
                         excluded += 1
                         continue
 
@@ -197,7 +212,7 @@ from(bucket: "{solar_bucket}")
 
             self.logger.info(
                 f"Base load profile built: {total} non-heating hours "
-                f"({excluded} heating hours excluded), "
+                f"({excluded} heating+EV hours excluded), "
                 f"{len(profile.profile)} slots. {profile.summary()}"
             )
             return profile
@@ -211,18 +226,28 @@ from(bucket: "{solar_bucket}")
     ) -> None:
         """Update profile with yesterday's actual data using EMA (0.9 old + 0.1 new)."""
         try:
-            # Query yesterday's heating hours
+            # Query yesterday's heating + EV hours
             heating_result = await influxdb_client.query(f'''
 from(bucket: "{loxone_bucket}")
   |> range(start: -1d, stop: -0d)
   |> filter(fn: (r) => r._measurement == "relay" and r.tag1 == "heating" and r._value == 1)
   |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
 ''')
-            heating_hours: set = set()
+            ev_result = await influxdb_client.query(f'''
+from(bucket: "{loxone_bucket}")
+  |> range(start: -1d, stop: -0d)
+  |> filter(fn: (r) => r._measurement == "ev" and r._field == "ev_charging" and r._value == 1)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+''')
+            high_load_hours: set = set()
             if heating_result:
                 for table in heating_result:
                     for record in table.records:
-                        heating_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+            if ev_result:
+                for table in ev_result:
+                    for record in table.records:
+                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
 
             # Query yesterday's load
             load_result = await influxdb_client.query(f'''
@@ -239,7 +264,7 @@ from(bucket: "{solar_bucket}")
                 for record in table.records:
                     t = record.get_time()
                     key = t.strftime("%Y-%m-%d-%H")
-                    if key in heating_hours:
+                    if key in high_load_hours:
                         continue
 
                     hour = t.hour
@@ -336,6 +361,8 @@ from(bucket: "{solar_bucket}")
         discharge_rate_kw: float = 2.5,  # Max discharge rate (at 100% power)
         discharge_power_pct: float = 25.0,  # Actual discharge power %
         efficiency: float = 0.85,
+        sell_fee_czk: float = 0.5,  # Fee per kWh sold to grid
+        battery_amortisation_czk: float = 2.0,  # Battery wear cost per kWh
     ) -> Tuple[Set[datetime], Set[datetime], List[BlockDecision]]:
         """Optimize charge/discharge schedule.
 
@@ -455,6 +482,39 @@ from(bucket: "{solar_bucket}")
             running_min = min(running_min, prices[i])
             future_min_price[i] = running_min
 
+        # Pre-select charge blocks: pick cheapest N blocks where charging is
+        # profitable vs buying from grid later. Don't charge at 1.28 CZK when
+        # -2.0 blocks are available — better to sit at min SOC and buy from grid.
+        median_price = sorted_prices[n // 2] if n > 0 else 2.0
+        charge_threshold = median_price * efficiency  # Only charge below this
+        profitable_charge_blocks = [
+            (ts, p) for ts, p in blocks if p < charge_threshold
+        ]
+        profitable_charge_blocks.sort(key=lambda x: x[1])  # Cheapest first
+
+        # Calculate how much grid charging we actually need:
+        # Total battery gap minus expected net solar charging (solar - consumption)
+        battery_gap_kwh = battery_capacity_kwh * (max_soc - current_soc) / 100
+        expected_solar_charge = 0.0
+        for ts, _ in blocks:
+            h = ts.hour
+            solar_h = solar_hourly.get(h, 0) / 4.0  # kWh per 15-min block
+            consumption_h = consumption_hourly.get(h, 0) / 4.0
+            net = solar_h - consumption_h
+            if net > 0:
+                expected_solar_charge += net * efficiency
+        grid_needed_kwh = max(0, battery_gap_kwh - expected_solar_charge)
+
+        # Convert to blocks needed (min 4 to always grab the cheapest/negative prices)
+        kwh_per_charge = kwh_per_block * efficiency
+        blocks_to_fill = max(4, int(grid_needed_kwh / kwh_per_charge) + 1) if kwh_per_charge > 0 else 4
+
+        # Also always include negative price blocks (get paid to charge)
+        negative_blocks = set(ts for ts, p in blocks if p < 0)
+
+        max_charge = min(len(profitable_charge_blocks), blocks_to_fill)
+        charge_block_set = set(ts for ts, _ in profitable_charge_blocks[:max_charge]) | negative_blocks
+
         # Forward simulation
         soc = current_soc
         decisions: List[BlockDecision] = []
@@ -494,9 +554,11 @@ from(bucket: "{solar_bucket}")
             charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
             # --- DISCHARGE value ---
-            # Worth discharging if current price exceeds opportunity cost
+            # Real sell revenue = spot - distribution - sell_fee - battery_amortisation
+            # Must exceed recharge cost to be profitable
             recharge_cost = future_cheapest / efficiency  # Cost to refill later
-            discharge_profit = price_czk - recharge_cost - dist  # Net profit per kWh
+            sell_revenue = price_czk - dist - sell_fee_czk - battery_amortisation_czk
+            discharge_profit = sell_revenue - recharge_cost  # Net profit per kWh
             discharge_possible = min(
                 discharge_kwh_per_block,
                 (battery_kwh - min_battery_kwh) * efficiency
@@ -520,44 +582,74 @@ from(bucket: "{solar_bucket}")
             action = "hold"
             net_value = hold_value
 
-            if charge_value > discharge_value and charge_value > hold_value:
-                # Charge is best — but only if price is in the cheapest portion
-                # Use price ranking: only charge in bottom 30% of price blocks
-                price_rank = sum(1 for p in prices if p < price_czk) / n if n > 0 else 0.5
-                if price_rank < 0.35 and charge_possible > 0:
-                    action = "charge"
-                    net_value = charge_value
-                    soc += (charge_possible * efficiency / battery_capacity_kwh) * 100
-                    soc = min(max_soc, soc)
+            # Charge only during pre-selected cheapest blocks
+            if timestamp in charge_block_set and charge_possible > 0:
+                action = "charge"
+                net_value = charge_value
 
+            # Discharge when profitable (sell revenue > recharge cost + fees)
             if discharge_value > 0 and discharge_value > net_value:
-                # Discharge is profitable
-                price_rank = sum(1 for p in prices if p < price_czk) / n if n > 0 else 0.5
-                if price_rank > 0.7 and discharge_possible > 0:
+                if discharge_possible > 0 and soc > effective_min_soc:
                     action = "discharge"
                     net_value = discharge_value
-                    soc -= (discharge_kwh_per_block / battery_capacity_kwh) * 100
-                    soc = max(effective_min_soc, soc)
 
-            # Apply solar charging in hold/charge modes
-            if action != "discharge" and net_solar > 0:
-                solar_charge_kwh = min(
-                    net_solar,
-                    (battery_capacity_kwh * max_soc / 100 - battery_capacity_kwh * soc / 100)
-                )
-                if solar_charge_kwh > 0:
-                    soc += (solar_charge_kwh * efficiency / battery_capacity_kwh) * 100
-                    soc = min(max_soc, soc)
+            # === REALISTIC SOC SIMULATION ===
+            # Every block: house consumes, solar produces, charge/discharge adds/removes
+            # Base load always drains battery (when no solar/grid covers it)
 
-            # Apply consumption draw from battery in hold mode
-            if action == "hold" and net_solar < 0:
-                draw_kwh = min(
-                    abs(net_solar),
-                    (battery_capacity_kwh * soc / 100 - min_battery_kwh)
-                )
-                if draw_kwh > 0:
-                    soc -= (draw_kwh / battery_capacity_kwh) * 100
-                    soc = max(effective_min_soc, soc)
+            # 1. Solar production this block
+            solar_available = solar  # kWh this 15-min block
+
+            # 2. House consumption this block
+            # consumption is already per 15-min block (hourly / 4 from line above)
+            house_load = consumption if consumption > 0 else (
+                self._base_load_profile.get(hour, first_block_ts.weekday() >= 5) / 4.0
+            )
+
+            # 3. Net energy balance before charge/discharge command
+            net_from_solar = solar_available - house_load  # positive = excess solar
+
+            if action == "charge":
+                # Grid charges battery at charge_rate, house still consumes
+                # Net battery change = grid charge * efficiency + excess solar * efficiency - deficit from load
+                grid_charge = kwh_per_block
+                if net_from_solar > 0:
+                    # Solar covers house + charges battery
+                    solar_to_batt = min(net_from_solar * efficiency,
+                                        (max_battery_kwh - battery_kwh))
+                    soc += (grid_charge * efficiency + solar_to_batt) / battery_capacity_kwh * 100
+                else:
+                    # House draws some from grid charge, rest goes to battery
+                    # Grid provides charge_rate, some goes to house, rest to battery
+                    net_charge = grid_charge * efficiency + net_from_solar  # net_from_solar is negative
+                    soc += max(0, net_charge) / battery_capacity_kwh * 100
+                soc = min(max_soc, soc)
+
+            elif action == "discharge":
+                # Battery discharges at discharge_rate TO GRID + house consumes from battery
+                grid_discharge = discharge_kwh_per_block
+                if net_from_solar >= 0:
+                    soc -= grid_discharge / battery_capacity_kwh * 100
+                else:
+                    total_drain = grid_discharge + abs(net_from_solar)
+                    soc -= total_drain / battery_capacity_kwh * 100
+                # Discharge stops at physical min SOC (not reserve floor)
+                soc = max(min_soc, soc)
+
+            else:  # hold
+                if net_from_solar > 0:
+                    solar_to_batt = min(net_from_solar * efficiency,
+                                        max_battery_kwh - battery_kwh)
+                    if solar_to_batt > 0:
+                        soc += solar_to_batt / battery_capacity_kwh * 100
+                        soc = min(max_soc, soc)
+                else:
+                    # House draws from battery down to physical min SOC
+                    draw = min(abs(net_from_solar),
+                               battery_capacity_kwh * soc / 100 - battery_capacity_kwh * min_soc / 100)
+                    if draw > 0:
+                        soc -= draw / battery_capacity_kwh * 100
+                        soc = max(min_soc, soc)
 
             decision = BlockDecision(
                 timestamp=timestamp,
