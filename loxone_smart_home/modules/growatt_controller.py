@@ -37,6 +37,7 @@ from .growatt.consumption_forecast import ConsumptionForecast
 from .growatt.optimizer import BatteryOptimizer
 from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
+from .growatt.schedule_coordinator import ScheduleCoordinator
 
 
 class GrowattController(BaseModule):
@@ -102,11 +103,11 @@ class GrowattController(BaseModule):
         # Set sensible defaults for optional flags in a separate dict
         # (Pydantic models don't allow dynamic attribute assignment)
         self._optional_config = {
-            "dst_merge_policy": getattr(self.config, "dst_merge_policy", "avg"),
-            "eur_czk_rate": getattr(self.config, "eur_czk_rate", 25.0),
-            "temperature_avg_days": getattr(self.config, "temperature_avg_days", 3),
-            "summer_temp_threshold": getattr(self.config, "summer_temp_threshold", 15.0),
-            "simulation_mode": getattr(self.config, "simulation_mode", False),
+            "dst_merge_policy": self.config.dst_merge_policy if hasattr(self.config, "dst_merge_policy") else "avg",
+            "eur_czk_rate": self.config.eur_czk_rate,
+            "temperature_avg_days": self.config.temperature_avg_days,
+            "summer_temp_threshold": self.config.summer_temp_threshold,
+            "simulation_mode": self.config.simulation_mode,
         }
 
         # Note: All config validation is handled by Pydantic Field constraints
@@ -171,7 +172,7 @@ class GrowattController(BaseModule):
         self._cheapest_charging_blocks: Set[Tuple[str, str]] = set()
         self._pre_discharge_blocks: Set[Tuple[str, str]] = set()
         self._peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
-        self._combined_charging_blocks: Set[Tuple[str, str]] = set()
+        # _combined_charging_blocks is a property proxy to self._schedule
         self._prices_date: Optional[str] = None
         self._prices_updated: Optional[datetime] = None
 
@@ -189,12 +190,20 @@ class GrowattController(BaseModule):
 
         # Initialize refactored modules
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
-        self._mode_manager = ModeManager(self)
+        self._mode_manager = ModeManager(
+            logger=self.logger,
+            mqtt_client=self.mqtt_client,
+            config=self.config,
+            optional_config=self._optional_config,
+            local_tz=self._local_tz,
+            last_applied=self._last_applied,
+            adapter=self,
+        )
         self._decision_engine = GrowattDecisionEngine(self.logger)
 
         # Solar forecast (Phase 2)
         self._solar_forecast: Optional[SolarForecast] = None
-        if getattr(self.config, 'solar_forecast_enabled', False):
+        if self.config.solar_forecast_enabled:
             self._solar_forecast = SolarForecast.from_config(
                 self.config, self.logger, settings=self.settings
             )
@@ -205,13 +214,13 @@ class GrowattController(BaseModule):
 
         # Consumption forecast (Phase 3.1)
         self._consumption_forecast: Optional[ConsumptionForecast] = None
-        if getattr(self.config, 'consumption_forecast_enabled', False):
+        if self.config.consumption_forecast_enabled:
             self._consumption_forecast = ConsumptionForecast(self.logger)
             self.logger.info("Consumption forecast enabled (model will build on startup)")
 
         # Greedy optimizer (Phase 3.2)
         self._optimizer: Optional[BatteryOptimizer] = None
-        if getattr(self.config, 'optimizer_enabled', False):
+        if self.config.optimizer_enabled:
             self._optimizer = BatteryOptimizer(self.logger)
             self.logger.info("Battery optimizer enabled")
 
@@ -236,29 +245,8 @@ class GrowattController(BaseModule):
         self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
-        # Two-day lookahead state (defer charging if tomorrow significantly cheaper)
-        # NOTE: This defer logic will be replaced by cross-day optimization
-        self._defer_charging_to_tomorrow: bool = False  # Flag: skip today's charging for tomorrow
-        self._tomorrow_cheaper_by: Optional[float] = None  # How much cheaper tomorrow is (%)
-
-        # Cross-day scheduling (NEW: date-aware optimization across available window)
-        # Today's optimal blocks
-        self._cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's blocks
-        self._cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()
-        # Today's pre-discharge
-        self._pre_discharge_blocks_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's pre-discharge
-        self._pre_discharge_blocks_tomorrow: Set[Tuple[str, str]] = set()
-        # Today's discharge periods
-        self._discharge_periods_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's discharge
-        self._discharge_periods_tomorrow: Set[Tuple[str, str]] = set()
-
-        # Queued schedules for midnight application
-        self._queued_tomorrow_charging: List[Tuple[datetime, datetime, float]] = []
-        self._queued_tomorrow_pre_discharge: List[Tuple[datetime, datetime, float]] = []
-        self._queued_tomorrow_discharge: List[Tuple[datetime, datetime, float]] = []
+        # Schedule state is owned by ScheduleCoordinator (self._schedule).
+        # Property proxies below delegate to it for backward compatibility.
 
         # Command queue for managing multiple concurrent commands
         self._command_queue = CommandQueue(self.logger)
@@ -271,6 +259,9 @@ class GrowattController(BaseModule):
             self.logger.warning(
                 f"Invalid Growatt log level '{self.config.log_level}', using DETAIL"
             )
+
+        # Schedule coordinator (owns schedule state and price logging)
+        self._schedule = ScheduleCoordinator(self.logger, self._log_level)
 
         # Pre-register MQTT subscriptions before connection
         # This ensures subscriptions are active before the message loop starts
@@ -287,36 +278,113 @@ class GrowattController(BaseModule):
         """Check if we should log at given level."""
         return self._log_level >= level
 
+    # ── Property proxies delegating schedule state to ScheduleCoordinator ──
+
+    @property
+    def _cheapest_charging_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.cheapest_charging_blocks_today
+
+    @_cheapest_charging_blocks_today.setter
+    def _cheapest_charging_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.cheapest_charging_blocks_today = value
+
+    @property
+    def _cheapest_charging_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.cheapest_charging_blocks_tomorrow
+
+    @_cheapest_charging_blocks_tomorrow.setter
+    def _cheapest_charging_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.cheapest_charging_blocks_tomorrow = value
+
+    @property
+    def _pre_discharge_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.pre_discharge_blocks_today
+
+    @_pre_discharge_blocks_today.setter
+    def _pre_discharge_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.pre_discharge_blocks_today = value
+
+    @property
+    def _pre_discharge_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.pre_discharge_blocks_tomorrow
+
+    @_pre_discharge_blocks_tomorrow.setter
+    def _pre_discharge_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.pre_discharge_blocks_tomorrow = value
+
+    @property
+    def _discharge_periods_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.discharge_periods_today
+
+    @_discharge_periods_today.setter
+    def _discharge_periods_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.discharge_periods_today = value
+
+    @property
+    def _discharge_periods_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.discharge_periods_tomorrow
+
+    @_discharge_periods_tomorrow.setter
+    def _discharge_periods_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.discharge_periods_tomorrow = value
+
+    @property
+    def _combined_charging_blocks(self) -> Set[Tuple[str, str]]:
+        return self._schedule.combined_charging_blocks
+
+    @_combined_charging_blocks.setter
+    def _combined_charging_blocks(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.combined_charging_blocks = value
+
+    @property
+    def _queued_tomorrow_charging(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_charging
+
+    @_queued_tomorrow_charging.setter
+    def _queued_tomorrow_charging(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_charging = value
+
+    @property
+    def _queued_tomorrow_pre_discharge(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_pre_discharge
+
+    @_queued_tomorrow_pre_discharge.setter
+    def _queued_tomorrow_pre_discharge(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_pre_discharge = value
+
+    @property
+    def _queued_tomorrow_discharge(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_discharge
+
+    @_queued_tomorrow_discharge.setter
+    def _queued_tomorrow_discharge(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_discharge = value
+
+    @property
+    def _defer_charging_to_tomorrow(self) -> bool:
+        return self._schedule.defer_charging_to_tomorrow
+
+    @_defer_charging_to_tomorrow.setter
+    def _defer_charging_to_tomorrow(self, value: bool) -> None:
+        self._schedule.defer_charging_to_tomorrow = value
+
+    @property
+    def _tomorrow_cheaper_by(self) -> Optional[float]:
+        return self._schedule.tomorrow_cheaper_by
+
+    @_tomorrow_cheaper_by.setter
+    def _tomorrow_cheaper_by(self, value: Optional[float]) -> None:
+        self._schedule.tomorrow_cheaper_by = value
+
+    # ── Delegated methods ──
+
     def _format_price_summary(
         self,
         blocks: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float
+        eur_czk_rate: float,
     ) -> str:
-        """Format a compact price summary for DETAIL level logging."""
-        if not blocks:
-            return "No blocks"
-
-        prices_czk = [p * eur_czk_rate / 1000 for _, _, p in blocks]
-        min_price = min(prices_czk)
-        max_price = max(prices_czk)
-        avg_price = sum(prices_czk) / len(prices_czk)
-
-        # Group consecutive blocks for compact display
-        groups = self._group_consecutive_blocks_datetime(blocks)
-
-        if len(groups) == 1:
-            group = groups[0]
-            start = group[0][0]
-            end = group[-1][1]
-            return (
-                f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
-                f"({len(blocks)} blocks, avg {avg_price:.2f} CZK/kWh)"
-            )
-        else:
-            return (
-                f"{len(blocks)} blocks in {len(groups)} periods, "
-                f"avg {avg_price:.2f} CZK/kWh (min {min_price:.2f}, max {max_price:.2f})"
-            )
+        """Format a compact price summary. Delegates to ScheduleCoordinator."""
+        return self._schedule.format_price_summary(blocks)
 
     def _log_compact_schedule(
         self,
@@ -324,26 +392,12 @@ class GrowattController(BaseModule):
         charging_tomorrow: List[Tuple[datetime, datetime, float]],
         discharge_today: List[Tuple[datetime, datetime, float]],
         discharge_tomorrow: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float
+        eur_czk_rate: float,
     ) -> None:
-        """Log compact schedule summary for DETAIL level."""
-        self.logger.info("📊 Schedule Summary:")
-
-        if charging_today:
-            summary = self._format_price_summary(charging_today, eur_czk_rate)
-            self.logger.info(f"  🔋 Charging today: {summary}")
-
-        if charging_tomorrow:
-            summary = self._format_price_summary(charging_tomorrow, eur_czk_rate)
-            self.logger.info(f"  🔋 Charging tomorrow: {summary}")
-
-        if discharge_today:
-            summary = self._format_price_summary(discharge_today, eur_czk_rate)
-            self.logger.info(f"  ⚡ Discharge today: {summary}")
-
-        if discharge_tomorrow:
-            summary = self._format_price_summary(discharge_tomorrow, eur_czk_rate)
-            self.logger.info(f"  ⚡ Discharge tomorrow: {summary}")
+        """Log compact schedule summary. Delegates to ScheduleCoordinator."""
+        self._schedule.log_compact_schedule(
+            charging_today, charging_tomorrow, discharge_today, discharge_tomorrow
+        )
 
     async def _log_periodic_summary(self) -> None:
         """Log a periodic summary of the current state and statistics.
@@ -376,8 +430,7 @@ class GrowattController(BaseModule):
         block_key = (time_str, end_str)
 
         if block_key in self._current_prices:
-            price_eur = self._current_prices[block_key]
-            price_czk = price_eur * (self._eur_czk_rate or 25.0) / 1000
+            price_czk = self._current_prices[block_key]
             summary_parts.append(f"Price: {price_czk:.2f} CZK/kWh")
 
         # Command statistics
@@ -684,11 +737,6 @@ class GrowattController(BaseModule):
             self.logger.debug(f"🔍 DEBUG _to_device_hhmm: Converted {s!r} to {result!r}")
         return result
 
-    async def _set_mode(self, mode: str, *args: Any) -> None:
-        """Set the inverter mode (thin dispatcher to individual setters)."""
-        # These direct calls are no longer used - decision engine handles modes
-        pass
-
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
         local_date = self._get_local_now() + timedelta(days=days_ahead)
@@ -726,7 +774,7 @@ class GrowattController(BaseModule):
         enabling true global optimization across day boundaries.
 
         Returns:
-            List of (start_datetime, end_datetime, price_eur) sorted chronologically
+            List of (start_datetime, end_datetime, price_czk) sorted chronologically
             Empty list if no price data available
         """
         now = self._get_local_now()
@@ -795,157 +843,26 @@ class GrowattController(BaseModule):
     def _group_consecutive_blocks_datetime(
         self, blocks: List[Tuple[datetime, datetime, float]]
     ) -> List[List[Tuple[datetime, datetime, float]]]:
-        """Group consecutive datetime-based blocks into periods.
-
-        Args:
-            blocks: List of (start_dt, end_dt, price) tuples
-
-        Returns:
-            List of groups, where each group is a list of consecutive blocks
-        """
-        if not blocks:
-            return []
-
-        # Sort by start time
-        sorted_blocks = sorted(blocks, key=lambda x: x[0])
-
-        groups: List[List[Tuple[datetime, datetime, float]]] = []
-        current_group = [sorted_blocks[0]]
-
-        for i in range(1, len(sorted_blocks)):
-            prev_end = current_group[-1][1]
-            curr_start = sorted_blocks[i][0]
-
-            # Check if consecutive (end of prev equals start of current)
-            if prev_end == curr_start:
-                current_group.append(sorted_blocks[i])
-            else:
-                # Gap found - save current group and start new one
-                groups.append(current_group)
-                current_group = [sorted_blocks[i]]
-
-        # Add the last group
-        groups.append(current_group)
-
-        return groups
+        """Group consecutive blocks. Delegates to ScheduleCoordinator."""
+        return ScheduleCoordinator.group_consecutive_blocks(blocks)
 
     async def _log_cross_day_price_table(
         self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float,
         force_display: bool = False
     ) -> None:
-        """Log comprehensive cross-day price table showing all available blocks.
-
-        Displays a compact table with visual markers for each block's treatment:
-        - 🔋 = Regular charging block
-        - 🔌 = Pre-discharge charging block
-        - ⚡ = Discharge block
-        - (blank) = No special action
-
-        Args:
-            window: List of (start_dt, end_dt, price_eur) covering available price window
-            eur_czk_rate: Exchange rate for EUR to CZK conversion
-            force_display: If True, always show table regardless of log level (for startup)
-        """
-        if not window:
-            return
-
-        # When force_display, re-fetch window with past blocks included
+        """Log cross-day price table. Delegates to ScheduleCoordinator."""
+        # Provide full_window when force_display needs past blocks
+        full_window = None
         if force_display:
-            full_window = self._get_combined_price_window(include_past=True)
-            if full_window:
-                window = full_window
+            full_window = self._get_combined_price_window(include_past=True) or None
 
-        # Only show full table at VERBOSE level (unless forced for startup)
-        if not force_display and not self._should_log(GrowattLogLevel.VERBOSE):
-            # At DETAIL level, just show a summary
-            if self._should_log(GrowattLogLevel.DETAIL):
-                all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
-                min_price = min(all_prices_czk)
-                max_price = max(all_prices_czk)
-                avg_price = sum(all_prices_czk) / len(all_prices_czk)
-
-                self.logger.info(
-                    f"📊 Price summary ({len(window)} blocks): "
-                    f"Min={min_price:.2f} CZK/kWh, Max={max_price:.2f} CZK/kWh, "
-                    f"Avg={avg_price:.2f} CZK/kWh"
-                )
-            return
-
-        now = self._get_local_now()
-        today = now.date()
-
-        # Create lookup sets for fast classification
-        charging_today = self._cheapest_charging_blocks_today
-        charging_tomorrow = self._cheapest_charging_blocks_tomorrow
-        pre_discharge_today = self._pre_discharge_blocks_today
-        pre_discharge_tomorrow = self._pre_discharge_blocks_tomorrow
-        discharge_today = self._discharge_periods_today
-        discharge_tomorrow = self._discharge_periods_tomorrow
-
-        self.logger.info("")
-        self.logger.info("=" * 70)
-        self.logger.info("📊 COMPREHENSIVE PRICE TABLE (entire available window)")
-        self.logger.info("=" * 70)
-
-        # Group blocks by date
-        today_blocks = [(s, e, p) for s, e, p in window if s.date() == today]
-        tomorrow_blocks = [(s, e, p) for s, e, p in window if s.date() > today]
-
-        # Display today's prices (if any remaining)
-        if today_blocks:
-            self._log_price_table_for_date(
-                today_blocks,
-                today,
-                eur_czk_rate,
-                charging_today,
-                pre_discharge_today,
-                discharge_today,
-                "TODAY"
-            )
-
-        # Display tomorrow's prices (if available)
-        if tomorrow_blocks:
-            tomorrow_date = tomorrow_blocks[0][0].date()
-            self._log_price_table_for_date(
-                tomorrow_blocks,
-                tomorrow_date,
-                eur_czk_rate,
-                charging_tomorrow,
-                pre_discharge_tomorrow,
-                discharge_tomorrow,
-                "TOMORROW"
-            )
-
-        # Display legend
-        self.logger.info("")
-        legend_items = []
-        if self._optimizer:
-            # Optimizer mode: simplified labels
-            if charging_today or charging_tomorrow:
-                legend_items.append("🔋=Charge (optimizer)")
-            if discharge_today or discharge_tomorrow:
-                legend_items.append("⚡=Discharge (optimizer)")
-        else:
-            if charging_today or charging_tomorrow:
-                legend_items.append("🔋=Regular charge")
-            if pre_discharge_today or pre_discharge_tomorrow:
-                legend_items.append("🔌=Pre-discharge charge")
-            if discharge_today or discharge_tomorrow:
-                legend_items.append("⚡=Discharge")
-        if legend_items:
-            self.logger.info(f"Legend: {', '.join(legend_items)}")
-
-        # Display summary statistics across entire window
-        all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
-        min_price = min(all_prices_czk)
-        max_price = max(all_prices_czk)
-        avg_price = sum(all_prices_czk) / len(all_prices_czk)
-
-        self.logger.info(
-            f"Window summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
-            f"Avg={avg_price:.3f} CZK/kWh"
+        self._schedule.log_cross_day_price_table(
+            window,
+            force_display=force_display,
+            now=self._get_local_now(),
+            full_window=full_window,
+            has_optimizer=self._optimizer is not None,
         )
-        self.logger.info("=" * 70)
 
     def _log_price_table_for_date(
         self,
@@ -955,82 +872,12 @@ class GrowattController(BaseModule):
         charging_blocks: Set[Tuple[str, str]],
         pre_discharge_blocks: Set[Tuple[str, str]],
         discharge_blocks: Set[Tuple[str, str]],
-        title: str
+        title: str,
     ) -> None:
-        """Log price table for a single date in 4-column format.
-
-        Args:
-            blocks: List of (start_dt, end_dt, price_eur) for this date
-            date: Date being displayed
-            eur_czk_rate: Exchange rate
-            charging_blocks: Set of (start_str, end_str) for charging
-            pre_discharge_blocks: Set of (start_str, end_str) for pre-discharge
-            discharge_blocks: Set of (start_str, end_str) for discharge
-            title: Title to display for this table
-        """
-        self.logger.info("")
-        self.logger.info(f"--- {title} ({date.strftime('%Y-%m-%d')}) ---")
-        self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
-        self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
-        self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
-
-        # Create a dict for fast lookup by time string
-        block_dict = {}
-        for start_dt, end_dt, price in blocks:
-            start_str = start_dt.strftime("%H:%M")
-            end_str = end_dt.strftime("%H:%M")
-            block_dict[(start_str, end_str)] = price
-
-        # Process by hour (4 blocks per hour)
-        # Determine hour range from actual blocks
-        if blocks:
-            start_hour = blocks[0][0].hour
-            end_hour = blocks[-1][0].hour
-
-            for hour in range(start_hour, end_hour + 1):
-                row_prices = []
-
-                # Process 4 quarter-hour blocks
-                for quarter in range(4):
-                    minute = quarter * 15
-                    next_minute = (quarter + 1) * 15
-
-                    start_str = f"{hour:02d}:{minute:02d}"
-                    if next_minute < 60:
-                        end_str = f"{hour:02d}:{next_minute:02d}"
-                    else:
-                        end_str = f"{(hour + 1) % 24:02d}:00"
-
-                    # Find matching block
-                    block_key = (start_str, end_str)
-                    if block_key in block_dict:
-                        price_eur = block_dict[block_key]
-                        price_czk = price_eur * eur_czk_rate / 1000
-
-                        # Determine marker
-                        if block_key in pre_discharge_blocks:
-                            marker = "🔌"
-                        elif block_key in charging_blocks:
-                            marker = "🔋"
-                        elif block_key in discharge_blocks:
-                            marker = "⚡"
-                        else:
-                            marker = " "
-
-                        row_prices.append(f"{price_czk:5.2f}{marker}")
-                    else:
-                        row_prices.append("   -   ")
-
-                # Pad if we don't have all 4 blocks
-                while len(row_prices) < 4:
-                    row_prices.append("   -   ")
-
-                self.logger.info(
-                    f"│ {hour:02d}:00   │ {row_prices[0]} │ {row_prices[1]} │ "
-                    f"{row_prices[2]} │ {row_prices[3]} │"
-                )
-
-        self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
+        """Log price table for a single date. Delegates to ScheduleCoordinator."""
+        self._schedule.log_price_table_for_date(
+            blocks, date, charging_blocks, pre_discharge_blocks, discharge_blocks, title
+        )
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
@@ -1444,8 +1291,7 @@ class GrowattController(BaseModule):
 
                 # Get prices for each 15-minute block in CZK/kWh
                 prices = []
-                for (start, end), price_eur in hour_blocks:
-                    price_czk = price_eur * eur_czk_rate / 1000
+                for (start, end), price_czk in hour_blocks:
                     # Mark blocks: 🔋=regular charge, 🔌=pre-discharge charge, ⚡=discharge
                     if (hasattr(self, '_pre_discharge_blocks') and
                             (start, end) in self._pre_discharge_blocks):
@@ -1481,9 +1327,9 @@ class GrowattController(BaseModule):
 
             # Show summary statistics
             all_prices = list(prices_15min.values())
-            min_price = min(all_prices) * eur_czk_rate / 1000
-            max_price = max(all_prices) * eur_czk_rate / 1000
-            avg_price = sum(all_prices) / len(all_prices) * eur_czk_rate / 1000
+            min_price = min(all_prices)
+            max_price = max(all_prices)
+            avg_price = sum(all_prices) / len(all_prices)
 
             self.logger.info(
                 f"Summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
@@ -1491,19 +1337,18 @@ class GrowattController(BaseModule):
             )
         else:
             # Fallback for fewer blocks - show as list
-            self.logger.info("┌──────────────┬────────────┬──────────────┐")
-            self.logger.info("│   Period     │ EUR/MWh    │   CZK/kWh    │")
-            self.logger.info("├──────────────┼────────────┼──────────────┤")
+            self.logger.info("┌──────────────┬──────────────┐")
+            self.logger.info("│   Period     │   CZK/kWh    │")
+            self.logger.info("├──────────────┼──────────────┤")
 
             sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
-            for (start, end), price_eur_mwh in sorted_blocks:
-                price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
+            for (start, end), price_czk_kwh in sorted_blocks:
                 period = f"{start}-{end}"
                 self.logger.info(
-                    f"│ {period:12s} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │"
+                    f"│ {period:12s} │   {price_czk_kwh:7.3f}    │"
                 )
 
-            self.logger.info("└──────────────┴────────────┴──────────────┘")
+            self.logger.info("└──────────────┴──────────────┘")
 
     async def start(self) -> None:
         """Start the Growatt controller."""
@@ -2003,13 +1848,16 @@ from(bucket: "{bucket}")
                 prices_15min = self._price_analyzer.generate_mock_prices(target_date)
 
             if prices_15min:
-                # Store prices in cache (now 15-minute intervals)
-                self._current_prices = prices_15min
+                # Get exchange rate first (needed for conversion)
+                self._eur_czk_rate = await self._get_eur_czk_rate()
+
+                # Store prices converted to CZK/kWh (single conversion point)
+                from .growatt.price_utils import convert_price_dict
+                self._current_prices = convert_price_dict(
+                    prices_15min, self._eur_czk_rate
+                )
                 self._prices_date = target_date
                 self._prices_updated = datetime.now()
-
-                # Get exchange rate
-                self._eur_czk_rate = await self._get_eur_czk_rate()
 
                 self.logger.info(
                     f"📊 Fetched {len(prices_15min)} price blocks for {target_date}"
@@ -2063,35 +1911,35 @@ from(bucket: "{bucket}")
         # === STEP 1: Use shared scheduling logic to find optimal blocks ===
         discharge_threshold_czk = self.config.discharge_price_min
 
-        # Convert window format for shared function: (start_dt, end_dt, price_eur) -> (start_dt, price_czk)
-        price_blocks_czk = [(start_dt, price_eur * rate / 1000) for start_dt, end_dt, price_eur in window]
+        # Window prices are already in CZK/kWh (converted at storage time)
+        price_blocks_czk = [(start_dt, price_czk) for start_dt, end_dt, price_czk in window]
 
         # Determine charge block count (dynamic or fixed)
-        if getattr(self.config, 'dynamic_charge_blocks', True):
+        if self.config.dynamic_charge_blocks:
             all_prices = [price for _, price in price_blocks_czk]
             # Average self-consumption value: median price + average distribution tariff
             sorted_p = sorted(all_prices)
             median_price = sorted_p[len(sorted_p) // 2] if sorted_p else 2.0
             avg_dist = (
-                getattr(self.config, 'distribution_tariff_high', 1.5)
-                + getattr(self.config, 'distribution_tariff_low', 0.5)
+                self.config.distribution_tariff_high
+                + self.config.distribution_tariff_low
             ) / 2
             self_consumption_value = median_price + avg_dist
             charge_blocks_count = calculate_dynamic_block_count(
                 prices_czk=all_prices,
-                min_blocks=getattr(self.config, 'min_charge_blocks', 4),
-                max_blocks=getattr(self.config, 'max_charge_blocks', 16),
+                min_blocks=self.config.min_charge_blocks,
+                max_blocks=self.config.max_charge_blocks,
                 self_consumption_value=self_consumption_value,
-                battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
+                battery_efficiency=self.config.battery_efficiency,
             )
             self.logger.info(
                 f"Dynamic charging: {charge_blocks_count} blocks "
                 f"(self-consumption value: {self_consumption_value:.2f} CZK/kWh, "
-                f"range: {getattr(self.config, 'min_charge_blocks', 4)}-"
-                f"{getattr(self.config, 'max_charge_blocks', 16)})"
+                f"range: {self.config.min_charge_blocks}-"
+                f"{self.config.max_charge_blocks})"
             )
         else:
-            charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
+            charge_blocks_count = self.config.battery_charge_blocks
 
         # Solar forecast adjustment: reduce grid charging when solar will fill battery
         # Only count FUTURE solar production (hours that haven't happened yet)
@@ -2113,13 +1961,13 @@ from(bucket: "{bucket}")
                     (self.config.max_soc - self._battery_soc) / 100
                     * self.config.battery_capacity
                 )
-                efficiency = getattr(self.config, 'battery_efficiency', 0.85)
+                efficiency = self.config.battery_efficiency
                 grid_needed_kwh = max(0, battery_headroom - future_solar * efficiency)
                 # Each 15-min block charges roughly capacity/4 * charge_rate
                 # Conservative estimate: ~0.625 kWh per block for a 10kWh battery
                 kwh_per_block = self.config.battery_capacity / 16
                 solar_adjusted = max(
-                    getattr(self.config, 'min_charge_blocks', 4),
+                    self.config.min_charge_blocks,
                     min(charge_blocks_count, math.ceil(grid_needed_kwh / kwh_per_block))
                 )
                 if solar_adjusted < charge_blocks_count:
@@ -2158,16 +2006,16 @@ from(bucket: "{bucket}")
                     consumption_hourly[h] = self._optimizer._base_load_profile.get(h, is_weekend)
 
             dist_thresholds = PriceThresholds(
-                charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
-                export_price_min=getattr(self.config, 'export_price_min', 1.0),
-                discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
-                discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
-                battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
-                summer_charge_price_max=getattr(self.config, 'summer_charge_price_max', 0.0),
-                distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
-                distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
-                low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
-                eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
+                charge_price_max=self.config.charge_price_max,
+                export_price_min=self.config.export_price_min,
+                discharge_price_min=self.config.discharge_price_min,
+                discharge_profit_margin=self.config.discharge_profit_margin,
+                battery_efficiency=self.config.battery_efficiency,
+                summer_charge_price_max=self.config.summer_charge_price_max,
+                distribution_tariff_high=self.config.distribution_tariff_high,
+                distribution_tariff_low=self.config.distribution_tariff_low,
+                low_tariff_hours=self.config.low_tariff_hours,
+                eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
             )
             dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
                 h, dist_thresholds
@@ -2183,9 +2031,9 @@ from(bucket: "{bucket}")
                 min_soc=self.config.min_soc,
                 max_soc=self.config.max_soc,
                 discharge_power_pct=self.config.discharge_power_rate,
-                efficiency=getattr(self.config, 'battery_efficiency', 0.85),
-                sell_fee_czk=getattr(self.config, 'sell_fee_czk', 0.5),
-                battery_amortisation_czk=getattr(self.config, 'battery_amortisation_czk', 2.0),
+                efficiency=self.config.battery_efficiency,
+                sell_fee_czk=self.config.sell_fee_czk,
+                battery_amortisation_czk=self.config.battery_amortisation_czk,
             )
             summary = self._optimizer.summarize(decisions)
             self.logger.info(
@@ -2214,7 +2062,7 @@ from(bucket: "{bucket}")
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
-            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
             if start_dt in charge_times
         ]
         cheapest_sorted = sorted(cheapest_blocks, key=lambda x: x[0])  # Sort chronologically
@@ -2237,8 +2085,7 @@ from(bucket: "{bucket}")
                 if charging_today:
                     summary = self._format_price_summary(charging_today, rate)
                     self.logger.info(f"  Today: {summary}")
-                    for start_dt, end_dt, price in charging_today:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2246,8 +2093,7 @@ from(bucket: "{bucket}")
                 if charging_tomorrow:
                     summary = self._format_price_summary(charging_tomorrow, rate)
                     self.logger.info(f"  Tomorrow: {summary}")
-                    for start_dt, end_dt, price in charging_tomorrow:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2274,8 +2120,7 @@ from(bucket: "{bucket}")
                 if charging_today:
                     self.logger.info("")
                     self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
-                    for start_dt, end_dt, price in charging_today:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
                             f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2285,8 +2130,7 @@ from(bucket: "{bucket}")
                 if charging_tomorrow:
                     self.logger.info("")
                     self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
-                    for start_dt, end_dt, price in charging_tomorrow:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
                             f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2297,7 +2141,7 @@ from(bucket: "{bucket}")
 
         # Rebuild discharge schedule in original format for compatibility
         discharge_blocks = [
-            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
             if start_dt in discharge_times
         ]
 
@@ -2335,7 +2179,7 @@ from(bucket: "{bucket}")
                     for group in groups:
                         start = group[0][0]
                         end = group[-1][1]
-                        avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                        avg_price = sum(p for _, _, p in group) / len(group)
                         self.logger.info(
                             f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
                             f"{avg_price:.3f} CZK/kWh avg"
@@ -2349,7 +2193,7 @@ from(bucket: "{bucket}")
                 for group in groups:
                     start = group[0][0]
                     end = group[-1][1]
-                    avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                    avg_price = sum(p for _, _, p in group) / len(group)
                     self.logger.info(
                         f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
                         f"{avg_price:.3f} CZK/kWh avg"
@@ -2376,7 +2220,7 @@ from(bucket: "{bucket}")
                 merged_groups.append(current_merged)
 
             # For each discharge period, find cheapest blocks before it
-            max_pre_charge = getattr(self.config, 'pre_discharge_charge_blocks', 8)
+            max_pre_charge = self.config.pre_discharge_charge_blocks
 
             for group in merged_groups:
                 discharge_start = group[0][0]
@@ -2419,8 +2263,7 @@ from(bucket: "{bucket}")
 
                 if pre_discharge_today:
                     self.logger.info(f"   Today: {len(pre_discharge_today)} blocks")
-                    for start_dt, end_dt, price in pre_discharge_today:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in pre_discharge_today:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2428,8 +2271,7 @@ from(bucket: "{bucket}")
 
                 if pre_discharge_tomorrow:
                     self.logger.info(f"   Tomorrow: {len(pre_discharge_tomorrow)} blocks")
-                    for start_dt, end_dt, price in pre_discharge_tomorrow:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in pre_discharge_tomorrow:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2568,7 +2410,7 @@ from(bucket: "{bucket}")
             rate: EUR to CZK conversion rate
 
         Returns:
-            List of tuples (start_time, end_time, price_eur) for discharge periods
+            List of tuples (start_time, end_time, price_czk) for discharge periods
         """
         if not prices:
             return []
@@ -2579,19 +2421,17 @@ from(bucket: "{bucket}")
         discharge_min_czk = self.config.discharge_price_min
         profit_margin = self.config.discharge_profit_margin
 
-        # Find cheapest block price
-        cheapest_price_eur = min(prices.values())
-        cheapest_price_czk = cheapest_price_eur * rate / 1000
+        # Find cheapest block price (already CZK/kWh)
+        cheapest_price_czk = min(prices.values())
 
         # Calculate effective threshold
         required_by_margin = cheapest_price_czk * profit_margin
         effective_threshold_czk = max(discharge_min_czk, required_by_margin)
 
         # Find all periods above threshold
-        for (start, end), price_eur in sorted(prices.items()):
-            price_czk = price_eur * rate / 1000
+        for (start, end), price_czk in sorted(prices.items()):
             if price_czk >= effective_threshold_czk:
-                discharge_periods.append((start, end, price_eur))
+                discharge_periods.append((start, end, price_czk))
 
         return discharge_periods
 
@@ -2603,8 +2443,8 @@ from(bucket: "{bucket}")
 
         Returns:
             Dictionary containing:
-            - today_prices: Dict of (start, end) -> price_eur for today
-            - tomorrow_prices: Dict of (start, end) -> price_eur for tomorrow
+            - today_prices: Dict of (start, end) -> price_czk_kwh for today
+            - tomorrow_prices: Dict of (start, end) -> price_czk_kwh for tomorrow
             - today_date: ISO date string for today
             - tomorrow_date: ISO date string for tomorrow (or None)
             - charging_blocks_today: Set of (start, end) time tuples
@@ -2621,7 +2461,7 @@ from(bucket: "{bucket}")
 
         # Return current schedule state
         return {
-            # Price data (in EUR/MWh, same as stored internally)
+            # Price data (in CZK/kWh, converted at storage time)
             "today_prices": self._current_prices.copy() if self._current_prices else {},
             "tomorrow_prices": self._next_day_prices.copy() if self._next_day_prices else {},
             "today_date": self._prices_date or today_date,
@@ -2682,7 +2522,7 @@ from(bucket: "{bucket}")
         if charging_schedule:
             # Calculate average price for charging blocks
             avg_price = sum(block[2] for block in charging_schedule) / len(charging_schedule)
-            avg_czk = avg_price * rate / 1000
+            avg_czk = avg_price  # Already CZK/kWh
             charge_duration_hours = charge_blocks * 0.25  # 15 minutes = 0.25 hours
 
             # Log charging schedule
@@ -2694,8 +2534,7 @@ from(bucket: "{bucket}")
             self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
             self.logger.info("   Charging blocks:")
 
-            for start, end, price_eur in charging_schedule:
-                price_czk = price_eur * rate / 1000
+            for start, end, price_czk in charging_schedule:
                 self.logger.info(
                     f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
                 )
@@ -2714,12 +2553,11 @@ from(bucket: "{bucket}")
         if discharge_periods:
             # Calculate average price for discharge blocks
             avg_discharge_price = sum(p[2] for p in discharge_periods) / len(discharge_periods)
-            avg_discharge_czk = avg_discharge_price * rate / 1000
+            avg_discharge_czk = avg_discharge_price  # Already CZK/kWh
             discharge_duration_hours = len(discharge_periods) * 0.25
 
             # Get cheapest price for profit calculation
-            cheapest_price_eur = min(prices.values())
-            cheapest_price_czk = cheapest_price_eur * rate / 1000
+            cheapest_price_czk = min(prices.values())  # Already CZK/kWh
 
             # Calculate profit margin
             profit_margin = avg_discharge_czk / cheapest_price_czk if cheapest_price_czk > 0 else 0
@@ -2761,7 +2599,7 @@ from(bucket: "{bucket}")
                 start = group[0][0]
                 end = group[-1][1]
                 avg_group_price = sum(p[2] for p in group) / len(group)
-                avg_group_czk = avg_group_price * rate / 1000
+                avg_group_czk = avg_group_price  # Already CZK/kWh
                 if len(group) > 1:
                     self.logger.info(
                         f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh "
@@ -2792,167 +2630,6 @@ from(bucket: "{bucket}")
         """Handle new price data availability."""
         await self._evaluate_conditions("price_update")
 
-    async def _analyze_tomorrow_vs_today(self) -> None:
-        """DEPRECATED: Replaced by cross-day optimal scheduling.
-
-        The new `_calculate_cross_day_optimal_schedule()` method handles this
-        automatically by finding globally optimal blocks across the entire window.
-        """
-        # No-op: Cross-day scheduling handles this automatically
-        return
-
-        # OLD CODE BELOW (kept for reference, not executed)
-        """Compare tomorrow's prices vs today's remaining hours.
-
-        If tomorrow is significantly cheaper (based on defer_to_tomorrow_threshold),
-        set flag to defer charging until tomorrow.
-        """
-        if not self._next_day_prices or not self._current_prices:
-            return
-
-        now = self._get_local_now()
-        current_block = (now.hour, now.minute // 15)
-
-        # Get remaining today's prices (from now to 23:59)
-        remaining_today: Dict[Tuple[str, str], float] = {}
-        for (start, end), price in self._current_prices.items():
-            start_hour, start_min = map(int, start.split(':'))
-            block = (start_hour, start_min // 15)
-            if block >= current_block:
-                remaining_today[(start, end)] = price
-
-        if not remaining_today:
-            # No remaining hours today
-            self.logger.debug("No remaining hours today for comparison")
-            return
-
-        # Find cheapest N blocks from today's remaining
-        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-        today_schedule, today_avg = self._price_analyzer.get_charging_schedule(
-            remaining_today, num_blocks=min(charge_blocks, len(remaining_today))
-        )
-
-        # Find cheapest N blocks from tomorrow
-        tomorrow_schedule, tomorrow_avg = self._price_analyzer.get_charging_schedule(
-            self._next_day_prices, num_blocks=charge_blocks
-        )
-
-        # Get exchange rate
-        rate = self._eur_czk_rate or 25.0
-
-        # Compare averages
-        if today_avg > 0:
-            cheaper_by_percent = (1 - tomorrow_avg / today_avg) * 100
-
-            # Convert to CZK/kWh for display
-            today_avg_czk = today_avg * rate / 1000
-            tomorrow_avg_czk = tomorrow_avg * rate / 1000
-
-            # Decision threshold from config
-            defer_threshold = self.config.defer_to_tomorrow_threshold
-
-            self.logger.info("=" * 50)
-            self.logger.info("📊 TWO-DAY PRICE COMPARISON")
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"Today's remaining {len(today_schedule)} cheapest blocks: "
-                f"avg {today_avg_czk:.2f} CZK/kWh"
-            )
-            self.logger.info(
-                f"Tomorrow's {len(tomorrow_schedule)} cheapest blocks: "
-                f"avg {tomorrow_avg_czk:.2f} CZK/kWh"
-            )
-            self.logger.info(
-                f"Difference: {cheaper_by_percent:+.1f}% "
-                f"(threshold: {defer_threshold:.1f}%)"
-            )
-
-            if cheaper_by_percent >= defer_threshold:
-                self._defer_charging_to_tomorrow = True
-                self._tomorrow_cheaper_by = cheaper_by_percent
-
-                self.logger.info(
-                    f"🚫 DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
-                    f"(≥{defer_threshold:.1f}% threshold)"
-                )
-                self.logger.info(
-                    "   ⏸️  Deferring all charging to tomorrow's cheaper hours"
-                )
-                self.logger.info(
-                    f"   💰 Potential savings: "
-                    f"{(today_avg_czk - tomorrow_avg_czk):.2f} CZK/kWh"
-                )
-            else:
-                self._defer_charging_to_tomorrow = False
-                self._tomorrow_cheaper_by = None
-
-                self.logger.info(
-                    f"✅ DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
-                    f"(<{defer_threshold:.1f}% threshold)"
-                )
-                self.logger.info(
-                    "   ▶️  Continue with today's charging schedule"
-                )
-
-            self.logger.info("=" * 50)
-
-    async def _display_next_day_prices(self) -> None:
-        """DEPRECATED: Replaced by cross-day optimal scheduling.
-
-        The new `_calculate_cross_day_optimal_schedule()` method displays
-        comprehensive cross-day schedule including tomorrow's blocks.
-        """
-        # No-op: Cross-day scheduling displays this automatically
-        return
-
-        # OLD CODE BELOW (kept for reference, not executed)
-        """Display next-day price table and charging schedule."""
-        if not self._next_day_prices or not self._next_day_prices_date:
-            return
-
-        self.logger.info("")
-        self.logger.info("=" * 50)
-        self.logger.info(f"📅 NEXT DAY PRICES ({self._next_day_prices_date})")
-        self.logger.info("=" * 50)
-
-        # Calculate schedule for tomorrow
-        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-        charging_schedule, _ = self._price_analyzer.get_charging_schedule(
-            self._next_day_prices, num_blocks=charge_blocks
-        )
-
-        # Calculate discharge periods
-        rate = self._eur_czk_rate or 25.0
-        discharge_periods = self._calculate_discharge_periods(
-            self._next_day_prices, rate
-        )
-
-        # Calculate pre-discharge schedule
-        pre_discharge_schedule: List[Tuple[str, str, float]] = []
-        peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
-        if discharge_periods:
-            pre_discharge_charge_blocks = getattr(
-                self.config, 'pre_discharge_charge_blocks', 8
-            )
-
-            pre_discharge_schedule, peak_to_precharge_map = (
-                self._price_analyzer.calculate_pre_discharge_schedule(
-                    self._next_day_prices,
-                    discharge_periods,
-                    pre_discharge_charge_blocks
-                )
-            )
-
-        # Display the table
-        await self._log_price_analysis(
-            self._next_day_prices,
-            self._next_day_prices_date,
-            charging_schedule,
-            charge_blocks,
-            pre_discharge_schedule,
-            peak_to_precharge_map
-        )
-
     async def _fetch_next_day_prices_task(self) -> None:
         """Background task to fetch next day's prices with infinite retry.
 
@@ -2979,8 +2656,10 @@ from(bucket: "{bucket}")
             )
 
             if prices:
-                # Store next day's prices
-                self._next_day_prices = prices
+                # Store next day's prices converted to CZK/kWh
+                from .growatt.price_utils import convert_price_dict
+                rate = self._eur_czk_rate or self.config.eur_czk_rate
+                self._next_day_prices = convert_price_dict(prices, rate)
                 self._next_day_prices_date = tomorrow_date
                 self._next_day_prices_fetched = True
 
@@ -3076,7 +2755,7 @@ from(bucket: "{bucket}")
                 # even when mode hasn't changed
                 if self._current_inverter_state and context.price_thresholds:
                     if context.current_block_key in context.prices_15min:
-                        current_price_czk = context.current_price * context.eur_czk_rate / 1000
+                        current_price_czk = context.current_price  # Already CZK/kWh
                         should_export = current_price_czk >= context.price_thresholds.export_price_min
                         if should_export != self._current_inverter_state.export_enabled:
                             if should_export:
@@ -3138,16 +2817,16 @@ from(bucket: "{bucket}")
 
         # Create price thresholds from config (all in CZK/kWh)
         price_thresholds = PriceThresholds(
-            charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
-            export_price_min=getattr(self.config, 'export_price_min', 1.0),
-            discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
-            discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
-            battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85),
-            summer_charge_price_max=getattr(self.config, 'summer_charge_price_max', 0.0),
-            distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
-            distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
-            low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
-            eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
+            charge_price_max=self.config.charge_price_max,
+            export_price_min=self.config.export_price_min,
+            discharge_price_min=self.config.discharge_price_min,
+            discharge_profit_margin=self.config.discharge_profit_margin,
+            battery_efficiency=self.config.battery_efficiency,
+            summer_charge_price_max=self.config.summer_charge_price_max,
+            distribution_tariff_high=self.config.distribution_tariff_high,
+            distribution_tariff_low=self.config.distribution_tariff_low,
+            low_tariff_hours=self.config.low_tariff_hours,
+            eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
         )
 
         # Calculate price ranking for current 15-minute block
@@ -3162,7 +2841,7 @@ from(bucket: "{bucket}")
                     f"{price_ranking.total_blocks} "
                     f"(percentile {price_ranking.percentile:.1f}%, "
                     f"{price_ranking.price_quadrant}), "
-                    f"spread {price_ranking.daily_spread:.2f} EUR/MWh"
+                    f"spread {price_ranking.daily_spread:.2f} CZK/kWh"
                 )
 
         return DecisionContext(
@@ -3175,6 +2854,8 @@ from(bucket: "{bucket}")
             high_loads_active=self._high_loads_active,
             high_load_details=self._high_load_details,
             battery_soc=self._battery_soc,
+            min_soc=float(self.config.min_soc),
+            max_soc=float(self.config.max_soc),
             current_mode=self._current_mode,
             current_load=self._current_load,
             solar_power=self._solar_power,
@@ -3194,7 +2875,7 @@ from(bucket: "{bucket}")
             sunrise=sunrise,
             sunset=sunset,
             is_summer_mode=(await self._get_season_mode() == "summer"),
-            eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
+            eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
         )
 
     async def _build_desired_state(
@@ -3218,21 +2899,25 @@ from(bucket: "{bucket}")
             mode = "regular"
             mode_def = MODE_DEFINITIONS["regular"]
 
-        # Determine actual SOC value
-        stop_soc_raw = mode_def.get("stop_soc", 20)
-        stop_soc: int = 20
-        if stop_soc_raw == "configurable":
+        # Determine actual SOC value — resolve string markers from MODE_DEFINITIONS
+        stop_soc_raw = mode_def.get("stop_soc", "min_soc")
+        stop_soc: int = int(self.config.min_soc)
+        if stop_soc_raw == "min_soc":
+            stop_soc = int(self.config.min_soc)
+        elif stop_soc_raw == "max_soc":
+            stop_soc = int(self.config.max_soc)
+        elif stop_soc_raw == "configurable":
             # Use appropriate default based on mode type
             if mode == "discharge_to_grid":
-                default_soc = self.config.discharge_min_soc  # Use 20% for discharge
+                default_soc = self.config.discharge_min_soc
             elif mode == "charge_from_grid":
-                default_soc = self.config.max_soc  # Use 100% for charging
+                default_soc = self.config.max_soc
             else:
-                default_soc = self.config.max_soc  # Default to max for other modes
+                default_soc = self.config.max_soc
 
             soc_param = params.get("stop_soc", default_soc)
             stop_soc = int(soc_param) if soc_param is not None else int(default_soc)
-        elif isinstance(stop_soc_raw, (int, float, str)):
+        elif isinstance(stop_soc_raw, (int, float)):
             stop_soc = int(stop_soc_raw)
 
         # Determine power rate
@@ -3258,7 +2943,7 @@ from(bucket: "{bucket}")
         try:
             context = await self._build_decision_context()
             if context.price_thresholds and context.current_block_key in context.prices_15min:
-                current_price_czk = context.current_price * (self._eur_czk_rate or 25.0) / 1000  # EUR/MWh to CZK/kWh
+                current_price_czk = context.current_price  # Already CZK/kWh
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:
             self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")

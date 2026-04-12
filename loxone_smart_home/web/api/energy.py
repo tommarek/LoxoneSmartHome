@@ -820,8 +820,8 @@ def _format_day_schedule_from_controller(
         else:
             mode, icon = "normal", "-"
 
-        # Convert price EUR/MWh to CZK/kWh (same as controller)
-        price_czk_kwh = price_eur * eur_czk_rate / 1000
+        # Prices already in CZK/kWh (converted at storage time in controller)
+        price_czk_kwh = price_eur
 
         # Format time block
         time_block = f"{start_str}-{end_str}"

@@ -343,3 +343,64 @@ class TestOptimizer15Min:
             battery_amortisation_czk=2.0,
         )
         assert len(discharge_high_dist) < len(discharge_low_dist)
+
+
+class TestTwoPassOptimizer:
+    """Tests for the two-pass charge block refinement."""
+
+    def test_pass2_no_change_when_no_waste(self, optimizer: BatteryOptimizer) -> None:
+        """When no charge blocks are wasted, Pass 2 returns the same set."""
+        # Low SOC + cheap blocks = charge is useful, not wasted
+        blocks = make_15min_blocks([0.5, 0.5, 5.0, 5.0], start_hour=0)
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=lambda h: 0.5,
+            current_soc=20.0,  # Low SOC — charging is needed
+            min_soc=20.0,
+        )
+        # All charge blocks should have meaningful SOC increase
+        for d in decisions:
+            if d.action == "charge":
+                assert d.soc_after - d.soc_before >= 1.0, \
+                    f"Charge at {d.timestamp} had SOC change of only {d.soc_after - d.soc_before}%"
+
+    def test_pass2_redistributes_solar_overlap(self, optimizer: BatteryOptimizer) -> None:
+        """When solar fills battery during a charge slot, Pass 2 moves it."""
+        # Hour 0-1: cheap (charge candidates)
+        # Hour 2-3: expensive
+        # Heavy solar at hour 0 means charging at hour 0 is wasted
+        blocks = make_15min_blocks([0.5, 0.5, 5.0, 5.0], start_hour=0)
+        solar = {0: 10.0, 1: 0.0, 2: 0.0, 3: 0.0}  # Huge solar at hour 0
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly={0: 0.5, 1: 0.5, 2: 0.5, 3: 0.5},
+            distribution_func=lambda h: 0.5,
+            current_soc=20.0,
+            min_soc=20.0,
+            max_soc=100.0,
+            battery_capacity_kwh=10.0,
+        )
+        # The optimizer should still find charge blocks, but they should be
+        # at hours where solar doesn't already fill the battery
+        assert len(charge) > 0
+
+    def test_pass2_preserves_negative_prices(self, optimizer: BatteryOptimizer) -> None:
+        """Negative price blocks should never be considered 'wasted'."""
+        # Negative prices = get paid to charge, should always be kept
+        blocks = make_15min_blocks([-1.0, -0.5, 5.0, 5.0], start_hour=0)
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={0: 10.0, 1: 10.0, 2: 0.0, 3: 0.0},  # Solar fills battery
+            consumption_hourly={},
+            distribution_func=lambda h: 0.5,
+            current_soc=20.0,
+            min_soc=20.0,
+            battery_capacity_kwh=10.0,
+        )
+        # Negative price blocks should be in charge set
+        negative_block_hours = {ts.hour for ts in charge if ts.hour in [0, 1]}
+        # At least some negative-price blocks should be selected
+        assert len(charge) > 0

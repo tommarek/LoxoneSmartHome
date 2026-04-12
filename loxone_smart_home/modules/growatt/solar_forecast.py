@@ -160,8 +160,8 @@ class SolarProductionModel:
             filtered = values
         return statistics.median(filtered)
 
-    def add_sample(self, rad_b: int, cloud_b: int, az_b: int, alt_b: int,
-                   temp_b: int, kwh: float) -> None:
+    def add_sample(self, rad_b: int, cloud_b: int, alt_b: int,
+                   kwh: float) -> None:
         """Add a training sample to all bin levels."""
         k3 = (rad_b, cloud_b, alt_b)
         k2 = (rad_b, cloud_b)
@@ -613,11 +613,9 @@ from(bucket: "{weather_bucket}")
 
                 rad_b = SolarProductionModel.radiation_to_bucket(ghi)
                 cloud_b = SolarProductionModel.cloud_to_bucket(cloud)
-                az_b = SolarProductionModel.azimuth_to_bucket(azimuth)
                 alt_b = SolarProductionModel.altitude_to_bucket(altitude)
-                temp_b = SolarProductionModel.temp_to_bucket(temp)
 
-                m.add_sample(rad_b, cloud_b, az_b, alt_b, temp_b, kwh)
+                m.add_sample(rad_b, cloud_b, alt_b, kwh)
 
             # PASS 1: Build rough model from all matched data
             total_kwp = sum(a.kwp for a in self.arrays)

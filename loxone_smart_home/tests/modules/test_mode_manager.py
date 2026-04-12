@@ -37,8 +37,16 @@ def mock_controller():
 
 @pytest.fixture
 def mode_manager(mock_controller):
-    """Create a ModeManager instance with mocked controller."""
-    return ModeManager(mock_controller)
+    """Create a ModeManager instance with explicit dependencies."""
+    return ModeManager(
+        logger=mock_controller.logger,
+        mqtt_client=mock_controller.mqtt_client,
+        config=mock_controller.config,
+        optional_config=mock_controller._optional_config,
+        local_tz=mock_controller._local_tz,
+        last_applied=mock_controller._last_applied,
+        adapter=mock_controller,
+    )
 
 
 @pytest.mark.asyncio

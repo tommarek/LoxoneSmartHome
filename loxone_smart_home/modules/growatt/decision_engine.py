@@ -84,6 +84,9 @@ class DecisionContext:
     is_battery_charging_scheduled: bool = False
     # High load details (which loads are active)
     high_load_details: Dict[str, Any] = field(default_factory=dict)
+    # Battery SOC limits (from config, avoids hardcoding)
+    min_soc: float = 20.0
+    max_soc: float = 100.0
     # Optimizer-scheduled discharge blocks
     optimizer_discharge_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_discharge_scheduled: bool = False
@@ -95,7 +98,7 @@ class DecisionContext:
             # (e.g., negative prices = get paid to consume)
             if self.current_block_key and self.cheapest_blocks:
                 in_cheapest = self.current_block_key in self.cheapest_blocks
-                current_czk = self.current_price * self.eur_czk_rate / 1000  # EUR/MWh to CZK/kWh
+                current_czk = self.current_price  # Already CZK/kWh
                 max_price = (
                     self.price_thresholds.summer_charge_price_max
                     if self.price_thresholds else 0.0
@@ -154,25 +157,25 @@ MODE_DEFINITIONS = {
     "regular": {
         "description": "Normal operation - load first",
         "inverter_mode": "load_first",
-        "stop_soc": 20,  # Default minimum SOC
+        "stop_soc": "min_soc",  # Resolved from config at runtime
         "ac_charge": False
     },
     "high_load_protected": {
         "description": "High load protection - prevent battery discharge",
         "inverter_mode": "load_first",
-        "stop_soc": 100,  # Prevent any discharge
+        "stop_soc": "max_soc",  # Prevent any discharge
         "ac_charge": False
     },
     "charge_from_grid": {
         "description": "Charging battery from grid to 100%",
         "inverter_mode": "battery_first",
-        "stop_soc": 100,  # Charge to full
+        "stop_soc": "max_soc",  # Charge to full
         "ac_charge": True
     },
     "battery_first_ac_charge": {
         "description": "Battery-first with AC charging (high load + cheap price)",
         "inverter_mode": "battery_first",
-        "stop_soc": 100,  # Charge to full and prevent discharge
+        "stop_soc": "max_soc",  # Charge to full and prevent discharge
         "ac_charge": True,
         "high_load_compatible": True  # Can run with high loads
     },
@@ -185,7 +188,7 @@ MODE_DEFINITIONS = {
     "sell_production": {
         "description": "Sell only solar production",
         "inverter_mode": "grid_first",
-        "stop_soc": 100,  # Don't discharge battery
+        "stop_soc": "max_soc",  # Don't discharge battery
         "ac_charge": False
     }
 }
@@ -227,7 +230,7 @@ class GrowattDecisionEngine:
                 priority=Priority.SCHEDULED_BATTERY_CHARGING,
                 condition=lambda ctx: (
                     ctx.high_loads_active
-                    and ctx.battery_soc < 100
+                    and ctx.battery_soc < ctx.max_soc
                     and ctx.is_battery_charging_scheduled
                 ),
                 action="battery_first_ac_charge",
@@ -242,7 +245,7 @@ class GrowattDecisionEngine:
                 name="Scheduled Battery Charging",
                 priority=Priority.SCHEDULED_BATTERY_CHARGING,
                 condition=lambda ctx: (
-                    ctx.battery_soc < 100
+                    ctx.battery_soc < ctx.max_soc
                     and ctx.is_battery_charging_scheduled
                 ),
                 action="charge_from_grid",
@@ -267,7 +270,7 @@ class GrowattDecisionEngine:
                 priority=Priority.SCHEDULED_MODE,
                 condition=lambda ctx: (
                     ctx.is_optimizer_discharge_scheduled
-                    and ctx.battery_soc > 20
+                    and ctx.battery_soc > ctx.min_soc
                     and not ctx.high_loads_active
                 ),
                 action="discharge_to_grid",
@@ -505,7 +508,7 @@ class GrowattDecisionEngine:
             True if battery should discharge to grid
         """
         # Don't discharge if battery is too low
-        if context.battery_soc <= 20:
+        if context.battery_soc <= context.min_soc:
             return False
 
         # Don't discharge during high loads
@@ -516,16 +519,14 @@ class GrowattDecisionEngine:
         if not context.price_thresholds or context.current_price <= 0:
             return False
 
-        # Convert current price to CZK/kWh (EUR/MWh * rate / 1000)
-        eur_czk = context.price_thresholds.eur_czk_rate if context.price_thresholds else 25.0
-        current_price_czk = context.current_price * eur_czk / 1000
+        # Prices are already in CZK/kWh (converted at storage time)
+        current_price_czk = context.current_price
 
         # Find the absolute cheapest 15-minute block price
         if not context.prices_15min:
             return False
 
-        cheapest_block_price = min(context.prices_15min.values())
-        cheapest_block_czk = cheapest_block_price * eur_czk / 1000
+        cheapest_block_czk = min(context.prices_15min.values())
 
         # Calculate required price based on profit margin
         required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
@@ -565,32 +566,6 @@ class GrowattDecisionEngine:
                 f"(margin: {required_by_margin:.2f}, "
                 f"self-consumption: {self_consumption_floor:.2f})"
             )
-            return False
-
-    def _is_hour_in_range(self, hour: str, start: str, end: str) -> bool:
-        """Check if an hour is within a time range.
-
-        Args:
-            hour: Hour to check (HH:MM)
-            start: Range start (HH:MM)
-            end: Range end (HH:MM)
-
-        Returns:
-            True if hour is in range
-        """
-        try:
-            # Handle both HH:MM and HH:00 formats
-            h_time = datetime.strptime(hour[:5], "%H:%M").time()
-            s_time = datetime.strptime(start[:5], "%H:%M").time()
-            e_time = datetime.strptime(end[:5], "%H:%M").time()
-
-            if s_time <= e_time:
-                return s_time <= h_time < e_time
-            else:
-                # Handles overnight ranges
-                return h_time >= s_time or h_time < e_time
-        except (ValueError, IndexError) as e:
-            self.logger.warning(f"Invalid time format in range check: {e}")
             return False
 
     def has_mode_changed(self, new_mode: str) -> bool:

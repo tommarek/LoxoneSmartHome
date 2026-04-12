@@ -124,7 +124,7 @@ async def api_live(request: web.Request) -> web.Response:
         now = ctrl._get_local_now()
         if ctrl._current_prices:
             prices = list(ctrl._current_prices.values())
-            avg_price = sum(p * rate / 1000 for p in prices) / len(prices) if prices else 0
+            avg_price = sum(prices) / len(prices) if prices else 0  # Already CZK/kWh
 
     return web.json_response({
         "power": {
@@ -157,8 +157,8 @@ async def api_status(request: web.Request) -> web.Response:
     now = ctrl._get_local_now()
     rate = ctrl._eur_czk_rate or 25.0
 
-    # Current price
-    current_price_eur = 0.0
+    # Current price (already CZK/kWh in _current_prices)
+    current_price_czk = 0.0
     current_block = None
     if ctrl._current_prices:
         block_min = (now.minute // 15) * 15
@@ -171,9 +171,7 @@ async def api_status(request: web.Request) -> web.Response:
         else:
             end_str = block_end.strftime("%H:%M")
         current_block = (start_str, end_str)
-        current_price_eur = ctrl._current_prices.get(current_block, 0.0)
-
-    current_price_czk = current_price_eur * rate / 1000
+        current_price_czk = ctrl._current_prices.get(current_block, 0.0)
 
     # Inverter state
     inv = ctrl._current_inverter_state
@@ -292,7 +290,6 @@ async def api_status(request: web.Request) -> web.Response:
         "mode": ctrl._current_mode,
         "battery_soc": _get_live_soc() or ctrl._battery_soc,
         "current_price": {
-            "eur_mwh": round(current_price_eur, 2),
             "czk_kwh": round(current_price_czk, 2),
             "block": current_block,
         },
@@ -359,7 +356,7 @@ async def api_prices(request: web.Request) -> web.Response:
     discharge = getattr(ctrl, '_discharge_periods_today', set())
 
     prices = []
-    for (start, end), price_eur in sorted(ctrl._current_prices.items()):
+    for (start, end), price_czk in sorted(ctrl._current_prices.items()):
         is_current = (start == cur_start and end == cur_end)
         is_charging = (start, end) in ctrl._combined_charging_blocks
         is_pre_discharge = (start, end) in pre_discharge
@@ -373,7 +370,7 @@ async def api_prices(request: web.Request) -> web.Response:
         elif is_discharge:
             status = "discharge"
 
-        czk = round(price_eur * rate / 1000, 2)
+        czk = round(price_czk, 2)  # Already CZK/kWh
         proj = soc_lookup.get(f"today:{start}", {})
         # Sell economics: what you actually get per kWh sold
         from .decision_engine import GrowattDecisionEngine, PriceThresholds
@@ -393,7 +390,6 @@ async def api_prices(request: web.Request) -> web.Response:
             "start": start,
             "end": end,
             "day": "today",
-            "eur_mwh": round(price_eur, 2),
             "czk_kwh": czk,
             "net_sell_czk": net_sell,
             "distribution_czk": round(dist, 2),
@@ -418,7 +414,7 @@ async def api_prices(request: web.Request) -> web.Response:
         pre_dis_tmrw = getattr(ctrl, '_pre_discharge_blocks_tomorrow', set())
         dis_tmrw = getattr(ctrl, '_discharge_periods_tomorrow', set())
 
-        for (start, end), price_eur in sorted(next_day.items()):
+        for (start, end), price_czk_t in sorted(next_day.items()):
             is_charging = (start, end) in charge_tmrw
             is_pre_discharge = (start, end) in pre_dis_tmrw
             is_discharge = (start, end) in dis_tmrw
@@ -431,7 +427,7 @@ async def api_prices(request: web.Request) -> web.Response:
             elif is_discharge:
                 status = "discharge"
 
-            czk_t = round(price_eur * rate / 1000, 2)
+            czk_t = round(price_czk_t, 2)  # Already CZK/kWh
             proj_t = soc_lookup.get(f"tomorrow:{start}", {})
             hour_t = int(start.split(":")[0])
             dist_t = GrowattDecisionEngine._get_distribution_tariff(
@@ -450,7 +446,6 @@ async def api_prices(request: web.Request) -> web.Response:
                 "start": start,
                 "end": end,
                 "day": "tomorrow",
-                "eur_mwh": round(price_eur, 2),
                 "czk_kwh": czk_t,
                 "net_sell_czk": net_sell_t,
                 "distribution_czk": round(dist_t, 2),
@@ -948,7 +943,7 @@ select, input {
       <h2>Current Price</h2>
       <div class="stat">
         <div class="stat-value" id="priceCzk">--</div>
-        <div class="stat-label">CZK/kWh (<span id="priceEur">--</span> EUR/MWh)</div>
+        <div class="stat-label">CZK/kWh</div>
       </div>
       <div class="stat" style="margin-top:8px">
         <div class="stat-label">Block: <span id="priceBlock">--</span></div>
@@ -1103,7 +1098,6 @@ function updateUI(d) {
   // Price
   const p = d.current_price || {};
   document.getElementById('priceCzk').textContent = (p.czk_kwh || 0).toFixed(2) + ' CZK/kWh';
-  document.getElementById('priceEur').textContent = (p.eur_mwh || 0).toFixed(1);
   document.getElementById('priceBlock').textContent = p.block ? p.block[0] + ' - ' + p.block[1] : '--';
   const priceEl = document.getElementById('priceCzk');
   priceEl.style.color = (p.czk_kwh || 0) < 0 ? 'var(--green)' : (p.czk_kwh || 0) > 3 ? 'var(--red)' : 'var(--text)';
@@ -1366,7 +1360,6 @@ function showTooltip(e, bar, tooltip) {
   tooltip.innerHTML =
     '<div class="tt-time">' + p.start + ' - ' + p.end + dayLabel + '</div>' +
     '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh</div>' +
-    '<div class="tt-row"><span class="tt-label">EUR/MWh</span><span>' + p.eur_mwh.toFixed(1) + '</span></div>' +
     '<div class="tt-row"><span class="tt-label">Net sell</span><span style="color:' + sellColor + '">' + netSell.toFixed(2) + ' CZK/kWh</span></div>' +
     '<div class="tt-row"><span class="tt-label" style="font-size:10px">spot ' + v.toFixed(2) + ' - dist ' + (p.distribution_czk||0).toFixed(2) + ' - fee 0.50 - amort 2.00</span></div>' +
     '<div class="tt-row"><span class="tt-label">Rank</span><span>#' + priceRank + '/' + sameDayPrices.length + ' (' + rankLabel + ')</span></div>' +

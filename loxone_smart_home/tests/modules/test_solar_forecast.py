@@ -297,8 +297,8 @@ class TestSolarProductionModel:
         """3D bin is the top level and is used when populated."""
         model = SolarProductionModel(total_kwp=13.5)
         # rad_b=20 (500 W/m²), cloud_b=2 (20%), alt_b=9 (45°)
-        model.add_sample(20, 2, 12, 9, 6, 5.0)
-        model.add_sample(20, 2, 12, 9, 6, 5.5)
+        model.add_sample(20, 2, 9, 5.0)
+        model.add_sample(20, 2, 9, 5.5)
         model.build()
         result = model.predict(ghi=500, cloud_cover=20, sun_altitude=45)
         assert result == pytest.approx(5.25, abs=0.1)
@@ -308,7 +308,7 @@ class TestSolarProductionModel:
         """Falls back to 2D when 3D bin is empty for the queried altitude."""
         model = SolarProductionModel(total_kwp=13.5)
         # Only populate altitude bucket 9 (45°)
-        model.add_sample(20, 2, 12, 9, 6, 5.0)
+        model.add_sample(20, 2, 9, 5.0)
         model.build()
         # Query altitude 30° (bucket 6) — misses 3D, hits 2D
         result = model.predict(ghi=500, cloud_cover=20, sun_altitude=30)
@@ -319,8 +319,8 @@ class TestSolarProductionModel:
         """Falls back to interpolation when 2D exact is empty."""
         model = SolarProductionModel(total_kwp=13.5)
         # Populate rad bucket 18 and 22 with cloud bucket 2
-        model.add_sample(18, 2, 12, 9, 6, 4.0)
-        model.add_sample(22, 2, 12, 9, 6, 6.0)
+        model.add_sample(18, 2, 9, 4.0)
+        model.add_sample(22, 2, 9, 6.0)
         model.build()
         # Query rad bucket 20 (ghi=500), cloud bucket 2 (20%), altitude bucket 4 (20°)
         # No 3D match at (20,2,4), no 2D exact at (20,2), interpolates between (18,2) and (22,2)

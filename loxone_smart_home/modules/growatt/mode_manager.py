@@ -4,30 +4,44 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
-
-if TYPE_CHECKING:
-    from ..growatt_controller import GrowattController
+from .types import InverterAdapter
 
 
 class ModeManager:
     """Manages Growatt inverter modes including battery-first, grid-first, and load-first."""
 
-    def __init__(self, controller: GrowattController) -> None:
-        """Initialize ModeManager with reference to main controller.
+    def __init__(
+        self,
+        logger: logging.Logger,
+        mqtt_client: Any,
+        config: Any,
+        optional_config: Dict[str, Any],
+        local_tz: Any,
+        last_applied: Dict[str, Tuple[Any, ...]],
+        adapter: InverterAdapter,
+    ) -> None:
+        """Initialize ModeManager with explicit dependencies.
 
         Args:
-            controller: Reference to the GrowattController instance
+            logger: Logger instance
+            mqtt_client: Async MQTT client for sending commands
+            config: GrowattConfig with topic and parameter settings
+            optional_config: Runtime override dict (simulation_mode, etc.)
+            local_tz: Local timezone (e.g., Europe/Prague)
+            last_applied: Shared dict tracking last-applied command signatures
+            adapter: InverterAdapter for time helpers and inverter queries
         """
-        self.controller = controller
-        self.logger = controller.logger
-        self.mqtt_client = controller.mqtt_client
-        self.config = controller.config
-        self._optional_config: Dict[str, Any] = controller._optional_config
-        self._local_tz = controller._local_tz
-        self._last_applied = controller._last_applied
+        self.logger = logger
+        self.mqtt_client = mqtt_client
+        self.config = config
+        self._optional_config = optional_config
+        self._local_tz = local_tz
+        self._last_applied = last_applied
+        self._adapter = adapter
 
         # Mode tracking
         self._battery_first_slots: Dict[int, Dict[str, Any]] = {}
@@ -40,9 +54,7 @@ class ModeManager:
 
     def _to_device_hhmm(self, s: str) -> str:
         """Convert time string to device format (HH:MM)."""
-        result = self.controller._to_device_hhmm(s)
-        assert isinstance(result, str)
-        return result
+        return self._adapter._to_device_hhmm(s)
 
     def _ensure_future_start(
         self,
@@ -52,22 +64,17 @@ class ModeManager:
         immediate_activation: bool = False
     ) -> tuple[str, str]:
         """Ensure start time is in future for inverter scheduling."""
-        result = self.controller._ensure_future_start(
+        return self._adapter._ensure_future_start(
             start_hour, stop_hour, preserve_duration, immediate_activation=immediate_activation
         )
-        assert isinstance(result, tuple) and len(result) == 2
-        return result
 
     async def _wait_for_command_result(self, command_path: str) -> Optional[Dict[str, Any]]:
         """Wait for command result from inverter."""
-        result = await self.controller._wait_for_command_result(command_path)
-        return result
+        return await self._adapter._wait_for_command_result(command_path)
 
     async def _query_inverter_state(self) -> Dict[str, Any]:
         """Query inverter state."""
-        result = await self.controller._query_inverter_state()
-        assert isinstance(result, dict)
-        return result
+        return await self._adapter._query_inverter_state()
 
     async def _execute_command_with_retry(
         self,
@@ -106,7 +113,7 @@ class ModeManager:
             await self.mqtt_client.publish(topic, json.dumps(payload))
 
             # Wait for result with configured timeout
-            result = await self.controller._wait_for_command_result(
+            result = await self._adapter._wait_for_command_result(
                 command_type, timeout=self.config.command_timeout
             )
 

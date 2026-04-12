@@ -564,7 +564,106 @@ from(bucket: "{solar_bucket}")
         max_charge = min(len(profitable_charge_blocks), blocks_to_fill)
         charge_block_set = set(ts for ts, _ in profitable_charge_blocks[:max_charge]) | negative_blocks
 
-        # Forward simulation
+        # Pass 1: initial forward simulation
+        charge_times, discharge_times, decisions = self._single_pass(
+            blocks, charge_block_set, solar_hourly, consumption_hourly,
+            distribution_func, battery_capacity_kwh, current_soc, min_soc,
+            max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
+            effective_min_socs, future_min_price, future_min_price_hour,
+            future_max_discharge_value, sorted_prices, sell_fee_czk,
+            battery_amortisation_czk, first_block_ts,
+        )
+
+        # Pass 2: refine charge block selection using actual SOC trajectory
+        refined_set = self._refine_charge_blocks(
+            blocks, charge_block_set, decisions, max_soc
+        )
+        if refined_set != charge_block_set:
+            moved = len(charge_block_set - refined_set)
+            self.logger.info(
+                f"Pass 2: redistributed {moved} charge blocks "
+                f"(wasted slots replaced with better candidates)"
+            )
+            charge_times, discharge_times, decisions = self._single_pass(
+                blocks, refined_set, solar_hourly, consumption_hourly,
+                distribution_func, battery_capacity_kwh, current_soc, min_soc,
+                max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
+                effective_min_socs, future_min_price, future_min_price_hour,
+                future_max_discharge_value, sorted_prices, sell_fee_czk,
+                battery_amortisation_czk, first_block_ts,
+            )
+
+        self._last_decisions = decisions
+        return charge_times, discharge_times, decisions
+
+    def _refine_charge_blocks(
+        self,
+        blocks: List[Tuple[datetime, float]],
+        original_charge_set: Set[datetime],
+        decisions: List[BlockDecision],
+        max_soc: float,
+    ) -> Set[datetime]:
+        """Identify wasted charge blocks and replace with better candidates.
+
+        A charge block is "wasted" if the battery was nearly full (from solar)
+        and the charge action barely increased SOC. These wasted slots are
+        replaced with the cheapest available hold blocks that had room to charge.
+
+        Returns the original set if no improvement is possible.
+        """
+        # Find wasted charge blocks: SOC barely changed (< 1%)
+        # Never consider negative-price blocks as wasted (we get paid to charge)
+        wasted = {
+            d.timestamp for d in decisions
+            if d.action == "charge"
+            and (d.soc_after - d.soc_before) < 1.0
+            and d.price_czk >= 0
+        }
+        if not wasted:
+            return original_charge_set
+
+        # Find candidate replacement blocks: hold blocks with room to charge
+        candidates = sorted(
+            [(d.timestamp, d.price_czk) for d in decisions
+             if d.action == "hold" and d.soc_before < max_soc - 5],
+            key=lambda x: x[1]  # Cheapest first
+        )
+
+        if not candidates:
+            return original_charge_set
+
+        # Replace wasted blocks with cheapest candidates
+        new_set = original_charge_set - wasted
+        for ts, _ in candidates[:len(wasted)]:
+            new_set.add(ts)
+
+        return new_set
+
+    def _single_pass(
+        self,
+        blocks: List[Tuple[datetime, float]],
+        charge_block_set: Set[datetime],
+        solar_hourly: Dict[int, float],
+        consumption_hourly: Dict[int, float],
+        distribution_func,
+        battery_capacity_kwh: float,
+        current_soc: float,
+        min_soc: float,
+        max_soc: float,
+        kwh_per_block: float,
+        discharge_kwh_per_block: float,
+        efficiency: float,
+        effective_min_socs: List[float],
+        future_min_price: List[float],
+        future_min_price_hour: List[int],
+        future_max_discharge_value: List[float],
+        sorted_prices: List[float],
+        sell_fee_czk: float,
+        battery_amortisation_czk: float,
+        first_block_ts: datetime,
+    ) -> Tuple[Set[datetime], Set[datetime], List[BlockDecision]]:
+        """Run a single forward simulation pass with given charge block set."""
+        n = len(blocks)
         soc = current_soc
         decisions: List[BlockDecision] = []
         charge_times: Set[datetime] = set()
@@ -595,23 +694,18 @@ from(bucket: "{solar_bucket}")
             future_cheapest = future_min_price[i] if i < n else sorted_prices[0]
 
             # --- CHARGE value ---
-            # Worth charging if future self-consumption value exceeds charge cost
-            charge_cost = price_czk + dist  # Cost to charge now
-            # Median price as estimate of future self-consumption value
+            charge_cost = price_czk + dist
             median_price = sorted_prices[n // 2] if n > 0 else 0
             future_value = (median_price + dist) * efficiency
             charge_possible = min(kwh_per_block, (max_battery_kwh - battery_kwh))
             charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
             # --- DISCHARGE value ---
-            # When selling to grid: receive spot minus distribution, sell fee, and wear.
-            # In Czech market, distribution tariff is paid on both buy and sell.
-            # When recharging later: pay spot + distribution at that future hour.
             sell_revenue = price_czk - dist - sell_fee_czk - battery_amortisation_czk
             future_recharge_hour = future_min_price_hour[i] if i < n else 0
             future_dist = distribution_func(future_recharge_hour)
             recharge_cost = (future_cheapest + future_dist) / efficiency
-            discharge_profit = sell_revenue - recharge_cost  # Net profit per kWh
+            discharge_profit = sell_revenue - recharge_cost
             discharge_possible = min(
                 discharge_kwh_per_block,
                 (battery_kwh - min_battery_kwh) * efficiency
@@ -619,15 +713,9 @@ from(bucket: "{solar_bucket}")
             discharge_value = discharge_profit if discharge_possible > 0 else float('-inf')
 
             # --- HOLD value ---
-            # Battery stays put; solar charges, consumption draws from grid
             hold_value = 0.0
-
-            # If there's excess solar and battery has room, solar charges battery
-            # for free — this is value we get without doing anything
             if net_solar > 0 and battery_kwh < max_battery_kwh:
-                # Solar fills battery for free → future self-consumption savings
                 solar_charge = min(net_solar, max_battery_kwh - battery_kwh)
-                # Don't need grid charging this block if solar covers it
                 hold_value += solar_charge * self_consumption_value * efficiency
 
             # Pick best action
@@ -635,15 +723,10 @@ from(bucket: "{solar_bucket}")
             action = "hold"
             net_value = hold_value
 
-            # Charge only during pre-selected cheapest blocks
             if timestamp in charge_block_set and charge_possible > 0:
                 action = "charge"
                 net_value = charge_value
 
-            # Discharge when profitable (sell revenue > recharge cost + fees)
-            # Only discharge if this block is at least 80% of the best remaining
-            # opportunity — prevents wasting battery on mediocre blocks when
-            # much better ones are upcoming.
             best_remaining = future_max_discharge_value[i] if i < n else 0
             is_worthwhile = (best_remaining <= 0) or (discharge_value >= best_remaining * 0.8)
             if discharge_value > 0 and discharge_value > net_value and is_worthwhile:
@@ -651,48 +734,29 @@ from(bucket: "{solar_bucket}")
                     action = "discharge"
                     net_value = discharge_value
 
-            # === REALISTIC SOC SIMULATION ===
-            # Every block: house consumes, solar produces, charge/discharge adds/removes
-            # Base load always drains battery (when no solar/grid covers it)
-
-            # 1. Solar production this block
-            solar_available = solar  # kWh this 15-min block
-
-            # 2. House consumption this block
-            # consumption is already per 15-min block (hourly / 4 from line above)
+            # === SOC SIMULATION ===
+            solar_available = solar
             house_load = consumption if consumption > 0 else (
                 self._base_load_profile.get(hour, first_block_ts.weekday() >= 5) / 4.0
             )
-
-            # 3. Net energy balance before charge/discharge command
-            net_from_solar = solar_available - house_load  # positive = excess solar
+            net_from_solar = solar_available - house_load
 
             if action == "charge":
-                # In charge-from-grid mode, battery charges at full charge_rate.
-                # Solar is used first (cheapest source), grid fills the gap.
-                # House consumption is covered separately — it does NOT reduce
-                # the charge power going to the battery.
-                # (AC charge power_rate is 100% — see _build_desired_state)
                 grid_charge = kwh_per_block
                 soc += (grid_charge * efficiency) / battery_capacity_kwh * 100
-                # Excess solar (after house load) also charges the battery
                 if net_from_solar > 0:
                     solar_to_batt = min(net_from_solar * efficiency,
                                         max_battery_kwh - battery_kwh)
                     soc += solar_to_batt / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
-
             elif action == "discharge":
-                # Battery discharges at discharge_rate TO GRID + house consumes from battery
                 grid_discharge = discharge_kwh_per_block
                 if net_from_solar >= 0:
                     soc -= grid_discharge / battery_capacity_kwh * 100
                 else:
                     total_drain = grid_discharge + abs(net_from_solar)
                     soc -= total_drain / battery_capacity_kwh * 100
-                # Discharge stops at physical min SOC (not reserve floor)
                 soc = max(min_soc, soc)
-
             else:  # hold
                 if net_from_solar > 0:
                     solar_to_batt = min(net_from_solar * efficiency,
@@ -701,7 +765,6 @@ from(bucket: "{solar_bucket}")
                         soc += solar_to_batt / battery_capacity_kwh * 100
                         soc = min(max_soc, soc)
                 else:
-                    # House draws from battery down to physical min SOC
                     draw = min(abs(net_from_solar),
                                battery_capacity_kwh * soc / 100 - battery_capacity_kwh * min_soc / 100)
                     if draw > 0:
@@ -726,7 +789,6 @@ from(bucket: "{solar_bucket}")
             elif action == "discharge":
                 discharge_times.add(timestamp)
 
-        self._last_decisions = decisions
         return charge_times, discharge_times, decisions
 
     def summarize(self, decisions: List[BlockDecision]) -> Dict:
