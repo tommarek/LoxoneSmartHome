@@ -242,6 +242,8 @@ async def api_status(request: web.Request) -> web.Response:
 
     # Optimizer summary
     optimizer_info = None
+    charge_today: set = set()
+    discharge_today: set = set()
     if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
         discharge_today = getattr(ctrl, '_discharge_periods_today', set())
         charge_today = getattr(ctrl, '_combined_charging_blocks', set())
@@ -277,7 +279,7 @@ async def api_status(request: web.Request) -> web.Response:
 
     # Next scheduled action
     next_action = None
-    if charge_today or discharge_today if optimizer_info else False:
+    if optimizer_info and (charge_today or discharge_today):
         current_block_str = f"{now.hour:02d}:{(now.minute // 15) * 15:02d}"
         all_blocks = [(b, "charge") for b in sorted(charge_today)] + [(b, "discharge") for b in sorted(discharge_today)]
         for (start, end), action_type in sorted(all_blocks):

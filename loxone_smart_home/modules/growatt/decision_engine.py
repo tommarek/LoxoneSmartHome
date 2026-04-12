@@ -70,7 +70,7 @@ class DecisionContext:
     current_mode: Optional[str] = None
     current_load: float = 0.0  # Current home load in kW
     solar_power: float = 0.0  # Current solar generation in kW
-    current_price: float = 0.0  # Current 15-minute block price EUR/MWh
+    current_price: float = 0.0  # Current 15-minute block price CZK/kWh
     current_block_key: Optional[Tuple[str, str]] = None  # Current 15-minute block
     prices_15min: Dict[Tuple[str, str], float] = field(default_factory=dict)  # 96 15-min blocks
     # Set of cheapest charging blocks
@@ -276,7 +276,7 @@ class GrowattDecisionEngine:
                 action="discharge_to_grid",
                 explanation=lambda ctx: (
                     f"Optimizer scheduled discharge: "
-                    f"{ctx.current_price:.1f} EUR/MWh, "
+                    f"{ctx.current_price:.2f} CZK/kWh, "
                     f"discharging at 25% power"
                 )
             ),
@@ -289,7 +289,7 @@ class GrowattDecisionEngine:
                 action="discharge_to_grid",
                 explanation=lambda ctx: (
                     f"Battery discharge profitable: "
-                    f"{ctx.current_price:.1f} EUR/MWh meets spread requirement, "
+                    f"{ctx.current_price:.2f} CZK/kWh meets spread requirement, "
                     f"discharging at 25% power"
                 )
             ),
@@ -422,13 +422,17 @@ class GrowattDecisionEngine:
     def test_scenario(self,
                       manual_override: bool = False,
                       high_loads: bool = False,
-                      battery_soc: float = 50.0) -> Dict[str, Any]:
+                      battery_soc: float = 50.0,
+                      min_soc: float = 20.0,
+                      max_soc: float = 100.0) -> Dict[str, Any]:
         """Test a specific scenario for debugging.
 
         Args:
             manual_override: Whether manual override is active
             high_loads: Whether high loads are active
             battery_soc: Current battery SOC
+            min_soc: Minimum SOC from config
+            max_soc: Maximum SOC from config
 
         Returns:
             Decision explanation for the scenario
@@ -437,6 +441,8 @@ class GrowattDecisionEngine:
             manual_override_active=manual_override,
             high_loads_active=high_loads,
             battery_soc=battery_soc,
+            min_soc=min_soc,
+            max_soc=max_soc,
             current_time=datetime.now(),
             manual_override_mode="regular" if manual_override else None,
             current_mode=None
@@ -593,11 +599,11 @@ class GrowattDecisionEngine:
         if not hourly_prices:
             return False
 
-        # Check for reasonable price range (-500 to 10000 EUR/MWh)
-        # Czech OTE market regularly goes negative; 2022 energy crisis saw 1000+ spikes
+        # Check for reasonable price range in CZK/kWh
+        # Czech OTE market regularly goes negative; 2022 energy crisis saw ~25 CZK/kWh spikes
         for price in hourly_prices.values():
-            if not -500 <= price <= 10000:
-                self.logger.warning(f"Suspicious price detected: {price} EUR/MWh")
+            if not -12.5 <= price <= 250:
+                self.logger.warning(f"Suspicious price detected: {price} CZK/kWh")
                 return False
 
         return True
