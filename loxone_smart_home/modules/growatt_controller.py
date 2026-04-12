@@ -195,7 +195,9 @@ class GrowattController(BaseModule):
         # Solar forecast (Phase 2)
         self._solar_forecast: Optional[SolarForecast] = None
         if getattr(self.config, 'solar_forecast_enabled', False):
-            self._solar_forecast = SolarForecast.from_config(self.config, self.logger)
+            self._solar_forecast = SolarForecast.from_config(
+                self.config, self.logger, settings=self.settings
+            )
             self.logger.info(
                 f"Solar forecast enabled: {len(self._solar_forecast.arrays)} arrays, "
                 f"total {sum(a.kwp for a in self._solar_forecast.arrays):.1f} kWp"
@@ -1817,11 +1819,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         if self._solar_forecast._production_model:
             try:
                 # Fetch fresh 48h weather forecast from OpenMeteo
+                from modules.growatt.solar_forecast import _effective_cloud_cover
                 url = (
                     f"https://api.open-meteo.com/v1/forecast"
                     f"?latitude={self._solar_forecast.latitude}"
                     f"&longitude={self._solar_forecast.longitude}"
-                    f"&hourly=shortwave_radiation,cloudcover,temperature_2m"
+                    f"&hourly=shortwave_radiation,cloudcover,cloudcover_low,cloudcover_mid,cloudcover_high,temperature_2m"
                     f"&forecast_days=2&timezone=auto"
                 )
                 async with aiohttp.ClientSession() as session:
@@ -1831,22 +1834,29 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             hourly = data.get("hourly", {})
                             times = hourly.get("time", [])
                             ghi = hourly.get("shortwave_radiation", [])
-                            cloud_covers = hourly.get("cloudcover", [])
+                            cloud_low = hourly.get("cloudcover_low", [])
+                            cloud_mid = hourly.get("cloudcover_mid", [])
+                            cloud_high = hourly.get("cloudcover_high", [])
+                            cloud_total = hourly.get("cloudcover", [])
                             temps = hourly.get("temperature_2m", [])
-                            weather_hours = [
-                                {
+                            weather_hours = []
+                            for i, t in enumerate(times):
+                                g = (ghi[i] if i < len(ghi) else 0) or 0
+                                tp = (temps[i] if i < len(temps) else 15) or 15
+                                if cloud_low and i < len(cloud_low):
+                                    c = _effective_cloud_cover(
+                                        cloud_low[i] or 0,
+                                        (cloud_mid[i] or 0) if cloud_mid and i < len(cloud_mid) else 0,
+                                        (cloud_high[i] or 0) if cloud_high and i < len(cloud_high) else 0,
+                                    )
+                                else:
+                                    c = (cloud_total[i] if cloud_total and i < len(cloud_total) else 50) or 50
+                                weather_hours.append({
                                     "time": t,
-                                    "shortwave_radiation": g or 0,
-                                    "cloudcover": c or 50,
-                                    "temperature_2m": tp or 15,
-                                }
-                                for t, g, c, tp in zip(
-                                    times,
-                                    ghi,
-                                    cloud_covers or [50] * len(times),
-                                    temps or [15] * len(times),
-                                )
-                            ]
+                                    "shortwave_radiation": g,
+                                    "cloudcover": c,
+                                    "temperature_2m": tp,
+                                })
                             model_result = self._solar_forecast.predict_from_model(weather_hours)
                             if model_result:
                                 total = sum(f.total_kwh for f in model_result.values())

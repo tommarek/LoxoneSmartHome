@@ -16,6 +16,26 @@ from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 
+def _effective_cloud_cover(
+    cloud_low: float, cloud_mid: float, cloud_high: float,
+) -> float:
+    """Compute solar-effective cloud cover from low/mid/high layers.
+
+    Low clouds are thick and block most radiation, mid clouds are thinner,
+    high clouds (cirrus) barely affect solar production. Uses a transmittance
+    model: each layer transmits a fraction of light based on its opacity.
+
+    Returns:
+        Effective cloud cover percentage (0-100).
+    """
+    transmittance = (
+        (1.0 - 0.9 * cloud_low / 100)
+        * (1.0 - 0.5 * cloud_mid / 100)
+        * (1.0 - 0.15 * cloud_high / 100)
+    )
+    return max(0.0, min(100.0, (1.0 - transmittance) * 100))
+
+
 def _sun_position(latitude: float, year: int, month: int, day: int, hour: int) -> Tuple[float, float]:
     """Compute sun azimuth and altitude for a given hour (mid-hour).
 
@@ -289,8 +309,11 @@ class SolarForecast:
         self._production_model: Optional[SolarProductionModel] = None
 
     @classmethod
-    def from_config(cls, config: Any, logger: Optional[logging.Logger] = None) -> "SolarForecast":
-        """Create SolarForecast from GrowattConfig."""
+    def from_config(
+        cls, config: Any, logger: Optional[logging.Logger] = None,
+        settings: Any = None,
+    ) -> "SolarForecast":
+        """Create SolarForecast from GrowattConfig + optional global Settings."""
         arrays_json = getattr(config, "solar_arrays", "[]")
         arrays_data = json.loads(arrays_json) if isinstance(arrays_json, str) else arrays_json
         arrays = [
@@ -302,10 +325,13 @@ class SolarForecast:
             )
             for a in arrays_data
         ]
+        # Prefer global settings lat/lon (from .env), fall back to config
+        lat = getattr(settings, "latitude", None) or getattr(config, "latitude", 49.0)
+        lon = getattr(settings, "longitude", None) or getattr(config, "longitude", 14.5)
         return cls(
             arrays=arrays,
-            latitude=getattr(config, "latitude", 49.0),
-            longitude=getattr(config, "longitude", 14.5),
+            latitude=lat,
+            longitude=lon,
             confidence=getattr(config, "solar_forecast_confidence", 0.7),
             logger=logger,
         )
@@ -403,7 +429,7 @@ class SolarForecast:
         url = (
             f"https://api.open-meteo.com/v1/forecast"
             f"?latitude={self.latitude}&longitude={self.longitude}"
-            f"&hourly=shortwave_radiation,cloudcover,temperature_2m"
+            f"&hourly=shortwave_radiation,cloudcover,cloudcover_low,cloudcover_mid,cloudcover_high,temperature_2m"
             f"&forecast_days=2"
             f"&timezone=auto"
         )
@@ -418,7 +444,10 @@ class SolarForecast:
                     hourly = data.get("hourly", {})
                     times = hourly.get("time", [])
                     radiation = hourly.get("shortwave_radiation", [])
-                    cloud_covers = hourly.get("cloudcover", [])
+                    cloud_low = hourly.get("cloudcover_low", [])
+                    cloud_mid = hourly.get("cloudcover_mid", [])
+                    cloud_high = hourly.get("cloudcover_high", [])
+                    cloud_total = hourly.get("cloudcover", [])
                     temperatures = hourly.get("temperature_2m", [])
 
                     if not times or not radiation:
@@ -426,10 +455,20 @@ class SolarForecast:
 
                     weather_data = {"hourly": []}
                     for i, t in enumerate(times):
+                        # Compute effective cloud cover from layers
+                        if cloud_low and i < len(cloud_low):
+                            eff_cloud = _effective_cloud_cover(
+                                cloud_low[i] or 0,
+                                cloud_mid[i] if cloud_mid and i < len(cloud_mid) else 0,
+                                cloud_high[i] if cloud_high and i < len(cloud_high) else 0,
+                            )
+                        else:
+                            eff_cloud = cloud_total[i] if cloud_total and i < len(cloud_total) else 50
+
                         weather_data["hourly"].append({
                             "time": t,
                             "shortwave_radiation": radiation[i] if i < len(radiation) else 0,
-                            "cloudcover": cloud_covers[i] if i < len(cloud_covers) else 50,
+                            "cloudcover": eff_cloud,
                             "temperature_2m": temperatures[i] if i < len(temperatures) else 15,
                         })
 
@@ -521,12 +560,18 @@ from(bucket: "{settings.influxdb.bucket_solar}")
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
-            cloud_by_hour: Dict[str, float] = {}
+            cloud_total_by_hour: Dict[str, float] = {}
+            cloud_low_by_hour: Dict[str, float] = {}
+            cloud_mid_by_hour: Dict[str, float] = {}
+            cloud_high_by_hour: Dict[str, float] = {}
             temp_by_hour: Dict[str, float] = {}
 
             field_targets = {
                 "shortwave_radiation": ghi_by_hour,
-                "cloudcover": cloud_by_hour,
+                "cloudcover": cloud_total_by_hour,
+                "cloudcover_low": cloud_low_by_hour,
+                "cloudcover_mid": cloud_mid_by_hour,
+                "cloudcover_high": cloud_high_by_hour,
                 "temperature_2m": temp_by_hour,
             }
 
@@ -556,6 +601,16 @@ from(bucket: "{weather_bucket}")
                 self.logger.warning("No weather radiation data found")
                 return False
 
+            def _get_cloud(hour_key: str) -> float:
+                """Get effective cloud cover from layered data, fall back to total."""
+                if hour_key in cloud_low_by_hour:
+                    return _effective_cloud_cover(
+                        cloud_low_by_hour.get(hour_key, 0),
+                        cloud_mid_by_hour.get(hour_key, 0),
+                        cloud_high_by_hour.get(hour_key, 0),
+                    )
+                return cloud_total_by_hour.get(hour_key, 50.0)
+
             # Helper to add a data point to all bin levels
             def _add_to_model(m: SolarProductionModel, hour_key: str, kwh: float) -> None:
                 ghi = ghi_by_hour.get(hour_key, 0)
@@ -564,7 +619,7 @@ from(bucket: "{weather_bucket}")
                 parts = hour_key.split("-")
                 year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
-                cloud = cloud_by_hour.get(hour_key, 50.0)
+                cloud = _get_cloud(hour_key)
                 temp = temp_by_hour.get(hour_key, 15.0)
                 azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
@@ -611,7 +666,7 @@ from(bucket: "{weather_bucket}")
                 parts = hour_key.split("-")
                 year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
-                cloud = cloud_by_hour.get(hour_key, 50.0)
+                cloud = _get_cloud(hour_key)
                 temp = temp_by_hour.get(hour_key, 15.0)
                 azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
@@ -761,6 +816,11 @@ from(bucket: "{weather_bucket}")
             date_str = dt.strftime("%Y-%m-%d")
             hour = dt.hour
 
+            # Skip hours where sun is below horizon
+            _, altitude = _sun_position(self.latitude, dt.year, dt.month, dt.day, hour)
+            if altitude <= 0:
+                continue
+
             # Simple model: production = GHI * total_kwp * performance_ratio / 1000
             # GHI in W/m² for 1 hour → Wh/m², divided by 1000 W/m² (STC reference)
             # gives fraction of peak output
@@ -829,32 +889,35 @@ from(bucket: "{weather_bucket}")
                     all_hours |= set(s.hourly.keys())
 
                 for hour in all_hours:
+                    model_val = model.hourly.get(hour, 0)
+
+                    # Model says 0 (sun below horizon) — trust it,
+                    # other sources don't check sun position
+                    if model_val <= 0:
+                        hourly[hour] = 0
+                        continue
+
                     vals = [s.hourly.get(hour, 0) for s in sources if s.hourly.get(hour, 0) > 0]
                     if not vals:
                         hourly[hour] = 0
                     elif len(vals) == 1:
                         hourly[hour] = vals[0]
                     else:
-                        # Model is first val if present
-                        model_val = model.hourly.get(hour, 0)
-                        if model_val > 0:
-                            avg_others = sum(v for v in vals if v != model_val) / max(1, len(vals) - 1)
-                            if avg_others > 0:
-                                divergence = abs(model_val - avg_others) / ((model_val + avg_others) / 2)
-                                if divergence <= 0.3:
-                                    # Agreement: average all
-                                    hourly[hour] = sum(vals) / len(vals)
-                                elif model_val >= avg_others:
-                                    # Model predicts more: trust it (real installation data)
-                                    hourly[hour] = model_val
-                                else:
-                                    # Model predicts much less: likely sparse bin,
-                                    # use average to avoid extreme underprediction
-                                    hourly[hour] = sum(vals) / len(vals)
-                            else:
+                        avg_others = sum(v for v in vals if v != model_val) / max(1, len(vals) - 1)
+                        if avg_others > 0:
+                            divergence = abs(model_val - avg_others) / ((model_val + avg_others) / 2)
+                            if divergence <= 0.3:
+                                # Agreement: average all
+                                hourly[hour] = sum(vals) / len(vals)
+                            elif model_val >= avg_others:
+                                # Model predicts more: trust it (real installation data)
                                 hourly[hour] = model_val
+                            else:
+                                # Model predicts much less: likely sparse bin,
+                                # use average to avoid extreme underprediction
+                                hourly[hour] = sum(vals) / len(vals)
                         else:
-                            hourly[hour] = sum(vals) / len(vals)
+                            hourly[hour] = model_val
 
                 total = sum(hourly.values())
                 source_names = [s.source for s in sources]
