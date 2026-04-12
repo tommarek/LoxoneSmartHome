@@ -471,3 +471,74 @@ class TestSimResultSanity:
         assert result.grid_sold_kwh == 0
         assert result.discharge_revenue == 0
         assert result.grid_bought_kwh > 0
+
+
+# ---- 15-minute resolution helpers and tests ----
+
+def make_15min_two_day_blocks(
+    day1_prices: List[float],
+    day2_prices: List[float],
+) -> List[Tuple[datetime, float]]:
+    """Create 15-minute price blocks from two days of hourly prices."""
+    blocks = []
+    base = datetime(2026, 4, 11, 0, 0)
+    for i, price in enumerate(day1_prices + day2_prices):
+        for q in range(4):
+            blocks.append((base + timedelta(hours=i, minutes=q * 15), price))
+    return blocks
+
+
+class TestOptimizer15MinResolution:
+    """Verify optimizer works correctly at 15-minute resolution."""
+
+    SIM_PARAMS = dict(
+        battery_capacity=10.0,
+        initial_soc=50.0,
+        min_soc=20.0,
+        max_soc=100.0,
+        charge_rate_kw=2.5,
+        discharge_power_pct=25.0,
+        efficiency=0.85,
+    )
+
+    def test_15min_spring_day(self) -> None:
+        """At 15-min resolution, optimizer still beats no-battery on spring days."""
+        blocks = make_15min_two_day_blocks(_spring_day_prices(), _spring_day_prices())
+        assert len(blocks) == 192  # 48 hours * 4
+        optimized = run_optimizer(
+            blocks, distribution_func=lambda h: 1.0,
+            consumption_hourly={h: 1.0 for h in range(24)},
+            **self.SIM_PARAMS,
+        )
+        no_batt = run_no_battery(blocks, **self.SIM_PARAMS)
+        assert optimized.total_cost <= no_batt.total_cost
+
+    def test_15min_extreme_spread(self) -> None:
+        """Extreme spread at 15-min resolution."""
+        blocks = make_15min_two_day_blocks(_extreme_day_prices(), _extreme_day_prices())
+        optimized = run_optimizer(
+            blocks, distribution_func=lambda h: 1.0,
+            consumption_hourly={h: 1.0 for h in range(24)},
+            **self.SIM_PARAMS,
+        )
+        no_batt = run_no_battery(blocks, **self.SIM_PARAMS)
+        assert optimized.total_cost <= no_batt.total_cost
+
+    def test_15min_with_solar(self) -> None:
+        """Solar reduces cost at 15-min resolution."""
+        blocks = make_15min_two_day_blocks(_spring_day_prices(), _spring_day_prices())
+        solar = {h: 3.0 for h in range(9, 16)}
+
+        no_solar = run_optimizer(
+            blocks, distribution_func=lambda h: 1.0,
+            consumption_hourly={h: 1.5 for h in range(24)},
+            solar_hourly={},
+            **self.SIM_PARAMS,
+        )
+        with_solar = run_optimizer(
+            blocks, distribution_func=lambda h: 1.0,
+            consumption_hourly={h: 1.5 for h in range(24)},
+            solar_hourly=solar,
+            **self.SIM_PARAMS,
+        )
+        assert with_solar.total_cost < no_solar.total_cost

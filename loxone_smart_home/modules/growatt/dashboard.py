@@ -297,6 +297,13 @@ async def api_status(request: web.Request) -> web.Response:
             "block": current_block,
         },
         "high_loads_active": ctrl._high_loads_active,
+        "high_loads": {
+            "active": ctrl._high_loads_active,
+            "ev_charging": ctrl._high_load_details.get("ev_charging", False),
+            "ev_power": ctrl._high_load_details.get("ev_power", 0),
+            "heating_active": ctrl._high_load_details.get("heating_active", False),
+            "heating_relays": ctrl._high_load_details.get("heating_relays", []),
+        },
         "season": season,
         "inverter": inverter_state,
         "solar_forecast": solar,
@@ -1080,7 +1087,12 @@ function updateUI(d) {
   // Tags
   const tags = [];
   if (d.simulation_mode) tags.push('<span class="tag tag-warn">SIM</span>');
-  if (d.high_loads_active) tags.push('<span class="tag tag-warn">HIGH LOAD</span>');
+  if (d.high_loads_active) {
+    let hlParts = [];
+    if (d.high_loads?.heating_relays?.length) hlParts.push('🔥 ' + d.high_loads.heating_relays.join(', '));
+    if (d.high_loads?.ev_charging) hlParts.push('🚗 EV ' + (d.high_loads.ev_power/1000).toFixed(1) + ' kW');
+    tags.push('<span class="tag tag-warn">' + (hlParts.length ? hlParts.join(' · ') : 'HIGH LOAD') + '</span>');
+  }
   if (d.inverter) {
     tags.push(d.inverter.export ? '<span class="tag tag-on">EXP ON</span>' : '<span class="tag tag-off">EXP OFF</span>');
     tags.push(d.inverter.ac_charge ? '<span class="tag tag-on">AC CHG</span>' : '<span class="tag tag-off">AC CHG OFF</span>');

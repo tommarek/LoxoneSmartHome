@@ -35,6 +35,7 @@ class PriceThresholds:
     distribution_tariff_high: float = 1.5  # High tariff distribution cost CZK/kWh
     distribution_tariff_low: float = 0.5  # Low tariff distribution cost CZK/kWh
     low_tariff_hours: str = "0-6,22-24"  # Comma-separated hour ranges for low tariff
+    eur_czk_rate: float = 25.0  # EUR to CZK exchange rate
 
 
 @dataclass
@@ -79,7 +80,10 @@ class DecisionContext:
     sunrise: Optional[time] = None
     sunset: Optional[time] = None
     is_summer_mode: bool = False
+    eur_czk_rate: float = 25.0  # EUR to CZK exchange rate
     is_battery_charging_scheduled: bool = False
+    # High load details (which loads are active)
+    high_load_details: Dict[str, Any] = field(default_factory=dict)
     # Optimizer-scheduled discharge blocks
     optimizer_discharge_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_discharge_scheduled: bool = False
@@ -91,7 +95,7 @@ class DecisionContext:
             # (e.g., negative prices = get paid to consume)
             if self.current_block_key and self.cheapest_blocks:
                 in_cheapest = self.current_block_key in self.cheapest_blocks
-                current_czk = self.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
+                current_czk = self.current_price * self.eur_czk_rate / 1000  # EUR/MWh to CZK/kWh
                 max_price = (
                     self.price_thresholds.summer_charge_price_max
                     if self.price_thresholds else 0.0
@@ -254,9 +258,7 @@ class GrowattDecisionEngine:
                     and not ctx.is_battery_charging_scheduled
                 ),
                 action="high_load_protected",
-                explanation=(
-                    "High loads active - load-first mode with 100% stop SOC (no discharge)"
-                )
+                explanation=lambda ctx: self._high_load_explanation(ctx),
             ),
 
             # Priority 4A: Optimizer-scheduled discharge
@@ -471,6 +473,19 @@ class GrowattDecisionEngine:
                     return thresholds.distribution_tariff_low
         return thresholds.distribution_tariff_high
 
+    @staticmethod
+    def _high_load_explanation(ctx: DecisionContext) -> str:
+        """Build detailed explanation of which high loads are active."""
+        parts = []
+        details = ctx.high_load_details
+        if details.get("heating_relays"):
+            relays = details["heating_relays"]
+            parts.append(f"Heating: {', '.join(relays)}")
+        if details.get("ev_charging"):
+            parts.append(f"EV charging: {details['ev_power']:.0f}W")
+        detail = " + ".join(parts) if parts else "High loads active"
+        return f"{detail} — no discharge (100% stop SOC)"
+
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on simple price thresholds.
 
@@ -501,15 +516,16 @@ class GrowattDecisionEngine:
         if not context.price_thresholds or context.current_price <= 0:
             return False
 
-        # Convert current price to CZK/kWh (EUR/MWh * 25 / 1000)
-        current_price_czk = context.current_price * 25 / 1000
+        # Convert current price to CZK/kWh (EUR/MWh * rate / 1000)
+        eur_czk = context.price_thresholds.eur_czk_rate if context.price_thresholds else 25.0
+        current_price_czk = context.current_price * eur_czk / 1000
 
         # Find the absolute cheapest 15-minute block price
         if not context.prices_15min:
             return False
 
         cheapest_block_price = min(context.prices_15min.values())
-        cheapest_block_czk = cheapest_block_price * 25 / 1000
+        cheapest_block_czk = cheapest_block_price * eur_czk / 1000
 
         # Calculate required price based on profit margin
         required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
@@ -602,9 +618,10 @@ class GrowattDecisionEngine:
         if not hourly_prices:
             return False
 
-        # Check for reasonable price range (0-1000 EUR/MWh)
+        # Check for reasonable price range (-500 to 10000 EUR/MWh)
+        # Czech OTE market regularly goes negative; 2022 energy crisis saw 1000+ spikes
         for price in hourly_prices.values():
-            if not 0 <= price <= 1000:
+            if not -500 <= price <= 10000:
                 self.logger.warning(f"Suspicious price detected: {price} EUR/MWh")
                 return False
 

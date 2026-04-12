@@ -92,29 +92,26 @@ class DailyForecast:
 class SolarProductionModel:
     """Learned solar production model trained on historical data.
 
-    Features (finer granularity for better accuracy):
+    Features:
     - GHI radiation: 25 W/m² steps (41 buckets)
     - Cloud cover: 10% steps (11 buckets) — direct weather parameter
-    - Sun azimuth: 15° steps (24 buckets) — which array gets light
     - Sun altitude: 5° steps (19 buckets) — angle of incidence
-    - Temperature: 5°C steps (13 buckets) — panel efficiency derating
 
     Cloud cover is ALWAYS included in predictions — never dropped in fallbacks.
+    Fallback: 3D (rad, cloud, alt) → 2D (rad, cloud) → interpolate → global.
     Uses p50 (median) for prediction, physics cap as safety net.
     """
-    # 5D bins: (rad, cloud, az, alt, temp) -> [kwh]
-    bins_5d: Dict[Tuple[int, int, int, int, int], List[float]] = field(default_factory=dict)
-    median_5d: Dict[Tuple[int, int, int, int, int], float] = field(default_factory=dict)
-    # 4D bins: (rad, cloud, az, alt) -> [kwh] (drop temp)
-    bins_4d: Dict[Tuple[int, int, int, int], List[float]] = field(default_factory=dict)
-    median_4d: Dict[Tuple[int, int, int, int], float] = field(default_factory=dict)
-    # 3D bins: (rad, cloud, alt) -> [kwh] (drop azimuth)
+    # 3D bins: (rad, cloud, alt) -> [kwh]
     bins_3d: Dict[Tuple[int, int, int], List[float]] = field(default_factory=dict)
     median_3d: Dict[Tuple[int, int, int], float] = field(default_factory=dict)
-    # 2D bins: (rad, cloud) -> [kwh] (minimum — always includes cloud!)
+    # 2D bins: (rad, cloud) -> [kwh] (fallback — always includes cloud!)
     bins_2d: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
     median_2d: Dict[Tuple[int, int], float] = field(default_factory=dict)
     global_median: float = 0.0
+    # Observability: which bin level is actually used
+    hit_level_counts: Dict[str, int] = field(
+        default_factory=lambda: {"3d": 0, "2d": 0, "interpolate": 0, "global": 0}
+    )
     # Metadata
     total_kwp: float = 13.5
     data_points: int = 0
@@ -166,12 +163,9 @@ class SolarProductionModel:
     def add_sample(self, rad_b: int, cloud_b: int, az_b: int, alt_b: int,
                    temp_b: int, kwh: float) -> None:
         """Add a training sample to all bin levels."""
-        k5 = (rad_b, cloud_b, az_b, alt_b, temp_b)
-        k4 = (rad_b, cloud_b, az_b, alt_b)
         k3 = (rad_b, cloud_b, alt_b)
         k2 = (rad_b, cloud_b)
-        for bins, key in [(self.bins_5d, k5), (self.bins_4d, k4),
-                          (self.bins_3d, k3), (self.bins_2d, k2)]:
+        for bins, key in [(self.bins_3d, k3), (self.bins_2d, k2)]:
             if key not in bins:
                 bins[key] = []
             bins[key].append(kwh)
@@ -179,7 +173,6 @@ class SolarProductionModel:
     def build(self) -> None:
         """Compute median for all bin levels."""
         for bins, median_dict in [
-            (self.bins_5d, self.median_5d), (self.bins_4d, self.median_4d),
             (self.bins_3d, self.median_3d), (self.bins_2d, self.median_2d),
         ]:
             median_dict.clear()
@@ -234,16 +227,14 @@ class SolarProductionModel:
     ) -> float:
         """Predict kWh production. Cloud cover is ALWAYS used.
 
-        Fallback: 5D → 4D (drop temp) → 3D (drop az) → 2D (rad, cloud) → interpolate.
+        Fallback: 3D (rad, cloud, alt) → 2D (rad, cloud) → interpolate → global.
         """
         if ghi <= 0 or sun_altitude <= 0:
             return 0.0
 
         rad_b = self.radiation_to_bucket(ghi)
         cloud_b = self.cloud_to_bucket(cloud_cover)
-        az_b = self.azimuth_to_bucket(sun_azimuth)
         alt_b = self.altitude_to_bucket(sun_altitude)
-        temp_b = self.temp_to_bucket(temperature)
 
         # Physics cap: can't exceed nameplate capacity per hour
         physics_max = self.total_kwp
@@ -251,31 +242,25 @@ class SolarProductionModel:
         def _cap(v: float) -> float:
             return min(v, physics_max)
 
-        # 5D exact (all features)
-        k = (rad_b, cloud_b, az_b, alt_b, temp_b)
-        if k in self.median_5d:
-            return _cap(self.median_5d[k])
-
-        # 4D (drop temp — least important)
-        k = (rad_b, cloud_b, az_b, alt_b)
-        if k in self.median_4d:
-            return _cap(self.median_4d[k])
-
-        # 3D (drop azimuth)
+        # 3D (rad, cloud, alt)
         k = (rad_b, cloud_b, alt_b)
         if k in self.median_3d:
+            self.hit_level_counts["3d"] += 1
             return _cap(self.median_3d[k])
 
-        # 2D exact (rad, cloud) — core prediction, always has cloud
+        # 2D exact (rad, cloud)
         k = (rad_b, cloud_b)
         if k in self.median_2d:
+            self.hit_level_counts["2d"] += 1
             return _cap(self.median_2d[k])
 
         # 2D interpolation — find nearest on radiation/cloud axes
         interp = self._interpolate_2d(rad_b, cloud_b)
         if interp is not None:
+            self.hit_level_counts["interpolate"] += 1
             return _cap(interp)
 
+        self.hit_level_counts["global"] += 1
         return _cap(self.global_median)
 
 
@@ -704,7 +689,7 @@ from(bucket: "{weather_bucket}")
             self.logger.info(
                 f"Solar production model built: {model2.data_points} hours "
                 f"({curtailed} curtailed filtered), "
-                f"{len(model2.median_2d)} bins, "
+                f"{len(model2.median_3d)} 3D / {len(model2.median_2d)} 2D bins, "
                 f"range {model2.date_range}"
             )
             return True
@@ -796,8 +781,9 @@ from(bucket: "{weather_bucket}")
             return {}
 
         total_kwp = sum(a.kwp for a in self.arrays)
-        # Performance ratio: accounts for inverter losses, wiring, temperature, etc.
-        performance_ratio = 0.80
+        # Base performance ratio: accounts for inverter losses, wiring, etc.
+        # Temperature derating is applied per-hour below.
+        base_performance_ratio = 0.80
 
         combined_hourly: Dict[str, Dict[int, float]] = {}
 
@@ -821,10 +807,15 @@ from(bucket: "{weather_bucket}")
             if altitude <= 0:
                 continue
 
-            # Simple model: production = GHI * total_kwp * performance_ratio / 1000
+            # Temperature derating: silicon panels lose ~0.4%/°C above 25°C cell temp
+            temp = entry.get("temperature_2m", 25)
+            cell_temp = temp + 25  # NOCT approximation: cell ≈ ambient + 25°C
+            temp_factor = 1 + (-0.004) * (cell_temp - 25)
+
+            # production = GHI * total_kwp * performance_ratio * temp_factor / 1000
             # GHI in W/m² for 1 hour → Wh/m², divided by 1000 W/m² (STC reference)
             # gives fraction of peak output
-            production_kwh = ghi * total_kwp * performance_ratio / 1000.0
+            production_kwh = ghi * total_kwp * base_performance_ratio * temp_factor / 1000.0
 
             if date_str not in combined_hourly:
                 combined_hourly[date_str] = {}
@@ -897,27 +888,28 @@ from(bucket: "{weather_bucket}")
                         hourly[hour] = 0
                         continue
 
-                    vals = [s.hourly.get(hour, 0) for s in sources if s.hourly.get(hour, 0) > 0]
-                    if not vals:
-                        hourly[hour] = 0
-                    elif len(vals) == 1:
-                        hourly[hour] = vals[0]
+                    # Separate model from non-model sources by identity
+                    other_vals = [
+                        s.hourly.get(hour, 0)
+                        for s in sources
+                        if s.source != "model" and s.hourly.get(hour, 0) > 0
+                    ]
+
+                    if not other_vals:
+                        hourly[hour] = model_val
                     else:
-                        avg_others = sum(v for v in vals if v != model_val) / max(1, len(vals) - 1)
-                        if avg_others > 0:
-                            divergence = abs(model_val - avg_others) / ((model_val + avg_others) / 2)
-                            if divergence <= 0.3:
-                                # Agreement: average all
-                                hourly[hour] = sum(vals) / len(vals)
-                            elif model_val >= avg_others:
-                                # Model predicts more: trust it (real installation data)
-                                hourly[hour] = model_val
-                            else:
-                                # Model predicts much less: likely sparse bin,
-                                # use average to avoid extreme underprediction
-                                hourly[hour] = sum(vals) / len(vals)
-                        else:
+                        avg_others = sum(other_vals) / len(other_vals)
+                        divergence = abs(model_val - avg_others) / ((model_val + avg_others) / 2)
+                        if divergence <= 0.3:
+                            # Agreement: average all sources
+                            all_vals = [model_val] + other_vals
+                            hourly[hour] = sum(all_vals) / len(all_vals)
+                        elif model_val >= avg_others:
+                            # Model predicts more: trust it (real installation data)
                             hourly[hour] = model_val
+                        else:
+                            # Model predicts much less: sparse bin, use other sources
+                            hourly[hour] = avg_others
 
                 total = sum(hourly.values())
                 source_names = [s.source for s in sources]
@@ -1001,7 +993,9 @@ from(bucket: "{bucket}")
                 return
 
             # Compare with stored forecasts (if we have any for those days)
-            # Try consensus (actual prediction path) first, then model, then API
+            # Try consensus (actual prediction path) first, then model, then API,
+            # then persisted history from InfluxDB (survives restarts)
+            persisted_history: Optional[Dict[str, DailyForecast]] = None
             ratios: list = []
             for day_str, actual_kwh in actual_by_day.items():
                 forecast = (
@@ -1009,6 +1003,13 @@ from(bucket: "{bucket}")
                     or self._model_forecast.get(day_str)
                     or self._api_forecast.get(day_str)
                 )
+                if not forecast:
+                    # Lazy-load persisted history on first miss
+                    if persisted_history is None:
+                        persisted_history = await self._load_forecast_history(
+                            influxdb_client, bucket, days=days,
+                        )
+                    forecast = persisted_history.get(day_str)
                 if forecast and forecast.total_kwh > 1.0:
                     ratio = actual_kwh / forecast.total_kwh
                     # Clamp to reasonable range (0.3 - 1.5)
@@ -1067,16 +1068,20 @@ from(bucket: "{bucket}")
         """Check if we have a reliable solar forecast to base decisions on.
 
         Returns False if:
-        - No forecast data at all (API rate-limited + no cache + no weather)
-        - Total kWp > 5 but forecast < 5 kWh for a day (suspiciously low)
+        - No forecast data at all
+        - Forecast is suspiciously low for the season and system size
         """
         if not self._consensus:
             return False
 
         total_kwp = sum(a.kwp for a in self.arrays)
         for forecast in self._consensus.values():
-            # A 13.5 kWp system should produce > 5 kWh on almost any day
-            if total_kwp > 5 and forecast.total_kwh < 5:
+            day_of_year = forecast.date.timetuple().tm_yday
+            if 91 <= day_of_year <= 273:  # April-September
+                min_kwh = total_kwp * 0.3
+            else:  # October-March
+                min_kwh = total_kwp * 0.1
+            if total_kwp > 5 and forecast.total_kwh < min_kwh:
                 return False
 
         return True
@@ -1148,6 +1153,80 @@ from(bucket: "{bucket}")
             self.logger.debug(f"Saved {len(self._api_forecast)} forecast days to InfluxDB")
         except Exception as e:
             self.logger.warning(f"Failed to persist forecast: {e}")
+
+    async def save_consensus_to_influxdb(self, influxdb_client: Any, bucket: str) -> None:
+        """Persist consensus forecasts to InfluxDB for post-restart calibration."""
+        if not self._consensus or not influxdb_client:
+            return
+
+        try:
+            for date_str, forecast in self._consensus.items():
+                hourly_json = json.dumps({str(h): round(kwh, 3) for h, kwh in forecast.hourly.items()})
+                await influxdb_client.write_point(
+                    bucket=bucket,
+                    measurement="solar_forecast_history",
+                    fields={
+                        "total_kwh": forecast.total_kwh,
+                        "hourly_json": hourly_json,
+                        "source": forecast.source,
+                    },
+                    tags={"forecast_date": date_str},
+                )
+            self.logger.debug(f"Saved {len(self._consensus)} consensus forecast days to InfluxDB")
+        except Exception as e:
+            self.logger.warning(f"Failed to persist consensus forecast: {e}")
+
+    async def _load_forecast_history(
+        self, influxdb_client: Any, bucket: str, days: int = 30,
+    ) -> Dict[str, DailyForecast]:
+        """Batch-load historical consensus forecasts from InfluxDB.
+
+        Used by calibration to compare past forecasts with actuals after restarts.
+        """
+        try:
+            query = f'''
+from(bucket: "{bucket}")
+  |> range(start: -{days}d)
+  |> filter(fn: (r) => r._measurement == "solar_forecast_history")
+  |> last()
+'''
+            result = await influxdb_client.query(query)
+            if not result:
+                return {}
+
+            by_date: Dict[str, Dict[str, Any]] = {}
+            for table in result:
+                for record in table.records:
+                    date_tag = record.values.get("forecast_date", "")
+                    if not date_tag:
+                        continue
+                    if date_tag not in by_date:
+                        by_date[date_tag] = {}
+                    by_date[date_tag][record.get_field()] = record.get_value()
+
+            forecasts: Dict[str, DailyForecast] = {}
+            for date_str, fields in by_date.items():
+                total = fields.get("total_kwh", 0)
+                if not total or total < 1:
+                    continue
+                hourly_json = fields.get("hourly_json", "{}")
+                try:
+                    hourly_raw = json.loads(hourly_json) if isinstance(hourly_json, str) else {}
+                    hourly = {int(h): float(kwh) for h, kwh in hourly_raw.items()}
+                except (json.JSONDecodeError, ValueError):
+                    hourly = {}
+                forecasts[date_str] = DailyForecast(
+                    date=datetime.strptime(date_str, "%Y-%m-%d").date(),
+                    total_kwh=float(total),
+                    hourly=hourly,
+                    source=str(fields.get("source", "cached_consensus")),
+                )
+
+            if forecasts:
+                self.logger.debug(f"Loaded {len(forecasts)} historical forecast days from InfluxDB")
+            return forecasts
+        except Exception:
+            return {}
 
     async def load_from_influxdb(self, influxdb_client: Any, bucket: str) -> bool:
         """Load cached forecast from InfluxDB (used on startup when API is rate-limited)."""

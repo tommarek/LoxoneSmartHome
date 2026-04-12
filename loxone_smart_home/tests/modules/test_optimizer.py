@@ -18,6 +18,16 @@ def make_blocks(prices: list, start_hour: int = 0) -> list:
     return [(base + timedelta(hours=i), p) for i, p in enumerate(prices)]
 
 
+def make_15min_blocks(hourly_prices: list, start_hour: int = 0) -> list:
+    """Create 15-min price blocks from hourly prices (4 blocks per hour)."""
+    base = datetime(2026, 4, 11, start_hour, 0)
+    blocks = []
+    for i, p in enumerate(hourly_prices):
+        for q in range(4):
+            blocks.append((base + timedelta(hours=i, minutes=q * 15), p))
+    return blocks
+
+
 def const_dist(rate: float):
     """Return a constant distribution tariff function."""
     return lambda h: rate
@@ -184,3 +194,152 @@ class TestOptimizerDistribution:
         # With high distribution, self-consumption is worth more,
         # so fewer discharge blocks (or equal)
         assert len(discharge_high) <= len(discharge_low)
+
+
+class TestOptimizer15Min:
+    """Tests using 15-minute resolution blocks (matching production)."""
+
+    def test_15min_charge_discharge_pattern(self, optimizer) -> None:
+        """With 15-min blocks, charge should span multiple blocks per hour."""
+        # Day 1 + Day 2 for recharge visibility
+        prices = (
+            [-1.0] * 6 + [2.0] * 6 + [1.0] * 6 + [8.0] * 6
+            + [-1.0] * 6 + [2.0] * 18
+        )
+        blocks = make_15min_blocks(prices)
+        assert len(blocks) == 192  # 48 hours * 4 blocks
+        # Low consumption so battery doesn't drain before evening
+        low_consumption = {h: 0.1 for h in range(24)}
+
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=low_consumption,
+            distribution_func=const_dist(1.0),
+            current_soc=50.0,
+        )
+        assert len(decisions) == 192
+        assert len(charge) > 0
+        # Expensive hours (18-23 day1) should have discharging
+        discharge_hours = {t.hour for t in discharge}
+        assert len(discharge_hours & set(range(18, 24))) > 0
+
+    def test_all_negative_prices(self, optimizer) -> None:
+        """All negative prices: should charge, never discharge."""
+        prices = [-2.0] * 24
+        blocks = make_15min_blocks(prices)
+
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            current_soc=20.0,
+        )
+        assert len(charge) > 0
+        assert len(discharge) == 0
+
+    def test_single_block(self, optimizer) -> None:
+        """Single block edge case."""
+        blocks = [(datetime(2026, 4, 11, 12, 0), 3.0)]
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            current_soc=50.0,
+        )
+        assert len(decisions) == 1
+
+    def test_two_blocks(self, optimizer) -> None:
+        """Two block edge case: one cheap, one expensive."""
+        base = datetime(2026, 4, 11, 0, 0)
+        blocks = [(base, -1.0), (base + timedelta(minutes=15), 10.0)]
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            current_soc=50.0,
+        )
+        assert len(decisions) == 2
+
+    def test_night_reserve_defaults(self, optimizer) -> None:
+        """Verify _night_reserve_kwh defaults to 5.0 without calling calibrate."""
+        assert optimizer._night_reserve_kwh == 5.0
+        assert optimizer._night_reserve_updated is None
+
+    def test_backward_pass_prefers_better_blocks(self, optimizer) -> None:
+        """6 CZK block before 10 CZK block with limited battery — should
+        prefer the more profitable block."""
+        # Setup: moderate prices, then a good block, then a great block
+        # Hours 0-16: moderate (2 CZK) — hold
+        # Hour 17: good (6 CZK)
+        # Hour 18-19: great (10 CZK)
+        # Hours 20-23: moderate
+        # Day 2: cheap (recharge opportunity)
+        prices = (
+            [2.0] * 17 + [6.0] + [10.0] * 2 + [2.0] * 4
+            + [0.0] * 6 + [2.0] * 18
+        )
+        blocks = make_15min_blocks(prices)
+
+        _, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(0.5),
+            current_soc=40.0,  # Limited battery
+            min_soc=20.0,
+        )
+
+        # With limited battery (only 20% usable = 2 kWh), should prefer
+        # discharging at hour 18/19 (10 CZK) over hour 17 (6 CZK)
+        discharge_at_17 = sum(1 for t in discharge if t.hour == 17)
+        discharge_at_18_19 = sum(1 for t in discharge if t.hour in (18, 19))
+        # Should have more discharge blocks at the better price
+        assert discharge_at_18_19 >= discharge_at_17
+
+    def test_discharge_economics_includes_recharge_dist(self, optimizer) -> None:
+        """Verify recharge cost includes future distribution tariff.
+
+        With low distribution, discharge is profitable (low cost on both sides).
+        With very high distribution, sell revenue drops and recharge cost rises,
+        making discharge unprofitable.
+        """
+        # High spot price evening, cheap recharge tomorrow
+        prices = (
+            [1.0] * 18 + [12.0] * 6  # Day 1: cheap then expensive evening
+            + [0.5] * 6 + [2.0] * 18  # Day 2: cheap night for recharge
+        )
+        blocks = make_15min_blocks(prices)
+        # Low consumption so base load doesn't drain battery before evening
+        low_consumption = {h: 0.1 for h in range(24)}
+
+        # Low distribution: sell_revenue = 12.0 - 0.5 - 0.5 - 2.0 = 9.0
+        # recharge_cost = (0.5 + 0.5) / 0.85 = 1.18
+        # profit = 9.0 - 1.18 = 7.82 > 0 → should discharge
+        _, discharge_low_dist, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=low_consumption,
+            distribution_func=const_dist(0.5),
+            current_soc=80.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert len(discharge_low_dist) > 0
+
+        # Very high distribution: sell_revenue = 12.0 - 5.0 - 0.5 - 2.0 = 4.5
+        # recharge_cost = (0.5 + 5.0) / 0.85 = 6.47
+        # profit = 4.5 - 6.47 = -1.97 < 0 → should NOT discharge
+        _, discharge_high_dist, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=low_consumption,
+            distribution_func=const_dist(5.0),
+            current_soc=80.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert len(discharge_high_dist) < len(discharge_low_dist)

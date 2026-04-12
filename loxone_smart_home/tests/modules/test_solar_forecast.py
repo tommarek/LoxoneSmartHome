@@ -4,7 +4,9 @@ import pytest
 from datetime import date, datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from modules.growatt.solar_forecast import SolarForecast, SolarArray, DailyForecast
+from modules.growatt.solar_forecast import (
+    SolarForecast, SolarArray, SolarProductionModel, DailyForecast,
+)
 
 
 @pytest.fixture
@@ -62,16 +64,17 @@ class TestWeatherCalculation:
         """Test that GHI converts to reasonable kWh production."""
         weather_data = {
             "hourly": [
-                {"time": "2026-04-11T10:00:00", "shortwave_radiation": 500},
-                {"time": "2026-04-11T11:00:00", "shortwave_radiation": 800},
-                {"time": "2026-04-11T12:00:00", "shortwave_radiation": 900},
+                {"time": "2026-04-11T10:00:00", "shortwave_radiation": 500, "temperature_2m": 0},
+                {"time": "2026-04-11T11:00:00", "shortwave_radiation": 800, "temperature_2m": 0},
+                {"time": "2026-04-11T12:00:00", "shortwave_radiation": 900, "temperature_2m": 0},
             ]
         }
         result = forecast.calculate_from_weather(weather_data)
         assert "2026-04-11" in result
         day = result["2026-04-11"]
         assert day.total_kwh > 0
-        # 13.5 kWp * 0.80 perf_ratio * (500+800+900)/1000 = 23.76 kWh
+        # 13.5 kWp * 0.80 perf_ratio * 1.0 temp_factor * (500+800+900)/1000 = 23.76 kWh
+        # temp_factor=1.0 at 0°C ambient (cell=25°C=STC)
         assert abs(day.total_kwh - 23.76) < 0.1
 
     def test_zero_radiation_excluded(self, forecast) -> None:
@@ -153,10 +156,8 @@ class TestConsensus:
             )
         }
         result = forecast.build_consensus()
-        # Model=1.0, avg_others=7.5 → model much lower → use average of all
-        assert result["2026-04-11"].hourly[12] == pytest.approx(
-            (1.0 + 8.0 + 7.0) / 3, abs=0.01
-        )
+        # Model=1.0, avg_others=7.5 → model much lower → use other sources only
+        assert result["2026-04-11"].hourly[12] == pytest.approx(7.5, abs=0.01)
 
     def test_model_overpredicts_trusts_model(self, forecast) -> None:
         """When model predicts more than other sources, trust it (real data)."""
@@ -288,3 +289,225 @@ class TestCalibration:
         original = forecast.confidence
         await forecast.calibrate_from_actuals(mock_client, "solar", days=7)
         assert forecast.confidence == original
+
+
+class TestSolarProductionModel:
+
+    def test_predict_3d_hit(self) -> None:
+        """3D bin is the top level and is used when populated."""
+        model = SolarProductionModel(total_kwp=13.5)
+        # rad_b=20 (500 W/m²), cloud_b=2 (20%), alt_b=9 (45°)
+        model.add_sample(20, 2, 12, 9, 6, 5.0)
+        model.add_sample(20, 2, 12, 9, 6, 5.5)
+        model.build()
+        result = model.predict(ghi=500, cloud_cover=20, sun_altitude=45)
+        assert result == pytest.approx(5.25, abs=0.1)
+        assert model.hit_level_counts["3d"] == 1
+
+    def test_predict_2d_fallback(self) -> None:
+        """Falls back to 2D when 3D bin is empty for the queried altitude."""
+        model = SolarProductionModel(total_kwp=13.5)
+        # Only populate altitude bucket 9 (45°)
+        model.add_sample(20, 2, 12, 9, 6, 5.0)
+        model.build()
+        # Query altitude 30° (bucket 6) — misses 3D, hits 2D
+        result = model.predict(ghi=500, cloud_cover=20, sun_altitude=30)
+        assert result > 0
+        assert model.hit_level_counts["2d"] == 1
+
+    def test_predict_interpolation_fallback(self) -> None:
+        """Falls back to interpolation when 2D exact is empty."""
+        model = SolarProductionModel(total_kwp=13.5)
+        # Populate rad bucket 18 and 22 with cloud bucket 2
+        model.add_sample(18, 2, 12, 9, 6, 4.0)
+        model.add_sample(22, 2, 12, 9, 6, 6.0)
+        model.build()
+        # Query rad bucket 20 (ghi=500), cloud bucket 2 (20%), altitude bucket 4 (20°)
+        # No 3D match at (20,2,4), no 2D exact at (20,2), interpolates between (18,2) and (22,2)
+        result = model.predict(ghi=500, cloud_cover=20, sun_altitude=20)
+        assert result > 0
+        assert model.hit_level_counts["interpolate"] == 1
+
+    def test_no_5d_or_4d_bins(self) -> None:
+        """5D and 4D bin attributes no longer exist."""
+        model = SolarProductionModel()
+        assert not hasattr(model, "bins_5d")
+        assert not hasattr(model, "median_5d")
+        assert not hasattr(model, "bins_4d")
+        assert not hasattr(model, "median_4d")
+
+
+class TestConsensusFloatEquality:
+
+    def test_model_same_value_as_other_source(self, forecast) -> None:
+        """When model and another source produce the same float value,
+        both are correctly identified by source identity."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={12: 8.0}, source="model",
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={12: 8.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=35.0,
+                hourly={12: 7.0}, source="weather",
+            )
+        }
+        result = forecast.build_consensus()
+        # avg_others = (8.0 + 7.0) / 2 = 7.5
+        # divergence = |8.0 - 7.5| / 7.75 ≈ 0.065 < 0.3 → average all
+        assert result["2026-04-11"].hourly[12] == pytest.approx(
+            (8.0 + 8.0 + 7.0) / 3, abs=0.01
+        )
+
+
+class TestTemperatureDerating:
+
+    def test_hot_day_derating(self, forecast) -> None:
+        """Hot summer day: 35°C ambient → cell 60°C → ~14% derating."""
+        weather_data = {
+            "hourly": [
+                {"time": "2026-07-15T12:00:00", "shortwave_radiation": 800, "temperature_2m": 35},
+            ]
+        }
+        result = forecast.calculate_from_weather(weather_data)
+        day = result["2026-07-15"]
+        # base: 800 * 13.5 * 0.80 / 1000 = 8.64
+        # temp_factor at 35°C: cell=60°C, factor = 1 + (-0.004)*(60-25) = 0.86
+        # expected: 8.64 * 0.86 = 7.43
+        assert day.total_kwh == pytest.approx(7.43, abs=0.1)
+
+    def test_cold_day_near_stc(self, forecast) -> None:
+        """Cold day: 5°C ambient → cell 30°C → slight derating from STC."""
+        weather_data = {
+            "hourly": [
+                {"time": "2026-01-15T12:00:00", "shortwave_radiation": 300, "temperature_2m": 5},
+            ]
+        }
+        result = forecast.calculate_from_weather(weather_data)
+        day = result["2026-01-15"]
+        # base: 300 * 13.5 * 0.80 / 1000 = 3.24
+        # temp_factor at 5°C: cell=30°C, factor = 1 + (-0.004)*(30-25) = 0.98
+        # expected: 3.24 * 0.98 = 3.175
+        assert day.total_kwh == pytest.approx(3.18, abs=0.1)
+
+
+class TestReliableForecast:
+
+    def test_winter_low_forecast_is_reliable(self, forecast) -> None:
+        """3 kWh in December is reliable for a 13.5 kWp system."""
+        forecast._consensus = {
+            "2026-12-15": DailyForecast(
+                date=date(2026, 12, 15), total_kwh=3.0,
+                hourly={12: 2.0, 13: 1.0}, source="consensus",
+            )
+        }
+        assert forecast.has_reliable_forecast() is True
+
+    def test_winter_very_low_forecast_unreliable(self, forecast) -> None:
+        """0.5 kWh in December is unreliable even in winter."""
+        forecast._consensus = {
+            "2026-12-15": DailyForecast(
+                date=date(2026, 12, 15), total_kwh=0.5,
+                hourly={12: 0.5}, source="consensus",
+            )
+        }
+        assert forecast.has_reliable_forecast() is False
+
+    def test_summer_low_forecast_unreliable(self, forecast) -> None:
+        """3 kWh in June is unreliable for a 13.5 kWp system."""
+        forecast._consensus = {
+            "2026-06-15": DailyForecast(
+                date=date(2026, 6, 15), total_kwh=3.0,
+                hourly={12: 2.0, 13: 1.0}, source="consensus",
+            )
+        }
+        # min_kwh = 13.5 * 0.3 = 4.05, so 3.0 < 4.05 → unreliable
+        assert forecast.has_reliable_forecast() is False
+
+    def test_summer_normal_forecast_reliable(self, forecast) -> None:
+        """25 kWh in June is reliable."""
+        forecast._consensus = {
+            "2026-06-15": DailyForecast(
+                date=date(2026, 6, 15), total_kwh=25.0,
+                hourly={10: 3.0, 11: 5.0, 12: 7.0, 13: 6.0, 14: 4.0},
+                source="consensus",
+            )
+        }
+        assert forecast.has_reliable_forecast() is True
+
+    def test_empty_consensus_unreliable(self, forecast) -> None:
+        forecast._consensus = {}
+        assert forecast.has_reliable_forecast() is False
+
+
+class TestConsensusPersistence:
+
+    @pytest.mark.asyncio
+    async def test_save_consensus_to_influxdb(self, forecast) -> None:
+        """Consensus forecasts are written to solar_forecast_history."""
+        forecast._consensus = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={10: 5.0, 12: 8.0}, source="model+api",
+            )
+        }
+        mock_client = AsyncMock()
+        mock_client.write_point = AsyncMock()
+        await forecast.save_consensus_to_influxdb(mock_client, "solar")
+
+        mock_client.write_point.assert_called_once()
+        call_kwargs = mock_client.write_point.call_args.kwargs
+        assert call_kwargs["measurement"] == "solar_forecast_history"
+        assert call_kwargs["fields"]["total_kwh"] == 40.0
+        assert call_kwargs["tags"]["forecast_date"] == "2026-04-11"
+
+    @pytest.mark.asyncio
+    async def test_calibration_uses_influxdb_when_memory_empty(self, forecast) -> None:
+        """After restart, calibration loads historical forecasts from InfluxDB."""
+        forecast._api_forecast = {}
+        forecast._consensus = {}
+        forecast._model_forecast = {}
+
+        # Mock actual production: 3 days (needed for weighted avg)
+        mock_actual_records = []
+        for day_offset, actual_kwh in [(3, 36.0), (2, 40.0), (1, 48.0)]:
+            rec = MagicMock()
+            rec.get_time.return_value = datetime(2026, 4, 12 - day_offset)
+            rec.get_value.return_value = actual_kwh
+            mock_actual_records.append(rec)
+
+        actual_table = MagicMock()
+        actual_table.records = mock_actual_records
+
+        # Mock historical forecast from InfluxDB (solar_forecast_history)
+        history_records = []
+        for day_offset, forecast_kwh in [(3, 40.0), (2, 45.0), (1, 50.0)]:
+            date_str = f"2026-04-{12 - day_offset:02d}"
+            for field_name, field_val in [("total_kwh", forecast_kwh), ("source", "model+api")]:
+                rec = MagicMock()
+                rec.values = {"forecast_date": date_str}
+                rec.get_field.return_value = field_name
+                rec.get_value.return_value = field_val
+                history_records.append(rec)
+
+        history_table = MagicMock()
+        history_table.records = history_records
+
+        mock_client = AsyncMock()
+        # First call: actual production query; second call: forecast history query
+        mock_client.query = AsyncMock(side_effect=[[actual_table], [history_table]])
+
+        await forecast.calibrate_from_actuals(mock_client, "solar", days=7)
+
+        # Should have used InfluxDB history, not fallen back to theoretical max
+        # Ratios: 36/40=0.9, 40/45=0.889, 48/50=0.96
+        # Confidence should be in a reasonable calibrated range
+        assert 0.8 < forecast.confidence < 1.0

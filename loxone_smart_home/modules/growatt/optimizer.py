@@ -100,6 +100,8 @@ class BatteryOptimizer:
         self._profile_updated: Optional[datetime] = None
         self._last_reserve_info: Dict[str, Any] = {}
         self._last_decisions: List[BlockDecision] = []
+        self._night_reserve_kwh: float = 5.0
+        self._night_reserve_updated: Optional[datetime] = None
 
     async def build_base_load_profile(
         self, influxdb_client: Any, solar_bucket: str, loxone_bucket: str,
@@ -347,6 +349,100 @@ from(bucket: "{solar_bucket}")
             self.logger.warning(f"Night reserve calibration failed: {e}")
             return self._night_reserve_kwh
 
+    def _compute_reserve_soc_per_block(
+        self,
+        blocks: List[Tuple[datetime, float]],
+        prices: List[float],
+        solar_hourly: Dict[int, float],
+        battery_capacity_kwh: float,
+        min_soc: float,
+        max_soc: float,
+        kwh_per_block: float,
+        efficiency: float,
+    ) -> List[float]:
+        """Compute effective minimum SOC for each block position.
+
+        For each block i, calculates the reserve needed to cover base load
+        from block i until the next recharge opportunity (cheap price or solar).
+        Blocks closer to recharge need less reserve.
+
+        Returns:
+            List of effective_min_soc values, one per block.
+        """
+        n = len(blocks)
+        if n == 0:
+            return []
+
+        sorted_prices = sorted(prices)
+        price_threshold = sorted_prices[n // 4] if n > 4 else sorted_prices[0]
+        max_reserve = battery_capacity_kwh * (max_soc - min_soc) / 100 * 0.85
+        effective_min_socs = [min_soc] * n
+
+        # Precompute next-recharge index for each block (scan forward once)
+        # next_recharge[i] = index of next recharge block after i, or n if none
+        next_recharge_idx = [n] * n
+        # Scan backward: propagate the nearest recharge index
+        for j in range(n - 1, -1, -1):
+            h_j = blocks[j][0].hour
+            solar_j = solar_hourly.get(h_j, 0)
+            if solar_j > 1.0 or prices[j] <= price_threshold:
+                next_recharge_idx[j] = j
+            elif j + 1 < n:
+                next_recharge_idx[j] = next_recharge_idx[j + 1]
+
+        for block_idx in range(n):
+            block_ts = blocks[block_idx][0]
+
+            # Find hours until next recharge
+            recharge_j = next_recharge_idx[min(block_idx + 1, n - 1)] if block_idx + 1 < n else n
+            if recharge_j < n:
+                delta = (blocks[recharge_j][0] - block_ts).total_seconds() / 3600
+                hours_until = max(1, int(delta))
+            else:
+                delta = (blocks[-1][0] - block_ts).total_seconds() / 3600
+                hours_until = max(1, int(delta))
+
+            # Sum base load for hours until recharge
+            gross_reserve_kwh = 0.0
+            for offset in range(hours_until):
+                future_hour = (block_ts.hour + offset) % 24
+                future_weekend = (block_ts + timedelta(hours=offset)).weekday() >= 5
+                gross_reserve_kwh += self._base_load_profile.get(future_hour, future_weekend)
+
+            gross_reserve_kwh = gross_reserve_kwh / efficiency
+
+            # Subtract incoming energy before recharge
+            incoming_kwh = 0.0
+            for j in range(block_idx + 1, n):
+                ts_j = blocks[j][0]
+                if recharge_j < n and j >= recharge_j:
+                    break
+                price_rank = sum(1 for p in prices if p < prices[j]) / n if n > 0 else 0.5
+                if price_rank < 0.35:
+                    incoming_kwh += kwh_per_block * efficiency
+                solar_block = solar_hourly.get(ts_j.hour, 0) / 4.0
+                if solar_block > 0:
+                    incoming_kwh += solar_block * efficiency
+
+            reserve_kwh = max(0, gross_reserve_kwh - incoming_kwh)
+            reserve_kwh = min(reserve_kwh, max_reserve)
+            effective_min_socs[block_idx] = min(
+                max_soc - 5,
+                min_soc + (reserve_kwh / battery_capacity_kwh) * 100
+            )
+
+        # Store first block's info for dashboard
+        if effective_min_socs:
+            recharge_j = next_recharge_idx[min(1, n - 1)] if n > 1 else n
+            recharge_ts = blocks[recharge_j][0] if recharge_j < n else None
+            self._last_reserve_info = {
+                "next_recharge_ts": recharge_ts.isoformat() if recharge_ts else None,
+                "next_recharge_reason": "auto",
+                "effective_min_soc": round(effective_min_socs[0], 1),
+            }
+
+        return effective_min_socs
+
     def optimize(
         self,
         blocks: List[Tuple[datetime, float]],  # (timestamp, price_czk_kwh)
@@ -396,91 +492,44 @@ from(bucket: "{solar_bucket}")
         sorted_prices = sorted(prices)
         n = len(blocks)
 
-        # Dynamic reserve: find next recharge opportunity (cheap price or solar)
-        # then sum base load hours until that point
+        # Compute per-block effective minimum SOC (dynamic reserve)
         first_block_ts = blocks[0][0] if blocks else datetime.now()
-        is_weekend = first_block_ts.weekday() >= 5
+        effective_min_socs = self._compute_reserve_soc_per_block(
+            blocks, prices, solar_hourly, battery_capacity_kwh,
+            min_soc, max_soc, kwh_per_block, efficiency,
+        )
 
-        # Find next recharge: iterate blocks chronologically (today + tomorrow)
-        price_threshold = sorted_prices[n // 4] if n > 4 else sorted_prices[0]
-        next_recharge_ts = None
-        next_recharge_reason = "none"
-        hours_until_recharge = 0
-
-        for i, (ts, price) in enumerate(blocks):
-            if i == 0:
-                continue  # Skip current block
-            h = ts.hour
-            solar_h = solar_hourly.get(h, 0)
-
-            if solar_h > 1.0:
-                next_recharge_ts = ts
-                next_recharge_reason = f"solar ({solar_h:.1f} kWh)"
-                break
-            elif price <= price_threshold:
-                next_recharge_ts = ts
-                next_recharge_reason = f"cheap ({price:.2f} CZK)"
-                break
-
-        if next_recharge_ts:
-            # Count actual hours between now and recharge
-            delta = (next_recharge_ts - first_block_ts).total_seconds() / 3600
-            hours_until_recharge = max(1, int(delta))
-        else:
-            # No recharge found in schedule — assume 24 hours (worst case)
-            hours_until_recharge = 24
-
-        # Sum base load for each hour until recharge
-        gross_reserve_kwh = 0.0
-        for offset in range(hours_until_recharge):
-            future_hour = (first_block_ts.hour + offset) % 24
-            future_weekend = (first_block_ts + timedelta(hours=offset)).weekday() >= 5
-            gross_reserve_kwh += self._base_load_profile.get(future_hour, future_weekend)
-
-        # Account for efficiency
-        gross_reserve_kwh = gross_reserve_kwh / efficiency
-
-        # Subtract incoming energy: scheduled charge blocks + solar before recharge
-        incoming_charge_kwh = 0.0
-        for ts, price in blocks:
-            if next_recharge_ts and ts >= next_recharge_ts:
-                break
-            if ts <= first_block_ts:
-                continue
-            # Cheap blocks (bottom 35%) will charge the battery
-            price_rank = sum(1 for p in prices if p < price) / n if n > 0 else 0.5
-            if price_rank < 0.35:
-                incoming_charge_kwh += kwh_per_block * efficiency
-            # Solar production for this block (quarter of hourly)
-            solar_block = solar_hourly.get(ts.hour, 0) / 4.0
-            if solar_block > 0:
-                incoming_charge_kwh += solar_block * efficiency
-
-        reserve_kwh = max(0, gross_reserve_kwh - incoming_charge_kwh)
-
-        # Clamp to usable capacity
-        max_reserve = battery_capacity_kwh * (max_soc - min_soc) / 100 * 0.85
-        reserve_kwh = min(reserve_kwh, max_reserve)
-        effective_min_soc = min(max_soc - 5, min_soc + (reserve_kwh / battery_capacity_kwh) * 100)
-
-        # Store for dashboard
-        self._last_reserve_info = {
-            "next_recharge_ts": next_recharge_ts.isoformat() if next_recharge_ts else None,
-            "next_recharge_reason": next_recharge_reason,
-            "hours_until_recharge": hours_until_recharge,
-            "gross_reserve_kwh": round(gross_reserve_kwh, 1),
-            "incoming_charge_kwh": round(incoming_charge_kwh, 1),
-            "net_reserve_kwh": round(reserve_kwh, 1),
-            "effective_min_soc": round(effective_min_soc, 1),
-        }
+        # Store first block's reserve info for dashboard (backward compatibility)
+        if effective_min_socs:
+            self._last_reserve_info["effective_min_soc"] = round(effective_min_socs[0], 1)
 
         # Future cheapest price (for estimating recharge cost)
         # For each block, what's the cheapest price available in remaining blocks?
+        # Also track which hour that cheapest price occurs at (for distribution tariff)
         future_min_price = [0.0] * n
+        future_min_price_hour = [0] * n
         running_min = float('inf')
+        running_min_hour = 0
         for i in range(n - 1, -1, -1):
-            running_min = min(running_min, prices[i])
+            if prices[i] <= running_min:
+                running_min = prices[i]
+                running_min_hour = blocks[i][0].hour
             future_min_price[i] = running_min
+            future_min_price_hour[i] = running_min_hour
+
+        # Future best discharge value: for each block, what's the maximum
+        # discharge profit achievable in remaining blocks? Used to avoid
+        # spending battery on mediocre blocks when better ones are ahead.
+        future_max_discharge_value = [0.0] * n
+        running_max = float('-inf')
+        for i in range(n - 1, -1, -1):
+            dist_i = distribution_func(blocks[i][0].hour)
+            sell_rev_i = prices[i] - dist_i - sell_fee_czk - battery_amortisation_czk
+            future_dist_i = distribution_func(future_min_price_hour[i])
+            recharge_cost_i = (future_min_price[i] + future_dist_i) / efficiency
+            dv = sell_rev_i - recharge_cost_i
+            running_max = max(running_max, dv)
+            future_max_discharge_value[i] = running_max
 
         # Pre-select charge blocks: pick cheapest N blocks where charging is
         # profitable vs buying from grid later. Don't charge at 1.28 CZK when
@@ -532,7 +581,8 @@ from(bucket: "{solar_bucket}")
             # Net solar: excess solar charges battery automatically
             net_solar = solar - consumption  # Positive = excess, negative = deficit
 
-            # Current battery energy
+            # Current battery energy (per-block dynamic reserve)
+            effective_min_soc = effective_min_socs[i] if i < len(effective_min_socs) else min_soc
             battery_kwh = battery_capacity_kwh * soc / 100
             max_battery_kwh = battery_capacity_kwh * max_soc / 100
             min_battery_kwh = battery_capacity_kwh * effective_min_soc / 100
@@ -554,10 +604,13 @@ from(bucket: "{solar_bucket}")
             charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
             # --- DISCHARGE value ---
-            # Real sell revenue = spot - distribution - sell_fee - battery_amortisation
-            # Must exceed recharge cost to be profitable
-            recharge_cost = future_cheapest / efficiency  # Cost to refill later
+            # When selling to grid: receive spot minus distribution, sell fee, and wear.
+            # In Czech market, distribution tariff is paid on both buy and sell.
+            # When recharging later: pay spot + distribution at that future hour.
             sell_revenue = price_czk - dist - sell_fee_czk - battery_amortisation_czk
+            future_recharge_hour = future_min_price_hour[i] if i < n else 0
+            future_dist = distribution_func(future_recharge_hour)
+            recharge_cost = (future_cheapest + future_dist) / efficiency
             discharge_profit = sell_revenue - recharge_cost  # Net profit per kWh
             discharge_possible = min(
                 discharge_kwh_per_block,
@@ -588,7 +641,12 @@ from(bucket: "{solar_bucket}")
                 net_value = charge_value
 
             # Discharge when profitable (sell revenue > recharge cost + fees)
-            if discharge_value > 0 and discharge_value > net_value:
+            # Only discharge if this block is at least 80% of the best remaining
+            # opportunity — prevents wasting battery on mediocre blocks when
+            # much better ones are upcoming.
+            best_remaining = future_max_discharge_value[i] if i < n else 0
+            is_worthwhile = (best_remaining <= 0) or (discharge_value >= best_remaining * 0.8)
+            if discharge_value > 0 and discharge_value > net_value and is_worthwhile:
                 if discharge_possible > 0 and soc > effective_min_soc:
                     action = "discharge"
                     net_value = discharge_value
@@ -610,19 +668,18 @@ from(bucket: "{solar_bucket}")
             net_from_solar = solar_available - house_load  # positive = excess solar
 
             if action == "charge":
-                # Grid charges battery at charge_rate, house still consumes
-                # Net battery change = grid charge * efficiency + excess solar * efficiency - deficit from load
+                # In charge-from-grid mode, battery charges at full charge_rate.
+                # Solar is used first (cheapest source), grid fills the gap.
+                # House consumption is covered separately — it does NOT reduce
+                # the charge power going to the battery.
+                # (AC charge power_rate is 100% — see _build_desired_state)
                 grid_charge = kwh_per_block
+                soc += (grid_charge * efficiency) / battery_capacity_kwh * 100
+                # Excess solar (after house load) also charges the battery
                 if net_from_solar > 0:
-                    # Solar covers house + charges battery
                     solar_to_batt = min(net_from_solar * efficiency,
-                                        (max_battery_kwh - battery_kwh))
-                    soc += (grid_charge * efficiency + solar_to_batt) / battery_capacity_kwh * 100
-                else:
-                    # House draws some from grid charge, rest goes to battery
-                    # Grid provides charge_rate, some goes to house, rest to battery
-                    net_charge = grid_charge * efficiency + net_from_solar  # net_from_solar is negative
-                    soc += max(0, net_charge) / battery_capacity_kwh * 100
+                                        max_battery_kwh - battery_kwh)
+                    soc += solar_to_batt / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
 
             elif action == "discharge":

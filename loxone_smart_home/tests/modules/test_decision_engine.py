@@ -65,7 +65,7 @@ def base_context() -> DecisionContext:
 def test_decision_engine_initialization(decision_engine: GrowattDecisionEngine) -> None:
     """Test that decision engine initializes correctly."""
     assert decision_engine is not None
-    assert len(decision_engine.decision_tree) == 6  # 6 decision nodes (consolidated export control)
+    assert len(decision_engine.decision_tree) == 7  # 7 decision nodes
     assert decision_engine._last_decision is None
 
 

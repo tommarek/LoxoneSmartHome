@@ -218,6 +218,7 @@ class GrowattController(BaseModule):
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
         self._high_loads_active: bool = False
+        self._high_load_details: Dict[str, Any] = {}
         self._home_status_topic = "loxone/status"
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
@@ -1701,6 +1702,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             was_high_load = self._high_loads_active
 
             self._high_loads_active = high_loads["active"]
+            self._high_load_details = high_loads
 
             # Log significant changes
             if self._high_loads_active != was_high_load:
@@ -1879,6 +1881,14 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
 
         # Build consensus from available sources
         self._solar_forecast.build_consensus()
+
+        # Persist consensus for calibration across restarts
+        try:
+            await self._solar_forecast.save_consensus_to_influxdb(
+                self.influxdb_client, self.settings.influxdb.bucket_solar
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not persist consensus forecast: {e}")
 
         # Log summary
         now = self._get_local_now()
@@ -2157,6 +2167,7 @@ from(bucket: "{bucket}")
                 distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
                 distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
                 low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
+                eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
             )
             dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
                 h, dist_thresholds
@@ -3065,7 +3076,7 @@ from(bucket: "{bucket}")
                 # even when mode hasn't changed
                 if self._current_inverter_state and context.price_thresholds:
                     if context.current_block_key in context.prices_15min:
-                        current_price_czk = context.current_price * 25 / 1000
+                        current_price_czk = context.current_price * context.eur_czk_rate / 1000
                         should_export = current_price_czk >= context.price_thresholds.export_price_min
                         if should_export != self._current_inverter_state.export_enabled:
                             if should_export:
@@ -3136,6 +3147,7 @@ from(bucket: "{bucket}")
             distribution_tariff_high=getattr(self.config, 'distribution_tariff_high', 1.5),
             distribution_tariff_low=getattr(self.config, 'distribution_tariff_low', 0.5),
             low_tariff_hours=getattr(self.config, 'low_tariff_hours', '0-6,22-24'),
+            eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
         )
 
         # Calculate price ranking for current 15-minute block
@@ -3161,6 +3173,7 @@ from(bucket: "{bucket}")
             ),
             # System state
             high_loads_active=self._high_loads_active,
+            high_load_details=self._high_load_details,
             battery_soc=self._battery_soc,
             current_mode=self._current_mode,
             current_load=self._current_load,
@@ -3180,7 +3193,8 @@ from(bucket: "{bucket}")
             # Solar schedule
             sunrise=sunrise,
             sunset=sunset,
-            is_summer_mode=(await self._get_season_mode() == "summer")
+            is_summer_mode=(await self._get_season_mode() == "summer"),
+            eur_czk_rate=self._eur_czk_rate or getattr(self.config, 'eur_czk_rate', 25.0),
         )
 
     async def _build_desired_state(
@@ -3244,7 +3258,7 @@ from(bucket: "{bucket}")
         try:
             context = await self._build_decision_context()
             if context.price_thresholds and context.current_block_key in context.prices_15min:
-                current_price_czk = context.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
+                current_price_czk = context.current_price * (self._eur_czk_rate or 25.0) / 1000  # EUR/MWh to CZK/kWh
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:
             self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
@@ -3724,12 +3738,18 @@ from(bucket: "{bucket}")
                 if self._last_evaluation_block != current_block:
                     self._last_evaluation_block = current_block
 
-                    # Re-run optimizer if schedule is empty (no charge/discharge blocks)
-                    if (self._optimizer and self._current_prices
-                            and not self._combined_charging_blocks
-                            and not self._discharge_periods_today):
-                        self.logger.info("Optimizer schedule empty — recalculating")
-                        await self._calculate_cross_day_optimal_schedule()
+                    # Re-run optimizer with current real SOC + remaining future blocks
+                    if self._optimizer and self._current_prices:
+                        old_charge = self._combined_charging_blocks.copy()
+                        old_discharge = self._discharge_periods_today.copy()
+                        await self._calculate_cross_day_optimal_schedule(suppress_print=True)
+                        if self._combined_charging_blocks != old_charge or self._discharge_periods_today != old_discharge:
+                            ch = len(self._combined_charging_blocks)
+                            dis = len(self._discharge_periods_today)
+                            self.logger.info(
+                                f"🔄 Schedule updated (SOC {self._battery_soc:.0f}%): "
+                                f"{ch} charge, {dis} discharge blocks"
+                            )
 
                     await self._evaluate_conditions("15min_block_change")
 
