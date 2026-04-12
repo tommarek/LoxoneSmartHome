@@ -132,6 +132,51 @@ class TestConsensus:
         # No model available → average all sources
         assert result["2026-04-11"].hourly[12] == pytest.approx(7.5, abs=0.01)
 
+    def test_model_underpredicts_uses_average(self, forecast) -> None:
+        """When model predicts much less than other sources, use average (sparse bin)."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=10.0,
+                hourly={12: 1.0}, source="model",
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={12: 8.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=35.0,
+                hourly={12: 7.0}, source="weather",
+            )
+        }
+        result = forecast.build_consensus()
+        # Model=1.0, avg_others=7.5 → model much lower → use average of all
+        assert result["2026-04-11"].hourly[12] == pytest.approx(
+            (1.0 + 8.0 + 7.0) / 3, abs=0.01
+        )
+
+    def test_model_overpredicts_trusts_model(self, forecast) -> None:
+        """When model predicts more than other sources, trust it (real data)."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=50.0,
+                hourly={12: 10.0}, source="model",
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={12: 5.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        # Model=10.0, avg_others=5.0 → model higher → trust model
+        assert result["2026-04-11"].hourly[12] == 10.0
+
     def test_single_source_used_directly(self, forecast) -> None:
         forecast._api_forecast = {
             "2026-04-11": DailyForecast(

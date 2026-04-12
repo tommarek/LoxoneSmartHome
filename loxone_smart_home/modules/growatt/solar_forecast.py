@@ -844,9 +844,13 @@ from(bucket: "{weather_bucket}")
                                 if divergence <= 0.3:
                                     # Agreement: average all
                                     hourly[hour] = sum(vals) / len(vals)
-                                else:
-                                    # Divergence: trust model (trained on real data)
+                                elif model_val >= avg_others:
+                                    # Model predicts more: trust it (real installation data)
                                     hourly[hour] = model_val
+                                else:
+                                    # Model predicts much less: likely sparse bin,
+                                    # use average to avoid extreme underprediction
+                                    hourly[hour] = sum(vals) / len(vals)
                             else:
                                 hourly[hour] = model_val
                         else:
