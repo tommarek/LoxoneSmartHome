@@ -1351,24 +1351,29 @@ class GrowattController(BaseModule):
             self.logger.info("└──────────────┴──────────────┘")
 
     async def start(self) -> None:
-        """Start the Growatt controller."""
+        """Start the Growatt controller.
+
+        Designed for fast startup: fetches prices and SOC, starts the periodic
+        evaluation loop immediately, then builds ML models in the background.
+        Models improve optimizer quality but aren't needed for basic operation.
+        """
         self._running = True
 
         # Note: MQTT subscriptions are pre-registered in __init__ to ensure they're
         # active before the message loop starts (avoids asyncio-mqtt race conditions)
+
+        # === PHASE 1: Quick startup (seconds) ===
 
         # Sync inverter time on startup
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
 
         # Check if we should fetch tomorrow's prices at startup
-        # (if we're past the configured fetch hour and haven't fetched yet)
         now = self._get_local_now()
         fetch_hour = self.config.price_fetch_hour
         will_fetch_tomorrow = now.hour >= fetch_hour and not self._next_day_prices_fetched
 
-        # Fetch initial prices (suppress schedule print if we're about to fetch tomorrow's)
-        # Always show full table at startup
+        # Fetch initial prices (needed for mode decisions)
         await self._fetch_prices(
             suppress_schedule_print=will_fetch_tomorrow,
             force_table_display=True
@@ -1383,53 +1388,12 @@ class GrowattController(BaseModule):
                 self._fetch_next_day_prices_task()
             )
 
-        # Build solar production model from historical data (one-time, 365 days)
-        if self._solar_forecast:
-            try:
-                success = await self._solar_forecast.build_production_model(
-                    self.influxdb_client, self.settings
-                )
-                if success and self._solar_forecast._production_model:
-                    m = self._solar_forecast._production_model
-                    self.logger.info(
-                        f"Solar production model: {m.data_points} hours, "
-                        f"{m.curtailed_filtered} curtailed filtered, "
-                        f"{len(m.median_2d)} bins"
-                    )
-            except Exception as e:
-                self.logger.warning(f"Failed to build solar production model: {e}")
-
-        # Fetch initial solar forecast
-        if self._solar_forecast:
-            await self._update_solar_forecast()
-
-        # Build consumption model from historical data
-        if self._consumption_forecast:
-            success = await self._consumption_forecast.build_model(
-                self.influxdb_client, self.settings
-            )
-            if success:
-                summary = self._consumption_forecast.get_model_summary()
-                self.logger.info(
-                    f"📊 Consumption model: {summary['data_points']} data points, "
-                    f"{summary['bins']} bins, range {summary['date_range']}"
-                )
-
-        # Build optimizer base load profile from historical non-heating consumption
-        if self._optimizer:
-            await self._optimizer.build_base_load_profile(
-                self.influxdb_client,
-                self.settings.influxdb.bucket_solar,
-                self.settings.influxdb.bucket_loxone,
-            )
-
-        # Initialize battery SOC from InfluxDB before running optimizer
-        # (telemetry hasn't arrived yet at startup, default is 50%)
+        # Initialize battery SOC from InfluxDB (quick query, last value only)
         if self.influxdb_client:
             try:
                 soc_query = f'''
 from(bucket: "{self.settings.influxdb.bucket_solar}")
-  |> range(start: -1d)
+  |> range(start: -1h)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
   |> last()
 '''
@@ -1447,20 +1411,89 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except Exception as e:
                 self.logger.debug(f"Could not load initial SOC: {e}")
 
-        # Re-run optimizer schedule now that ALL models are ready
-        # (solar forecast, consumption model, base load profile)
-        # The initial schedule calculation during price fetch ran before models were built
-        if self._optimizer and self._current_prices:
-            self.logger.info("Recalculating optimizer schedule with all models ready...")
-            await self._calculate_cross_day_optimal_schedule()
+        # === PHASE 2: Go operational (controller responds to events) ===
 
-        # Start periodic evaluation loop
+        # Start periodic evaluation loop BEFORE model builds
+        # Controller is now operational with price data + SOC
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
 
-        # Perform initial evaluation
+        # Perform initial evaluation (mode decision with available data)
         await self._evaluate_conditions("startup")
 
         self.logger.info("Growatt controller started with event-driven evaluation")
+
+        # === PHASE 3: Build models in background (minutes) ===
+        # Models improve optimizer quality but aren't needed for basic operation
+        asyncio.create_task(self._build_models_background())
+
+    async def _build_models_background(self) -> None:
+        """Build ML models in background without blocking controller operation.
+
+        Queries InfluxDB for historical data (730 days solar, 365 days consumption,
+        90 days base load). When complete, recalculates the schedule with better data.
+        """
+        try:
+            self.logger.info("Starting background model builds...")
+
+            # Solar production model (730 days, ~10 InfluxDB queries)
+            if self._solar_forecast:
+                try:
+                    success = await self._solar_forecast.build_production_model(
+                        self.influxdb_client, self.settings
+                    )
+                    if success and self._solar_forecast._production_model:
+                        m = self._solar_forecast._production_model
+                        self.logger.info(
+                            f"Solar production model ready: {m.data_points} hours, "
+                            f"{m.curtailed_filtered} curtailed filtered, "
+                            f"{len(m.median_2d)} bins"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build solar production model: {e}")
+
+            # Solar forecast API
+            if self._solar_forecast:
+                try:
+                    await self._update_solar_forecast()
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch solar forecast: {e}")
+
+            # Consumption model (365 days, 2 queries)
+            if self._consumption_forecast:
+                try:
+                    success = await self._consumption_forecast.build_model(
+                        self.influxdb_client, self.settings
+                    )
+                    if success:
+                        summary = self._consumption_forecast.get_model_summary()
+                        self.logger.info(
+                            f"📊 Consumption model ready: {summary['data_points']} data points, "
+                            f"{summary['bins']} bins, range {summary['date_range']}"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build consumption model: {e}")
+
+            # Base load profile (90 days, 3 queries)
+            if self._optimizer:
+                try:
+                    await self._optimizer.build_base_load_profile(
+                        self.influxdb_client,
+                        self.settings.influxdb.bucket_solar,
+                        self.settings.influxdb.bucket_loxone,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build base load profile: {e}")
+
+            # Recalculate schedule with all models ready
+            if self._optimizer and self._current_prices:
+                self.logger.info("Recalculating optimizer schedule with all models ready...")
+                await self._calculate_cross_day_optimal_schedule()
+                await self._evaluate_conditions("models_ready")
+
+            self.logger.info("✅ All background models built successfully")
+
+        except Exception as e:
+            self.logger.error(f"Background model build failed: {e}", exc_info=True)
 
     async def stop(self) -> None:
         """Stop the Growatt controller."""
