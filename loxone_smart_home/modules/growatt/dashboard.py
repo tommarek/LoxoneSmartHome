@@ -736,6 +736,13 @@ body {
   gap: 1px;
   margin-top: 8px;
 }
+.price-chart-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 2px;
+  display: flex;
+  justify-content: space-between;
+}
 .price-bar {
   flex: 1;
   min-width: 2px;
@@ -1024,10 +1031,20 @@ select, input {
 
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
-    <h2 id="priceChartTitle">Today's Prices (15-min blocks)</h2>
-    <div style="position:relative">
-      <div class="price-chart" id="priceChart"></div>
-      <svg id="socLine" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
+    <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
+    <div class="price-chart-day" id="priceChartTodayWrap">
+      <div class="price-chart-label" id="priceChartTodayLabel">Today</div>
+      <div style="position:relative">
+        <div class="price-chart" id="priceChartToday"></div>
+        <svg id="socLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
+      </div>
+    </div>
+    <div class="price-chart-day" id="priceChartTomorrowWrap" style="display:none;margin-top:12px">
+      <div class="price-chart-label" id="priceChartTomorrowLabel">Tomorrow</div>
+      <div style="position:relative">
+        <div class="price-chart" id="priceChartTomorrow"></div>
+        <svg id="socLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
+      </div>
     </div>
   </div>
   <div class="chart-tooltip" id="chartTooltip"></div>
@@ -1226,23 +1243,42 @@ async function fetchPrices() {
     ]);
     const data = await priceRes.json();
     const projData = await projRes.json();
-    const allPrices = [...(data.prices || []), ...(data.tomorrow || [])];
-    const title = document.getElementById('priceChartTitle');
-    if (data.has_tomorrow) {
-      title.textContent = 'Today + Tomorrow Prices & Battery SOC';
+    const todayPrices = data.prices || [];
+    const tomorrowPrices = data.tomorrow || [];
+    const allPrices = [...todayPrices, ...tomorrowPrices];
+    priceData = allPrices;  // unified array for tooltip lookups across both charts
+
+    document.getElementById('priceChartTitle').textContent =
+      data.has_tomorrow ? 'Today + Tomorrow Prices & Battery SOC' : "Today's Prices & Battery SOC";
+
+    // Shared vertical scale so both charts are visually comparable
+    const allVals = allPrices.map(p => p.czk_kwh);
+    const maxAbs = allVals.length
+      ? Math.max(Math.abs(Math.min(...allVals)), Math.abs(Math.max(...allVals)), 1)
+      : 1;
+
+    const timeline = projData.timeline || [];
+    renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
+    renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday');
+
+    const tomorrowWrap = document.getElementById('priceChartTomorrowWrap');
+    if (data.has_tomorrow && tomorrowPrices.length) {
+      tomorrowWrap.style.display = '';
+      renderPriceChart(tomorrowPrices, 'priceChartTomorrow', todayPrices.length, maxAbs);
+      renderSocLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'socLineTomorrow');
     } else {
-      title.textContent = "Today's Prices & Battery SOC";
+      tomorrowWrap.style.display = 'none';
     }
-    renderPriceChart(allPrices);
-    renderSocLine(allPrices, projData.timeline || []);
   } catch (e) { console.error('fetchPrices error:', e); }
 }
 
-function renderSocLine(prices, timeline) {
-  const svg = document.getElementById('socLine');
-  if (!svg || !timeline.length || !prices.length) { svg.innerHTML = ''; return; }
+function renderSocLine(prices, timeline, chartId, svgId) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  if (!timeline.length || !prices.length) { svg.innerHTML = ''; return; }
 
-  const chart = document.getElementById('priceChart');
+  const chart = document.getElementById(chartId);
+  if (!chart) { svg.innerHTML = ''; return; }
   const w = chart.offsetWidth;
   const h = chart.offsetHeight;
   if (!w || !h) return;
@@ -1251,8 +1287,10 @@ function renderSocLine(prices, timeline) {
   const socMap = {};
   timeline.forEach(t => { socMap[t.time + '|' + t.day] = t.soc; });
 
-  // Build points for the polyline
+  // Build points for the polyline. Track which price-bar index produced each
+  // point so we can place start/middle/end SOC% labels on actual rendered bars.
   const points = [];
+  const labelMeta = [];  // parallel array: { soc: number } per point
   const barWidth = w / prices.length;
   prices.forEach((p, i) => {
     const key = p.start + '|' + p.day;
@@ -1261,6 +1299,7 @@ function renderSocLine(prices, timeline) {
       const x = i * barWidth + barWidth / 2;
       const y = h - (soc / 100 * h);  // SOC 100% = top, 0% = bottom
       points.push(x.toFixed(1) + ',' + y.toFixed(1));
+      labelMeta.push({ soc: soc });
     }
   });
 
@@ -1271,17 +1310,17 @@ function renderSocLine(prices, timeline) {
     'fill="none" stroke="#f97316" stroke-width="2" stroke-opacity="0.8" ' +
     'stroke-linejoin="round" stroke-linecap="round"/>';
 
-  // Add SOC% labels at start, middle, end
+  // SOC% labels at start, middle, end of THIS chart's points
   const labelIndices = [0, Math.floor(points.length / 2), points.length - 1];
   labelIndices.forEach(idx => {
-    const t = timeline[idx];
-    if (!t) return;
+    const meta = labelMeta[idx];
+    if (!meta) return;
     const coords = points[idx].split(',');
     const x = parseFloat(coords[0]);
     const y = parseFloat(coords[1]) - 6;
     svgContent += '<text x="' + x + '" y="' + Math.max(12, y) + '" ' +
       'font-size="10" fill="#f97316" text-anchor="middle" font-weight="600">' +
-      t.soc + '%</text>';
+      meta.soc + '%</text>';
   });
 
   svg.innerHTML = svgContent;
@@ -1289,23 +1328,19 @@ function renderSocLine(prices, timeline) {
 
 let priceData = [];
 
-function renderPriceChart(prices) {
-  priceData = prices;
-  const chart = document.getElementById('priceChart');
+function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
+  const chart = document.getElementById(mountId);
+  if (!chart) return;
   if (!prices.length) { chart.innerHTML = '<div style="color:var(--muted)">No price data</div>'; return; }
 
-  const vals = prices.map(p => p.czk_kwh);
-  const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
+  // Fall back to per-chart scale if caller didn't pass one
+  if (!maxAbs) {
+    const vals = prices.map(p => p.czk_kwh);
+    maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
+  }
 
   let html = '';
-  let prevDay = null;
   prices.forEach((p, i) => {
-    // Day separator
-    if (prevDay && p.day !== prevDay) {
-      html += '<div style="width:3px;flex-shrink:0;background:var(--accent);border-radius:2px;opacity:0.5;align-self:stretch" title="Tomorrow"></div>';
-    }
-    prevDay = p.day;
-
     const v = p.czk_kwh;
     const h = Math.abs(v) / maxAbs * 100;
     const isNeg = v < 0;
@@ -1316,16 +1351,17 @@ function renderPriceChart(prices) {
     else if (p.is_sell_production) cls = 'sell-production';
     if (p.is_current) cls += ' current';
 
+    const globalIdx = i + (idxOffset || 0);
     const tmrwOpacity = p.day === 'tomorrow' ? 'opacity:0.6;' : '';
     if (isNeg) {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + h + '%;align-self:flex-start;opacity:0.5;' + tmrwOpacity + '"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + h + '%;align-self:flex-start;opacity:0.5;' + tmrwOpacity + '"></div>';
     } else {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + i + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '"></div>';
     }
   });
   chart.innerHTML = html;
 
-  // Attach tooltip events
+  // Attach tooltip events for THIS chart's bars
   const tooltip = document.getElementById('chartTooltip');
   chart.querySelectorAll('.price-bar').forEach(bar => {
     bar.addEventListener('mouseenter', (e) => showTooltip(e, bar, tooltip));
@@ -1333,10 +1369,15 @@ function renderPriceChart(prices) {
     bar.addEventListener('mouseleave', () => tooltip.style.display = 'none');
     bar.addEventListener('touchstart', (e) => { e.preventDefault(); showTooltip(e.touches[0], bar, tooltip); });
   });
-  document.addEventListener('touchstart', (e) => {
-    if (!e.target.classList.contains('price-bar')) tooltip.style.display = 'none';
-  });
 }
+
+// Hide the tooltip on any touch outside a price bar (attached once globally)
+document.addEventListener('touchstart', (e) => {
+  if (!e.target.classList.contains('price-bar')) {
+    const tt = document.getElementById('chartTooltip');
+    if (tt) tt.style.display = 'none';
+  }
+});
 
 function showTooltip(e, bar, tooltip) {
   const idx = parseInt(bar.dataset.idx);
