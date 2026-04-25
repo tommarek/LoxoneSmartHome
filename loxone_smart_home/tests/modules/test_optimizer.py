@@ -405,6 +405,61 @@ class TestTwoPassOptimizer:
         # At least some negative-price blocks should be selected
         assert len(charge) > 0
 
+    def test_picks_cheapest_negatives_not_chronologically_first(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Steep negative gradient: cheapest later blocks must win over earlier
+        less-negative blocks.
+
+        Reproduces the production bug from 2026-04-25 where the optimizer
+        scheduled charging at 09:15-11:00 (-0.05 to -1.75 CZK) and skipped
+        the deeply-negative midday window 13:30-15:30 (-6 to -12 CZK).
+        Battery filled to 100% from the morning charges, so the much cheaper
+        afternoon blocks became no-ops in the forward simulation.
+
+        After the fix, the cheapest-N selector picks the deepest negatives
+        first regardless of when they fall in the day.
+        """
+        # 9-12: mildly negative morning (4 hours)
+        # 13-14: positive (skip)
+        # 15-18: deeply negative (4 hours) — these MUST win
+        # 19+:  high evening (filler)
+        prices = (
+            [-0.05, -0.5, -1.0, -2.0]
+            + [0.5, 0.5]
+            + [-6.0, -9.0, -11.0, -12.0]
+            + [5.0] * 14
+        )
+        blocks = make_blocks(prices, start_hour=9)
+
+        charge, _, _sp, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,           # small 2 kWh gap → blocks_to_fill at the floor of 4
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        charge_hours = sorted({t.hour for t in charge})
+
+        # The four deeply-negative midday hours must be charged.
+        deep_negative_hours = {15, 16, 17, 18}
+        assert deep_negative_hours.issubset(charge_hours), (
+            f"Optimizer must pick deeply-negative blocks {deep_negative_hours}; "
+            f"got {charge_hours}"
+        )
+        # And the marginally-negative morning ones should NOT be picked
+        # (battery has limited capacity and cheaper alternatives are ahead).
+        marginal_morning = {9, 10}
+        assert not (marginal_morning & set(charge_hours)), (
+            f"Optimizer must not waste battery headroom on marginally-negative "
+            f"blocks {marginal_morning} when -12 CZK blocks are coming; "
+            f"got {charge_hours}"
+        )
+
 
 class TestSelfConsumptionHold:
     """Tests for self-consumption hold value — battery should prefer
@@ -541,10 +596,12 @@ class TestSelfConsumptionHold:
             + ", ".join(f"{d.timestamp.strftime('%H:%M')}={d.price_czk:+.2f}" for d in bad)
         )
 
-        # Sanity: very-negative blocks should still be picked up as charge candidates.
+        # Sanity: the very-negative midday blocks (-3.0 CZK) should be the
+        # cheapest picked — not the marginally-negative morning blocks.
         cheap_charge_hours = {ts.hour for ts in charge}
-        assert any(h in cheap_charge_hours for h in (8, 9, 10, 11)), (
-            f"Should still charge at very-negative midday blocks, got hours: {sorted(cheap_charge_hours)}"
+        assert any(h in cheap_charge_hours for h in (12, 13, 14, 15)), (
+            f"Should charge at the cheapest (-3 CZK) midday blocks, "
+            f"got hours: {sorted(cheap_charge_hours)}"
         )
 
     def test_no_discharge_at_negative_spot_even_with_cheaper_future(

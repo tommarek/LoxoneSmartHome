@@ -570,10 +570,13 @@ from(bucket: "{solar_bucket}")
         # Pre-select charge blocks: pick cheapest N blocks where charging is
         # profitable vs buying from grid later. Don't charge at 1.28 CZK when
         # -2.0 blocks are available — better to sit at min SOC and buy from grid.
+        # The "or p < 0" safety covers deeply-negative days where the median
+        # itself is below zero and the multiplicative threshold would otherwise
+        # filter out marginally-negative blocks we still want as fallback.
         median_price = sorted_prices[n // 2] if n > 0 else 2.0
         charge_threshold = median_price * efficiency  # Only charge below this
         profitable_charge_blocks = [
-            (ts, p) for ts, p in blocks if p < charge_threshold
+            (ts, p) for ts, p in blocks if p < charge_threshold or p < 0
         ]
         profitable_charge_blocks.sort(key=lambda x: x[1])  # Cheapest first
 
@@ -594,11 +597,14 @@ from(bucket: "{solar_bucket}")
         kwh_per_charge = kwh_per_block * efficiency
         blocks_to_fill = max(4, int(grid_needed_kwh / kwh_per_charge) + 1) if kwh_per_charge > 0 else 4
 
-        # Also always include negative price blocks (get paid to charge)
-        negative_blocks = set(ts for ts, p in blocks if p < 0)
-
+        # Pick exactly the cheapest N needed. Do NOT union with all-negatives:
+        # the forward simulation walks chronologically, so adding extra
+        # candidates ahead of cheaper ones causes early candidates to consume
+        # battery headroom that the deeper-negative later blocks then cannot
+        # use. Sorting profitable_charge_blocks ascending and taking [:N] is
+        # already the optimum because all negatives are in the candidate pool.
         max_charge = min(len(profitable_charge_blocks), blocks_to_fill)
-        charge_block_set = set(ts for ts, _ in profitable_charge_blocks[:max_charge]) | negative_blocks
+        charge_block_set = set(ts for ts, _ in profitable_charge_blocks[:max_charge])
 
         # === SELL-PRODUCTION SCHEDULING ===
         # When morning solar would otherwise charge the battery but later in the
