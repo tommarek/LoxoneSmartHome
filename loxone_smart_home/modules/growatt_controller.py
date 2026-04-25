@@ -3249,6 +3249,20 @@ from(bucket: "{bucket}")
 
                 now = self._get_local_now()
 
+                # Refresh battery SOC from live inverter telemetry. The
+                # home_status MQTT path that feeds self._battery_soc can lag
+                # or stop updating; the telemetry topic is the freshest source
+                # the inverter exposes. Keeping these in sync ensures the
+                # optimizer (and every downstream consumer) builds schedules
+                # against real SOC, not a stale cached value.
+                try:
+                    from .growatt.api import _telemetry_cache  # type: ignore
+                    live_soc = _telemetry_cache.get("SOC") if _telemetry_cache else None
+                    if isinstance(live_soc, (int, float)) and 0 <= live_soc <= 100:
+                        self._battery_soc = float(live_soc)
+                except Exception:
+                    pass  # telemetry cache absent — fall back to existing value
+
                 # Log periodic summary once per hour at SUMMARY level
                 if now.hour != last_summary_hour:
                     last_summary_hour = now.hour
