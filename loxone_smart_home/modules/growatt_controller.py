@@ -329,6 +329,22 @@ class GrowattController(BaseModule):
         self._schedule.discharge_periods_tomorrow = value
 
     @property
+    def _sell_production_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.sell_production_blocks_today
+
+    @_sell_production_blocks_today.setter
+    def _sell_production_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.sell_production_blocks_today = value
+
+    @property
+    def _sell_production_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.sell_production_blocks_tomorrow
+
+    @_sell_production_blocks_tomorrow.setter
+    def _sell_production_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.sell_production_blocks_tomorrow = value
+
+    @property
     def _combined_charging_blocks(self) -> Set[Tuple[str, str]]:
         return self._schedule.combined_charging_blocks
 
@@ -2054,7 +2070,7 @@ from(bucket: "{bucket}")
                 h, dist_thresholds
             )
 
-            charge_times, discharge_times, decisions = self._optimizer.optimize(
+            charge_times, discharge_times, sell_production_times, decisions = self._optimizer.optimize(
                 blocks=price_blocks_czk,
                 solar_hourly=solar_hourly,
                 consumption_hourly=consumption_hourly,
@@ -2069,10 +2085,12 @@ from(bucket: "{bucket}")
                 battery_amortisation_czk=self.config.battery_amortisation_czk,
             )
             summary = self._optimizer.summarize(decisions)
+            sp_count = summary.get('sell_production_blocks', 0)
+            sp_str = f", {sp_count} sell-production" if sp_count else ""
             self.logger.info(
                 f"🧠 Optimizer: {summary['charge_blocks']} charge, "
                 f"{summary['discharge_blocks']} discharge, "
-                f"{summary['hold_blocks']} hold blocks "
+                f"{summary['hold_blocks']} hold{sp_str} blocks "
                 f"(avg charge: {summary['avg_charge_price']:.2f}, "
                 f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
             )
@@ -2085,13 +2103,14 @@ from(bucket: "{bucket}")
                 default=discharge_threshold_czk,
             )
         else:
-            # Rule-based scheduling (default)
+            # Rule-based scheduling (default) — no sell_production support
             charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
                 price_blocks_czk,
                 charge_blocks_count=charge_blocks_count,
                 discharge_threshold_czk=discharge_threshold_czk,
                 discharge_profit_margin=discharge_profit_margin
             )
+            sell_production_times = set()
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
@@ -2180,6 +2199,24 @@ from(bucket: "{bucket}")
 
         discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
         discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
+
+        # Sell-production blocks (export solar excess to grid, battery passive)
+        sell_production_blocks = [
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
+            if start_dt in sell_production_times
+        ]
+        sell_production_today = [
+            (s, e, p) for s, e, p in sell_production_blocks if s.date() == today
+        ]
+        sell_production_tomorrow = [
+            (s, e, p) for s, e, p in sell_production_blocks if s.date() > today
+        ]
+        if (not suppress_print or force_table) and sell_production_blocks:
+            self.logger.info(
+                f"☀️  Sell-production: {len(sell_production_blocks)} blocks "
+                f"({len(sell_production_today)} today, "
+                f"{len(sell_production_tomorrow)} tomorrow)"
+            )
 
         if (not suppress_print or force_table) and discharge_blocks:
             self.logger.info(
@@ -2331,6 +2368,10 @@ from(bucket: "{bucket}")
             (s.strftime("%H:%M"), e.strftime("%H:%M"))
             for s, e, _ in discharge_today
         }
+        self._sell_production_blocks_today = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in sell_production_today
+        }
 
         # Tomorrow's schedules (queue for midnight)
         self._cheapest_charging_blocks_tomorrow = {
@@ -2344,6 +2385,10 @@ from(bucket: "{bucket}")
         self._discharge_periods_tomorrow = {
             (s.strftime("%H:%M"), e.strftime("%H:%M"))
             for s, e, _ in discharge_tomorrow
+        }
+        self._sell_production_blocks_tomorrow = {
+            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            for s, e, _ in sell_production_tomorrow
         }
 
         # Store queued schedules for midnight application
@@ -2903,6 +2948,10 @@ from(bucket: "{bucket}")
             # Optimizer discharge blocks (when optimizer is enabled)
             optimizer_discharge_blocks=(
                 self._discharge_periods_today.copy() if self._optimizer else set()
+            ),
+            # Optimizer sell-production blocks (export solar, battery passive)
+            optimizer_sell_production_blocks=(
+                self._sell_production_blocks_today.copy() if self._optimizer else set()
             ),
             # Solar schedule
             sunrise=sunrise,

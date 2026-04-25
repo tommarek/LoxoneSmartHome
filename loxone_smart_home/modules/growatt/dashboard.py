@@ -244,9 +244,11 @@ async def api_status(request: web.Request) -> web.Response:
     optimizer_info = None
     charge_today: set = set()
     discharge_today: set = set()
+    sell_production_today: set = set()
     if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
         discharge_today = getattr(ctrl, '_discharge_periods_today', set())
         charge_today = getattr(ctrl, '_combined_charging_blocks', set())
+        sell_production_today = getattr(ctrl, '_sell_production_blocks_today', set())
         profile = getattr(ctrl._optimizer, '_base_load_profile', None)
         profile_summary = profile.summary() if profile else "Not built"
         reserve_info = getattr(ctrl._optimizer, '_last_reserve_info', {})
@@ -254,8 +256,10 @@ async def api_status(request: web.Request) -> web.Response:
             "enabled": True,
             "charge_blocks_today": len(charge_today),
             "discharge_blocks_today": len(discharge_today),
+            "sell_production_blocks_today": len(sell_production_today),
             "charge_blocks": sorted(list(charge_today)),
             "discharge_blocks": sorted(list(discharge_today)),
+            "sell_production_blocks": sorted(list(sell_production_today)),
             "base_load_profile": profile_summary,
             "reserve": reserve_info,
         }
@@ -1161,9 +1165,14 @@ function updateUI(d) {
     } else {
       reserveHtml = '<br>No recharge found in schedule';
     }
+    var sellProdCount = opt.sell_production_blocks_today || 0;
+    var sellProdHtml = sellProdCount > 0
+      ? ' + <span style="color:#c084fc">' + sellProdCount + ' solar-export</span>'
+      : '';
     document.getElementById('optimizerSummary').innerHTML =
       '<span style="color:var(--green)">' + opt.charge_blocks_today + ' charge</span> + ' +
-      '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span> blocks today' +
+      '<span style="color:var(--red)">' + opt.discharge_blocks_today + ' discharge</span>' +
+      sellProdHtml + ' blocks today' +
       '<span style="font-size:11px;color:var(--muted)">' + reserveHtml + '</span>' +
       '<br><span style="color:var(--muted);font-size:10px">' + (opt.base_load_profile || '') + '</span>';
   } else {

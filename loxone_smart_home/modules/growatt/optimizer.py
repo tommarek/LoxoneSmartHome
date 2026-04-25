@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 class BlockDecision:
     """Decision for a single 15-minute block."""
     timestamp: datetime
-    action: str  # "charge", "discharge", "hold"
+    action: str  # "charge", "discharge", "hold", "sell_production"
     price_czk: float  # Spot price CZK/kWh
     distribution_czk: float  # Distribution tariff CZK/kWh
     solar_kwh: float  # Expected solar production this block
@@ -23,6 +23,11 @@ class BlockDecision:
     soc_before: float  # SOC % before action
     soc_after: float  # SOC % after action
     net_value: float  # Value of this action (positive = saves money)
+
+
+# Margin (CZK/kWh) above which a sell-production swap is worthwhile.
+# Smaller spreads aren't worth the mode change (risk noise from forecast error).
+SELL_PRODUCTION_MARGIN_CZK = 0.3
 
 
 @dataclass
@@ -459,7 +464,7 @@ from(bucket: "{solar_bucket}")
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,  # Fee per kWh sold to grid
         battery_amortisation_czk: float = 2.0,  # Battery wear cost per kWh
-    ) -> Tuple[Set[datetime], Set[datetime], List[BlockDecision]]:
+    ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Optimize charge/discharge schedule.
 
         Args:
@@ -477,10 +482,11 @@ from(bucket: "{solar_bucket}")
             efficiency: Round-trip battery efficiency
 
         Returns:
-            Tuple of (charge_timestamps, discharge_timestamps, all_decisions)
+            Tuple of (charge_timestamps, discharge_timestamps,
+                      sell_production_timestamps, all_decisions)
         """
         if not blocks:
-            return set(), set(), []
+            return set(), set(), set(), []
 
         # Battery energy parameters
         usable_capacity = battery_capacity_kwh * (max_soc - min_soc) / 100
@@ -594,9 +600,22 @@ from(bucket: "{solar_bucket}")
         max_charge = min(len(profitable_charge_blocks), blocks_to_fill)
         charge_block_set = set(ts for ts, _ in profitable_charge_blocks[:max_charge]) | negative_blocks
 
-        # Pass 1: initial forward simulation
-        charge_times, discharge_times, decisions = self._single_pass(
+        # === SELL-PRODUCTION SCHEDULING ===
+        # When morning solar would otherwise charge the battery but later in the
+        # day either (a) cheaper grid energy or (b) more solar is available,
+        # exporting morning solar straight to grid is more profitable than
+        # storing it. See SELL_PRODUCTION_MARGIN_CZK and the swap-profit logic.
+        sell_production_set = self._select_sell_production_blocks(
             blocks, charge_block_set, solar_hourly, consumption_hourly,
+            distribution_func, battery_capacity_kwh, current_soc, max_soc,
+            kwh_per_block, efficiency, sell_fee_czk,
+            battery_amortisation_czk, future_sc_value,
+        )
+
+        # Pass 1: initial forward simulation
+        charge_times, discharge_times, sell_production_times, decisions = self._single_pass(
+            blocks, charge_block_set, sell_production_set,
+            solar_hourly, consumption_hourly,
             distribution_func, battery_capacity_kwh, current_soc, min_soc,
             max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
             effective_min_socs, future_min_price, future_min_price_hour,
@@ -615,8 +634,9 @@ from(bucket: "{solar_bucket}")
                 f"Pass 2: redistributed {moved} charge blocks "
                 f"(wasted slots replaced with better candidates)"
             )
-            charge_times, discharge_times, decisions = self._single_pass(
-                blocks, refined_set, solar_hourly, consumption_hourly,
+            charge_times, discharge_times, sell_production_times, decisions = self._single_pass(
+                blocks, refined_set, sell_production_set,
+                solar_hourly, consumption_hourly,
                 distribution_func, battery_capacity_kwh, current_soc, min_soc,
                 max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
                 effective_min_socs, future_min_price, future_min_price_hour,
@@ -626,7 +646,138 @@ from(bucket: "{solar_bucket}")
             )
 
         self._last_decisions = decisions
-        return charge_times, discharge_times, decisions
+        return charge_times, discharge_times, sell_production_times, decisions
+
+    def _select_sell_production_blocks(
+        self,
+        blocks: List[Tuple[datetime, float]],
+        charge_block_set: Set[datetime],
+        solar_hourly: Dict[int, float],
+        consumption_hourly: Dict[int, float],
+        distribution_func,
+        battery_capacity_kwh: float,
+        current_soc: float,
+        max_soc: float,
+        kwh_per_block: float,
+        efficiency: float,
+        sell_fee_czk: float,
+        battery_amortisation_czk: float,
+        future_sc_value: List[float],
+    ) -> Set[datetime]:
+        """Mark blocks where solar should be exported instead of stored.
+
+        Note: sell_production is the WEAKER variant of selling — it exports
+        solar excess only, leaving the battery passive. Discharge is the
+        STRONGER variant: it sells battery AND solar excess. So sell_production
+        is needed primarily in the gap zone where sell_revenue (battery export)
+        is unprofitable due to amortisation but sell_now (solar export, no
+        battery wear) is still profitable.
+
+        Per-block swap profit:
+
+            sell_now           = spot - dist - fees                  # solar→grid revenue
+            grid_replacement   = (future_min_charge_spot + dist) / efficiency
+            solar_replacement  = future_min_export_revenue if solar refills battery
+            storage_value      = future_sc_value[i]  (already amort-adjusted)
+
+            effective_loss     = min(storage_value, grid_replacement, solar_replacement)
+            swap_profit        = sell_now - effective_loss
+
+        eligible if swap_profit > MARGIN.
+
+        Aggregate refill budget caps total exported solar to what can actually
+        be replaced from cheap grid + future solar surplus.
+        """
+        n = len(blocks)
+        if n == 0:
+            return set()
+
+        max_battery_kwh = battery_capacity_kwh * max_soc / 100
+        current_battery_kwh = battery_capacity_kwh * current_soc / 100
+        battery_gap_remaining = max(0.0, max_battery_kwh - current_battery_kwh)
+
+        # Per-block sell-now revenue and solar excess
+        sell_now = [0.0] * n
+        solar_excess = [0.0] * n
+        for i, (ts, p) in enumerate(blocks):
+            h = ts.hour
+            sell_now[i] = p - distribution_func(h) - sell_fee_czk
+            s = solar_hourly.get(h, 0.0) / 4.0
+            c = consumption_hourly.get(h, 0.0) / 4.0
+            solar_excess[i] = max(0.0, s - c)
+
+        # Future solar surplus suffix sums (kWh available from block i+1 onward)
+        future_solar_surplus = [0.0] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            future_solar_surplus[i] = future_solar_surplus[i + 1] + solar_excess[i]
+
+        # Future cheapest grid charge cost STRICTLY after each block (per battery kWh).
+        future_min_charge_after = [float('inf')] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            future_min_charge_after[i] = future_min_charge_after[i + 1]
+            if i + 1 < n:
+                ts_next, p_next = blocks[i + 1]
+                if ts_next in charge_block_set:
+                    cost = (p_next + distribution_func(ts_next.hour)) / efficiency
+                    if cost < future_min_charge_after[i]:
+                        future_min_charge_after[i] = cost
+
+        # Future minimum export revenue at solar-surplus blocks STRICTLY after
+        # each block — the "cheapest" future solar moment to sell at (we'd
+        # rather export at the higher-priced morning than at this lower future).
+        future_min_export_revenue_after = [float('inf')] * (n + 1)
+        for i in range(n - 1, -1, -1):
+            future_min_export_revenue_after[i] = future_min_export_revenue_after[i + 1]
+            if i + 1 < n and solar_excess[i + 1] > 0 and sell_now[i + 1] > 0:
+                if sell_now[i + 1] < future_min_export_revenue_after[i]:
+                    future_min_export_revenue_after[i] = sell_now[i + 1]
+
+        # Score eligible blocks
+        candidates: List[Tuple[float, int]] = []  # (-swap_profit, i) for sort
+        for i in range(n):
+            if solar_excess[i] <= 0 or sell_now[i] <= SELL_PRODUCTION_MARGIN_CZK:
+                continue
+
+            grid_replacement = future_min_charge_after[i]
+            solar_only_refills = (
+                future_solar_surplus[i + 1] * efficiency >= battery_gap_remaining
+            )
+            solar_replacement = (
+                future_min_export_revenue_after[i] if solar_only_refills
+                else float('inf')
+            )
+            storage_value = future_sc_value[i] if i < len(future_sc_value) else 0.0
+            effective_loss = min(storage_value, grid_replacement, solar_replacement)
+            if effective_loss == float('inf'):
+                # No refill option AND no SC value — fully forfeit storage value.
+                # storage_value is already finite (≥ 0), so this only triggers
+                # when SC value happens to be 0; treat as straightforward sell.
+                effective_loss = 0.0
+
+            swap_profit = sell_now[i] - effective_loss
+            if swap_profit > SELL_PRODUCTION_MARGIN_CZK:
+                candidates.append((-swap_profit, i))
+
+        if not candidates:
+            return set()
+
+        # Aggregate refill budget: cheap grid charging capacity + future solar
+        cheap_charge_kwh = sum(
+            kwh_per_block * efficiency
+            for ts, _ in blocks if ts in charge_block_set
+        )
+        refill_budget = cheap_charge_kwh + future_solar_surplus[0] * efficiency
+
+        # Allocate top-down by swap profit
+        candidates.sort()  # smallest -profit = highest profit first
+        sell_production_set: Set[datetime] = set()
+        allocated = 0.0
+        for _neg_profit, i in candidates:
+            if allocated + solar_excess[i] > refill_budget:
+                continue
+            sell_production_set.add(blocks[i][0])
+            allocated += solar_excess[i]
+        return sell_production_set
 
     def _refine_charge_blocks(
         self,
@@ -675,6 +826,7 @@ from(bucket: "{solar_bucket}")
         self,
         blocks: List[Tuple[datetime, float]],
         charge_block_set: Set[datetime],
+        sell_production_set: Set[datetime],
         solar_hourly: Dict[int, float],
         consumption_hourly: Dict[int, float],
         distribution_func,
@@ -695,13 +847,14 @@ from(bucket: "{solar_bucket}")
         sell_fee_czk: float,
         battery_amortisation_czk: float,
         first_block_ts: datetime,
-    ) -> Tuple[Set[datetime], Set[datetime], List[BlockDecision]]:
+    ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Run a single forward simulation pass with given charge block set."""
         n = len(blocks)
         soc = current_soc
         decisions: List[BlockDecision] = []
         charge_times: Set[datetime] = set()
         discharge_times: Set[datetime] = set()
+        sell_production_times: Set[datetime] = set()
 
         for i, (timestamp, price_czk) in enumerate(blocks):
             hour = timestamp.hour
@@ -788,6 +941,17 @@ from(bucket: "{solar_bucket}")
                     action = "discharge"
                     net_value = discharge_value
 
+            # Sell-production wins over charge/hold but never displaces a
+            # profitable discharge — discharge is the stronger variant: it
+            # sells battery AND solar excess. Sell_production only sells
+            # solar excess (battery passive). So when discharge fires, it
+            # already covers what sell_production would do.
+            if timestamp in sell_production_set and action != "discharge":
+                action = "sell_production"
+                # Informational value: sell-now revenue × solar excess this block
+                solar_excess_now = max(0.0, solar - consumption)
+                net_value = (price_czk - dist - sell_fee_czk) * solar_excess_now
+
             # === SOC SIMULATION ===
             solar_available = solar
             house_load = consumption if consumption > 0 else (
@@ -811,6 +975,16 @@ from(bucket: "{solar_bucket}")
                     total_drain = grid_discharge + abs(net_from_solar)
                     soc -= total_drain / battery_capacity_kwh * 100
                 soc = max(min_soc, soc)
+            elif action == "sell_production":
+                # Solar excess flows to grid (battery does NOT charge from it).
+                # Battery only drains if loads exceed solar (auto-SC).
+                if net_from_solar < 0:
+                    draw = min(abs(net_from_solar),
+                               battery_capacity_kwh * (soc - min_soc) / 100)
+                    if draw > 0:
+                        soc -= draw / battery_capacity_kwh * 100
+                        soc = max(min_soc, soc)
+                # net_from_solar >= 0: solar covers loads, excess to grid, SOC unchanged.
             else:  # hold
                 if net_from_solar > 0:
                     solar_to_batt = min(net_from_solar * efficiency,
@@ -842,8 +1016,10 @@ from(bucket: "{solar_bucket}")
                 charge_times.add(timestamp)
             elif action == "discharge":
                 discharge_times.add(timestamp)
+            elif action == "sell_production":
+                sell_production_times.add(timestamp)
 
-        return charge_times, discharge_times, decisions
+        return charge_times, discharge_times, sell_production_times, decisions
 
     def summarize(self, decisions: List[BlockDecision]) -> Dict:
         """Summarize optimizer decisions for logging."""
@@ -853,9 +1029,11 @@ from(bucket: "{solar_bucket}")
         charge_blocks = [d for d in decisions if d.action == "charge"]
         discharge_blocks = [d for d in decisions if d.action == "discharge"]
         hold_blocks = [d for d in decisions if d.action == "hold"]
+        sell_production_blocks = [d for d in decisions if d.action == "sell_production"]
 
         return {
             "total_blocks": len(decisions),
+            "sell_production_blocks": len(sell_production_blocks),
             "charge_blocks": len(charge_blocks),
             "discharge_blocks": len(discharge_blocks),
             "hold_blocks": len(hold_blocks),

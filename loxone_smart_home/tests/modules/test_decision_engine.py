@@ -65,7 +65,7 @@ def base_context() -> DecisionContext:
 def test_decision_engine_initialization(decision_engine: GrowattDecisionEngine) -> None:
     """Test that decision engine initializes correctly."""
     assert decision_engine is not None
-    assert len(decision_engine.decision_tree) == 7  # 7 decision nodes
+    assert len(decision_engine.decision_tree) == 8  # 8 decision nodes
     assert decision_engine._last_decision is None
 
 
@@ -1442,3 +1442,69 @@ class TestDistributionTariff:
 
         decision = decision_engine.decide(ctx)
         assert decision == "discharge_to_grid"
+
+
+class TestSellProductionDecision:
+    """Tests for the optimizer-scheduled sell_production decision node."""
+
+    def test_sell_production_node_selected(self, decision_engine: GrowattDecisionEngine) -> None:
+        """Block flagged by optimizer for sell_production picks that mode."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "sell_production"
+
+    def test_sell_production_blocked_by_high_loads(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """High-load protection takes precedence over sell_production."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=True,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "high_load_protected"
+
+    def test_sell_production_yields_to_manual_override(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Manual override beats sell_production."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=True,
+            manual_override_mode="regular",
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "regular"
+
+    def test_no_sell_production_when_block_not_scheduled(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """When the current block is not in the optimizer set, sell_production does not fire."""
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=("08:00", "08:15"),
+            optimizer_sell_production_blocks={("10:00", "10:15")},
+        )
+        assert decision_engine.decide(ctx) == "regular"

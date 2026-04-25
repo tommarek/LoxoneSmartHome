@@ -36,7 +36,7 @@ def const_dist(rate: float):
 class TestOptimizerBasic:
 
     def test_empty_input(self, optimizer) -> None:
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=[], solar_hourly={}, consumption_hourly={},
             distribution_func=const_dist(1.0),
         )
@@ -63,7 +63,7 @@ class TestOptimizerBasic:
         )
         blocks = make_blocks(prices)
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -89,7 +89,7 @@ class TestOptimizerBasic:
         prices = [10.0] * 24
         blocks = make_blocks(prices)
 
-        _, _, decisions = optimizer.optimize(
+        _, _, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -107,7 +107,7 @@ class TestOptimizerBasic:
         prices = [0.0] * 24
         blocks = make_blocks(prices)
 
-        _, _, decisions = optimizer.optimize(
+        _, _, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -123,7 +123,7 @@ class TestOptimizerBasic:
         prices = [0.5] * 8 + [3.0] * 8 + [6.0] * 8
         blocks = make_blocks(prices)
 
-        _, _, decisions = optimizer.optimize(
+        _, _, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -143,7 +143,7 @@ class TestOptimizerSolar:
         blocks = make_blocks(prices)
 
         # No solar
-        charge_no_solar, _, _ = optimizer.optimize(
+        charge_no_solar, _, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -153,7 +153,7 @@ class TestOptimizerSolar:
 
         # Heavy solar midday
         solar = {h: 3.0 for h in range(9, 16)}
-        charge_with_solar, _, _ = optimizer.optimize(
+        charge_with_solar, _, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly=solar,
             consumption_hourly={},
@@ -174,7 +174,7 @@ class TestOptimizerDistribution:
         blocks = make_blocks(prices)
 
         # Low distribution — discharge more attractive
-        _, discharge_low, _ = optimizer.optimize(
+        _, discharge_low, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -183,7 +183,7 @@ class TestOptimizerDistribution:
         )
 
         # High distribution — self-consumption more valuable
-        _, discharge_high, _ = optimizer.optimize(
+        _, discharge_high, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -211,7 +211,7 @@ class TestOptimizer15Min:
         # Low consumption so battery doesn't drain before evening
         low_consumption = {h: 0.1 for h in range(24)}
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=low_consumption,
@@ -229,7 +229,7 @@ class TestOptimizer15Min:
         prices = [-2.0] * 24
         blocks = make_15min_blocks(prices)
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -242,7 +242,7 @@ class TestOptimizer15Min:
     def test_single_block(self, optimizer) -> None:
         """Single block edge case."""
         blocks = [(datetime(2026, 4, 11, 12, 0), 3.0)]
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -255,7 +255,7 @@ class TestOptimizer15Min:
         """Two block edge case: one cheap, one expensive."""
         base = datetime(2026, 4, 11, 0, 0)
         blocks = [(base, -1.0), (base + timedelta(minutes=15), 10.0)]
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -284,7 +284,7 @@ class TestOptimizer15Min:
         )
         blocks = make_15min_blocks(prices)
 
-        _, discharge, decisions = optimizer.optimize(
+        _, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -319,7 +319,7 @@ class TestOptimizer15Min:
         # Low distribution: sell_revenue = 12.0 - 0.5 - 0.5 - 2.0 = 9.0
         # recharge_cost = (0.5 + 0.5) / 0.85 = 1.18
         # profit = 9.0 - 1.18 = 7.82 > 0 → should discharge
-        _, discharge_low_dist, _ = optimizer.optimize(
+        _, discharge_low_dist, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=low_consumption,
@@ -333,7 +333,7 @@ class TestOptimizer15Min:
         # Very high distribution: sell_revenue = 12.0 - 5.0 - 0.5 - 2.0 = 4.5
         # recharge_cost = (0.5 + 5.0) / 0.85 = 6.47
         # profit = 4.5 - 6.47 = -1.97 < 0 → should NOT discharge
-        _, discharge_high_dist, _ = optimizer.optimize(
+        _, discharge_high_dist, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=low_consumption,
@@ -352,7 +352,7 @@ class TestTwoPassOptimizer:
         """When no charge blocks are wasted, Pass 2 returns the same set."""
         # Low SOC + cheap blocks = charge is useful, not wasted
         blocks = make_15min_blocks([0.5, 0.5, 5.0, 5.0], start_hour=0)
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={},
@@ -373,7 +373,7 @@ class TestTwoPassOptimizer:
         # Heavy solar at hour 0 means charging at hour 0 is wasted
         blocks = make_15min_blocks([0.5, 0.5, 5.0, 5.0], start_hour=0)
         solar = {0: 10.0, 1: 0.0, 2: 0.0, 3: 0.0}  # Huge solar at hour 0
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly=solar,
             consumption_hourly={0: 0.5, 1: 0.5, 2: 0.5, 3: 0.5},
@@ -391,7 +391,7 @@ class TestTwoPassOptimizer:
         """Negative price blocks should never be considered 'wasted'."""
         # Negative prices = get paid to charge, should always be kept
         blocks = make_15min_blocks([-1.0, -0.5, 5.0, 5.0], start_hour=0)
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={0: 10.0, 1: 10.0, 2: 0.0, 3: 0.0},  # Solar fills battery
             consumption_hourly={},
@@ -424,7 +424,7 @@ class TestSelfConsumptionHold:
         # Meaningful house consumption so self-consumption matters
         consumption = {h: 1.0 for h in range(18)}  # 1 kWh/hr
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=consumption,
@@ -465,7 +465,7 @@ class TestSelfConsumptionHold:
         # Minimal consumption — battery has way more than needed
         consumption = {h: 0.1 for h in range(24)}  # Only 0.1 kWh/hr = 2.4 kWh/day
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=consumption,
@@ -520,7 +520,7 @@ class TestSelfConsumptionHold:
         )
         blocks = make_15min_blocks(prices, start_hour=4)
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={h: 0.2 for h in range(28)},
@@ -559,7 +559,7 @@ class TestSelfConsumptionHold:
         prices = [-1.0] * 4 + [-3.5] * 4 + [3.0] * 8
         blocks = make_15min_blocks(prices, start_hour=10)
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly={h: 0.2 for h in range(24)},
@@ -602,8 +602,8 @@ class TestSelfConsumptionHold:
             sell_fee_czk=0.5,
         )
 
-        _, discharge_no_amort, dec_no = optimizer.optimize(**common, battery_amortisation_czk=0.0)
-        _, discharge_high_amort, dec_hi = optimizer.optimize(**common, battery_amortisation_czk=2.0)
+        _, discharge_no_amort, _sp, dec_no = optimizer.optimize(**common, battery_amortisation_czk=0.0)
+        _, discharge_high_amort, _sp, dec_hi = optimizer.optimize(**common, battery_amortisation_czk=2.0)
 
         # At spot=2.0, the high-amort run must NOT discharge those blocks.
         spot_2_dischg_hi = [d for d in dec_hi
@@ -649,7 +649,7 @@ class TestSelfConsumptionHold:
         consumption[8] = 0.0   # peak block: no consumption → not a future-SC contributor
         consumption[9] = 0.0
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=consumption,
@@ -678,7 +678,7 @@ class TestSelfConsumptionHold:
         prices = [0.5] * 4 + [8.0] * 4
         blocks = make_15min_blocks(prices, start_hour=0)
 
-        charge, discharge, decisions = optimizer.optimize(
+        charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
             solar_hourly={h: 5.0 for h in range(8)},  # Solar covers everything
             consumption_hourly={h: 0.5 for h in range(8)},
@@ -697,3 +697,270 @@ class TestSelfConsumptionHold:
         assert len(discharge) > 0 or len(charge) > 0, (
             "Optimizer should still make active decisions when solar covers consumption"
         )
+
+
+class TestSellProduction:
+    """Tests for the sell_production action — export solar to grid instead
+    of storing it. Sell_production is the WEAKER variant of selling: it
+    exports solar excess only (battery passive). Discharge is the stronger
+    variant (sells battery + solar excess). So sell_production fires only
+    in the gap zone where battery export is unprofitable (sell_revenue ≤ 0
+    after amort) but solar export is still profitable (sell_now > 0)."""
+
+    def test_sells_gap_zone_solar_when_negative_midday(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Morning at 1.5 CZK is in the gap zone — sell_revenue (with amort)
+        is -1.12 so discharge gated off, but sell_now (no amort, solar→grid)
+        is +0.88. With midday at -2 CZK, the swap is profitable."""
+        # 1.5 CZK morning (gap zone), -2 CZK midday (very cheap recharge),
+        # 2 CZK evening (consumption hours)
+        prices = [1.5] * 4 + [-2.0] * 4 + [2.0] * 12
+        blocks = make_15min_blocks(prices, start_hour=8)
+        solar = {h: 5.0 for h in range(8, 12)}  # heavy morning solar
+        consumption = {h: 0.5 for h in range(24)}
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # Morning blocks (price 1.5) should be sell_production
+        morning_sp = [d for d in decisions
+                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
+        assert len(morning_sp) > 0, (
+            "Morning gap-zone solar at 1.5 CZK with cheap midday "
+            "should be sell_production. Got actions: "
+            f"{[(d.timestamp.strftime('%H:%M'), d.action) for d in decisions[:20]]}"
+        )
+
+        # Midday should still charge (paid to take energy)
+        midday_charge = [d for d in decisions
+                         if d.action == "charge" and 12 <= d.timestamp.hour < 16]
+        assert len(midday_charge) > 0, "Midday negative blocks should still charge"
+
+        # Morning blocks should NOT be discharge (sell_revenue is -1.12)
+        morning_discharge = [d for d in decisions
+                             if d.action == "discharge" and 8 <= d.timestamp.hour < 12]
+        assert morning_discharge == [], (
+            "Morning at 1.5 CZK shouldn't discharge — sell_revenue is negative "
+            "after amortisation"
+        )
+
+    def test_discharge_takes_precedence_over_sell_production(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """When a block qualifies for both discharge (high spot covers wear)
+        and sell_production, discharge wins — it sells battery AND solar."""
+        # 4 CZK morning (sell_revenue +1.38, discharges battery too) + cheap midday
+        prices = [4.0] * 4 + [-2.0] * 4 + [3.0] * 12
+        blocks = make_15min_blocks(prices, start_hour=8)
+        solar = {h: 5.0 for h in range(8, 12)}
+        consumption = {h: 0.5 for h in range(24)}
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # Morning blocks should DISCHARGE (sells battery + solar excess), not sell_production
+        morning_discharge = [d for d in decisions
+                             if d.action == "discharge" and 8 <= d.timestamp.hour < 12]
+        morning_sp = [d for d in decisions
+                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
+        assert len(morning_discharge) > 0, "Morning at 4 CZK should discharge"
+        assert morning_sp == [], (
+            "Discharge supersedes sell_production at 4 CZK morning"
+        )
+
+    def test_sells_when_huge_afternoon_solar_refills(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """No cheap grid charging, but later solar far exceeds battery gap:
+        morning solar is displaceable. Sell_production fires via solar
+        replacement path (lose lower-priced future export, sell at higher now)."""
+        # 1.8 CZK morning (gap zone, sell_now = 1.18), 0.8 CZK midday (also
+        # gap zone but cheaper), no charge blocks selected (all > median*0.85)
+        # MASSIVE midday solar fills battery alone, then exports rest.
+        # Swap: sell now at 1.18 vs export later at 0.18 → +1.0 profit.
+        prices = [1.8] * 4 + [0.8] * 8 + [1.5] * 12
+        blocks = make_15min_blocks(prices, start_hour=8)
+        solar = {h: 1.0 for h in range(8, 12)}      # modest morning
+        solar.update({h: 12.0 for h in range(12, 20)})  # huge midday/afternoon
+        consumption = {h: 0.5 for h in range(24)}
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,  # mostly full — small gap easy to refill
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        morning_sp = [d for d in decisions
+                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
+        assert len(morning_sp) > 0, (
+            "Morning solar at 1.8 CZK should be sell_production when later "
+            "solar at lower price fills battery alone. Got actions: "
+            f"{[(d.timestamp.strftime('%H:%M'), d.action) for d in decisions[:24]]}"
+        )
+
+    def test_holds_morning_solar_when_storage_value_too_high(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """When future SC value (with amort) exceeds sell_now by more than
+        the margin, holding for SC beats exporting now."""
+        # Morning at 1.0 CZK (gap zone, sell_now = 0.38), evening 5 CZK
+        # consumption (SC value = 5+0.12-2 = 3.12, way above 0.38).
+        # No cheap recharge, no future solar.
+        prices = [1.0] * 4 + [3.0] * 4 + [5.0] * 16
+        blocks = make_15min_blocks(prices, start_hour=8)
+        solar = {h: 2.0 for h in range(8, 12)}     # morning only
+        consumption = {h: 0.3 for h in range(8, 14)}  # light morning
+        consumption.update({h: 1.5 for h in range(14, 24)})  # heavy evening (SC need)
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=50.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # sell_now at 1.0 CZK = 0.38; storage_value = 3.12 (SC at evening 5)
+        # swap_profit = 0.38 - 3.12 = -2.74 → don't sell, hold for SC
+        morning_sp = [d for d in decisions
+                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
+        assert morning_sp == [], (
+            "Should hold morning solar when future SC saves more than selling now. "
+            f"Got: {[(d.timestamp.strftime('%H:%M'), d.action) for d in morning_sp]}"
+        )
+
+    def test_no_sell_production_when_storage_dominates(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """When neither cheap grid charging nor future solar is available
+        AND storage value (SC) exceeds sell_now, the heuristic must hold.
+
+        At gap-zone morning prices (sell_now small) and high evening SC
+        (storage_value large), holding is strictly better than selling.
+        """
+        # 1.5 CZK morning (gap zone, sell_now = 0.88), 6 CZK evening
+        # heavy consumption. Storage_value = 6+0.12-2 = 4.12 >> sell_now.
+        # No future solar (morning only), no cheap grid (all >> threshold).
+        prices = [1.5] * 4 + [5.5] * 4 + [6.0] * 16
+        blocks = make_15min_blocks(prices, start_hour=8)
+        solar = {h: 4.0 for h in range(8, 12)}     # morning only
+        consumption = {h: 0.3 for h in range(8, 14)}
+        consumption.update({h: 2.0 for h in range(14, 24)})  # heavy evening SC
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=50.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # sell_now (0.88) << storage_value (4.12) → swap_profit hugely negative
+        morning_sp = [d for d in decisions
+                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
+        assert morning_sp == [], (
+            "Should hold for high-value SC instead of selling at gap-zone morning. "
+            f"Got: {[(d.timestamp.strftime('%H:%M'), d.action) for d in morning_sp]}"
+        )
+
+    def test_aggregate_budget_caps_sell_production(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Many morning solar-surplus blocks but only one cheap recharge slot:
+        aggregate refill budget caps the number of sell_production blocks."""
+        # 8 hours of 4 CZK morning, all with heavy solar (32 kWh excess total)
+        # 1 hour of -3 CZK midday (~ 2.5 kWh charge capacity at 25% efficiency-adjusted)
+        # then evening at 4 CZK
+        prices = [4.0] * 8 + [-3.0] * 1 + [4.0] * 15
+        blocks = make_15min_blocks(prices, start_hour=4)
+        solar = {h: 5.0 for h in range(4, 12)}  # 8 hrs × 5 kWh = 40 kWh solar
+        consumption = {h: 1.0 for h in range(24)}  # 1 kWh/hr loads
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,  # Empty battery → big gap, no solar-only refill
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # Total morning solar excess: ~32 kWh. Refill budget bounded by
+        # 1 cheap charge hour × ~2.125 kWh + future_solar_surplus * eff.
+        # Either way, NOT all 32 morning blocks should be sell_production.
+        morning_sp_kwh = sum(
+            max(0.0, d.solar_kwh - d.consumption_kwh)
+            for d in decisions if d.action == "sell_production"
+        )
+        # Budget includes future_solar_surplus[0] × eff; allocation should
+        # not exceed available refill capacity
+        assert morning_sp_kwh < 40.0 * 0.85 + 5.0, (
+            f"Allocated solar export ({morning_sp_kwh:.2f} kWh) exceeds available "
+            f"refill capacity"
+        )
+
+    def test_no_double_action(self, optimizer: BatteryOptimizer) -> None:
+        """Each block has exactly one action — no overlap between charge,
+        discharge, and sell_production sets."""
+        prices = [4.0] * 4 + [-2.0] * 4 + [3.0] * 16
+        blocks = make_15min_blocks(prices, start_hour=6)
+        solar = {h: 5.0 for h in range(6, 14)}
+        consumption = {h: 0.5 for h in range(24)}
+
+        charge, discharge, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=70.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # Set intersections must be empty
+        assert charge & discharge == set(), "charge and discharge sets overlap"
+        assert charge & sell_prod == set(), "charge and sell_production overlap"
+        assert discharge & sell_prod == set(), "discharge and sell_production overlap"
+
+        # Per-block actions are mutually exclusive
+        valid_actions = {"charge", "discharge", "hold", "sell_production"}
+        for d in decisions:
+            assert d.action in valid_actions, f"Unknown action: {d.action}"

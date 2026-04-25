@@ -90,6 +90,9 @@ class DecisionContext:
     # Optimizer-scheduled discharge blocks
     optimizer_discharge_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_discharge_scheduled: bool = False
+    # Optimizer-scheduled sell-production blocks (export solar, battery passive)
+    optimizer_sell_production_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_sell_production_scheduled: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
@@ -119,6 +122,12 @@ class DecisionContext:
         if self.current_block_key and self.optimizer_discharge_blocks:
             self.is_optimizer_discharge_scheduled = (
                 self.current_block_key in self.optimizer_discharge_blocks
+            )
+
+        # Check if optimizer scheduled sell_production for this block
+        if self.current_block_key and self.optimizer_sell_production_blocks:
+            self.is_optimizer_sell_production_scheduled = (
+                self.current_block_key in self.optimizer_sell_production_blocks
             )
 
 
@@ -264,7 +273,7 @@ class GrowattDecisionEngine:
                 explanation=lambda ctx: self._high_load_explanation(ctx),
             ),
 
-            # Priority 4A: Optimizer-scheduled discharge
+            # Priority 4A: Optimizer-scheduled discharge (sells battery + solar excess)
             DecisionNode(
                 name="Optimizer Scheduled Discharge",
                 priority=Priority.SCHEDULED_MODE,
@@ -278,6 +287,25 @@ class GrowattDecisionEngine:
                     f"Optimizer scheduled discharge: "
                     f"{ctx.current_price:.2f} CZK/kWh, "
                     f"discharging at 25% power"
+                )
+            ),
+
+            # Priority 4A': Optimizer-scheduled sell_production
+            # Solar excess → grid, battery passive (no drain). Used when
+            # battery export wouldn't cover amortisation but solar export
+            # is still profitable AND a cheaper refill is available later.
+            DecisionNode(
+                name="Optimizer Scheduled Sell Production",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_sell_production_scheduled
+                    and not ctx.high_loads_active
+                ),
+                action="sell_production",
+                explanation=lambda ctx: (
+                    f"Optimizer scheduled solar export: "
+                    f"spot {ctx.current_price:.2f} CZK/kWh, "
+                    f"battery preserved for cheaper recharge later"
                 )
             ),
 
