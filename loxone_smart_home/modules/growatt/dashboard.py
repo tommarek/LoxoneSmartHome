@@ -360,6 +360,7 @@ async def api_prices(request: web.Request) -> web.Response:
 
     pre_discharge = getattr(ctrl, '_pre_discharge_blocks_today', set())
     discharge = getattr(ctrl, '_discharge_periods_today', set())
+    sell_production = getattr(ctrl, '_sell_production_blocks_today', set())
 
     prices = []
     for (start, end), price_czk in sorted(ctrl._current_prices.items()):
@@ -367,6 +368,7 @@ async def api_prices(request: web.Request) -> web.Response:
         is_charging = (start, end) in ctrl._combined_charging_blocks
         is_pre_discharge = (start, end) in pre_discharge
         is_discharge = (start, end) in discharge
+        is_sell_production = (start, end) in sell_production
 
         status = "normal"
         if is_charging and is_pre_discharge:
@@ -375,6 +377,8 @@ async def api_prices(request: web.Request) -> web.Response:
             status = "charging"
         elif is_discharge:
             status = "discharge"
+        elif is_sell_production:
+            status = "sell_production"
 
         czk = round(price_czk, 2)  # Already CZK/kWh
         proj = soc_lookup.get(f"today:{start}", {})
@@ -402,6 +406,7 @@ async def api_prices(request: web.Request) -> web.Response:
             "is_charging": is_charging,
             "is_pre_discharge": is_pre_discharge,
             "is_discharge": is_discharge,
+            "is_sell_production": is_sell_production,
             "is_current": is_current,
             "status": status,
             "projected_soc": proj.get("soc"),
@@ -419,11 +424,13 @@ async def api_prices(request: web.Request) -> web.Response:
         charge_tmrw = getattr(ctrl, '_cheapest_charging_blocks_tomorrow', set())
         pre_dis_tmrw = getattr(ctrl, '_pre_discharge_blocks_tomorrow', set())
         dis_tmrw = getattr(ctrl, '_discharge_periods_tomorrow', set())
+        sp_tmrw = getattr(ctrl, '_sell_production_blocks_tomorrow', set())
 
         for (start, end), price_czk_t in sorted(next_day.items()):
             is_charging = (start, end) in charge_tmrw
             is_pre_discharge = (start, end) in pre_dis_tmrw
             is_discharge = (start, end) in dis_tmrw
+            is_sell_production = (start, end) in sp_tmrw
 
             status = "normal"
             if is_charging and is_pre_discharge:
@@ -432,6 +439,8 @@ async def api_prices(request: web.Request) -> web.Response:
                 status = "charging"
             elif is_discharge:
                 status = "discharge"
+            elif is_sell_production:
+                status = "sell_production"
 
             czk_t = round(price_czk_t, 2)  # Already CZK/kWh
             proj_t = soc_lookup.get(f"tomorrow:{start}", {})
@@ -458,6 +467,7 @@ async def api_prices(request: web.Request) -> web.Response:
                 "is_charging": is_charging,
                 "is_pre_discharge": is_pre_discharge,
                 "is_discharge": is_discharge,
+                "is_sell_production": is_sell_production,
                 "is_current": False,
                 "projected_soc": proj_t.get("soc"),
                 "projected_kwh": proj_t.get("kwh"),
@@ -737,6 +747,7 @@ body {
 .price-bar.charging { background: var(--green) !important; }
 .price-bar.pre-discharge { background: #c084fc !important; }
 .price-bar.discharge { background: var(--red) !important; }
+.price-bar.sell-production { background: #f97316 !important; }
 .price-bar.current { outline: 2px solid var(--accent); outline-offset: -1px; }
 .price-bar.negative { background: #22c55e44; }
 .price-bar.cheap { background: #4f8cff44; }
@@ -768,6 +779,7 @@ body {
 .chart-tooltip .tt-charging { background: #164e2f; color: var(--green); }
 .chart-tooltip .tt-discharge { background: #4a1d1d; color: var(--red); }
 .chart-tooltip .tt-pre-discharge { background: #2d1b4e; color: #c084fc; }
+.chart-tooltip .tt-sell-production { background: #4a2a14; color: #f97316; }
 .chart-tooltip .tt-current { background: #1e3a5f; color: var(--accent); }
 
 .log-box {
@@ -1301,6 +1313,7 @@ function renderPriceChart(prices) {
     if (p.status === 'pre_discharge_charge') cls = 'pre-discharge';
     else if (p.is_charging) cls = 'charging';
     else if (p.is_discharge) cls = 'discharge';
+    else if (p.is_sell_production) cls = 'sell-production';
     if (p.is_current) cls += ' current';
 
     const tmrwOpacity = p.day === 'tomorrow' ? 'opacity:0.6;' : '';
@@ -1338,6 +1351,7 @@ function showTooltip(e, bar, tooltip) {
   if (p.status === 'charging') statusHtml += '<span class="tt-status tt-charging">CHARGING</span>';
   else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
   else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
+  else if (p.status === 'sell_production') statusHtml += '<span class="tt-status tt-sell-production">SELL PRODUCTION</span>';
 
   // Calculate actual price rank (1 = cheapest) within same day
   const sameDayPrices = priceData.filter(pp => pp.day === p.day);
