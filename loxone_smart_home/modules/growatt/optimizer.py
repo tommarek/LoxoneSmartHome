@@ -527,8 +527,11 @@ from(bucket: "{solar_bucket}")
             sell_rev_i = prices[i] - dist_i - sell_fee_czk - battery_amortisation_czk
             future_dist_i = distribution_func(future_min_price_hour[i])
             recharge_cost_i = (future_min_price[i] + future_dist_i) / efficiency
-            dv = sell_rev_i - recharge_cost_i
-            running_max = max(running_max, dv)
+            # Mirror the per-block gate: discharges with non-positive sell_revenue
+            # are never selected, so they shouldn't inflate "best-future" benchmarks.
+            if sell_rev_i > 0:
+                dv = sell_rev_i - recharge_cost_i
+                running_max = max(running_max, dv)
             future_max_discharge_value[i] = running_max
 
         # Future self-consumption value: for each block, what's the best
@@ -548,8 +551,12 @@ from(bucket: "{solar_bucket}")
             cons_i = consumption_hourly.get(h_i, 0) / 4.0
             net_cons = max(0, cons_i - solar_i)
             if net_cons > 0:
-                sc_val = prices[i] + distribution_func(h_i)
-                running_best_sc = max(running_best_sc, sc_val)
+                # Net SC value after battery wear: avoided buy minus amortisation.
+                # If non-positive, SC from battery is worse than just buying from
+                # grid, so it can't justify holding battery for that block.
+                sc_val = prices[i] + distribution_func(h_i) - battery_amortisation_czk
+                if sc_val > running_best_sc:
+                    running_best_sc = sc_val
                 running_sc_kwh += net_cons
             future_sc_value[i] = running_best_sc
             future_sc_kwh[i] = running_sc_kwh
@@ -714,8 +721,9 @@ from(bucket: "{solar_bucket}")
             min_battery_kwh = battery_capacity_kwh * effective_min_soc / 100
 
             # Score each action
-            # Self-consumption value = price + distribution (what we save by using battery)
-            self_consumption_value = price_czk + dist
+            # Self-consumption value = avoided buy price - battery wear cost.
+            # Using battery to power loads incurs amortisation just like grid discharge.
+            self_consumption_value = price_czk + dist - battery_amortisation_czk
 
             # Recharge cost estimate: cheapest future price + its distribution
             future_cheapest = future_min_price[i] if i < n else sorted_prices[0]
@@ -728,6 +736,10 @@ from(bucket: "{solar_bucket}")
             charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
             # --- DISCHARGE value ---
+            # sell_revenue already accounts for amortisation. Hard floor: never
+            # discharge to grid when the sale itself is unprofitable. Round-trip
+            # arbitrage with hypothetical future recharge does not justify
+            # destroying value now — every discharged kWh wears the battery.
             sell_revenue = price_czk - dist - sell_fee_czk - battery_amortisation_czk
             future_recharge_hour = future_min_price_hour[i] if i < n else 0
             future_dist = distribution_func(future_recharge_hour)
@@ -737,7 +749,10 @@ from(bucket: "{solar_bucket}")
                 discharge_kwh_per_block,
                 (battery_kwh - min_battery_kwh) * efficiency
             )
-            discharge_value = discharge_profit if discharge_possible > 0 else float('-inf')
+            if sell_revenue <= 0 or discharge_possible <= 0:
+                discharge_value = float('-inf')
+            else:
+                discharge_value = discharge_profit
 
             # --- HOLD value ---
             hold_value = 0.0

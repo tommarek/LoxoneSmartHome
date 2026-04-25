@@ -498,6 +498,177 @@ class TestSelfConsumptionHold:
                 f"SOC should remain high with low consumption, got {first_expensive.soc_before}"
             )
 
+    def test_no_discharge_when_sell_revenue_negative(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Discharge to grid must not be selected when sell_revenue ≤ 0.
+
+        Reproduces the production bug: optimizer scheduled discharges across
+        morning hours where spot prices were near zero or negative, justifying
+        them via 'round-trip arbitrage' against very-cheap midday recharge.
+        After the amortisation fix, a discharge is only allowed when the sale
+        itself covers fees + amortisation (sell_revenue > 0).
+        """
+        # Morning: cheap-ish (0.0–2.0 CZK), midday: very negative (recharge bait)
+        # Even though "round trip" math (-2.62 - (-3.5) = 0.88) is positive,
+        # we must refuse to discharge at a sale loss.
+        prices = (
+            [2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5]   # morning falling
+            + [-3.0, -3.0, -3.0, -3.0]                     # midday very negative
+            + [4.0, 5.0, 6.0, 7.0]                         # evening recovery
+            + [3.0] * 8
+        )
+        blocks = make_15min_blocks(prices, start_hour=4)
+
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 0.2 for h in range(28)},
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=12.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        # No discharge should land on blocks where sell_revenue ≤ 0:
+        # sell_rev = price - 0.12 - 0.5 - 2.0 ≤ 0  ⇔  price ≤ 2.62
+        bad = [d for d in decisions
+               if d.action == "discharge" and d.price_czk <= 2.62]
+        assert bad == [], (
+            "Discharge selected at unprofitable sell prices: "
+            + ", ".join(f"{d.timestamp.strftime('%H:%M')}={d.price_czk:+.2f}" for d in bad)
+        )
+
+        # Sanity: very-negative blocks should still be picked up as charge candidates.
+        cheap_charge_hours = {ts.hour for ts in charge}
+        assert any(h in cheap_charge_hours for h in (8, 9, 10, 11)), (
+            f"Should still charge at very-negative midday blocks, got hours: {sorted(cheap_charge_hours)}"
+        )
+
+    def test_no_discharge_at_negative_spot_even_with_cheaper_future(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """The 'round-trip arbitrage' bug: discharge at slightly-negative now,
+        recharge at very-negative later. Must not happen — battery wear is real."""
+        # Now: -1.0 (sell_rev = -1.0 - 0.12 - 0.5 - 2.0 = -3.62, loss)
+        # Future: -3.5 (recharge "gain" 3.5/0.85 ≈ 4.12)
+        # Old logic: discharge_profit = -3.62 - (-4.0) = +0.38 → would discharge.
+        # New logic: sell_revenue ≤ 0 → discharge forbidden.
+        prices = [-1.0] * 4 + [-3.5] * 4 + [3.0] * 8
+        blocks = make_15min_blocks(prices, start_hour=10)
+
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 0.2 for h in range(24)},
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=90.0,  # plenty of battery to abuse
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        negative_price_discharges = [
+            d for d in decisions if d.action == "discharge" and d.price_czk < 0
+        ]
+        assert negative_price_discharges == [], (
+            f"Optimizer discharged into negative-price market: "
+            + ", ".join(f"{d.timestamp.strftime('%H:%M')}={d.price_czk:+.2f}"
+                        for d in negative_price_discharges)
+        )
+
+    def test_amortisation_threshold_governs_discharge_floor(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """The discharge floor scales with amortisation: a higher wear cost
+        forbids discharges that a lower wear cost would still permit."""
+        # Spot 2.0 CZK, dist 0.12, fees 0.5.
+        # With amort=0: sell_rev = 2.0 - 0.12 - 0.5 - 0 = +1.38 → discharge OK
+        # With amort=2: sell_rev = 2.0 - 0.12 - 0.5 - 2.0 = -0.62 → forbidden
+        prices = [2.0] * 8 + [-1.0] * 4 + [4.0] * 12   # cheap recharge in middle
+        blocks = make_15min_blocks(prices, start_hour=0)
+
+        common = dict(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 0.1 for h in range(24)},
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+        )
+
+        _, discharge_no_amort, dec_no = optimizer.optimize(**common, battery_amortisation_czk=0.0)
+        _, discharge_high_amort, dec_hi = optimizer.optimize(**common, battery_amortisation_czk=2.0)
+
+        # At spot=2.0, the high-amort run must NOT discharge those blocks.
+        spot_2_dischg_hi = [d for d in dec_hi
+                            if d.action == "discharge" and abs(d.price_czk - 2.0) < 0.01]
+        assert spot_2_dischg_hi == [], (
+            "High amortisation should forbid discharge at spot=2.0 "
+            f"(sell_rev = -0.62), but got {len(spot_2_dischg_hi)} blocks"
+        )
+
+        # The zero-amort run is allowed to discharge there (sell_rev = +1.38).
+        spot_2_dischg_no = [d for d in dec_no
+                            if d.action == "discharge" and abs(d.price_czk - 2.0) < 0.01]
+        assert len(spot_2_dischg_no) > 0, (
+            "Zero amortisation should permit discharge at spot=2.0 with cheap recharge"
+        )
+
+    def test_self_consumption_value_subtracts_amortisation(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Future SC value used for the hold bonus must subtract amortisation.
+
+        Without the fix, future SC was valued at (price + dist) — the gross
+        avoided buy cost. That overstates the value of holding the battery,
+        because using it for SC also wears it. With the fix, future SC is
+        (price + dist - amort), so 'hold for SC' only fires when the saving
+        actually beats the wear cost.
+
+        Concrete: now=4.0 with NO consumption (solar covers it, so it's a
+        pure sell opportunity). Future=3.0 with consumption (only here can
+        SC value be earned). Sell-now revenue is +1.38; per-kWh SC saving
+        net of wear at 3.0 is +1.12. Pre-fix code valued future SC at +3.12
+        and would hold; post-fix correctly prefers discharge.
+        """
+        # Hour 8: peak (4.0 CZK), zero consumption (covered by solar).
+        # Hour 9: cheap (0.5 CZK) — recharge bait.
+        # Hours 10–31: moderate (3.0 CZK), real consumption — only here is SC valuable.
+        prices = [4.0] * 1 + [0.5] * 1 + [3.0] * 22
+        blocks = make_15min_blocks(prices, start_hour=8)
+
+        # Solar exactly cancels consumption at hour 8 (no SC need there);
+        # full consumption from hour 10 onward.
+        consumption = {h: 1.0 for h in range(24)}
+        consumption[8] = 0.0   # peak block: no consumption → not a future-SC contributor
+        consumption[9] = 0.0
+
+        charge, discharge, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        peak_discharge = [d for d in decisions
+                          if d.action == "discharge" and abs(d.price_czk - 4.0) < 0.01]
+        assert len(peak_discharge) > 0, (
+            "Should discharge at the 4.0 CZK peak: sell_rev=+1.38 beats "
+            "future SC saving net of amortisation (+1.12). The pre-fix code "
+            "would value future SC at +3.12 and incorrectly hold."
+        )
+
     def test_hold_value_does_not_block_when_no_future_consumption(
         self, optimizer: BatteryOptimizer
     ) -> None:
