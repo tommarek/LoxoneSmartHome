@@ -29,6 +29,14 @@ class BlockDecision:
 # Smaller spreads aren't worth the mode change (risk noise from forecast error).
 SELL_PRODUCTION_MARGIN_CZK = 0.3
 
+# Minimum forecast solar excess (kWh per 15-min block) required to trigger
+# sell_production. The mode locks the battery (stop_soc=max_soc), so on a
+# tiny phantom-excess block we'd lose self-consumption AND import the real
+# load deficit from grid at the same hour's spot — net loss when the
+# forecast overshoots. 0.25 kWh per 15 min ≈ 1 kW continuous solar surplus,
+# enough headroom for normal consumption-forecast error.
+SELL_PRODUCTION_MIN_EXCESS_KWH = 0.25
+
 
 @dataclass
 class BaseLoadProfile:
@@ -741,7 +749,13 @@ from(bucket: "{solar_bucket}")
         # Score eligible blocks
         candidates: List[Tuple[float, int]] = []  # (-swap_profit, i) for sort
         for i in range(n):
-            if solar_excess[i] <= 0 or sell_now[i] <= SELL_PRODUCTION_MARGIN_CZK:
+            # Require a minimum solar surplus to absorb consumption-forecast
+            # error — otherwise the mode change locks the battery and we end
+            # up importing the real load deficit from grid.
+            if (
+                solar_excess[i] < SELL_PRODUCTION_MIN_EXCESS_KWH
+                or sell_now[i] <= SELL_PRODUCTION_MARGIN_CZK
+            ):
                 continue
 
             grid_replacement = future_min_charge_after[i]

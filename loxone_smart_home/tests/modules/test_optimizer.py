@@ -856,7 +856,9 @@ class TestSellProduction:
         # Swap: sell now at 1.18 vs export later at 0.18 → +1.0 profit.
         prices = [1.8] * 4 + [0.8] * 8 + [1.5] * 12
         blocks = make_15min_blocks(prices, start_hour=8)
-        solar = {h: 1.0 for h in range(8, 12)}      # modest morning
+        # Morning solar above the per-block excess floor (0.5 kWh/15min after
+        # consumption deducted)
+        solar = {h: 2.5 for h in range(8, 12)}      # modest morning
         solar.update({h: 12.0 for h in range(12, 20)})  # huge midday/afternoon
         consumption = {h: 0.5 for h in range(24)}
 
@@ -1021,3 +1023,46 @@ class TestSellProduction:
         valid_actions = {"charge", "discharge", "hold", "sell_production"}
         for d in decisions:
             assert d.action in valid_actions, f"Unknown action: {d.action}"
+
+    def test_skips_sell_production_when_solar_excess_below_floor(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Tiny forecast solar excess (below the volume floor) must NOT
+        trigger sell_production, even when the spot price is high.
+
+        Reproduces the production case where a 90 Wh forecast excess at a
+        4.96 CZK evening block produced a sell_production assignment that
+        locked the battery and forced grid imports for the real load deficit
+        (consumption forecast under-predicted heating load).
+        """
+        # Two consecutive evening blocks at high prices. First has substantial
+        # solar excess (above floor) → should sell. Second has trickle excess
+        # (below floor) → should hold despite the very high price.
+        prices = [4.0] * 8 + [-3.0] * 4 + [3.0] * 12   # midday recharge available
+        blocks = make_15min_blocks(prices, start_hour=10)
+        # Hour 10: 5 kWh/hr solar, 0.5 kWh/hr cons → excess 1.125 kWh/block (>= floor)
+        # Hour 11: 0.6 kWh/hr solar, 0.5 kWh/hr cons → excess 0.025 kWh/block (< floor)
+        solar = {10: 5.0, 11: 0.6}
+        consumption = {h: 0.5 for h in range(24)}
+
+        _, _, sell_prod, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        sp_hours = {ts.hour for ts in sell_prod}
+        assert 10 in sp_hours, (
+            f"Hour 10 has 1.125 kWh excess (well above floor) — should fire. "
+            f"Got: {sorted(sp_hours)}"
+        )
+        assert 11 not in sp_hours, (
+            f"Hour 11 has only 0.025 kWh excess (below 0.25 floor) — must NOT "
+            f"fire even at high price. Got: {sorted(sp_hours)}"
+        )
