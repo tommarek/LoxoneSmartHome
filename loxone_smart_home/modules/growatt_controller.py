@@ -2465,6 +2465,39 @@ from(bucket: "{bucket}")
         # Store schedule data to InfluxDB for web API consumption
         await self._store_schedule_to_influxdb()
 
+    async def _write_inverter_state_point(self, source: str = "change") -> None:
+        """Persist current inverter state + operational mode to InfluxDB.
+
+        Used both event-driven (after each state change) and on a periodic
+        heartbeat (every 5 min) so historical queries can resolve "what was
+        the state at time T" via a simple last() over a small window.
+
+        Failures (no client, write rejected) are logged at debug — telemetry
+        storage must never block inverter control.
+        """
+        if not self.influxdb_client or not self._current_inverter_state:
+            return
+        try:
+            state = self._current_inverter_state
+            await self.influxdb_client.write_point(
+                bucket=self.settings.influxdb.bucket_solar,
+                measurement="inverter_state",
+                tags={
+                    "inverter_mode": state.inverter_mode,
+                    "operational_mode": self._current_mode or "unknown",
+                    "source": source,
+                },
+                fields={
+                    "export_enabled": int(state.export_enabled),
+                    "stop_soc": int(state.stop_soc),
+                    "power_rate": int(state.power_rate),
+                    "ac_charge_enabled": int(state.ac_charge_enabled),
+                },
+                timestamp=self._get_local_now(),
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not write inverter_state point: {e}")
+
     async def _store_schedule_to_influxdb(self) -> None:
         """Store current schedule data to InfluxDB for web service consumption."""
         if not self.influxdb_client:
@@ -2872,6 +2905,7 @@ from(bucket: "{bucket}")
                     # Apply the new mode (will log consolidated one-liner)
                     await self._apply_decided_mode(new_mode, reason=reason, explanation=explanation)
                     self._current_mode = new_mode
+                    await self._write_inverter_state_point(source="mode_change")
                 else:
                     self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
 
@@ -2898,6 +2932,7 @@ from(bucket: "{bucket}")
                                 timestamp=self._get_local_now(),
                                 source="export_price_update"
                             )
+                            await self._write_inverter_state_point(source="export_price_update")
                             state_str = "ENABLED" if should_export else "DISABLED"
                             self.logger.info(
                                 f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
@@ -3286,6 +3321,7 @@ from(bucket: "{bucket}")
         last_fetch_check = None
         last_pre_midnight_check = None
         last_solar_forecast_update: Optional[datetime] = None
+        last_inverter_state_write: Optional[datetime] = None
 
         last_summary_hour = None  # Track last hour we logged summary
 
@@ -3308,6 +3344,16 @@ from(bucket: "{bucket}")
                         self._battery_soc = float(live_soc)
                 except Exception:
                     pass  # telemetry cache absent — fall back to existing value
+
+                # Heartbeat: persist inverter state every 5 min so historical
+                # queries can resolve "what was the state at time T" without
+                # relying on event-only writes (which can have multi-hour gaps).
+                if (
+                    last_inverter_state_write is None
+                    or (now - last_inverter_state_write).total_seconds() >= 300
+                ):
+                    await self._write_inverter_state_point(source="heartbeat")
+                    last_inverter_state_write = now
 
                 # Log periodic summary once per hour at SUMMARY level
                 if now.hour != last_summary_hour:

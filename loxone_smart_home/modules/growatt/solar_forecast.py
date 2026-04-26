@@ -511,12 +511,22 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
+            # Hourly export-enabled flag from controller-persisted state.
+            # Using min: an hour where export was disabled at any point flags
+            # 0, so any partially-curtailed hour is excluded from training.
+            export_query = f'''
+from(bucket: "{settings.influxdb.bucket_solar}")
+  |> range(start: -730d)
+  |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "export_enabled")
+  |> aggregateWindow(every: 1h, fn: min, createEmpty: false)
+'''
             # Query weather fields separately (much faster than combined OR query)
             weather_bucket = settings.influxdb.bucket_weather
 
             solar_result = await influxdb_client.query(solar_query)
             soc_result = await influxdb_client.query(soc_query)
             load_result = await influxdb_client.query(load_query)
+            export_result = await influxdb_client.query(export_query)
 
             if not solar_result:
                 self.logger.warning("No solar production data found")
@@ -542,6 +552,17 @@ from(bucket: "{settings.influxdb.bucket_solar}")
                     for record in table.records:
                         key = record.get_time().strftime("%Y-%m-%d-%H")
                         load_by_hour[key] = record.get_value()
+
+            # export_enabled per hour — int 0/1. Missing key = before this
+            # metric existed; falls back to the SOC-based curtailment heuristic.
+            export_by_hour: Dict[str, int] = {}
+            if export_result:
+                for table in export_result:
+                    for record in table.records:
+                        key = record.get_time().strftime("%Y-%m-%d-%H")
+                        val = record.get_value()
+                        if isinstance(val, (int, float)):
+                            export_by_hour[key] = int(val)
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
@@ -663,9 +684,18 @@ from(bucket: "{weather_bucket}")
                     temperature=temp,
                 )
 
-                # Only filter as curtailed when battery is full AND load is low.
-                # When load is high, the inverter produces at full capacity to serve
-                # the load even at 100% SOC — this is real production data.
+                # Filter 1: controller had export disabled this hour → solar
+                # was likely curtailed; data isn't representative of true
+                # potential. Default 1 (enabled) for hours predating this
+                # measurement so they fall back to the heuristic below.
+                if export_by_hour.get(hour_key, 1) == 0:
+                    curtailed += 1
+                    continue
+
+                # Filter 2 (legacy heuristic): only filter as curtailed when
+                # battery is full AND load is low. When load is high, the
+                # inverter produces at full capacity to serve the load even
+                # at 100% SOC — this is real production data.
                 load_kwh = load / 1000.0
                 if (soc >= 100 and expected > 0 and kwh < expected * 0.6
                         and load_kwh < expected * 0.5):
