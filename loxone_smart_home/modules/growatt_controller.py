@@ -3321,7 +3321,6 @@ from(bucket: "{bucket}")
         last_fetch_check = None
         last_pre_midnight_check = None
         last_solar_forecast_update: Optional[datetime] = None
-        last_inverter_state_write: Optional[datetime] = None
 
         last_summary_hour = None  # Track last hour we logged summary
 
@@ -3344,16 +3343,6 @@ from(bucket: "{bucket}")
                         self._battery_soc = float(live_soc)
                 except Exception:
                     pass  # telemetry cache absent — fall back to existing value
-
-                # Heartbeat: persist inverter state every 5 min so historical
-                # queries can resolve "what was the state at time T" without
-                # relying on event-only writes (which can have multi-hour gaps).
-                if (
-                    last_inverter_state_write is None
-                    or (now - last_inverter_state_write).total_seconds() >= 300
-                ):
-                    await self._write_inverter_state_point(source="heartbeat")
-                    last_inverter_state_write = now
 
                 # Log periodic summary once per hour at SUMMARY level
                 if now.hour != last_summary_hour:

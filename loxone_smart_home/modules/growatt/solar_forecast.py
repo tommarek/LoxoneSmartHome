@@ -511,14 +511,16 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
-            # Hourly export-enabled flag from controller-persisted state.
-            # Using min: an hour where export was disabled at any point flags
-            # 0, so any partially-curtailed hour is excluded from training.
+            # Raw export_enabled state-change records from controller-persisted
+            # state. We carry the last value forward over hours that had no
+            # change (state intervals), so an hour where export was disabled
+            # the WHOLE time still counts as disabled even though no point
+            # falls inside that hour's window.
             export_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "export_enabled")
-  |> aggregateWindow(every: 1h, fn: min, createEmpty: false)
+  |> sort(columns: ["_time"])
 '''
             # Query weather fields separately (much faster than combined OR query)
             weather_bucket = settings.influxdb.bucket_weather
@@ -553,16 +555,51 @@ from(bucket: "{settings.influxdb.bucket_solar}")
                         key = record.get_time().strftime("%Y-%m-%d-%H")
                         load_by_hour[key] = record.get_value()
 
-            # export_enabled per hour — int 0/1. Missing key = before this
-            # metric existed; falls back to the SOC-based curtailment heuristic.
-            export_by_hour: Dict[str, int] = {}
+            # Carry-forward: state intervals span until the next change record.
+            # First collect (time, value) tuples sorted ascending, then for
+            # each solar-data hour key, find the most recent state at-or-before
+            # that hour. Hours predating the first record stay missing —
+            # `export_by_hour.get(key, 1)` later defaults them to "enabled"
+            # so they fall through to the SOC-based heuristic.
+            export_changes: List[Tuple[datetime, int]] = []
             if export_result:
                 for table in export_result:
                     for record in table.records:
-                        key = record.get_time().strftime("%Y-%m-%d-%H")
                         val = record.get_value()
                         if isinstance(val, (int, float)):
-                            export_by_hour[key] = int(val)
+                            export_changes.append((record.get_time(), int(val)))
+
+            export_by_hour: Dict[str, int] = {}
+            if export_changes and solar_by_hour:
+                # For each hour H spanning [H, H+1):
+                #   effective_state = min(state_entering_H, any state changes in [H, H+1))
+                # That way an hour where export was disabled at any point during
+                # it counts as disabled, not just hours starting in disabled state.
+                ci = 0
+                last_state: Optional[int] = None
+                for key in sorted(solar_by_hour.keys()):
+                    hour_start = datetime.strptime(key, "%Y-%m-%d-%H")
+                    hour_end = hour_start + timedelta(hours=1)
+                    # Advance state up to (but not including) hour_start
+                    while (
+                        ci < len(export_changes)
+                        and export_changes[ci][0].replace(tzinfo=None) < hour_start
+                    ):
+                        last_state = export_changes[ci][1]
+                        ci += 1
+                    # Collect state observations active during the hour
+                    states_in_hour: List[int] = []
+                    if last_state is not None:
+                        states_in_hour.append(last_state)
+                    while (
+                        ci < len(export_changes)
+                        and export_changes[ci][0].replace(tzinfo=None) < hour_end
+                    ):
+                        last_state = export_changes[ci][1]
+                        states_in_hour.append(last_state)
+                        ci += 1
+                    if states_in_hour:
+                        export_by_hour[key] = min(states_in_hour)
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
