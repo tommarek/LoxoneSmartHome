@@ -1282,6 +1282,38 @@ class GrowattController(BaseModule):
         self._season_mode_updated = now
         return self._season_mode
 
+    async def _fetch_recent_hourly_temps(self) -> Dict[int, float]:
+        """Fetch hourly outdoor temperatures from the last 24 hours.
+
+        Returns a dict {hour_of_day: temperature_celsius} that can be used as
+        a proxy for the next 24h forecast — diurnal patterns repeat reliably
+        enough day-to-day for the consumption model's coarse temp bins. Empty
+        dict on error or no data; caller should fall back to base_load_profile.
+        """
+        if not self.influxdb_client:
+            return {}
+        try:
+            query = f'''
+from(bucket: "{self.settings.influxdb.bucket_loxone}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "temperature")
+  |> filter(fn: (r) => r._field == "temperature_outside")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+            result = await self.influxdb_client.query(query)
+            temps: Dict[int, float] = {}
+            for table in result:
+                for record in table.records:
+                    hour = record.get_time().hour
+                    val = record.get_value()
+                    if isinstance(val, (int, float)):
+                        # Last reading wins per hour (more recent = more relevant)
+                        temps[hour] = float(val)
+            return temps
+        except Exception as e:
+            self.logger.debug(f"Could not fetch hourly outdoor temps: {e}")
+            return {}
+
     async def _log_price_table(
         self, prices_15min: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
     ) -> None:
@@ -2046,10 +2078,24 @@ from(bucket: "{bucket}")
                 if h > now.hour:
                     solar_hourly[h] = solar_hourly.get(h, 0) + kwh
 
-            # Use base load profile for consumption (non-heating hours only,
-            # since heating triggers high load protection which disables discharge)
+            # Consumption forecast: prefer the temperature-aware total-load model
+            # (heating + EV included) over the heating-excluded base load profile.
+            # Falls back to base_load_profile if the consumption model isn't built
+            # or temperature data is unavailable.
             consumption_hourly: Dict[int, float] = {}
-            if self._optimizer and self._optimizer._base_load_profile.profile:
+            forecast_temps = await self._fetch_recent_hourly_temps()
+            if (
+                self._consumption_forecast
+                and self._consumption_forecast.model
+                and forecast_temps
+            ):
+                hourly = self._consumption_forecast.predict_hourly(
+                    forecast_temps, now.date()
+                )
+                if hourly:
+                    consumption_hourly = hourly
+
+            if not consumption_hourly and self._optimizer and self._optimizer._base_load_profile.profile:
                 is_weekend = now.weekday() >= 5
                 for h in range(24):
                     consumption_hourly[h] = self._optimizer._base_load_profile.get(h, is_weekend)
