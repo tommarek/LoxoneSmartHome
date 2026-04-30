@@ -47,6 +47,7 @@ class ModeManager:
         self._battery_first_slots: Dict[int, Dict[str, Any]] = {}
         self._ac_enabled = False
         self._export_enabled = False
+        self._inverter_on = True  # Default ON until proven otherwise
 
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
@@ -493,6 +494,42 @@ class ModeManager:
     async def disable_export(self) -> None:
         """Disable electricity export to grid."""
         await self.set_export(False)
+
+    async def set_inverter_power(self, on: bool) -> None:
+        """Power the inverter on or off via Modbus holding register 0.
+
+        Uses the OpenInverterGateway `modbus/set` command. Idempotent —
+        if the desired state matches the last successfully applied one,
+        skips the MQTT command.
+        """
+        if self._inverter_on == on:
+            return  # No change needed
+
+        topic = self.config.inverter_onoff_topic
+        payload = {
+            "id": 0,
+            "type": "16b",
+            "registerType": "H",
+            "value": 1 if on else 0,
+        }
+        action = "ON" if on else "OFF"
+        success, _ = await self._execute_command_with_retry(
+            topic,
+            payload,
+            "modbus/set",
+            f"inverter {action.lower()}"
+        )
+        if not success:
+            self.logger.error(f"Failed to power inverter {action}")
+            return  # Don't update state if command failed
+
+        self._inverter_on = on
+        current_time = self._get_local_now().strftime("%H:%M:%S")
+        emoji = "⚡" if on else "🛑"
+        self.logger.info(
+            f"{emoji} INVERTER {action} at {current_time} "
+            f"via holding register 0 → Topic: {topic}"
+        )
 
     async def set_grid_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,

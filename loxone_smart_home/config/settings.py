@@ -259,6 +259,21 @@ class GrowattConfig(BaseSettings):
     # Load-first mode topics
     load_first_stopsoc_topic: str = "energy/solar/command/loadfirst/set/stopsoc"
 
+    # Inverter on/off via Modbus holding register 0 (OpenInverterGateway).
+    # When the spot price drops below the threshold (with hysteresis), the
+    # controller writes register 0 = 0 to power the inverter off; when the
+    # price recovers above threshold + hysteresis, register 0 = 1 turns it
+    # back on. Scheduled grid-charging blocks always force the inverter on.
+    inverter_onoff_topic: str = "energy/solar/command/modbus/set"
+    inverter_off_price_threshold_czk: float = Field(
+        default=2.0,
+        description="Power inverter off when spot price (CZK/kWh) is below this"
+    )
+    inverter_off_price_hysteresis_czk: float = Field(
+        default=0.1, ge=0,
+        description="Hysteresis around threshold to avoid flapping (CZK/kWh)"
+    )
+
     # Season detection parameters
     summer_temp_threshold: float = Field(default=15.0, ge=-20, le=40)  # °C
     temperature_avg_days: int = Field(default=3, ge=1, le=7)  # Days for temperature average

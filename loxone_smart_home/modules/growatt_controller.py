@@ -2492,6 +2492,7 @@ from(bucket: "{bucket}")
                     "stop_soc": int(state.stop_soc),
                     "power_rate": int(state.power_rate),
                     "ac_charge_enabled": int(state.ac_charge_enabled),
+                    "inverter_on": int(state.inverter_on),
                 },
                 timestamp=self._get_local_now(),
             )
@@ -2938,6 +2939,55 @@ from(bucket: "{bucket}")
                                 f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
                                 f"threshold: {context.price_thresholds.export_price_min:.2f})"
                             )
+
+                # Inverter on/off gate: power the inverter off when the spot
+                # price is below the configured threshold (with hysteresis)
+                # AND the block is not in the optimizer's charge schedule.
+                # Scheduled charge blocks always force the inverter ON so AC
+                # charging works at the cheapest hours.
+                if self._current_inverter_state and context.current_block_key in context.prices_15min:
+                    current_price_czk = context.current_price
+                    threshold = self.config.inverter_off_price_threshold_czk
+                    hysteresis = self.config.inverter_off_price_hysteresis_czk
+                    current_state_on = self._current_inverter_state.inverter_on
+                    is_scheduled_charge = (
+                        context.current_block_key in self._combined_charging_blocks
+                    )
+                    if is_scheduled_charge:
+                        desired_inverter_on = True
+                    elif current_price_czk < threshold - hysteresis:
+                        desired_inverter_on = False
+                    elif current_price_czk > threshold + hysteresis:
+                        desired_inverter_on = True
+                    else:
+                        desired_inverter_on = current_state_on  # deadband holds
+                    if desired_inverter_on != current_state_on:
+                        # Pace after any same-cycle Modbus write to respect
+                        # the 850 ms minimum between writes.
+                        await asyncio.sleep(1.0)
+                        await self._mode_manager.set_inverter_power(desired_inverter_on)
+                        self._current_inverter_state = InverterState(
+                            inverter_mode=self._current_inverter_state.inverter_mode,
+                            stop_soc=self._current_inverter_state.stop_soc,
+                            power_rate=self._current_inverter_state.power_rate,
+                            time_start=self._current_inverter_state.time_start,
+                            time_stop=self._current_inverter_state.time_stop,
+                            ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
+                            export_enabled=self._current_inverter_state.export_enabled,
+                            timestamp=self._get_local_now(),
+                            source="price_threshold_gate",
+                            inverter_on=desired_inverter_on,
+                        )
+                        await self._write_inverter_state_point(source="price_threshold_gate")
+                        emoji = "⚡" if desired_inverter_on else "🛑"
+                        state_word = "ON" if desired_inverter_on else "OFF"
+                        scheduled_note = ", scheduled charge" if is_scheduled_charge else ""
+                        self.logger.info(
+                            f"{emoji} Inverter {state_word} "
+                            f"(price: {current_price_czk:+.2f} CZK/kWh, "
+                            f"threshold: {threshold:.2f} ±{hysteresis:.2f}"
+                            f"{scheduled_note})"
+                        )
 
             except Exception as e:
                 self.logger.error(f"Failed to evaluate conditions: {e}", exc_info=True)

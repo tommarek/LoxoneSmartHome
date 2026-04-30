@@ -21,7 +21,7 @@ from modules.growatt_controller import GrowattController
 
 def _make_state(*, export_enabled: bool, inverter_mode: str = "load_first",
                 stop_soc: int = 20, power_rate: int = 25,
-                ac_charge: bool = False) -> InverterState:
+                ac_charge: bool = False, inverter_on: bool = True) -> InverterState:
     return InverterState(
         inverter_mode=inverter_mode,
         stop_soc=stop_soc,
@@ -32,6 +32,7 @@ def _make_state(*, export_enabled: bool, inverter_mode: str = "load_first",
         export_enabled=export_enabled,
         timestamp=datetime(2026, 4, 27, 12, 0),
         source="evaluation",
+        inverter_on=inverter_on,
     )
 
 
@@ -78,6 +79,7 @@ async def test_write_inverter_state_point_export_enabled() -> None:
         "stop_soc": 20,
         "power_rate": 25,
         "ac_charge_enabled": 0,
+        "inverter_on": 1,  # default True
     }
 
 
@@ -98,6 +100,23 @@ async def test_write_inverter_state_point_export_disabled() -> None:
     assert kwargs["fields"]["export_enabled"] == 0
     assert kwargs["fields"]["stop_soc"] == 100
     assert kwargs["fields"]["ac_charge_enabled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_write_inverter_state_point_inverter_off() -> None:
+    """inverter_on=False is persisted as int 0 with the gate's source tag."""
+    fake = _make_fake_controller(
+        state=_make_state(export_enabled=False, inverter_on=False),
+        mode="regular",
+    )
+
+    await GrowattController._write_inverter_state_point(  # type: ignore[arg-type]
+        fake, source="price_threshold_gate"
+    )
+
+    kwargs = fake.influxdb_client.write_point.await_args.kwargs
+    assert kwargs["fields"]["inverter_on"] == 0
+    assert kwargs["tags"]["source"] == "price_threshold_gate"
 
 
 @pytest.mark.asyncio

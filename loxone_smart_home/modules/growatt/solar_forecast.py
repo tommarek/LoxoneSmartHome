@@ -511,15 +511,21 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
 '''
-            # Raw export_enabled state-change records from controller-persisted
-            # state. We carry the last value forward over hours that had no
-            # change (state intervals), so an hour where export was disabled
-            # the WHOLE time still counts as disabled even though no point
-            # falls inside that hour's window.
+            # Raw export_enabled and inverter_on state-change records from
+            # controller-persisted state. We carry the last value forward
+            # over hours that had no change (state intervals), so an hour
+            # where the field was 0 the WHOLE time still counts as 0 even
+            # though no point falls inside that hour's window.
             export_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "export_enabled")
+  |> sort(columns: ["_time"])
+'''
+            inverter_on_query = f'''
+from(bucket: "{settings.influxdb.bucket_solar}")
+  |> range(start: -730d)
+  |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "inverter_on")
   |> sort(columns: ["_time"])
 '''
             # Query weather fields separately (much faster than combined OR query)
@@ -529,6 +535,7 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             soc_result = await influxdb_client.query(soc_query)
             load_result = await influxdb_client.query(load_query)
             export_result = await influxdb_client.query(export_query)
+            inverter_on_result = await influxdb_client.query(inverter_on_query)
 
             if not solar_result:
                 self.logger.warning("No solar production data found")
@@ -555,51 +562,57 @@ from(bucket: "{settings.influxdb.bucket_solar}")
                         key = record.get_time().strftime("%Y-%m-%d-%H")
                         load_by_hour[key] = record.get_value()
 
-            # Carry-forward: state intervals span until the next change record.
-            # First collect (time, value) tuples sorted ascending, then for
-            # each solar-data hour key, find the most recent state at-or-before
-            # that hour. Hours predating the first record stay missing —
-            # `export_by_hour.get(key, 1)` later defaults them to "enabled"
-            # so they fall through to the SOC-based heuristic.
-            export_changes: List[Tuple[datetime, int]] = []
-            if export_result:
-                for table in export_result:
-                    for record in table.records:
-                        val = record.get_value()
-                        if isinstance(val, (int, float)):
-                            export_changes.append((record.get_time(), int(val)))
-
-            export_by_hour: Dict[str, int] = {}
-            if export_changes and solar_by_hour:
-                # For each hour H spanning [H, H+1):
-                #   effective_state = min(state_entering_H, any state changes in [H, H+1))
-                # That way an hour where export was disabled at any point during
-                # it counts as disabled, not just hours starting in disabled state.
+            # Carry-forward state intervals: state-change records span until
+            # the next change. For each solar-data hour key we want the
+            # effective state DURING that hour. `min` over (state-entering,
+            # any changes within the hour) means a partial-disabled hour
+            # still counts as disabled. Hours predating the first record
+            # stay missing — `_by_hour.get(key, 1)` callers default to
+            # "enabled/on" so they fall through to the SOC-based heuristic.
+            def _carry_forward_hourly(
+                result: Any, hour_keys: Any
+            ) -> Dict[str, int]:
+                changes: List[Tuple[datetime, int]] = []
+                if result:
+                    for table in result:
+                        for record in table.records:
+                            val = record.get_value()
+                            if isinstance(val, (int, float)):
+                                changes.append((record.get_time(), int(val)))
+                out: Dict[str, int] = {}
+                if not changes or not hour_keys:
+                    return out
                 ci = 0
                 last_state: Optional[int] = None
-                for key in sorted(solar_by_hour.keys()):
+                for key in sorted(hour_keys):
                     hour_start = datetime.strptime(key, "%Y-%m-%d-%H")
                     hour_end = hour_start + timedelta(hours=1)
-                    # Advance state up to (but not including) hour_start
                     while (
-                        ci < len(export_changes)
-                        and export_changes[ci][0].replace(tzinfo=None) < hour_start
+                        ci < len(changes)
+                        and changes[ci][0].replace(tzinfo=None) < hour_start
                     ):
-                        last_state = export_changes[ci][1]
+                        last_state = changes[ci][1]
                         ci += 1
-                    # Collect state observations active during the hour
                     states_in_hour: List[int] = []
                     if last_state is not None:
                         states_in_hour.append(last_state)
                     while (
-                        ci < len(export_changes)
-                        and export_changes[ci][0].replace(tzinfo=None) < hour_end
+                        ci < len(changes)
+                        and changes[ci][0].replace(tzinfo=None) < hour_end
                     ):
-                        last_state = export_changes[ci][1]
+                        last_state = changes[ci][1]
                         states_in_hour.append(last_state)
                         ci += 1
                     if states_in_hour:
-                        export_by_hour[key] = min(states_in_hour)
+                        out[key] = min(states_in_hour)
+                return out
+
+            export_by_hour = _carry_forward_hourly(
+                export_result, solar_by_hour.keys()
+            )
+            inverter_on_by_hour = _carry_forward_hourly(
+                inverter_on_result, solar_by_hour.keys()
+            )
 
             # Query each weather field separately for performance
             ghi_by_hour: Dict[str, float] = {}
@@ -721,11 +734,18 @@ from(bucket: "{weather_bucket}")
                     temperature=temp,
                 )
 
-                # Filter 1: controller had export disabled this hour → solar
+                # Filter 1a: controller had export disabled this hour → solar
                 # was likely curtailed; data isn't representative of true
                 # potential. Default 1 (enabled) for hours predating this
                 # measurement so they fall back to the heuristic below.
                 if export_by_hour.get(hour_key, 1) == 0:
+                    curtailed += 1
+                    continue
+
+                # Filter 1b: controller had inverter physically off this hour
+                # via Modbus register 0 (price-threshold gate). Production
+                # was zero by definition — must not be in the training set.
+                if inverter_on_by_hour.get(hour_key, 1) == 0:
                     curtailed += 1
                     continue
 

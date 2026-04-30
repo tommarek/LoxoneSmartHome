@@ -337,3 +337,67 @@ async def test_set_load_first_aborts_on_stopsoc_failure(mode_manager, mock_contr
     # Verify final success message was NOT logged
     assert not any("LOAD-FIRST MODE SET" in str(call)
                    for call in mode_manager.logger.info.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_set_inverter_power_off_publishes_register_0_value_0(
+    mode_manager, mock_controller
+):
+    """set_inverter_power(False) publishes the OIG modbus/set payload."""
+    mock_controller.config.inverter_onoff_topic = "energy/solar/command/modbus/set"
+    mock_controller._wait_for_command_result.return_value = {
+        "success": True, "message": "ok"
+    }
+
+    await mode_manager.set_inverter_power(False)
+
+    # First (and only) publish call carries the register-0=0 payload
+    publish_call = mock_controller.mqtt_client.publish.await_args_list[0]
+    assert publish_call.args[0] == "energy/solar/command/modbus/set"
+    import json
+    body = json.loads(publish_call.args[1])
+    assert body == {"id": 0, "type": "16b", "registerType": "H", "value": 0}
+    assert mode_manager._inverter_on is False
+
+
+@pytest.mark.asyncio
+async def test_set_inverter_power_on_publishes_register_0_value_1(
+    mode_manager, mock_controller
+):
+    """set_inverter_power(True) publishes value=1 only when state needs change."""
+    mock_controller.config.inverter_onoff_topic = "energy/solar/command/modbus/set"
+    mock_controller._wait_for_command_result.return_value = {
+        "success": True, "message": "ok"
+    }
+
+    # Force initial state = False so True is a change
+    mode_manager._inverter_on = False
+    await mode_manager.set_inverter_power(True)
+
+    import json
+    body = json.loads(mock_controller.mqtt_client.publish.await_args.args[1])
+    assert body["value"] == 1
+    assert mode_manager._inverter_on is True
+
+
+@pytest.mark.asyncio
+async def test_set_inverter_power_idempotent(mode_manager, mock_controller):
+    """No MQTT publish when desired state already matches current."""
+    mode_manager._inverter_on = True
+    await mode_manager.set_inverter_power(True)
+    mock_controller.mqtt_client.publish.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_set_inverter_power_does_not_update_state_on_failure(
+    mode_manager, mock_controller
+):
+    """If the MQTT command fails after retries, _inverter_on must NOT change."""
+    mock_controller.config.inverter_onoff_topic = "energy/solar/command/modbus/set"
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "device unreachable"
+    }
+
+    # State starts True; off-attempt fails; state must remain True
+    await mode_manager.set_inverter_power(False)
+    assert mode_manager._inverter_on is True
