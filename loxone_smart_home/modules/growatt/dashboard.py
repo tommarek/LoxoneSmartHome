@@ -183,6 +183,7 @@ async def api_status(request: web.Request) -> web.Response:
             "power_rate": inv.power_rate,
             "ac_charge": inv.ac_charge_enabled,
             "export": inv.export_enabled,
+            "on": bool(inv.inverter_on),
             "time_start": inv.time_start,
             "time_stop": inv.time_stop,
             "source": inv.source,
@@ -361,6 +362,12 @@ async def api_prices(request: web.Request) -> web.Response:
     pre_discharge = getattr(ctrl, '_pre_discharge_blocks_today', set())
     discharge = getattr(ctrl, '_discharge_periods_today', set())
     sell_production = getattr(ctrl, '_sell_production_blocks_today', set())
+    # Threshold gate: inverter would be off below (threshold - hysteresis),
+    # except in scheduled-charge blocks where it's forced on.
+    inv_off_threshold = (
+        getattr(ctrl.config, 'inverter_off_price_threshold_czk', -2.0)
+        - getattr(ctrl.config, 'inverter_off_price_hysteresis_czk', 0.1)
+    )
 
     prices = []
     for (start, end), price_czk in sorted(ctrl._current_prices.items()):
@@ -369,6 +376,7 @@ async def api_prices(request: web.Request) -> web.Response:
         is_pre_discharge = (start, end) in pre_discharge
         is_discharge = (start, end) in discharge
         is_sell_production = (start, end) in sell_production
+        is_inverter_off = (price_czk < inv_off_threshold) and not is_charging
 
         status = "normal"
         if is_charging and is_pre_discharge:
@@ -379,6 +387,8 @@ async def api_prices(request: web.Request) -> web.Response:
             status = "discharge"
         elif is_sell_production:
             status = "sell_production"
+        elif is_inverter_off:
+            status = "inverter_off"
 
         czk = round(price_czk, 2)  # Already CZK/kWh
         proj = soc_lookup.get(f"today:{start}", {})
@@ -407,6 +417,7 @@ async def api_prices(request: web.Request) -> web.Response:
             "is_pre_discharge": is_pre_discharge,
             "is_discharge": is_discharge,
             "is_sell_production": is_sell_production,
+            "is_inverter_off": is_inverter_off,
             "is_current": is_current,
             "status": status,
             "projected_soc": proj.get("soc"),
@@ -431,6 +442,7 @@ async def api_prices(request: web.Request) -> web.Response:
             is_pre_discharge = (start, end) in pre_dis_tmrw
             is_discharge = (start, end) in dis_tmrw
             is_sell_production = (start, end) in sp_tmrw
+            is_inverter_off = (price_czk_t < inv_off_threshold) and not is_charging
 
             status = "normal"
             if is_charging and is_pre_discharge:
@@ -441,6 +453,8 @@ async def api_prices(request: web.Request) -> web.Response:
                 status = "discharge"
             elif is_sell_production:
                 status = "sell_production"
+            elif is_inverter_off:
+                status = "inverter_off"
 
             czk_t = round(price_czk_t, 2)  # Already CZK/kWh
             proj_t = soc_lookup.get(f"tomorrow:{start}", {})
@@ -468,6 +482,7 @@ async def api_prices(request: web.Request) -> web.Response:
                 "is_pre_discharge": is_pre_discharge,
                 "is_discharge": is_discharge,
                 "is_sell_production": is_sell_production,
+                "is_inverter_off": is_inverter_off,
                 "is_current": False,
                 "projected_soc": proj_t.get("soc"),
                 "projected_kwh": proj_t.get("kwh"),
@@ -755,6 +770,15 @@ body {
 .price-bar.pre-discharge { background: #c084fc !important; }
 .price-bar.discharge { background: var(--red) !important; }
 .price-bar.sell-production { background: #f97316 !important; }
+.price-bar.inverter-off {
+  background: repeating-linear-gradient(
+    45deg,
+    #555 0,
+    #555 4px,
+    #2a2a2a 4px,
+    #2a2a2a 8px
+  ) !important;
+}
 .price-bar.current { outline: 2px solid var(--accent); outline-offset: -1px; }
 .price-bar.negative { background: #22c55e44; }
 .price-bar.cheap { background: #4f8cff44; }
@@ -787,6 +811,7 @@ body {
 .chart-tooltip .tt-discharge { background: #4a1d1d; color: var(--red); }
 .chart-tooltip .tt-pre-discharge { background: #2d1b4e; color: #c084fc; }
 .chart-tooltip .tt-sell-production { background: #4a2a14; color: #f97316; }
+.chart-tooltip .tt-inverter-off { background: #2a2a2a; color: #aaa; }
 .chart-tooltip .tt-current { background: #1e3a5f; color: var(--accent); }
 
 .log-box {
@@ -885,6 +910,9 @@ select, input {
   <div>
     <span class="status-dot" id="statusDot"></span>
     <h1 style="display:inline">Growatt Battery Dashboard</h1>
+    <span id="invPowerBadge"
+          style="display:none;margin-left:10px;padding:3px 9px;border-radius:8px;
+                 font-size:12px;font-weight:700;vertical-align:middle"></span>
   </div>
   <div style="font-size:12px;color:var(--muted)" id="lastUpdate">--</div>
 </div>
@@ -1100,6 +1128,24 @@ function updateUI(d) {
   // Time
   const t = new Date(d.timestamp);
   document.getElementById('lastUpdate').textContent = t.toLocaleTimeString();
+
+  // Inverter on/off badge in header
+  const invBadge = document.getElementById('invPowerBadge');
+  if (d.inverter && typeof d.inverter.on === 'boolean') {
+    if (d.inverter.on) {
+      invBadge.style.display = 'inline-block';
+      invBadge.style.background = '#164e2f';
+      invBadge.style.color = 'var(--green)';
+      invBadge.textContent = '⚡ INVERTER ON';
+    } else {
+      invBadge.style.display = 'inline-block';
+      invBadge.style.background = '#4a1d1d';
+      invBadge.style.color = 'var(--red)';
+      invBadge.textContent = '🛑 INVERTER OFF';
+    }
+  } else {
+    invBadge.style.display = 'none';
+  }
 
   // Mode
   const mode = d.mode || 'unknown';
@@ -1349,6 +1395,7 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
     else if (p.is_charging) cls = 'charging';
     else if (p.is_discharge) cls = 'discharge';
     else if (p.is_sell_production) cls = 'sell-production';
+    else if (p.is_inverter_off) cls = 'inverter-off';
     if (p.is_current) cls += ' current';
 
     const globalIdx = i + (idxOffset || 0);
@@ -1393,6 +1440,7 @@ function showTooltip(e, bar, tooltip) {
   else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
   else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
   else if (p.status === 'sell_production') statusHtml += '<span class="tt-status tt-sell-production">SELL PRODUCTION</span>';
+  else if (p.status === 'inverter_off') statusHtml += '<span class="tt-status tt-inverter-off">INVERTER OFF</span>';
 
   // Calculate actual price rank (1 = cheapest) within same day
   const sameDayPrices = priceData.filter(pp => pp.day === p.day);
