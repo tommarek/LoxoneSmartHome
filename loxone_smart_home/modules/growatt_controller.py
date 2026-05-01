@@ -3161,6 +3161,16 @@ from(bucket: "{bucket}")
         except Exception as e:
             self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
 
+        # Preserve the current inverter on/off state — it's owned by the
+        # price-threshold gate, NOT mode evaluation. Without this, every
+        # mode change would reset it to the dataclass default (True),
+        # causing spurious ON commands during deep-negative blocks where
+        # the gate had correctly turned the inverter off.
+        current_inverter_on = (
+            self._current_inverter_state.inverter_on
+            if self._current_inverter_state else True
+        )
+
         return InverterState(
             inverter_mode=inverter_mode,
             stop_soc=stop_soc,
@@ -3170,7 +3180,8 @@ from(bucket: "{bucket}")
             ac_charge_enabled=ac_charge_enabled,
             export_enabled=export_enabled,
             timestamp=self._get_local_now(),
-            source="evaluation"
+            source="evaluation",
+            inverter_on=current_inverter_on,
         )
 
     async def _apply_state_changes_with_rollback(
