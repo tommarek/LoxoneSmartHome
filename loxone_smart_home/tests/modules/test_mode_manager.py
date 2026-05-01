@@ -389,6 +389,20 @@ async def test_set_inverter_power_idempotent(mode_manager, mock_controller):
 
 
 @pytest.mark.asyncio
+async def test_set_inverter_power_sends_first_call_even_when_matching(
+    mode_manager, mock_controller
+):
+    """Initial _inverter_on=None must NOT short-circuit — first call always sends.
+    This recovers from container restart where the controller has no idea what
+    the hardware's actual state is."""
+    mock_controller.config.inverter_onoff_topic = "energy/solar/command/modbus/set"
+    mock_controller._wait_for_command_result.return_value = {"success": True}
+    assert mode_manager._inverter_on is None  # default
+    await mode_manager.set_inverter_power(True)
+    mock_controller.mqtt_client.publish.assert_awaited()
+
+
+@pytest.mark.asyncio
 async def test_set_inverter_power_does_not_update_state_on_failure(
     mode_manager, mock_controller
 ):

@@ -3301,6 +3301,17 @@ from(bucket: "{bucket}")
                     f"⚡ Export to grid DISABLED (source: {new_state.source})"
                 )
 
+        # Inverter on/off change. On startup (old_state is None) we ALWAYS
+        # send the desired state to recover from a previous run that may have
+        # left the hardware in the opposite state — the controller's
+        # in-memory default of True can otherwise mask a hardware-OFF.
+        if (
+            not old_state
+            or old_state.inverter_on != new_state.inverter_on
+        ):
+            self._commands_sent_count += 1
+            await self._mode_manager.set_inverter_power(new_state.inverter_on)
+
         # AC charge change
         if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:
             self._commands_sent_count += 1

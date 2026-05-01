@@ -266,8 +266,11 @@ class GrowattConfig(BaseSettings):
     # back on. Scheduled grid-charging blocks always force the inverter on.
     inverter_onoff_topic: str = "energy/solar/command/modbus/set"
     inverter_off_price_threshold_czk: float = Field(
-        default=2.0,
-        description="Power inverter off when spot price (CZK/kWh) is below this"
+        default=-2.0,
+        description="Power inverter off when spot price (CZK/kWh) is below this. "
+                    "Default -2.0 CZK = only deeply-negative hours where "
+                    "exporting solar costs us AND importing direct from grid "
+                    "earns money (grid balancing payment)."
     )
     inverter_off_price_hysteresis_czk: float = Field(
         default=0.1, ge=0,

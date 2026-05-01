@@ -47,7 +47,10 @@ class ModeManager:
         self._battery_first_slots: Dict[int, Dict[str, Any]] = {}
         self._ac_enabled = False
         self._export_enabled = False
-        self._inverter_on = True  # Default ON until proven otherwise
+        # Inverter on/off state — None means "unknown, force-send first command"
+        # to recover from a previous run that may have left the hardware in an
+        # unexpected state.
+        self._inverter_on: Optional[bool] = None
 
     def _get_local_now(self) -> datetime:
         """Get current time in local timezone."""
