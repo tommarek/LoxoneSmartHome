@@ -115,12 +115,75 @@ class ConsumptionModel:
         return self.global_median
 
 
+def _carry_forward_hourly(
+    result: Any, hour_keys: Any
+) -> Dict[str, int]:
+    """Reconstruct effective hourly state from sparse state-change records.
+
+    Mirror of solar_forecast._carry_forward_hourly. State-change records span
+    until the next change. For each hour key we want the effective state
+    DURING that hour: min over (state-entering, any changes within the hour),
+    so a partially-disabled hour still counts as disabled. Hours predating
+    the first record stay missing — caller defaults to "enabled".
+    """
+    changes: List[Tuple[datetime, int]] = []
+    if result:
+        for table in result:
+            for record in table.records:
+                val = record.get_value()
+                if isinstance(val, (int, float)):
+                    changes.append((record.get_time(), int(val)))
+    out: Dict[str, int] = {}
+    if not changes or not hour_keys:
+        return out
+    ci = 0
+    last_state: Optional[int] = None
+    for key in sorted(hour_keys):
+        hour_start = datetime.strptime(key, "%Y-%m-%d-%H")
+        hour_end = hour_start + timedelta(hours=1)
+        while (
+            ci < len(changes)
+            and changes[ci][0].replace(tzinfo=None) < hour_start
+        ):
+            last_state = changes[ci][1]
+            ci += 1
+        states_in_hour: List[int] = []
+        if last_state is not None:
+            states_in_hour.append(last_state)
+        while (
+            ci < len(changes)
+            and changes[ci][0].replace(tzinfo=None) < hour_end
+        ):
+            last_state = changes[ci][1]
+            states_in_hour.append(last_state)
+            ci += 1
+        if states_in_hour:
+            out[key] = min(states_in_hour)
+    return out
+
+
+# Bumped when the build_model logic changes in a way that invalidates
+# previously cached models (e.g., new training-data filters). On version
+# mismatch the controller forces a fresh rebuild, even if the cached
+# model is younger than rebuild_interval_days.
+MODEL_SCHEMA_VERSION = 3
+
+# Upper bound for a "real household" hourly consumption sample (kWh).
+# INVPowerToLocalLoad reports grid passthrough when the inverter is in
+# bypass (manual off, fault, etc.) — those readings can be 15-25 kW for
+# hours, which is not real local consumption. Anything above this cap
+# is filtered from training. Set generously enough to allow legitimate
+# heating + EV stacking; tighten if your loads stay smaller.
+MAX_REALISTIC_HOURLY_KWH = 10.0
+
+
 class ConsumptionForecast:
     """Consumption forecaster using historical data and temperature correlation."""
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
         self._model: Optional[ConsumptionModel] = None
+        self._model_version: int = 0  # 0 = no model yet
         self._last_model_build: Optional[datetime] = None
         # Rebuild model weekly
         self.rebuild_interval_days: int = 7
@@ -132,6 +195,8 @@ class ConsumptionForecast:
     def needs_rebuild(self) -> bool:
         """Check if model needs rebuilding."""
         if self._model is None or self._last_model_build is None:
+            return True
+        if self._model_version != MODEL_SCHEMA_VERSION:
             return True
         age = (datetime.now() - self._last_model_build).total_seconds()
         return age > self.rebuild_interval_days * 86400
@@ -171,9 +236,19 @@ from(bucket: "{settings.influxdb.bucket_loxone}")
   |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
   |> yield(name: "temperature")
 '''
+            # Inverter on/off state changes — used to exclude hours where the
+            # inverter was off (INVPowerToLocalLoad reads grid passthrough
+            # then, not real household load, so those samples poison the bins).
+            inverter_on_query = f'''
+from(bucket: "{settings.influxdb.bucket_solar}")
+  |> range(start: -365d)
+  |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "inverter_on")
+  |> sort(columns: ["_time"])
+'''
 
             consumption_result = await influxdb_client.query(consumption_query)
             temperature_result = await influxdb_client.query(temperature_query)
+            inverter_on_result = await influxdb_client.query(inverter_on_query)
 
             if not consumption_result or not temperature_result:
                 self.logger.warning("No consumption or temperature data found")
@@ -195,9 +270,16 @@ from(bucket: "{settings.influxdb.bucket_loxone}")
                     key = t.strftime("%Y-%m-%d-%H")
                     temp_by_hour[key] = record.get_value()
 
+            # Resolve inverter on/off state per hour from sparse change records.
+            inverter_on_by_hour = _carry_forward_hourly(
+                inverter_on_result, consumption_by_hour.keys()
+            )
+
             # Build model bins
             model = ConsumptionModel()
             matched = 0
+            inverter_off_excluded = 0
+            outlier_excluded = 0
 
             for hour_key, watts in consumption_by_hour.items():
                 if hour_key not in temp_by_hour:
@@ -205,9 +287,23 @@ from(bucket: "{settings.influxdb.bucket_loxone}")
                 if watts <= 0:
                     continue
 
+                # Skip hours where the controller knew the inverter was off.
+                if inverter_on_by_hour.get(hour_key, 1) == 0:
+                    inverter_off_excluded += 1
+                    continue
+
                 temp = temp_by_hour[hour_key]
                 # Convert watts average to kWh for 1 hour
                 kwh = watts / 1000.0
+
+                # Skip implausibly-large samples — almost always inverter
+                # bypass (user toggled off via OIG UI without telling the
+                # controller, or device fault). Grid passthrough then reports
+                # 15-25kW for hours, contaminating bins for that
+                # (temp, hour, weekday) slot.
+                if kwh > MAX_REALISTIC_HOURLY_KWH:
+                    outlier_excluded += 1
+                    continue
 
                 # Parse hour and day of week
                 parts = hour_key.split("-")
@@ -238,12 +334,15 @@ from(bucket: "{settings.influxdb.bucket_loxone}")
             model.build()
 
             self._model = model
+            self._model_version = MODEL_SCHEMA_VERSION
             self._last_model_build = datetime.now()
 
             self.logger.info(
                 f"Consumption model built: {matched} data points, "
                 f"{len(model.medians)} bins, "
-                f"range {model.date_range}"
+                f"range {model.date_range} "
+                f"(excluded {inverter_off_excluded} inverter-off hours, "
+                f"{outlier_excluded} outliers >{MAX_REALISTIC_HOURLY_KWH:.0f}kWh)"
             )
             return True
 

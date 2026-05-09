@@ -184,7 +184,8 @@ class TestConsumptionForecast:
         t_table.records = temp_records
 
         mock_client = AsyncMock()
-        mock_client.query = AsyncMock(side_effect=[[c_table], [t_table]])
+        # Three queries now: consumption, temperature, inverter_on
+        mock_client.query = AsyncMock(side_effect=[[c_table], [t_table], []])
 
         mock_settings = MagicMock()
         mock_settings.influxdb.bucket_solar = "solar"
@@ -195,3 +196,74 @@ class TestConsumptionForecast:
         assert cf.model is not None
         assert cf.model.data_points > 0
         assert len(cf.model.medians) > 0
+
+    @pytest.mark.asyncio
+    async def test_build_model_excludes_inverter_off_hours(self) -> None:
+        """Hours where inverter_on=0 must be excluded from training to
+        avoid INVPowerToLocalLoad grid-passthrough contamination.
+
+        Reproduces the 2026-04-26 outage: ~6 hours of 20 kW grid imports
+        landed in the (warm-temp, hour 11, weekend) bin and poisoned every
+        future prediction for that slot.
+        """
+        cf = ConsumptionForecast(logger=MagicMock())
+
+        # 30 days of clean ~2 kW load + one contaminated day at 20 kW
+        consumption_records = []
+        temp_records = []
+        for day_offset in range(30):
+            for hour in range(24):
+                dt = datetime(2026, 3, 1 + day_offset % 28, hour, 0)
+                # Day 0 hour 11 is contaminated: 20 kW spike
+                watts = 20000.0 if (day_offset == 0 and hour == 11) else 1500.0
+                c_rec = MagicMock()
+                c_rec.get_time.return_value = dt
+                c_rec.get_value.return_value = float(watts)
+                consumption_records.append(c_rec)
+
+                t_rec = MagicMock()
+                t_rec.get_time.return_value = dt
+                t_rec.get_value.return_value = 5.0
+                temp_records.append(t_rec)
+
+        # inverter_state records: a transition to 0 just before the
+        # contaminated hour, then back to 1 after. Carry-forward will
+        # mark hour 11 of day 0 as off.
+        from datetime import timezone
+        inv_off_change = MagicMock()
+        inv_off_change.get_time.return_value = datetime(
+            2026, 3, 1, 10, 30, tzinfo=timezone.utc
+        )
+        inv_off_change.get_value.return_value = 0
+        inv_on_change = MagicMock()
+        inv_on_change.get_time.return_value = datetime(
+            2026, 3, 1, 12, 30, tzinfo=timezone.utc
+        )
+        inv_on_change.get_value.return_value = 1
+
+        c_table = MagicMock(); c_table.records = consumption_records
+        t_table = MagicMock(); t_table.records = temp_records
+        inv_table = MagicMock(); inv_table.records = [inv_off_change, inv_on_change]
+
+        mock_client = AsyncMock()
+        mock_client.query = AsyncMock(
+            side_effect=[[c_table], [t_table], [inv_table]]
+        )
+
+        mock_settings = MagicMock()
+        mock_settings.influxdb.bucket_solar = "solar"
+        mock_settings.influxdb.bucket_loxone = "loxone"
+
+        ok = await cf.build_model(mock_client, mock_settings)
+        assert ok is True
+        # The hour-11 weekday bin (Sunday 2026-03-01 = weekend, but
+        # subsequent days are weekdays) should NOT contain the 20 kW sample
+        # — verify median stays sane.
+        # bucket for 5°C = (5+20)/2 = 12; hour 11; weekday OR weekend
+        for is_weekend in (True, False):
+            key = (12, 11, is_weekend)
+            if key in cf.model.medians:
+                assert cf.model.medians[key] < 5.0, (
+                    f"bin {key} median {cf.model.medians[key]} suggests the "
+                    f"20 kW contamination wasn't filtered"
+                )
