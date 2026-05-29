@@ -308,11 +308,65 @@ class GrowattConfig(BaseSettings):
         default=False,
         description="Enable temperature-aware consumption forecasting from historical data"
     )
+    consumption_forecast_engine: str = Field(
+        default="binned",
+        pattern="^(binned|ml)$",
+        description=(
+            "Which consumption forecaster to use: 'binned' (temperature-binned "
+            "median, default) or 'ml' (skforecast autoregressive). Falls back "
+            "to 'binned' if ML training fails or skforecast isn't installed."
+        ),
+    )
+
+    # Solcast PV forecast (optional, replaces forecast.solar when configured).
+    # Free tier: 10 API requests/day per rooftop site.
+    solcast_api_key: str = Field(
+        default="",
+        description="Solcast API key (https://solcast.com). Empty disables Solcast."
+    )
+    solcast_rooftop_id: str = Field(
+        default="",
+        description="Solcast rooftop site UUID (configured per-array on solcast.com)."
+    )
+
+    # Deferrable loads — controllable appliances that can be time-shifted to
+    # the cheapest hours within a permitted window. Schema (JSON array):
+    # [{
+    #   "name": "ev_charger",
+    #   "energy_required_kwh": 25,
+    #   "power_kw": 11,
+    #   "earliest_start": "22:00",   # HH:MM local
+    #   "latest_end": "06:00",
+    #   "interruptible": true,
+    #   "mqtt_topic_on": "loxone/ev/charge/on",
+    #   "mqtt_topic_off": "loxone/ev/charge/off"
+    # }]
+    deferrable_loads_json: str = Field(
+        default="[]",
+        description=(
+            "JSON array of deferrable load specs (see module docstring). "
+            "earliest_start may be later than latest_end for overnight windows "
+            "(e.g. 22:00-06:00). WARNING: only list loads NOT already present in "
+            "the consumption history (INVPowerToLocalLoad) — adding a load the "
+            "consumption forecast already learned double-counts it and makes the "
+            "battery over-charge from grid."
+        )
+    )
 
     # Optimizer
     optimizer_enabled: bool = Field(
         default=False,
         description="Enable greedy optimizer (replaces rule-based scheduling when active)"
+    )
+    optimizer_engine: str = Field(
+        default="greedy",
+        pattern="^(greedy|milp)$",
+        description=(
+            "Which optimizer engine to use: 'greedy' (forward simulation, "
+            "default, fast) or 'milp' (PuLP-based global optimum, slower but "
+            "more stable across re-evaluations). Falls back to 'greedy' if "
+            "PuLP isn't installed or the MILP solve is infeasible/times out."
+        ),
     )
 
     # Sell economics

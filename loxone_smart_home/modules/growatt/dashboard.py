@@ -531,6 +531,60 @@ async def api_projection(request: web.Request) -> web.Response:
     return web.json_response({"timeline": timeline})
 
 
+async def api_solar_actuals(request: web.Request) -> web.Response:
+    """Today's actual hourly solar production (for forecast-vs-actual overlay).
+
+    Cached ~5 min per controller to keep dashboard refreshes cheap.
+    """
+    ctrl = _get_controller(request)
+    if not ctrl or not getattr(ctrl, 'influxdb_client', None):
+        return web.json_response({"hourly": {}})
+
+    # Tiny per-process cache: refresh at most every 5 min.
+    cache = getattr(ctrl, '_solar_actuals_cache', None)
+    if cache:
+        ts, payload = cache
+        if (datetime.now() - ts).total_seconds() < 300:
+            return web.json_response(payload)
+
+    try:
+        bucket = ctrl.settings.influxdb.bucket_solar
+        q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+        r = await ctrl.influxdb_client.query(q)
+        hourly: Dict[str, float] = {}
+        # InfluxDB returns UTC-aware timestamps; bucket by LOCAL hour so the
+        # actuals line up with the optimizer's local-hour forecast (the
+        # tooltip compares them directly). Fall back to naive/UTC if the
+        # zoneinfo db isn't available.
+        try:
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo("Europe/Prague")
+        except Exception:
+            local_tz = None
+        local_now = datetime.now(local_tz) if local_tz else datetime.now()
+        today = local_now.date()
+        for table in r:
+            for record in table.records:
+                t = record.get_time()
+                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                    t = t.astimezone(local_tz)
+                if t.date() != today:
+                    continue
+                watts = record.get_value()
+                if isinstance(watts, (int, float)):
+                    hourly[t.strftime("%H:00")] = round(float(watts) / 1000.0, 3)  # kWh
+        payload = {"hourly": hourly}
+        ctrl._solar_actuals_cache = (datetime.now(), payload)
+        return web.json_response(payload)
+    except Exception as e:
+        return web.json_response({"hourly": {}, "error": str(e)})
+
+
 async def api_logs(request: web.Request) -> web.Response:
     """Get recent log entries."""
     count = int(request.query.get("count", "100"))
@@ -618,6 +672,7 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/prices", api_prices)
     app.router.add_get("/api/projection", api_projection)
+    app.router.add_get("/api/solar_actuals", api_solar_actuals)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
@@ -1283,12 +1338,17 @@ function updateUI(d) {
 
 async function fetchPrices() {
   try {
-    const [priceRes, projRes] = await Promise.all([
+    const [priceRes, projRes, actualsRes] = await Promise.all([
       fetch('/api/prices'),
       fetch('/api/projection'),
+      fetch('/api/solar_actuals'),
     ]);
     const data = await priceRes.json();
     const projData = await projRes.json();
+    try {
+      const actualsData = await actualsRes.json();
+      solarActuals = (actualsData && actualsData.hourly) || {};
+    } catch (e) { solarActuals = {}; }
     const todayPrices = data.prices || [];
     const tomorrowPrices = data.tomorrow || [];
     const allPrices = [...todayPrices, ...tomorrowPrices];
@@ -1373,6 +1433,7 @@ function renderSocLine(prices, timeline, chartId, svgId) {
 }
 
 let priceData = [];
+let solarActuals = {};  // "HH:00" -> actual solar kWh (today only)
 
 function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   const chart = document.getElementById(mountId);
@@ -1464,10 +1525,20 @@ function showTooltip(e, bar, tooltip) {
     const nfColor = nf > 0 ? 'var(--green)' : nf < 0 ? 'var(--red)' : 'var(--muted)';
     const solar = p.projected_solar || 0;
     const cons = p.projected_consumption || 0;
+    // Forecast-vs-actual solar overlay (today only; actuals keyed by hour).
+    let solarCell = solar.toFixed(2);
+    if (p.day !== 'tomorrow' && p.start) {
+      const hourKey = p.start.slice(0, 2) + ':00';
+      if (Object.prototype.hasOwnProperty.call(solarActuals, hourKey)) {
+        const act = solarActuals[hourKey];
+        const driftColor = act >= solar ? 'var(--green)' : 'var(--red)';
+        solarCell = solar.toFixed(2) + ' <span style="color:' + driftColor + '">(act ' + act.toFixed(2) + ')</span>';
+      }
+    }
     projHtml = '<div style="margin-top:4px;padding-top:4px;border-top:1px solid var(--border)">' +
       '<div class="tt-row"><span class="tt-label">Battery</span><span style="color:' + projColor + '">' + p.projected_soc + '% (' + p.projected_kwh + ' kWh) ' + projAction + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Net flow</span><span style="color:' + nfColor + '">' + nfSign + nf.toFixed(2) + ' kWh</span></div>' +
-      '<div class="tt-row"><span class="tt-label">Solar / Load</span><span>' + solar.toFixed(2) + ' / ' + cons.toFixed(2) + ' kWh</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Solar / Load</span><span>' + solarCell + ' / ' + cons.toFixed(2) + ' kWh</span></div>' +
       '</div>';
   }
 

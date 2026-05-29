@@ -212,17 +212,118 @@ class GrowattController(BaseModule):
                 f"total {sum(a.kwp for a in self._solar_forecast.arrays):.1f} kWp"
             )
 
-        # Consumption forecast (Phase 3.1)
+        # Consumption forecast (Phase 3.1) — engine-switchable
         self._consumption_forecast: Optional[ConsumptionForecast] = None
+        self._ml_consumption_forecast = None  # Optional[MLConsumptionForecast]
         if self.config.consumption_forecast_enabled:
             self._consumption_forecast = ConsumptionForecast(self.logger)
+            engine = getattr(self.config, "consumption_forecast_engine", "binned")
+            if engine == "ml":
+                try:
+                    from .growatt.ml_consumption_forecast import MLConsumptionForecast
+                    ml = MLConsumptionForecast(self.logger)
+                    if ml.available:
+                        self._ml_consumption_forecast = ml
+                        self.logger.info(
+                            "ML consumption forecaster enabled (skforecast)"
+                        )
+                    else:
+                        self.logger.warning(
+                            "consumption_forecast_engine=ml but skforecast is not "
+                            "installed — falling back to binned model"
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        f"ML consumption forecaster init failed: {e} — "
+                        f"falling back to binned model"
+                    )
             self.logger.info("Consumption forecast enabled (model will build on startup)")
 
-        # Greedy optimizer (Phase 3.2)
+        # Optimizer (Phase 3.2) — engine-switchable: greedy or MILP
         self._optimizer: Optional[BatteryOptimizer] = None
         if self.config.optimizer_enabled:
-            self._optimizer = BatteryOptimizer(self.logger)
-            self.logger.info("Battery optimizer enabled")
+            engine = getattr(self.config, "optimizer_engine", "greedy")
+            if engine == "milp":
+                try:
+                    from .growatt.milp_optimizer import MILPBatteryOptimizer
+                    milp = MILPBatteryOptimizer(self.logger)
+                    if milp.is_available():
+                        self._optimizer = milp  # type: ignore[assignment]
+                        self.logger.info("Battery optimizer enabled (MILP engine)")
+                    else:
+                        self.logger.warning(
+                            "optimizer_engine=milp but PuLP isn't installed — "
+                            "falling back to greedy"
+                        )
+                        self._optimizer = BatteryOptimizer(self.logger)
+                        self.logger.info("Battery optimizer enabled (greedy fallback)")
+                except Exception as e:
+                    self.logger.warning(
+                        f"MILP optimizer init failed: {e} — falling back to greedy"
+                    )
+                    self._optimizer = BatteryOptimizer(self.logger)
+            else:
+                self._optimizer = BatteryOptimizer(self.logger)
+                self.logger.info("Battery optimizer enabled (greedy engine)")
+
+        # Solcast PV forecast (optional). If configured, used as an
+        # additional input to the consensus alongside forecast.solar and
+        # the trained production model.
+        self._solcast_forecast = None  # Optional[SolcastForecast]
+        if getattr(self.config, "solcast_api_key", ""):
+            try:
+                from .growatt.solcast_forecast import SolcastForecast
+                self._solcast_forecast = SolcastForecast(
+                    api_key=self.config.solcast_api_key,
+                    rooftop_id=getattr(self.config, "solcast_rooftop_id", ""),
+                    logger=self.logger,
+                )
+                if self._solcast_forecast.enabled:
+                    self.logger.info("Solcast PV forecast enabled")
+                else:
+                    self._solcast_forecast = None
+            except Exception as e:
+                self.logger.warning(f"Solcast init failed: {e}")
+                self._solcast_forecast = None
+
+        # Deferrable loads — parsed from JSON config
+        self._deferrable_loads = []
+        self._deferrable_scheduler = None
+        try:
+            import json as _json
+            from datetime import time as _time
+            from .growatt.deferrable_loads import (
+                DeferrableLoad, DeferrableLoadScheduler,
+            )
+            spec = _json.loads(
+                getattr(self.config, "deferrable_loads_json", "[]") or "[]"
+            )
+            for entry in spec:
+                self._deferrable_loads.append(DeferrableLoad(
+                    name=entry["name"],
+                    energy_required_kwh=float(entry["energy_required_kwh"]),
+                    power_kw=float(entry["power_kw"]),
+                    earliest_start=_time.fromisoformat(entry.get("earliest_start", "00:00")),
+                    latest_end=_time.fromisoformat(entry.get("latest_end", "23:59")),
+                    interruptible=bool(entry.get("interruptible", True)),
+                    mqtt_topic_on=entry.get("mqtt_topic_on"),
+                    mqtt_topic_off=entry.get("mqtt_topic_off"),
+                    payload_on=entry.get("payload_on"),
+                    payload_off=entry.get("payload_off"),
+                ))
+            if self._deferrable_loads:
+                self._deferrable_scheduler = DeferrableLoadScheduler(self.logger)
+                self.logger.info(
+                    f"Deferrable loads enabled: "
+                    f"{', '.join(l.name for l in self._deferrable_loads)}"
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not parse deferrable_loads_json: {e}")
+            self._deferrable_loads = []
+            self._deferrable_scheduler = None
+
+        # Cached schedule for status / dashboard / actual MQTT firing
+        self._deferrable_schedules = []
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
@@ -1521,6 +1622,24 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 except Exception as e:
                     self.logger.warning(f"Failed to build consumption model: {e}")
 
+            # ML consumption forecaster (skforecast AR + exog).
+            # Trained alongside the binned model so we can compare/A-B.
+            if self._ml_consumption_forecast is not None:
+                try:
+                    ok = await self._ml_consumption_forecast.build_model(
+                        self.influxdb_client, self.settings,
+                        local_tz=self._local_tz,
+                    )
+                    if not ok:
+                        self.logger.info(
+                            "ML consumption training declined (insufficient/gappy data) "
+                            "— controller will use binned model"
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        f"ML consumption training failed: {e} — using binned fallback"
+                    )
+
             # Base load profile (90 days, 3 queries)
             if self._optimizer:
                 try:
@@ -1725,6 +1844,19 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 )
         except Exception as e:
             self.logger.warning(f"Failed to fetch forecast.solar API: {e}")
+
+        # Source 1b: Solcast (if configured). Independent API; throttled
+        # internally to stay under the 10-req/day free-tier cap.
+        solcast = getattr(self, '_solcast_forecast', None)
+        if solcast is not None:
+            try:
+                hourly = await solcast.fetch_hourly_today_tomorrow(
+                    local_tz=self._local_tz
+                )
+                if hourly:
+                    self._solar_forecast.set_solcast_hourly(hourly)
+            except Exception as e:
+                self.logger.debug(f"Solcast fetch failed: {e}")
 
         # If API failed or was rate-limited, try fallbacks in order
         if not self._solar_forecast._api_forecast:
@@ -2129,12 +2261,28 @@ from(bucket: "{bucket}")
 
             # Consumption forecast: prefer the temperature-aware total-load model
             # (heating + EV included) over the heating-excluded base load profile.
-            # Falls back to base_load_profile if the consumption model isn't built
-            # or temperature data is unavailable.
+            # Order: ML (if enabled+trained) → binned model → base_load_profile.
             consumption_hourly: Dict[int, float] = {}
             forecast_temps = await self._fetch_recent_hourly_temps()
+
+            ml_cf = getattr(self, '_ml_consumption_forecast', None)
+            if ml_cf and ml_cf.is_trained and forecast_temps:
+                try:
+                    # Recursive RF inference is CPU-bound — run off the loop.
+                    hourly = await asyncio.to_thread(
+                        ml_cf.predict_hourly, forecast_temps, now.date()
+                    )
+                    if hourly:
+                        consumption_hourly = hourly
+                        self.logger.debug(
+                            f"Using ML consumption forecast ({len(hourly)} hours)"
+                        )
+                except Exception as e:
+                    self.logger.debug(f"ML predict_hourly failed: {e}")
+
             if (
-                self._consumption_forecast
+                not consumption_hourly
+                and self._consumption_forecast
                 and self._consumption_forecast.model
                 and forecast_temps
             ):
@@ -2164,6 +2312,31 @@ from(bucket: "{bucket}")
             dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
                 h, dist_thresholds
             )
+
+            # Deferrable loads — schedule each into its cheapest allowed
+            # blocks, then ADD the scheduled per-block consumption to
+            # consumption_hourly so the battery optimizer plans around it.
+            if self._deferrable_scheduler and self._deferrable_loads:
+                try:
+                    schedules = self._deferrable_scheduler.schedule_all(
+                        self._deferrable_loads, price_blocks_czk, dist_func,
+                    )
+                    self._deferrable_schedules = schedules
+                    loads_by_name = {l.name: l for l in self._deferrable_loads}
+                    overlay = self._deferrable_scheduler.consumption_overlay(
+                        schedules, loads_by_name,
+                    )
+                    for h, extra_kwh in overlay.items():
+                        consumption_hourly[h] = consumption_hourly.get(h, 0.0) + extra_kwh
+                    for sched in schedules:
+                        if sched.blocks:
+                            self.logger.info(
+                                f"📋 Deferrable {sched.load_name}: "
+                                f"{len(sched.blocks)} blocks scheduled, "
+                                f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                            )
+                except Exception as e:
+                    self.logger.warning(f"Deferrable scheduling failed: {e}")
 
             charge_times, discharge_times, sell_production_times, decisions = self._optimizer.optimize(
                 blocks=price_blocks_czk,

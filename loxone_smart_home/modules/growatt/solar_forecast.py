@@ -287,6 +287,7 @@ class SolarForecast:
         self._api_forecast: Dict[str, DailyForecast] = {}  # date_str -> forecast
         self._weather_forecast: Dict[str, DailyForecast] = {}
         self._model_forecast: Dict[str, DailyForecast] = {}  # from learned model
+        self._solcast_forecast: Dict[str, DailyForecast] = {}  # from Solcast API
         self._consensus: Dict[str, DailyForecast] = {}
         self._last_api_update: Optional[datetime] = None
 
@@ -925,10 +926,33 @@ from(bucket: "{weather_bucket}")
 
     # --- Consensus ---
 
+    def set_solcast_hourly(self, hourly_by_date: Dict[str, Dict[int, float]]) -> None:
+        """Ingest Solcast forecast (date_str → hour → kWh) into the consensus pool.
+
+        Called by the controller after a successful Solcast API fetch.
+        Stored alongside model + forecast.solar; build_consensus() blends them.
+        """
+        from datetime import datetime as _dt
+        new: Dict[str, DailyForecast] = {}
+        for date_str, hourly in hourly_by_date.items():
+            if not hourly:
+                continue
+            try:
+                d = _dt.strptime(date_str, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            new[date_str] = DailyForecast(
+                date=d,
+                total_kwh=sum(hourly.values()),
+                hourly=dict(hourly),
+                source="solcast",
+            )
+        self._solcast_forecast = new
+
     def build_consensus(self) -> Dict[str, DailyForecast]:
         """Combine all forecast sources into a consensus.
 
-        Priority: learned model (most accurate) > forecast.solar API > weather GHI.
+        Priority: learned model (most accurate) > Solcast > forecast.solar API > weather GHI.
         When multiple sources available, average values that agree, use model
         when sources diverge (it's trained on actual installation data).
         """
@@ -936,6 +960,7 @@ from(bucket: "{weather_bucket}")
             set(self._api_forecast.keys())
             | set(self._weather_forecast.keys())
             | set(self._model_forecast.keys())
+            | set(self._solcast_forecast.keys())
         )
         result: Dict[str, DailyForecast] = {}
 
@@ -943,11 +968,14 @@ from(bucket: "{weather_bucket}")
             model = self._model_forecast.get(date_str)
             api = self._api_forecast.get(date_str)
             weather = self._weather_forecast.get(date_str)
+            solcast = self._solcast_forecast.get(date_str)
 
             # Collect all available sources for this date
             sources: List[DailyForecast] = []
             if model and model.total_kwh > 0:
                 sources.append(model)
+            if solcast and solcast.total_kwh > 0:
+                sources.append(solcast)
             if api and api.total_kwh > 0:
                 sources.append(api)
             if weather and weather.total_kwh > 0:
