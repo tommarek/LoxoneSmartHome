@@ -1214,6 +1214,119 @@ from(bucket: "{bucket}")
             return dict(forecast.hourly)
         return {h: kwh * self.confidence for h, kwh in forecast.hourly.items()}
 
+    async def compute_intraday_calibration(
+        self,
+        influxdb_client: Any,
+        bucket: str,
+        current_hour: int,
+        target_date: date,
+        local_tz: Any = None,
+        lookback_hours: int = 3,
+        min_forecast_kwh: float = 0.3,
+        clamp_low: float = 0.5,
+        clamp_high: float = 3.0,
+    ) -> Optional[float]:
+        """Return a scaling ratio that aligns today's forecast to recent actuals.
+
+        Looks at the last `lookback_hours` COMPLETED hours of today: pulls
+        actual hourly InputPower from InfluxDB and compares with what
+        get_hourly_production() said for those same hours. Returns a single
+        scalar that the caller should multiply against the remaining-day
+        forecast.
+
+        Returns None when there isn't enough useful data (night, very early
+        morning, freshly-deployed, or all-tiny forecasts) — caller leaves
+        the forecast untouched in that case.
+
+        Args:
+            influxdb_client: AsyncInfluxDBClient instance
+            bucket: solar bucket name
+            current_hour: hour-of-day (0-23) we're currently in (incomplete)
+            target_date: today's date
+            lookback_hours: how many complete hours back to consider
+            min_forecast_kwh: skip the calibration if forecast for all
+                considered hours is below this (predawn / dusk noise)
+            clamp_low, clamp_high: hard bounds on the ratio so a single
+                outlier hour can't drive a wild correction
+
+        Returns:
+            Scaling factor in [clamp_low, clamp_high], or None.
+        """
+        # Pull last lookback_hours of actual hourly production.
+        # We need data from completed hours only, so window ends at the
+        # start of current_hour (today, local). For InfluxDB simplicity we
+        # use a relative range — current_hour is an hour-of-day; we use
+        # the wall time and trust aggregateWindow to bucket cleanly.
+        if current_hour <= 0:
+            return None  # nothing completed yet today
+        try:
+            # Query the last lookback_hours+1 hours so we have buffer; we'll
+            # then filter to completed hours of today only.
+            q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -{lookback_hours + 1}h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+            result = await influxdb_client.query(q)
+            actual_by_hour: Dict[int, float] = {}
+            if result:
+                for table in result:
+                    for record in table.records:
+                        t = record.get_time()
+                        # InfluxDB returns UTC timestamps; convert to local
+                        # so hour/date match what the caller expects (the
+                        # controller passes local-time current_hour and
+                        # local-date target_date).
+                        if local_tz is not None and t.tzinfo is not None:
+                            t = t.astimezone(local_tz)
+                        if t.date() != target_date:
+                            continue
+                        h = t.hour
+                        if h >= current_hour:
+                            continue  # incomplete current hour — skip
+                        watts = record.get_value()
+                        if isinstance(watts, (int, float)):
+                            actual_by_hour[h] = float(watts) / 1000.0  # kWh
+
+            if not actual_by_hour:
+                return None
+
+            forecast_today = self.get_hourly_production(target_date)
+
+            # Drop pre-dawn / dusk hours: if EITHER actual or forecast is
+            # tiny, the ratio is dominated by noise (e.g., sun hadn't yet
+            # risen → actual=0 with non-zero forecast pulls ratio to 0).
+            usable_hours = [
+                h for h in sorted(actual_by_hour.keys())
+                if actual_by_hour[h] >= 0.2 and forecast_today.get(h, 0.0) >= 0.2
+            ]
+
+            if not usable_hours:
+                return None
+
+            # Restrict to the most recent `lookback_hours` USABLE hours.
+            considered = usable_hours[-lookback_hours:]
+
+            total_actual = sum(actual_by_hour[h] for h in considered)
+            total_forecast = sum(forecast_today.get(h, 0.0) for h in considered)
+
+            if total_forecast < min_forecast_kwh:
+                # Pre-dawn / very dim forecasts have huge ratio noise.
+                return None
+
+            ratio = total_actual / total_forecast
+            clamped = max(clamp_low, min(clamp_high, ratio))
+            self.logger.info(
+                f"☀️  Intraday solar calibration: actual {total_actual:.2f} kWh "
+                f"vs forecast {total_forecast:.2f} kWh over hours {considered} "
+                f"→ ratio {ratio:.2f} (clamped {clamped:.2f})"
+            )
+            return clamped
+        except Exception as e:
+            self.logger.debug(f"Intraday calibration failed: {e}")
+            return None
+
     # --- Persistence ---
 
     async def save_to_influxdb(self, influxdb_client: Any, bucket: str) -> None:

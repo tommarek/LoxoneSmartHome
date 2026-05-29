@@ -2074,9 +2074,25 @@ from(bucket: "{bucket}")
             ) if self._solar_forecast else {}
             # Merge today's remaining + tomorrow's solar
             today_solar = self._solar_forecast.get_hourly_production(today) if self._solar_forecast else {}
+
+            # Intraday calibration: scale today's REMAINING hours by the ratio
+            # of recent actual production vs what the forecast had predicted
+            # for the same hours. Catches systematic under/over-forecasts
+            # (e.g., model says cloudy, reality is sunny). Tomorrow stays
+            # untouched — different weather window.
+            calibration_ratio = None
+            if self.influxdb_client:
+                calibration_ratio = await self._solar_forecast.compute_intraday_calibration(
+                    self.influxdb_client,
+                    self.settings.influxdb.bucket_solar,
+                    current_hour=now.hour,
+                    target_date=today,
+                    local_tz=self._local_tz,
+                )
             for h, kwh in today_solar.items():
                 if h > now.hour:
-                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
+                    scaled = kwh * calibration_ratio if calibration_ratio else kwh
+                    solar_hourly[h] = solar_hourly.get(h, 0) + scaled
 
             # Consumption forecast: prefer the temperature-aware total-load model
             # (heating + EV included) over the heating-excluded base load profile.

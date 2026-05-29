@@ -511,3 +511,132 @@ class TestConsensusPersistence:
         # Ratios: 36/40=0.9, 40/45=0.889, 48/50=0.96
         # Confidence should be in a reasonable calibrated range
         assert 0.8 < forecast.confidence < 1.0
+
+
+class TestIntradayCalibration:
+    """Live actual-vs-forecast scaling that the controller applies to the
+    rest of today's solar forecast before passing it to the optimizer."""
+
+    def _make_forecast_with_today(self, forecast, today_hourly: dict) -> None:
+        """Plant a model-source consensus forecast for today with the given
+        per-hour kWh values, so get_hourly_production(today) returns them."""
+        from datetime import date as _date
+        from modules.growatt.solar_forecast import DailyForecast
+        today_obj = _date(2026, 5, 29)
+        forecast._consensus[today_obj.strftime("%Y-%m-%d")] = DailyForecast(
+            date=today_obj,
+            total_kwh=sum(today_hourly.values()),
+            hourly=today_hourly,
+            source="model",
+        )
+        return today_obj
+
+    def _mock_query(self, hourly_actuals_w: dict, target_date):
+        """Build an AsyncMock that returns InputPower records at the given
+        hours (watts) on target_date."""
+        records = []
+        for hour, watts in hourly_actuals_w.items():
+            rec = MagicMock()
+            t = datetime(target_date.year, target_date.month, target_date.day, hour, 0)
+            rec.get_time.return_value = t
+            rec.get_value.return_value = float(watts)
+            records.append(rec)
+        table = MagicMock()
+        table.records = records
+        client = AsyncMock()
+        client.query = AsyncMock(return_value=[table])
+        return client
+
+    @pytest.mark.asyncio
+    async def test_under_forecast_returns_ratio_above_1(self, forecast) -> None:
+        """Reality > forecast → ratio > 1, scaling future hours UP."""
+        today = self._make_forecast_with_today(
+            forecast,
+            # Cloudy-morning forecast: 0.5 kWh/hour through 09:00, then sun
+            {h: 0.5 for h in range(6, 10)} | {h: 3.0 for h in range(10, 18)},
+        )
+        # Reality was 7× higher than forecast for the completed hours.
+        client = self._mock_query({6: 3500, 7: 3500, 8: 3500}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=9, target_date=today,
+        )
+        assert ratio is not None
+        # actual_sum=10.5, forecast_sum=1.5 → 7.0, clamped to 3.0
+        assert ratio == pytest.approx(3.0)
+
+    @pytest.mark.asyncio
+    async def test_over_forecast_returns_ratio_below_1(self, forecast) -> None:
+        """Reality < forecast → ratio < 1, scaling future hours DOWN."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 3.0 for h in range(6, 18)},
+        )
+        # Reality is half the forecast.
+        client = self._mock_query({6: 1500, 7: 1500, 8: 1500}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=9, target_date=today,
+        )
+        assert ratio == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_clamped_to_low_bound(self, forecast) -> None:
+        """Crazy-low actuals can't drive a runaway downward correction."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 3.0 for h in range(6, 18)},
+        )
+        # Actual is 1/15 of forecast → raw ratio 0.067, must clamp to 0.5.
+        # Need ≥0.2 kWh/h to pass the dawn/dusk usable filter (200W mean).
+        client = self._mock_query({6: 200, 7: 200, 8: 200}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=9, target_date=today,
+        )
+        assert ratio == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_dawn_hours_excluded(self, forecast) -> None:
+        """Pre-sunrise hours (zero actual) get filtered out even if forecast
+        had non-zero values for them. Otherwise calibration would always go
+        DOWN during early-morning calls."""
+        today = self._make_forecast_with_today(
+            forecast,
+            {5: 0.5, 6: 0.5, 7: 1.0, 8: 2.0, 9: 3.0},
+        )
+        # Hour 5 is pre-dawn (zero actual); hour 6+ sun rising and matches
+        # forecast roughly. Without the filter, ratio would include hour 5's
+        # 0/0.5=0 → dragged down. With the filter, only hours 6 and 7 count.
+        client = self._mock_query({5: 0, 6: 500, 7: 1000}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=8, target_date=today,
+        )
+        assert ratio is not None
+        # Hours 6, 7 considered: actual 0.5+1.0=1.5, forecast 0.5+1.0=1.5 → 1.0
+        assert ratio == pytest.approx(1.0)
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_completed_hours(self, forecast) -> None:
+        """current_hour == 0 → nothing completed today, can't calibrate."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 1.0 for h in range(6, 18)},
+        )
+        client = self._mock_query({}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=0, target_date=today,
+        )
+        assert ratio is None
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_forecast_tiny(self, forecast) -> None:
+        """Pre-dawn forecast is too small to ratio against — return None."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 0.01 for h in range(24)},
+        )
+        client = self._mock_query({5: 5, 6: 5}, today)
+
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=7, target_date=today,
+        )
+        assert ratio is None  # forecast sum < min_forecast_kwh
