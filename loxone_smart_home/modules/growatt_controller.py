@@ -2089,10 +2089,43 @@ from(bucket: "{bucket}")
                     target_date=today,
                     local_tz=self._local_tz,
                 )
+
+            # Live persistence anchor: scale today's REMAINING hours up to
+            # match current measured solar production. Inspired by EMHASS:
+            # current hour dominated by live observation, smoothly decaying
+            # to model over the next 2 hours. Catches the case where the
+            # model under-predicts present-moment sun (e.g., forecast said
+            # cloudy, reality is bright).
+            live_solar_kw = 0.0
+            try:
+                from .growatt.api import _telemetry_cache  # type: ignore
+                live_w = _telemetry_cache.get("InputPower") if _telemetry_cache else None
+                if isinstance(live_w, (int, float)) and live_w > 0:
+                    live_solar_kw = float(live_w) / 1000.0
+            except Exception:
+                pass
+
+            # Apply scaling + persistence to today's remaining hours, then
+            # merge into solar_hourly (which already has tomorrow's data).
+            scaled_today: Dict[int, float] = {}
             for h, kwh in today_solar.items():
-                if h > now.hour:
-                    scaled = kwh * calibration_ratio if calibration_ratio else kwh
-                    solar_hourly[h] = solar_hourly.get(h, 0) + scaled
+                if h >= now.hour:  # include current hour for persistence anchor
+                    scaled_today[h] = kwh * calibration_ratio if calibration_ratio else kwh
+            if live_solar_kw > 0:
+                scaled_today = self._solar_forecast.apply_live_persistence(
+                    scaled_today, live_solar_kw, current_hour=now.hour,
+                )
+                self.logger.info(
+                    f"☀️  Live solar persistence: anchoring near-future forecast "
+                    f"to live {live_solar_kw:.2f} kW reading"
+                )
+            for h, kwh in scaled_today.items():
+                if h > now.hour:  # don't double-count current/past in optimizer
+                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
+                elif h == now.hour:
+                    # Current incomplete hour: optimizer's blocks list includes
+                    # the current 15-min block, so we still want a forecast value
+                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
 
             # Consumption forecast: prefer the temperature-aware total-load model
             # (heating + EV included) over the heating-excluded base load profile.

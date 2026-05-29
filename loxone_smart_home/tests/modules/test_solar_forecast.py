@@ -594,6 +594,45 @@ class TestIntradayCalibration:
         )
         assert ratio == pytest.approx(0.5)
 
+    def test_persistence_lifts_current_hour_when_live_above_forecast(self, forecast) -> None:
+        """Live PV power >> forecast → current hour anchored to live, no
+        downward effect."""
+        # Forecast says cloudy: 0.5 kWh/h. Reality: 3.65 kW (sunny).
+        model = {h: 0.5 for h in range(6, 20)}
+        out = forecast.apply_live_persistence(
+            model, live_power_kw=3.65, current_hour=8, blend_horizon_hours=2,
+        )
+        # Hour 8 (α=1): blended = 1.0*3.65 + 0.0*0.5 = 3.65; max with 0.5 → 3.65
+        assert out[8] == pytest.approx(3.65)
+        # Hour 9 (α=0.5): blended = 0.5*3.65 + 0.5*0.5 = 2.075; max → 2.075
+        assert out[9] == pytest.approx(2.075)
+        # Hour 10 (α=0): blended = 0*3.65 + 1*0.5 = 0.5; max(0.5,0.5)=0.5
+        assert out[10] == pytest.approx(0.5)
+        # Hour 11+ untouched
+        assert out[11] == 0.5
+
+    def test_persistence_never_lowers_forecast(self, forecast) -> None:
+        """If model already predicts higher than live, keep the model
+        prediction — don't let a cloud-pass briefly suppress the forecast."""
+        # Forecast: 5 kWh/h. Live: only 1 kW (cloud-pass).
+        model = {h: 5.0 for h in range(6, 20)}
+        out = forecast.apply_live_persistence(
+            model, live_power_kw=1.0, current_hour=8, blend_horizon_hours=2,
+        )
+        # Even at α=1 for current hour: max(model=5.0, blended=1.0) → keep 5.0
+        assert out[8] == 5.0
+        assert out[9] == 5.0
+        assert out[10] == 5.0
+
+    def test_persistence_skipped_when_live_below_threshold(self, forecast) -> None:
+        """Nighttime or fault → live near 0 → no persistence applied at all."""
+        model = {h: 5.0 for h in range(6, 20)}
+        out = forecast.apply_live_persistence(
+            model, live_power_kw=0.1, current_hour=8,
+        )
+        # Output identical to input (no anchoring)
+        assert out == model
+
     @pytest.mark.asyncio
     async def test_dawn_hours_excluded(self, forecast) -> None:
         """Pre-sunrise hours (zero actual) get filtered out even if forecast

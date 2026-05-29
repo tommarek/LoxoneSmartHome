@@ -1214,6 +1214,56 @@ from(bucket: "{bucket}")
             return dict(forecast.hourly)
         return {h: kwh * self.confidence for h, kwh in forecast.hourly.items()}
 
+    @staticmethod
+    def apply_live_persistence(
+        hourly_forecast: Dict[int, float],
+        live_power_kw: float,
+        current_hour: int,
+        min_live_kw: float = 0.5,
+        blend_horizon_hours: int = 2,
+    ) -> Dict[int, float]:
+        """Anchor near-future forecast to live measured solar power.
+
+        Inspired by EMHASS's "mixed one-observation persistence" approach:
+        the very near future is dominated by what's actually happening RIGHT
+        NOW (live PV power), smoothly transitioning to the model forecast
+        for further-out hours.
+
+        For each affected hour h, returns:
+            max(forecast[h], α(h) * live_power_kw + (1-α(h)) * forecast[h])
+
+        where α decays linearly from 1.0 at the current hour to 0.0 at
+        `current_hour + blend_horizon_hours`. Using max() means we only
+        ever *lift* the forecast — we don't trust a temporary cloud-pass
+        (live dropped to 0 for a minute) to suppress an otherwise-sunny
+        forecast. Calibration handles the over-prediction direction.
+
+        Disabled when live_power_kw < min_live_kw (likely nighttime or
+        fault — model forecast handles those correctly).
+
+        Args:
+            hourly_forecast: model+API forecast, mutated COPY returned
+            live_power_kw: instantaneous PV power from telemetry, in kW
+            current_hour: hour-of-day (0-23) we're currently in (local)
+            min_live_kw: skip blending if live below this (night/fault)
+            blend_horizon_hours: how far ahead the live anchor decays to 0
+
+        Returns:
+            Blended forecast dict (does not mutate input).
+        """
+        out = dict(hourly_forecast)
+        if live_power_kw < min_live_kw:
+            return out
+        for h_offset in range(blend_horizon_hours + 1):
+            h = current_hour + h_offset
+            if h >= 24:
+                break
+            alpha = max(0.0, 1.0 - h_offset / blend_horizon_hours)
+            model_kwh = out.get(h, 0.0)
+            blended = alpha * live_power_kw + (1.0 - alpha) * model_kwh
+            out[h] = max(model_kwh, blended)
+        return out
+
     async def compute_intraday_calibration(
         self,
         influxdb_client: Any,
