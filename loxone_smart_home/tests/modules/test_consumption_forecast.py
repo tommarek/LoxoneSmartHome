@@ -18,10 +18,12 @@ class TestConsumptionModel:
         assert ConsumptionModel.temp_to_bucket(-10.0) == 5
 
     def test_temp_to_bucket_clamped(self) -> None:
-        # Below -20 gets clamped
+        # Below -20 gets clamped to bucket 0
         assert ConsumptionModel.temp_to_bucket(-30.0) == 0
-        # Above 40 gets clamped
-        assert ConsumptionModel.temp_to_bucket(50.0) == 30
+        # Above 40 folds into the top bucket 29 (30 buckets, indices 0-29)
+        assert ConsumptionModel.temp_to_bucket(50.0) == 29
+        # Exactly 40°C also folds into the top bucket (not a lone bucket 30)
+        assert ConsumptionModel.temp_to_bucket(40.0) == 29
 
     def test_build_computes_medians(self) -> None:
         model = ConsumptionModel()

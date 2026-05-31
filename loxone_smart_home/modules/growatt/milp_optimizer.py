@@ -403,7 +403,12 @@ class MILPBatteryOptimizer:
             prob += batt_to_grid[i] >= (
                 MIN_GRID_DISCHARGE_FRACTION * batt_to_grid_max * is_disch[i]
             )
-            prob += solar_to_grid[i] <= max(s, 0.0) * is_sp[i]
+            # Solar may be exported in a sell-production block OR alongside a
+            # battery discharge block: the real `discharge_to_grid` mode is
+            # grid-first and exports solar excess too, so the plan must allow it
+            # (otherwise the planned energy flows diverge from actuation on
+            # discharge blocks that coincide with solar).
+            prob += solar_to_grid[i] <= max(s, 0.0) * (is_sp[i] + is_disch[i])
             # One grid-facing mode per block.
             prob += is_charge[i] + is_disch[i] + is_sp[i] <= 1
 

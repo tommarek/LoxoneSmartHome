@@ -38,9 +38,11 @@ class ConsumptionModel:
 
     @staticmethod
     def temp_to_bucket(temp: float) -> int:
-        """Convert temperature to bucket index."""
+        """Convert temperature to bucket index (0-29, 30 buckets of 2°C)."""
         clamped = max(-20, min(40, temp))
-        return int((clamped + 20) / 2)
+        # min(.., 29) folds the exact-40°C edge into the top bucket so we keep
+        # exactly 30 buckets (0-29) rather than spawning a lone bucket 30.
+        return min(29, int((clamped + 20) / 2))
 
     def build(self) -> None:
         """Compute medians from raw bins, with IQR outlier removal."""

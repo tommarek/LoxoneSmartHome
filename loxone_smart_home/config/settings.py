@@ -494,6 +494,37 @@ class GrowattConfig(BaseSettings):
             raise ValueError("max_soc must be greater than min_soc")
         return v
 
+    @field_validator("deferrable_loads_json")
+    @classmethod
+    def validate_deferrable_loads_json(cls, v: str) -> str:
+        """Fail fast on malformed deferrable-loads JSON.
+
+        The controller parses this best-effort at __init__ (swallowing errors
+        into an empty list), so a typo would silently schedule no loads. Catch
+        gross JSON/shape errors here at startup instead.
+        """
+        import json
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"deferrable_loads_json is not valid JSON: {e}")
+        if not isinstance(parsed, list):
+            raise ValueError("deferrable_loads_json must be a JSON array")
+        return v
+
+    @field_validator("max_charge_blocks")
+    @classmethod
+    def validate_charge_block_range(cls, v: int, info: Any) -> int:
+        """Ensure max_charge_blocks >= min_charge_blocks.
+
+        Otherwise calculate_dynamic_block_count's `max(min_blocks, count)` floor
+        would silently exceed the intended ceiling, charging more blocks than
+        max_charge_blocks.
+        """
+        if "min_charge_blocks" in info.data and v < info.data["min_charge_blocks"]:
+            raise ValueError("max_charge_blocks must be >= min_charge_blocks")
+        return v
+
 
 class WebServiceConfig(BaseSettings):
     """Configuration for the web monitoring service."""

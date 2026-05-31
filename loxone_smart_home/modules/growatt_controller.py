@@ -3263,7 +3263,10 @@ from(bucket: "{bucket}")
                                 ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
                                 export_enabled=should_export,
                                 timestamp=self._get_local_now(),
-                                source="export_price_update"
+                                source="export_price_update",
+                                # Preserve gate-controlled power state; the frozen
+                                # dataclass defaults inverter_on=True otherwise.
+                                inverter_on=self._current_inverter_state.inverter_on,
                             )
                             await self._write_inverter_state_point(source="export_price_update")
                             state_str = "ENABLED" if should_export else "DISABLED"
@@ -3297,29 +3300,41 @@ from(bucket: "{bucket}")
                         # Pace after any same-cycle Modbus write to respect
                         # the 850 ms minimum between writes.
                         await asyncio.sleep(1.0)
-                        await self._mode_manager.set_inverter_power(desired_inverter_on)
-                        self._current_inverter_state = InverterState(
-                            inverter_mode=self._current_inverter_state.inverter_mode,
-                            stop_soc=self._current_inverter_state.stop_soc,
-                            power_rate=self._current_inverter_state.power_rate,
-                            time_start=self._current_inverter_state.time_start,
-                            time_stop=self._current_inverter_state.time_stop,
-                            ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
-                            export_enabled=self._current_inverter_state.export_enabled,
-                            timestamp=self._get_local_now(),
-                            source="price_threshold_gate",
-                            inverter_on=desired_inverter_on,
-                        )
-                        await self._write_inverter_state_point(source="price_threshold_gate")
-                        emoji = "⚡" if desired_inverter_on else "🛑"
-                        state_word = "ON" if desired_inverter_on else "OFF"
-                        scheduled_note = ", scheduled charge" if is_scheduled_charge else ""
-                        self.logger.info(
-                            f"{emoji} Inverter {state_word} "
-                            f"(price: {current_price_czk:+.2f} CZK/kWh, "
-                            f"threshold: {threshold:.2f} ±{hysteresis:.2f}"
-                            f"{scheduled_note})"
-                        )
+                        # Only commit tracked state if the Modbus write actually
+                        # succeeded — otherwise the controller would believe the
+                        # inverter changed, skip future retries, and leave the
+                        # hardware stuck in the wrong state.
+                        ok = await self._mode_manager.set_inverter_power(desired_inverter_on)
+                        if not ok:
+                            self.logger.error(
+                                f"Inverter power change to "
+                                f"{'ON' if desired_inverter_on else 'OFF'} failed; "
+                                f"keeping tracked state {'ON' if current_state_on else 'OFF'} "
+                                f"so the next evaluation retries"
+                            )
+                        else:
+                            self._current_inverter_state = InverterState(
+                                inverter_mode=self._current_inverter_state.inverter_mode,
+                                stop_soc=self._current_inverter_state.stop_soc,
+                                power_rate=self._current_inverter_state.power_rate,
+                                time_start=self._current_inverter_state.time_start,
+                                time_stop=self._current_inverter_state.time_stop,
+                                ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
+                                export_enabled=self._current_inverter_state.export_enabled,
+                                timestamp=self._get_local_now(),
+                                source="price_threshold_gate",
+                                inverter_on=desired_inverter_on,
+                            )
+                            await self._write_inverter_state_point(source="price_threshold_gate")
+                            emoji = "⚡" if desired_inverter_on else "🛑"
+                            state_word = "ON" if desired_inverter_on else "OFF"
+                            scheduled_note = ", scheduled charge" if is_scheduled_charge else ""
+                            self.logger.info(
+                                f"{emoji} Inverter {state_word} "
+                                f"(price: {current_price_czk:+.2f} CZK/kWh, "
+                                f"threshold: {threshold:.2f} ±{hysteresis:.2f}"
+                                f"{scheduled_note})"
+                            )
 
             except Exception as e:
                 self.logger.error(f"Failed to evaluate conditions: {e}", exc_info=True)
@@ -3653,7 +3668,15 @@ from(bucket: "{bucket}")
             or old_state.inverter_on != new_state.inverter_on
         ):
             self._commands_sent_count += 1
-            await self._mode_manager.set_inverter_power(new_state.inverter_on)
+            # Raise on a failed Modbus write so the rollback wrapper triggers and
+            # _apply_decided_mode does NOT commit desired_state — otherwise the
+            # controller's tracked inverter_on would advance while the hardware
+            # never changed (same desync class as the price-threshold gate).
+            if not await self._mode_manager.set_inverter_power(new_state.inverter_on):
+                raise RuntimeError(
+                    f"Failed to set inverter power to "
+                    f"{'ON' if new_state.inverter_on else 'OFF'}"
+                )
 
         # AC charge change
         if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:

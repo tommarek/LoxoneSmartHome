@@ -30,7 +30,13 @@ def calculate_optimal_schedule(
         - Effective discharge threshold used
 
     Discharge threshold is: max(discharge_threshold_czk, cheapest_block * discharge_profit_margin)
-    This matches the runtime decision engine logic in GrowattDecisionEngine._should_discharge_battery.
+
+    NOTE: This is the simplified rule-based heuristic used by the legacy
+    (non-optimizer) scheduling path and the dashboard/API display. It does NOT
+    apply the self-consumption floor (recharge cost + distribution tariff) that
+    GrowattDecisionEngine._should_discharge_battery adds, so it can mark MORE
+    blocks as discharge than the greedy/MILP engines would actually fire. Do not
+    treat its discharge set as equivalent to the optimizer's dispatch.
     """
     if not price_blocks:
         return set(), set(), 0.0, discharge_threshold_czk

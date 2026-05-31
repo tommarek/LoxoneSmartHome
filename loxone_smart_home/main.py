@@ -58,6 +58,9 @@ class LoxoneSmartHome:
         self.api_runner: Optional[web.AppRunner] = None
         self.api_site: Optional[web.TCPSite] = None
 
+        # Monitoring dashboard runner (port 5555) — tracked for cleanup
+        self.dashboard_runner: Optional[web.AppRunner] = None
+
         # Shutdown event
         self.shutdown_event = asyncio.Event()
 
@@ -223,7 +226,7 @@ class LoxoneSmartHome:
         # Start monitoring dashboard on port 5555
         if self.growatt_controller:
             try:
-                await start_dashboard(self.growatt_controller, port=5555)
+                self.dashboard_runner = await start_dashboard(self.growatt_controller, port=5555)
                 logger.info("Monitoring dashboard started on port 5555")
             except Exception as e:
                 logger.warning(f"Failed to start dashboard: {e}")
@@ -245,6 +248,11 @@ class LoxoneSmartHome:
             await self.stop_web_service()
         else:
             await self.stop_api_server()
+
+        # Stop monitoring dashboard (port 5555)
+        if self.dashboard_runner:
+            await self.dashboard_runner.cleanup()
+            self.dashboard_runner = None
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()

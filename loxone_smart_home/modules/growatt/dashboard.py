@@ -694,8 +694,13 @@ def create_dashboard_app(controller=None) -> web.Application:
 _dashboard_handler_installed = False
 
 
-async def start_dashboard(controller, port: int = 5555) -> None:
-    """Start the dashboard web server."""
+async def start_dashboard(controller, port: int = 5555) -> "web.AppRunner":
+    """Start the dashboard web server.
+
+    Returns the AppRunner so the caller can ``await runner.cleanup()`` on
+    shutdown — otherwise the listener socket leaks and can block re-bind on a
+    fast restart.
+    """
     global _dashboard_handler_installed
     logger = logging.getLogger(__name__)
 
@@ -718,6 +723,7 @@ async def start_dashboard(controller, port: int = 5555) -> None:
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"Dashboard listening on http://0.0.0.0:{port}")
+    return runner
 
 
 # --- Embedded HTML Dashboard ---

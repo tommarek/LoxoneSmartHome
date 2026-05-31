@@ -1014,7 +1014,15 @@ from(bucket: "{solar_bucket}")
                     soc += solar_to_batt / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
             elif action == "discharge":
-                grid_discharge = discharge_kwh_per_block
+                # Cap the battery-side drain to energy available ABOVE the
+                # per-block dynamic reserve, so a discharge block can't push SOC
+                # below effective_min_soc (the value calc respects this via
+                # discharge_possible; the state update must too). The deficit
+                # branch below may still draw to the hardware floor to serve load.
+                grid_discharge = min(
+                    discharge_kwh_per_block,
+                    max(0.0, battery_kwh - min_battery_kwh),
+                )
                 if net_from_solar >= 0:
                     soc -= grid_discharge / battery_capacity_kwh * 100
                 else:

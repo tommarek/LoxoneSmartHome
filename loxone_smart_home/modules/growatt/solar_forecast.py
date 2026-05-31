@@ -223,7 +223,9 @@ class SolarProductionModel:
             weight = (rad_b - lower_rad) / span if span > 0 else 0.5
             return lower_val + (upper_val - lower_val) * weight
         if lower_val is not None or upper_val is not None:
-            return lower_val or upper_val
+            # Use `is not None` (not truthiness) so a legitimate 0.0 median
+            # from the populated side isn't skipped in favour of the other.
+            return lower_val if lower_val is not None else upper_val
 
         # Try cloud axis (same radiation bucket)
         lower_cloud, lower_cval = None, None
@@ -239,7 +241,9 @@ class SolarProductionModel:
             span = upper_cloud - lower_cloud
             weight = (cloud_b - lower_cloud) / span if span > 0 else 0.5
             return lower_cval + (upper_cval - lower_cval) * weight
-        return lower_cval or upper_cval
+        if lower_cval is not None or upper_cval is not None:
+            return lower_cval if lower_cval is not None else upper_cval
+        return None
 
     def predict(
         self, ghi: float,
@@ -1310,7 +1314,7 @@ from(bucket: "{bucket}")
             Blended forecast dict (does not mutate input).
         """
         out = dict(hourly_forecast)
-        if live_power_kw < min_live_kw:
+        if live_power_kw < min_live_kw or blend_horizon_hours <= 0:
             return out
         for h_offset in range(blend_horizon_hours + 1):
             h = current_hour + h_offset

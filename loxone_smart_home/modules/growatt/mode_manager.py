@@ -498,15 +498,20 @@ class ModeManager:
         """Disable electricity export to grid."""
         await self.set_export(False)
 
-    async def set_inverter_power(self, on: bool) -> None:
+    async def set_inverter_power(self, on: bool) -> bool:
         """Power the inverter on or off via Modbus holding register 0.
 
         Uses the OpenInverterGateway `modbus/set` command. Idempotent —
         if the desired state matches the last successfully applied one,
         skips the MQTT command.
+
+        Returns True if the inverter is in the desired state after this call
+        (either already there, or the Modbus write succeeded), False if the
+        write failed. Callers must not assume the hardware changed unless this
+        returns True.
         """
         if self._inverter_on == on:
-            return  # No change needed
+            return True  # No change needed
 
         topic = self.config.inverter_onoff_topic
         payload = {
@@ -524,7 +529,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error(f"Failed to power inverter {action}")
-            return  # Don't update state if command failed
+            return False  # Don't update state if command failed
 
         self._inverter_on = on
         current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -533,6 +538,7 @@ class ModeManager:
             f"{emoji} INVERTER {action} at {current_time} "
             f"via holding register 0 → Topic: {topic}"
         )
+        return True
 
     async def set_grid_first(
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,
