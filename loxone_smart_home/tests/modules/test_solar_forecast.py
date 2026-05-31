@@ -328,6 +328,21 @@ class TestSolarProductionModel:
         assert result > 0
         assert model.hit_level_counts["interpolate"] == 1
 
+    def test_quantile_default_is_median(self) -> None:
+        from modules.growatt.solar_forecast import SolarProductionModel
+        import statistics
+        vals = [1.0, 2.0, 3.0, 4.0, 8.0, 9.0, 10.0]
+        m = SolarProductionModel(quantile=0.5)
+        assert m._compute_quantile(vals) == pytest.approx(statistics.median(vals))
+
+    def test_higher_quantile_recovers_potential(self) -> None:
+        from modules.growatt.solar_forecast import SolarProductionModel
+        # Right-skewed bin (curtailment historically removed the sunniest highs).
+        vals = [1.0, 2.0, 3.0, 4.0, 8.0, 9.0, 10.0]
+        m50 = SolarProductionModel(quantile=0.5)
+        m75 = SolarProductionModel(quantile=0.75)
+        assert m75._compute_quantile(vals) > m50._compute_quantile(vals)
+
     def test_no_5d_or_4d_bins(self) -> None:
         """5D and 4D bin attributes no longer exist."""
         model = SolarProductionModel()
@@ -531,21 +546,88 @@ class TestIntradayCalibration:
         )
         return today_obj
 
-    def _mock_query(self, hourly_actuals_w: dict, target_date):
-        """Build an AsyncMock that returns InputPower records at the given
-        hours (watts) on target_date."""
-        records = []
-        for hour, watts in hourly_actuals_w.items():
+    def _mock_query(self, hourly_actuals_w: dict, target_date,
+                    soc=50.0, load_w=500.0, inverter_on=1, export_enabled=1):
+        """Build an AsyncMock whose query() is FIELD-AWARE.
+
+        The calibration now reads InputPower AND the curtailment signals (SOC,
+        load, export_enabled, inverter_on). Returning the right data per field
+        (default: battery not full, inverter on, export on → nothing curtailed)
+        keeps these ratio tests exercising the real curtailment-aware path.
+        """
+        def _rec(hour, value):
             rec = MagicMock()
-            t = datetime(target_date.year, target_date.month, target_date.day, hour, 0)
-            rec.get_time.return_value = t
-            rec.get_value.return_value = float(watts)
-            records.append(rec)
-        table = MagicMock()
-        table.records = records
+            rec.get_time.return_value = datetime(
+                target_date.year, target_date.month, target_date.day, hour, 0
+            )
+            rec.get_value.return_value = float(value)
+            return rec
+
+        def _table(records):
+            t = MagicMock()
+            t.records = records
+            return t
+
+        async def _query(q: str):
+            if 'InputPower' in q:
+                return [_table([_rec(h, w) for h, w in hourly_actuals_w.items()])]
+            if '"SOC"' in q:
+                return [_table([_rec(h, soc) for h in hourly_actuals_w])]
+            if 'INVPowerToLocalLoad' in q:
+                return [_table([_rec(h, load_w) for h in hourly_actuals_w])]
+            if 'export_enabled' in q:
+                return [_table([_rec(0, export_enabled)])]
+            if 'inverter_on' in q:
+                return [_table([_rec(0, inverter_on)])]
+            return []
+
         client = AsyncMock()
-        client.query = AsyncMock(return_value=[table])
+        client.query = AsyncMock(side_effect=_query)
         return client
+
+    @pytest.mark.asyncio
+    async def test_curtailed_hours_excluded_from_calibration(self, forecast) -> None:
+        """Battery-full + low-load hours (MPPT throttled) must NOT drag the
+        calibration ratio down — they reflect a dispatch decision, not the
+        panels' potential. With all recent hours curtailed, calibration backs
+        off (returns None) rather than suppressing the forecast."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 3.0 for h in range(6, 18)},
+        )
+        # Actual far below forecast BUT battery full (100%) and load tiny →
+        # this is curtailment, not real underproduction.
+        client = self._mock_query(
+            {6: 600, 7: 600, 8: 600}, today, soc=100.0, load_w=100.0,
+        )
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=9, target_date=today,
+        )
+        assert ratio is None, "curtailed actuals must not suppress the forecast"
+
+        # Sanity: the SAME low actuals, but battery NOT full → genuine
+        # underproduction → calibration DOES scale down (clamped to 0.5).
+        client2 = self._mock_query(
+            {6: 600, 7: 600, 8: 600}, today, soc=55.0, load_w=100.0,
+        )
+        ratio2 = await forecast.compute_intraday_calibration(
+            client2, "solar", current_hour=9, target_date=today,
+        )
+        assert ratio2 == pytest.approx(0.5)
+
+    @pytest.mark.asyncio
+    async def test_single_usable_hour_skips_calibration(self, forecast) -> None:
+        """After curtailment filtering, a lone surviving (early-morning) hour
+        must NOT drive a day-wide rescale — calibration backs off to None."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 3.0 for h in range(6, 18)},
+        )
+        # Only one completed usable hour (07:00); battery not full so it isn't
+        # curtailed, but a single noisy sample is too thin to calibrate on.
+        client = self._mock_query({7: 2230}, today, soc=55.0, load_w=100.0)
+        ratio = await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=8, target_date=today,
+        )
+        assert ratio is None
 
     @pytest.mark.asyncio
     async def test_under_forecast_returns_ratio_above_1(self, forecast) -> None:

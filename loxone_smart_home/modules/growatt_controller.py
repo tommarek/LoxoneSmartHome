@@ -1,9 +1,11 @@
 """Growatt controller module - manages solar battery based on energy prices."""
 
 import asyncio
+import functools
 import json
 import math
 import zoneinfo
+from dataclasses import replace
 from datetime import datetime
 from datetime import date as date_type
 from datetime import time as dt_time
@@ -35,6 +37,7 @@ from .growatt.inverter_state import InverterState
 from .growatt.solar_forecast import SolarForecast
 from .growatt.consumption_forecast import ConsumptionForecast
 from .growatt.optimizer import BatteryOptimizer
+from .growatt.deferrable_loads import DeferrableLoad, DeferrableLoadSchedule
 from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
 from .growatt.schedule_coordinator import ScheduleCoordinator
@@ -277,6 +280,7 @@ class GrowattController(BaseModule):
                     api_key=self.config.solcast_api_key,
                     rooftop_id=getattr(self.config, "solcast_rooftop_id", ""),
                     logger=self.logger,
+                    quantile=getattr(self.config, "solcast_quantile", "p50"),
                 )
                 if self._solcast_forecast.enabled:
                     self.logger.info("Solcast PV forecast enabled")
@@ -287,14 +291,12 @@ class GrowattController(BaseModule):
                 self._solcast_forecast = None
 
         # Deferrable loads — parsed from JSON config
-        self._deferrable_loads = []
+        self._deferrable_loads: List[DeferrableLoad] = []
         self._deferrable_scheduler = None
         try:
             import json as _json
             from datetime import time as _time
-            from .growatt.deferrable_loads import (
-                DeferrableLoad, DeferrableLoadScheduler,
-            )
+            from .growatt.deferrable_loads import DeferrableLoadScheduler
             spec = _json.loads(
                 getattr(self.config, "deferrable_loads_json", "[]") or "[]"
             )
@@ -323,7 +325,9 @@ class GrowattController(BaseModule):
             self._deferrable_scheduler = None
 
         # Cached schedule for status / dashboard / actual MQTT firing
-        self._deferrable_schedules = []
+        self._deferrable_schedules: List[DeferrableLoadSchedule] = []
+        self._deferrable_active: Set[str] = set()
+        self._deferrable_completed_blocks: Set[Tuple[str, datetime]] = set()
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
@@ -1971,7 +1975,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # Store to InfluxDB
         await self._store_solar_forecast_to_influxdb()
 
-    async def _get_weather_radiation_data(self) -> Optional[Dict]:
+    async def _get_weather_radiation_data(self) -> Optional[Dict[Any, Any]]:
         """Query weather radiation forecast from InfluxDB."""
         if not self.influxdb_client:
             return None
@@ -2199,13 +2203,22 @@ from(bucket: "{bucket}")
         discharge_profit_margin = self.config.discharge_profit_margin
 
         # Use optimizer if enabled, otherwise fall back to rule-based scheduling
-        if self._optimizer and self._solar_forecast:
+        if self._optimizer:
             from .growatt.decision_engine import GrowattDecisionEngine
-            solar_hourly = self._solar_forecast.get_hourly_production(
-                today + timedelta(days=1)
-            ) if self._solar_forecast else {}
-            # Merge today's remaining + tomorrow's solar
-            today_solar = self._solar_forecast.get_hourly_production(today) if self._solar_forecast else {}
+            tomorrow = today + timedelta(days=1)
+            solar_hourly: Dict[Any, float] = {}
+            if self._solar_forecast:
+                for target_day in (today, tomorrow):
+                    for hour, kwh in self._solar_forecast.get_hourly_production(target_day).items():
+                        solar_hourly[(target_day, hour)] = kwh
+
+            # Merge today's remaining + tomorrow's solar. With date-aware keys
+            # the optimizer can safely evaluate cross-day windows where the same
+            # hour appears on both dates.
+            today_solar = (
+                self._solar_forecast.get_hourly_production(today)
+                if self._solar_forecast else {}
+            )
 
             # Intraday calibration: scale today's REMAINING hours by the ratio
             # of recent actual production vs what the forecast had predicted
@@ -2213,7 +2226,7 @@ from(bucket: "{bucket}")
             # (e.g., model says cloudy, reality is sunny). Tomorrow stays
             # untouched — different weather window.
             calibration_ratio = None
-            if self.influxdb_client:
+            if self._solar_forecast and self.influxdb_client:
                 calibration_ratio = await self._solar_forecast.compute_intraday_calibration(
                     self.influxdb_client,
                     self.settings.influxdb.bucket_solar,
@@ -2230,7 +2243,7 @@ from(bucket: "{bucket}")
             # cloudy, reality is bright).
             live_solar_kw = 0.0
             try:
-                from .growatt.api import _telemetry_cache  # type: ignore
+                from .growatt.api import _telemetry_cache
                 live_w = _telemetry_cache.get("InputPower") if _telemetry_cache else None
                 if isinstance(live_w, (int, float)) and live_w > 0:
                     live_solar_kw = float(live_w) / 1000.0
@@ -2243,7 +2256,7 @@ from(bucket: "{bucket}")
             for h, kwh in today_solar.items():
                 if h >= now.hour:  # include current hour for persistence anchor
                     scaled_today[h] = kwh * calibration_ratio if calibration_ratio else kwh
-            if live_solar_kw > 0:
+            if self._solar_forecast and live_solar_kw > 0:
                 scaled_today = self._solar_forecast.apply_live_persistence(
                     scaled_today, live_solar_kw, current_hour=now.hour,
                 )
@@ -2252,30 +2265,42 @@ from(bucket: "{bucket}")
                     f"to live {live_solar_kw:.2f} kW reading"
                 )
             for h, kwh in scaled_today.items():
-                if h > now.hour:  # don't double-count current/past in optimizer
-                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
-                elif h == now.hour:
+                if h >= now.hour:
                     # Current incomplete hour: optimizer's blocks list includes
-                    # the current 15-min block, so we still want a forecast value
-                    solar_hourly[h] = solar_hourly.get(h, 0) + kwh
+                    # the current 15-min block, so we still want a forecast value.
+                    solar_hourly[(today, h)] = kwh
 
             # Consumption forecast: prefer the temperature-aware total-load model
             # (heating + EV included) over the heating-excluded base load profile.
             # Order: ML (if enabled+trained) → binned model → base_load_profile.
-            consumption_hourly: Dict[int, float] = {}
+            consumption_hourly: Dict[Any, float] = {}
             forecast_temps = await self._fetch_recent_hourly_temps()
 
             ml_cf = getattr(self, '_ml_consumption_forecast', None)
             if ml_cf and ml_cf.is_trained and forecast_temps:
+                # NOTE: forecast_temps is keyed by UTC hour (see
+                # _fetch_recent_hourly_temps, kept UTC for consistency with the
+                # binned model which trains on UTC-hour bins). The ML model
+                # trains/predicts in local hours, so its temperature exog is
+                # shifted by the UTC offset (1-2h). Temperature is a weak
+                # feature here (lags + hour-of-day dominate) and the ML engine
+                # is opt-in/experimental, so this is an accepted limitation; the
+                # ML *output* is correctly local-hour keyed for the optimizer.
                 try:
                     # Recursive RF inference is CPU-bound — run off the loop.
-                    hourly = await asyncio.to_thread(
-                        ml_cf.predict_hourly, forecast_temps, now.date()
+                    today_hourly = await asyncio.to_thread(
+                        ml_cf.predict_hourly, forecast_temps, today
                     )
-                    if hourly:
-                        consumption_hourly = hourly
+                    tomorrow_hourly = await asyncio.to_thread(
+                        ml_cf.predict_hourly, forecast_temps, tomorrow
+                    )
+                    if today_hourly or tomorrow_hourly:
+                        for hour, kwh in today_hourly.items():
+                            consumption_hourly[(today, hour)] = kwh
+                        for hour, kwh in tomorrow_hourly.items():
+                            consumption_hourly[(tomorrow, hour)] = kwh
                         self.logger.debug(
-                            f"Using ML consumption forecast ({len(hourly)} hours)"
+                            f"Using ML consumption forecast ({len(consumption_hourly)} date-hours)"
                         )
                 except Exception as e:
                     self.logger.debug(f"ML predict_hourly failed: {e}")
@@ -2286,16 +2311,25 @@ from(bucket: "{bucket}")
                 and self._consumption_forecast.model
                 and forecast_temps
             ):
-                hourly = self._consumption_forecast.predict_hourly(
-                    forecast_temps, now.date()
+                today_hourly = self._consumption_forecast.predict_hourly(
+                    forecast_temps, today
                 )
-                if hourly:
-                    consumption_hourly = hourly
+                tomorrow_hourly = self._consumption_forecast.predict_hourly(
+                    forecast_temps, tomorrow
+                )
+                if today_hourly or tomorrow_hourly:
+                    for hour, kwh in today_hourly.items():
+                        consumption_hourly[(today, hour)] = kwh
+                    for hour, kwh in tomorrow_hourly.items():
+                        consumption_hourly[(tomorrow, hour)] = kwh
 
             if not consumption_hourly and self._optimizer and self._optimizer._base_load_profile.profile:
-                is_weekend = now.weekday() >= 5
-                for h in range(24):
-                    consumption_hourly[h] = self._optimizer._base_load_profile.get(h, is_weekend)
+                for target_day in (today, tomorrow):
+                    is_weekend = target_day.weekday() >= 5
+                    for h in range(24):
+                        consumption_hourly[(target_day, h)] = (
+                            self._optimizer._base_load_profile.get(h, is_weekend)
+                        )
 
             dist_thresholds = PriceThresholds(
                 charge_price_max=self.config.charge_price_max,
@@ -2313,32 +2347,82 @@ from(bucket: "{bucket}")
                 h, dist_thresholds
             )
 
-            # Deferrable loads — schedule each into its cheapest allowed
-            # blocks, then ADD the scheduled per-block consumption to
-            # consumption_hourly so the battery optimizer plans around it.
+            # Deferrable loads. Two strategies depending on the engine:
+            #  - MILP CO-OPTIMIZES them: each load becomes a decision variable
+            #    placed where total cost is lowest (incl. PV surplus & battery
+            #    state). We hand the specs to optimize() and read the chosen
+            #    placement back off the optimizer after the solve.
+            #  - The greedy engine can't co-optimize, so we pre-schedule each
+            #    into its cheapest in-window blocks and ADD the per-block draw to
+            #    consumption_hourly so the battery at least plans around it.
+            co_opt_deferrable = getattr(
+                self._optimizer, "CO_OPTIMIZES_DEFERRABLE", False
+            )
+            deferrable_for_milp: List[DeferrableLoad] = []
             if self._deferrable_scheduler and self._deferrable_loads:
                 try:
-                    schedules = self._deferrable_scheduler.schedule_all(
-                        self._deferrable_loads, price_blocks_czk, dist_func,
-                    )
-                    self._deferrable_schedules = schedules
-                    loads_by_name = {l.name: l for l in self._deferrable_loads}
-                    overlay = self._deferrable_scheduler.consumption_overlay(
-                        schedules, loads_by_name,
-                    )
-                    for h, extra_kwh in overlay.items():
-                        consumption_hourly[h] = consumption_hourly.get(h, 0.0) + extra_kwh
-                    for sched in schedules:
-                        if sched.blocks:
-                            self.logger.info(
-                                f"📋 Deferrable {sched.load_name}: "
-                                f"{len(sched.blocks)} blocks scheduled, "
-                                f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                    active_window_start = now - timedelta(hours=24)
+                    self._deferrable_completed_blocks = {
+                        (name, ts) for name, ts in self._deferrable_completed_blocks
+                        if ts >= active_window_start
+                    }
+                    adjusted_loads: List[DeferrableLoad] = []
+                    for load in self._deferrable_loads:
+                        completed = sum(
+                            1 for name, _ts in self._deferrable_completed_blocks
+                            if name == load.name
+                        )
+                        delivered_kwh = completed * load.power_kw * 0.25
+                        remaining_kwh = max(0.0, load.energy_required_kwh - delivered_kwh)
+                        if remaining_kwh > 0:
+                            adjusted_loads.append(
+                                replace(load, energy_required_kwh=remaining_kwh)
                             )
+                    if co_opt_deferrable:
+                        # Hand specs to the optimizer; placement returns post-solve.
+                        deferrable_for_milp = adjusted_loads
+                    else:
+                        schedules = self._deferrable_scheduler.schedule_all(
+                            adjusted_loads, price_blocks_czk, dist_func,
+                        )
+                        self._deferrable_schedules = schedules
+                        loads_by_name = {l.name: l for l in adjusted_loads}
+                        overlay = self._deferrable_scheduler.consumption_overlay(
+                            schedules, loads_by_name,
+                        )
+                        for key, extra_kwh in overlay.items():
+                            if isinstance(key, datetime):
+                                # `is not None` (not `or`): a real 0.0-kWh block
+                                # must not fall through to another day's value.
+                                base_kwh = consumption_hourly.get(key)
+                                if base_kwh is None:
+                                    base_kwh = consumption_hourly.get(
+                                        (key.date(), key.hour)
+                                    )
+                                if base_kwh is None:
+                                    base_kwh = consumption_hourly.get(key.hour, 0.0)
+                                consumption_hourly[key] = base_kwh + extra_kwh
+                            else:
+                                consumption_hourly[key] = (
+                                    consumption_hourly.get(key, 0.0) + extra_kwh
+                                )
+                        for sched in schedules:
+                            if sched.blocks:
+                                self.logger.info(
+                                    f"📋 Deferrable {sched.load_name}: "
+                                    f"{len(sched.blocks)} blocks scheduled, "
+                                    f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                                )
                 except Exception as e:
                     self.logger.warning(f"Deferrable scheduling failed: {e}")
+                    self._deferrable_schedules = []
 
-            charge_times, discharge_times, sell_production_times, decisions = self._optimizer.optimize(
+            # Run the optimizer off the event loop. The greedy engine is fast,
+            # but the MILP engine shells out to CBC (a blocking subprocess that
+            # can run up to its solve time-limit); either way a 96-block solve
+            # is pure CPU work that must not freeze MQTT handling or the 15-min
+            # decision cadence.
+            opt_kwargs: Dict[str, Any] = dict(
                 blocks=price_blocks_czk,
                 solar_hourly=solar_hourly,
                 consumption_hourly=consumption_hourly,
@@ -2347,11 +2431,37 @@ from(bucket: "{bucket}")
                 current_soc=self._battery_soc,
                 min_soc=self.config.min_soc,
                 max_soc=self.config.max_soc,
+                charge_rate_kw=self.config.battery_charge_rate_kw,
+                discharge_rate_kw=self.config.battery_discharge_rate_kw,
                 discharge_power_pct=self.config.discharge_power_rate,
                 efficiency=self.config.battery_efficiency,
                 sell_fee_czk=self.config.sell_fee_czk,
                 battery_amortisation_czk=self.config.battery_amortisation_czk,
             )
+            # MILP-only knobs (the greedy engine doesn't accept these kwargs).
+            if co_opt_deferrable:
+                opt_kwargs["switch_penalty_czk"] = getattr(
+                    self.config, "milp_switch_penalty_czk", 0.0
+                )
+                if deferrable_for_milp:
+                    opt_kwargs["deferrable_loads"] = deferrable_for_milp
+            _optimize_call = functools.partial(self._optimizer.optimize, **opt_kwargs)
+            charge_times, discharge_times, sell_production_times, decisions = (
+                await asyncio.to_thread(_optimize_call)
+            )
+            # With MILP co-optimization the deferrable placement is decided by
+            # the solver; adopt it (for the dashboard + MQTT actuation).
+            if co_opt_deferrable and self._deferrable_loads:
+                self._deferrable_schedules = list(
+                    getattr(self._optimizer, "_last_deferrable_schedules", []) or []
+                )
+                for sched in self._deferrable_schedules:
+                    if sched.blocks:
+                        self.logger.info(
+                            f"📋 Deferrable {sched.load_name}: "
+                            f"{len(sched.blocks)} blocks (MILP co-optimized), "
+                            f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                        )
             summary = self._optimizer.summarize(decisions)
             sp_count = summary.get('sell_production_blocks', 0)
             sp_str = f", {sp_count} sell-production" if sp_count else ""
@@ -2403,16 +2513,16 @@ from(bucket: "{bucket}")
             if charging_today or charging_tomorrow:
                 self.logger.info("📊 Charging Schedule:")
                 if charging_today:
-                    summary = self._format_price_summary(charging_today, rate)
-                    self.logger.info(f"  Today: {summary}")
+                    price_summary = self._format_price_summary(charging_today, rate)
+                    self.logger.info(f"  Today: {price_summary}")
                     for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
                         )
                 if charging_tomorrow:
-                    summary = self._format_price_summary(charging_tomorrow, rate)
-                    self.logger.info(f"  Tomorrow: {summary}")
+                    price_summary = self._format_price_summary(charging_tomorrow, rate)
+                    self.logger.info(f"  Tomorrow: {price_summary}")
                     for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
@@ -2493,11 +2603,11 @@ from(bucket: "{bucket}")
                 f"threshold: {effective_discharge_threshold:.2f} CZK/kWh"
             )
             if discharge_today:
-                summary = self._format_price_summary(discharge_today, rate)
-                self.logger.info(f"  Discharge today: {summary}")
+                price_summary = self._format_price_summary(discharge_today, rate)
+                self.logger.info(f"  Discharge today: {price_summary}")
             if discharge_tomorrow:
-                summary = self._format_price_summary(discharge_tomorrow, rate)
-                self.logger.info(f"  Discharge tomorrow: {summary}")
+                price_summary = self._format_price_summary(discharge_tomorrow, rate)
+                self.logger.info(f"  Discharge tomorrow: {price_summary}")
 
             # VERBOSE level - full details
             if self._should_log(GrowattLogLevel.VERBOSE):
@@ -3609,6 +3719,62 @@ from(bucket: "{bucket}")
 
     # Event-driven evaluation methods
 
+    async def _apply_deferrable_load_schedule(self, now: datetime) -> None:
+        """Publish on/off commands for deferrable loads according to schedule."""
+        loads_by_name = {load.name: load for load in self._deferrable_loads}
+        desired_active: Set[str] = set()
+        current_block_start = now.replace(
+            minute=(now.minute // 15) * 15,
+            second=0,
+            microsecond=0,
+        )
+
+        for sched in self._deferrable_schedules:
+            if current_block_start in sched.block_datetimes:
+                desired_active.add(sched.load_name)
+
+        to_start = desired_active - self._deferrable_active
+        to_stop = self._deferrable_active - desired_active
+
+        def _payload(value: Any, default: Dict[str, int]) -> str:
+            if value is None:
+                return json.dumps(default)
+            return value if isinstance(value, str) else json.dumps(value)
+
+        for load_name in sorted(to_start):
+            load = loads_by_name.get(load_name)
+            if not load or not load.mqtt_topic_on:
+                continue
+            payload = _payload(load.payload_on, {"value": 1})
+            if self._optional_config.get("simulation_mode", False):
+                self.logger.info(f"[SIMULATE] Deferrable load {load.name} ON")
+            else:
+                assert self.mqtt_client is not None
+                await self.mqtt_client.publish(load.mqtt_topic_on, payload)
+            self._deferrable_active.add(load_name)
+            self.logger.info(f"📋 Deferrable load {load.name}: ON")
+
+        for load_name in desired_active & self._deferrable_active:
+            self._deferrable_completed_blocks.add((load_name, current_block_start))
+
+        for load_name in sorted(to_stop):
+            load = loads_by_name.get(load_name)
+            if not load or not load.mqtt_topic_off:
+                self.logger.warning(
+                    f"Deferrable load {load_name}: no OFF topic available; "
+                    "forgetting active state"
+                )
+                self._deferrable_active.discard(load_name)
+                continue
+            payload = _payload(load.payload_off, {"value": 0})
+            if self._optional_config.get("simulation_mode", False):
+                self.logger.info(f"[SIMULATE] Deferrable load {load.name} OFF")
+            else:
+                assert self.mqtt_client is not None
+                await self.mqtt_client.publish(load.mqtt_topic_off, payload)
+            self._deferrable_active.discard(load_name)
+            self.logger.info(f"📋 Deferrable load {load.name}: OFF")
+
     async def _periodic_evaluation_loop(self) -> None:
         """Periodically check for condition changes that need re-evaluation."""
         last_midnight_check = None
@@ -3631,7 +3797,7 @@ from(bucket: "{bucket}")
                 # optimizer (and every downstream consumer) builds schedules
                 # against real SOC, not a stale cached value.
                 try:
-                    from .growatt.api import _telemetry_cache  # type: ignore
+                    from .growatt.api import _telemetry_cache
                     live_soc = _telemetry_cache.get("SOC") if _telemetry_cache else None
                     if isinstance(live_soc, (int, float)) and 0 <= live_soc <= 100:
                         self._battery_soc = float(live_soc)
@@ -3666,6 +3832,20 @@ from(bucket: "{bucket}")
                         )
                     except Exception as e:
                         self.logger.warning(f"Consumption model rebuild failed: {e}")
+
+                # Rebuild the ML consumption model too. A recursive AR model is
+                # anchored at its training-end, so it must be refreshed often
+                # (needs_rebuild defaults to 1 day) to keep its prediction
+                # horizon near 'now' — otherwise it silently stops producing.
+                ml_cf = getattr(self, "_ml_consumption_forecast", None)
+                if ml_cf is not None and ml_cf.needs_rebuild():
+                    try:
+                        await ml_cf.build_model(
+                            self.influxdb_client, self.settings,
+                            local_tz=self._local_tz,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"ML consumption model rebuild failed: {e}")
 
                 # Check if it's time to start fetching next day's prices
                 if now.hour == self.config.price_fetch_hour and now.minute == 0:
@@ -3913,6 +4093,11 @@ from(bucket: "{bucket}")
                 if abs(self._battery_soc - self._last_battery_soc) >= 5:
                     self._last_battery_soc = self._battery_soc
                     await self._evaluate_conditions("battery_soc_change")
+
+                try:
+                    await self._apply_deferrable_load_schedule(now)
+                except Exception as e:
+                    self.logger.warning(f"Deferrable load actuation failed: {e}")
 
             except asyncio.CancelledError:
                 break

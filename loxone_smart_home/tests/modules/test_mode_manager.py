@@ -413,5 +413,6 @@ async def test_set_inverter_power_does_not_update_state_on_failure(
     }
 
     # State starts True; off-attempt fails; state must remain True
+    mode_manager._inverter_on = True
     await mode_manager.set_inverter_power(False)
     assert mode_manager._inverter_on is True

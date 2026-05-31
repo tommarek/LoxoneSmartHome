@@ -4,11 +4,12 @@ These exercise the real CBC solver when PuLP is installed; otherwise they
 skip (the controller falls back to the greedy engine in that case).
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta
 from typing import List, Tuple
 
 import pytest
 
+from modules.growatt.deferrable_loads import DeferrableLoad
 from modules.growatt.milp_optimizer import MILPBatteryOptimizer, PULP_AVAILABLE
 
 pytestmark = pytest.mark.skipif(
@@ -176,6 +177,142 @@ def test_empty_blocks_returns_empty():
         distribution_func=flat_dist(1.0),
     )
     assert (charge, discharge, sp, decisions) == (set(), set(), set(), [])
+
+
+def _ev(energy_kwh=2.5, power_kw=5.0, start=0, end=2, interruptible=True):
+    return DeferrableLoad(
+        name="ev", energy_required_kwh=energy_kwh, power_kw=power_kw,
+        earliest_start=time(start, 0), latest_end=time(end, 0),
+        interruptible=interruptible,
+    )
+
+
+def test_deferrable_interruptible_picks_cheapest_blocks():
+    # Cheapest blocks are indices 4,5 (01:00, 01:15). A 2.5 kWh @ 5 kW EV
+    # needs 2 blocks and must land there.
+    blocks = make_blocks([5.0, 5.0, 5.0, 5.0, -1.0, -1.0, 5.0, 5.0])
+    opt = MILPBatteryOptimizer()
+    opt.optimize(
+        blocks=blocks, solar_hourly={}, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=50.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        deferrable_loads=[_ev()],
+    )
+    sched = opt._last_deferrable_schedules[0]
+    assert sched.scheduled_blocks == 2
+    assert {b[0] for b in sched.blocks} == {"01:00", "01:15"}
+
+
+def test_deferrable_charges_into_solar_surplus():
+    # Flat grid price everywhere, but block 4 has free solar surplus the full
+    # battery can't absorb (so it would otherwise curtail). A high sell fee
+    # kills export, so that surplus is genuinely free — the EV should grab it
+    # instead of paying grid in an equally-priced block.
+    blocks = make_blocks([5.0] * 8)
+    # Key solar by the exact block timestamp so ONLY block 4 has surplus
+    # (hour-keyed solar would apply to all four blocks in that hour).
+    solar = {blocks[4][0]: 20.0}  # 5 kWh surplus in block 4 only
+    opt = MILPBatteryOptimizer()
+    opt.optimize(
+        blocks=blocks, solar_hourly=solar, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=100.0, max_soc=100.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        sell_fee_czk=10.0,  # export uneconomic → surplus would be curtailed
+        deferrable_loads=[_ev(energy_kwh=1.0)],  # 1 block
+    )
+    sched = opt._last_deferrable_schedules[0]
+    assert sched.scheduled_blocks == 1
+    assert sched.blocks[0][0] == blocks[4][0].strftime("%H:%M")
+
+
+def test_deferrable_noninterruptible_runs_contiguously():
+    # Cheapest blocks are non-adjacent (1 and 3,4). A non-interruptible 2-block
+    # load must pick a contiguous run, not the globally-cheapest scattered set.
+    blocks = make_blocks([5.0, -1.0, 5.0, -1.0, -1.0, 5.0, 5.0, 5.0])
+    opt = MILPBatteryOptimizer()
+    opt.optimize(
+        blocks=blocks, solar_hourly={}, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=50.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        deferrable_loads=[_ev(interruptible=False)],
+    )
+    sched = opt._last_deferrable_schedules[0]
+    assert sched.scheduled_blocks == 2
+    starts = [datetime.strptime(b[0], "%H:%M") for b in sched.blocks]
+    assert (starts[1] - starts[0]) == timedelta(minutes=15), "run must be contiguous"
+
+
+def test_deferrable_partial_when_window_too_narrow():
+    # Window admits only 2 blocks but the load needs 4 → partial + shortfall,
+    # and the MILP must stay feasible (not fall back).
+    blocks = make_blocks([1.0] * 8)
+    ev = DeferrableLoad(
+        name="ev", energy_required_kwh=5.0, power_kw=5.0,  # 4 blocks needed
+        earliest_start=time(0, 0), latest_end=time(0, 30),  # only blocks 0,1
+        interruptible=True,
+    )
+    opt = MILPBatteryOptimizer()
+    c, d, sp, decisions = opt.optimize(
+        blocks=blocks, solar_hourly={}, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=50.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        deferrable_loads=[ev],
+    )
+    assert len(decisions) == len(blocks)  # solved, no fallback to empty
+    sched = opt._last_deferrable_schedules[0]
+    assert sched.scheduled_blocks == 2
+    assert sched.energy_shortfall_kwh > 0
+
+
+def test_greedy_fallback_still_populates_deferrable_schedules():
+    # If the MILP solve is infeasible/timed-out/raises it delegates to greedy,
+    # which must still pre-schedule deferrable loads (else actuation goes dark).
+    blocks = make_blocks([-1.0] * 6 + [10.0] * 6)
+    opt = MILPBatteryOptimizer()
+    opt._greedy_fallback(
+        blocks, {}, {}, flat_dist(1.0),
+        battery_capacity_kwh=10.0, current_soc=50.0, min_soc=20.0,
+        max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
+        discharge_power_pct=100.0, efficiency=0.85, sell_fee_czk=0.5,
+        battery_amortisation_czk=2.0, deferrable_loads=[_ev()],
+    )
+    assert len(opt._last_deferrable_schedules) == 1
+    assert opt._last_deferrable_schedules[0].scheduled_blocks == 2
+
+
+def test_deferrable_placement_sticks_to_previous_plan_on_a_tie():
+    # All blocks equal price → EV placement is a tie. With a previous plan and
+    # a switch penalty, the load must keep its prior block rather than drift.
+    blocks = make_blocks([5.0] * 8)  # 00:00..01:45, all equal
+    opt = MILPBatteryOptimizer()
+    prev_block = blocks[6][0]  # 01:30
+    opt._prev_deferrable_runs = {"ev": {prev_block}}
+    opt.optimize(
+        blocks=blocks, solar_hourly={}, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=50.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        deferrable_loads=[_ev(energy_kwh=1.0)],  # 1 block
+        switch_penalty_czk=0.05,
+    )
+    sched = opt._last_deferrable_schedules[0]
+    assert sched.block_datetimes == [prev_block]
+
+
+def test_switch_penalty_does_not_override_real_arbitrage():
+    # Even when the previous plan claimed every block was idle, a tiny switch
+    # penalty must not stop the optimizer exploiting a real cheap→expensive
+    # spread (penalty << price spread). Use -0.5 (not -1.0) so import_cost stays
+    # positive and terminal SOC value can't out-value exporting at the peak.
+    blocks = make_blocks([-0.5] * 6 + [15.0] * 6)
+    opt = MILPBatteryOptimizer()
+    opt._prev_actions = {ts: "hold" for ts, _ in blocks}
+    charge, discharge, _, _ = opt.optimize(
+        blocks=blocks, solar_hourly={}, consumption_hourly={},
+        distribution_func=flat_dist(1.0), current_soc=30.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        switch_penalty_czk=0.05,
+    )
+    assert len(charge) > 0 and len(discharge) > 0
 
 
 def test_mutual_exclusion_no_block_does_two_things():

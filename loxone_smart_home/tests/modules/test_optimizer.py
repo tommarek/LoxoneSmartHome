@@ -1066,3 +1066,54 @@ class TestSellProduction:
             f"Hour 11 has only 0.025 kWh excess (below 0.25 floor) — must NOT "
             f"fire even at high price. Got: {sorted(sp_hours)}"
         )
+
+    def test_date_aware_forecasts_do_not_collide_across_days(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """A cross-day window must not reuse tomorrow's hour forecast for today."""
+        base = datetime(2026, 4, 11, 10, 0)
+        blocks = [
+            (base + timedelta(minutes=15 * i), 4.0)
+            for i in range(8)
+        ] + [
+            (base + timedelta(days=1, minutes=15 * i), 4.0)
+            for i in range(8)
+        ] + [
+            (base + timedelta(days=1, hours=2, minutes=15 * i), -3.0)
+            for i in range(4)
+        ]
+
+        today = base.date()
+        tomorrow = (base + timedelta(days=1)).date()
+        solar = {
+            (today, 10): 0.0,
+            (today, 11): 0.0,
+            (tomorrow, 10): 5.0,
+            (tomorrow, 11): 5.0,
+        }
+        consumption = {
+            (today, h): 0.5 for h in range(24)
+        }
+        consumption.update({(tomorrow, h): 0.5 for h in range(24)})
+
+        _, _, _, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly=solar,
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.12),
+            battery_capacity_kwh=10.0,
+            current_soc=80.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        today_10 = [d for d in decisions if d.timestamp.date() == today and d.timestamp.hour == 10]
+        tomorrow_10 = [
+            d for d in decisions
+            if d.timestamp.date() == tomorrow and d.timestamp.hour == 10
+        ]
+        assert today_10
+        assert tomorrow_10
+        assert all(d.solar_kwh == 0.0 for d in today_10)
+        assert all(d.solar_kwh == 1.25 for d in tomorrow_10)

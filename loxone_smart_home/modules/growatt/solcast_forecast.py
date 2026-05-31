@@ -25,15 +25,37 @@ class SolcastForecast:
 
     BASE_URL = "https://api.solcast.com.au/rooftop_sites"
 
+    # Solcast returns three PV estimates per interval; map our config token to
+    # the response field. p10 is the conservative (cloudy-biased) estimate,
+    # useful for risk-aware reserve sizing; p90 the optimistic one.
+    _QUANTILE_FIELD = {
+        "p10": "pv_estimate10",
+        "p50": "pv_estimate",
+        "p90": "pv_estimate90",
+    }
+
     def __init__(
         self,
         api_key: Optional[str],
         rooftop_id: Optional[str],
         logger: Optional[logging.Logger] = None,
+        quantile: str = "p50",
     ):
         self.api_key = (api_key or "").strip() or None
-        self.rooftop_id = (rooftop_id or "").strip() or None
+        # One or more rooftop sites (comma/semicolon/space separated). A home
+        # with multiple roof orientations (e.g. SW + SE arrays) registers one
+        # Solcast site per orientation; we query each and SUM them into total
+        # production. `rooftop_id` keeps the first id for back-compat/logging.
+        self.rooftop_ids: List[str] = [
+            s.strip()
+            for s in (rooftop_id or "").replace(";", ",").replace(" ", ",").split(",")
+            if s.strip()
+        ]
+        self.rooftop_id = self.rooftop_ids[0] if self.rooftop_ids else None
         self.logger = logger or logging.getLogger(__name__)
+        # Which PV-estimate quantile to read (falls back to p50/pv_estimate for
+        # any unrecognised value).
+        self.quantile = quantile if quantile in self._QUANTILE_FIELD else "p50"
         # Track last ATTEMPT (success or failure) so we throttle every call,
         # not just successful ones — the free tier hard cap is 10 req/day and
         # a failing endpoint must not be hammered. UTC-aware so the throttle
@@ -45,10 +67,16 @@ class SolcastForecast:
         self._req_day: Optional[date] = None
         self._req_count: int = 0
         self._max_requests_per_day: int = 9
+        # Set when a permanent auth error (401/403) is seen, so we stop
+        # hammering the API and burning the daily budget on a bad key.
+        # (No lock is needed for the throttle: the check-and-increment below
+        # has no await between gate and counter bump, so asyncio's cooperative
+        # scheduling makes it atomic across concurrent callers.)
+        self._auth_failed: bool = False
 
     @property
     def enabled(self) -> bool:
-        return bool(self.api_key and self.rooftop_id)
+        return bool(self.api_key and self.rooftop_ids)
 
     async def fetch_hourly_today_tomorrow(
         self,
@@ -56,14 +84,16 @@ class SolcastForecast:
         min_refresh_interval_hours: int = 3,
         local_tz: Any = None,
     ) -> Dict[str, Dict[int, float]]:
-        """Return {date_str: {hour: kWh}} for today + tomorrow.
+        """Return {date_str: {hour: kWh}} for today + tomorrow, summed across
+        ALL configured rooftop sites (e.g. SW + SE arrays → total home output).
 
         Throttled to stay under the Solcast free-tier hard cap of 10 req/day
-        per rooftop via two guards that BOTH count every attempt (success or
-        failure, so a failing endpoint can't be hammered):
-        - a per-call interval (default 3h ⇒ ≤8/day), and
-        - an absolute per-UTC-day counter (≤9/day).
-        On any error returns the last good cache if available, else {} (the
+        (shared across the account, so every site call counts) via two guards:
+        - a per-batch interval (default 3h), and
+        - an absolute per-UTC-day counter (≤9 total calls). A refresh is only
+          started if there's budget for ALL sites, so we never spend the budget
+          on a half-updated (one-array) forecast.
+        On error returns the last good cache if available, else {} (the
         controller then falls back to its model+API consensus).
 
         `local_tz`: timezone to bucket the forecast into. Solcast returns
@@ -73,6 +103,11 @@ class SolcastForecast:
         """
         if not self.enabled:
             return {}
+
+        # A permanent auth failure won't fix itself — stop attempting so we
+        # don't drain the daily budget on a bad key/rooftop id.
+        if self._auth_failed:
+            return dict(self._cached)
 
         now_utc = datetime.now(timezone.utc)
 
@@ -86,75 +121,109 @@ class SolcastForecast:
         ):
             return dict(self._cached)
 
-        # Absolute per-UTC-day backstop under the 10/day cap.
+        # Absolute per-UTC-day backstop under the 10/day cap. With N sites a
+        # refresh costs N calls, so only start one if the whole batch fits.
         today_utc = now_utc.date()
         if self._req_day != today_utc:
             self._req_day = today_utc
             self._req_count = 0
-        if not force and self._req_count >= self._max_requests_per_day:
+        n_sites = len(self.rooftop_ids)
+        if not force and self._req_count + n_sites > self._max_requests_per_day:
             self.logger.debug(
-                "Solcast daily request budget exhausted — using cache"
+                "Solcast daily request budget would be exceeded by a "
+                f"{n_sites}-site refresh — using cache"
             )
             return dict(self._cached)
 
-        # Count this attempt against both throttles up front.
+        # Reserve the interval slot up front (gates the whole batch).
         self._last_attempt = now_utc
-        self._req_count += 1
 
-        url = f"{self.BASE_URL}/{self.rooftop_id}/forecasts"
         params = {"format": "json", "hours": 48}
         headers = {"Authorization": f"Bearer {self.api_key}"}
+        combined: Dict[str, Dict[int, float]] = {}
+        per_site_totals = []
+        any_success = False
 
-        try:
-            timeout = aiohttp.ClientTimeout(total=15)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url, params=params, headers=headers) as resp:
-                    if resp.status != 200:
-                        # 401/403 = misconfig; 429 = rate limited; others
-                        # transient. Visible at WARNING; return stale cache.
-                        self.logger.warning(
-                            f"Solcast returned {resp.status}: {await resp.text()}"
-                        )
-                        return dict(self._cached)
-                    payload = await resp.json()
-        except Exception as e:
-            # Network/JSON errors: warn (rate-limited by the interval throttle)
-            # so a broken paid feature is visible rather than silently disabled.
-            self.logger.warning(f"Solcast fetch failed: {e}")
-            return dict(self._cached)
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            for rid in self.rooftop_ids:
+                # Each site call counts against the daily budget (success or not).
+                self._req_count += 1
+                url = f"{self.BASE_URL}/{rid}/forecasts"
+                try:
+                    async with session.get(url, params=params, headers=headers) as resp:
+                        if resp.status != 200:
+                            body = await resp.text()
+                            if resp.status in (401, 403):
+                                # Bad key — permanent for the whole account.
+                                self._auth_failed = True
+                                self.logger.error(
+                                    f"Solcast auth failed ({resp.status}) for "
+                                    f"site {rid} — disabling until restart. "
+                                    f"Check solcast_api_key. Body: {body}"
+                                )
+                                return dict(self._cached)
+                            # 429 / transient: skip this site, keep others.
+                            self.logger.warning(
+                                f"Solcast site {rid} returned {resp.status}: {body}"
+                            )
+                            continue
+                        payload = await resp.json()
+                except Exception as e:
+                    self.logger.warning(f"Solcast fetch failed for site {rid}: {e}")
+                    continue
 
-        result = self._parse_forecasts(payload, local_tz)
+                parsed = self._parse_forecasts(payload, local_tz, self.quantile)
+                if not parsed:
+                    continue
+                any_success = True
+                site_total = sum(sum(h.values()) for h in parsed.values())
+                per_site_totals.append(f"{rid[:4]}…={site_total:.1f}")
+                for date_str, hours in parsed.items():
+                    day = combined.setdefault(date_str, {})
+                    for h, kwh in hours.items():
+                        day[h] = day.get(h, 0.0) + kwh
 
-        if result:
-            self._cached = result
+        if any_success and combined:
+            self._cached = combined
+            total = sum(sum(h.values()) for h in combined.values())
             self.logger.info(
-                f"☀️  Solcast forecast: {sum(sum(h.values()) for h in result.values()):.1f} "
-                f"kWh across {len(result)} day(s)"
+                f"☀️  Solcast forecast: {total:.1f} kWh across "
+                f"{len(combined)} day(s), {n_sites} site(s) "
+                f"[{', '.join(per_site_totals)}]"
             )
-            return dict(result)
+            return dict(combined)
 
-        # Parsed empty (unexpected payload shape) — keep prior cache.
+        # Everything failed / parsed empty — keep prior cache.
         return dict(self._cached)
 
     @staticmethod
     def _parse_forecasts(
-        payload: Any, local_tz: Any = None
+        payload: Any, local_tz: Any = None, quantile: str = "p50"
     ) -> Dict[str, Dict[int, float]]:
         """Convert a Solcast forecasts payload into {date_str: {hour: kWh}}.
 
         Response shape: {"forecasts": [{"period_end": iso8601,
-        "pv_estimate": kW, ...}, ...]}. `period_end` marks the END of each
-        30-min interval (UTC); `pv_estimate` is the average kW over that
-        interval, so kWh = kW * 0.5. Times are converted to `local_tz`
-        before bucketing so hours align with the optimizer's local grid.
-        Malformed entries are skipped individually.
+        "pv_estimate": kW, "pv_estimate10": kW, "pv_estimate90": kW, ...}, ...]}.
+        `period_end` marks the END of each 30-min interval (UTC); the chosen
+        estimate is the average kW over that interval, so kWh = kW * 0.5. Times
+        are converted to `local_tz` before bucketing so hours align with the
+        optimizer's local grid. `quantile` selects p10/p50/p90; it falls back
+        to pv_estimate (p50) when the requested field is absent. Malformed
+        entries are skipped individually.
         """
+        field = SolcastForecast._QUANTILE_FIELD.get(quantile, "pv_estimate")
         forecasts = payload.get("forecasts", []) if isinstance(payload, dict) else []
         result: Dict[str, Dict[int, float]] = {}
         for entry in forecasts:
             try:
                 end_iso = entry.get("period_end")
-                kw = float(entry.get("pv_estimate", 0.0))
+                # Fall back to the median estimate if the quantile field is
+                # missing (older payloads / partial responses).
+                raw = entry.get(field)
+                if raw is None:
+                    raw = entry.get("pv_estimate", 0.0)
+                kw = float(raw)
                 if not end_iso:
                     continue
                 end_dt = SolcastForecast._parse_iso8601_utc(end_iso)

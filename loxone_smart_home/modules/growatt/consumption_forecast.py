@@ -6,7 +6,6 @@ where heating load dominates in winter.
 """
 
 import logging
-import math
 import statistics
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta

@@ -90,13 +90,11 @@ def _get_live_soc() -> Optional[float]:
 async def api_live(request: web.Request) -> web.Response:
     """Get real-time power flow data from inverter telemetry."""
     telemetry = _get_live_telemetry()
-    ctrl = _get_controller(request)
 
     solar_w = telemetry.get("InputPower", 0) or 0
     battery_w = telemetry.get("ChargePower", 0) or 0
     discharge_w = telemetry.get("DischargePower", 0) or 0
     grid_export_w = telemetry.get("ACPowerToGrid", 0) or 0
-    grid_import_w = 0  # Derived: if load > solar + battery discharge
     load_w = telemetry.get("INVPowerToLocalLoad", 0) or 0
     soc = telemetry.get("SOC", 0) or 0
 
@@ -111,20 +109,6 @@ async def api_live(request: web.Request) -> web.Response:
     # Self-consumption rate
     self_consumed = solar_today - export_today if solar_today > export_today else 0
     self_consumption_rate = (self_consumed / solar_today * 100) if solar_today > 0 else 0
-
-    # Current price info
-    rate = 25.0
-    if ctrl:
-        rate = ctrl._eur_czk_rate or 25.0
-
-    # Estimated savings today (very rough: self-consumed * avg price avoided)
-    now = None
-    avg_price = 0
-    if ctrl:
-        now = ctrl._get_local_now()
-        if ctrl._current_prices:
-            prices = list(ctrl._current_prices.values())
-            avg_price = sum(prices) / len(prices) if prices else 0  # Already CZK/kWh
 
     return web.json_response({
         "power": {
@@ -155,7 +139,6 @@ async def api_status(request: web.Request) -> web.Response:
         return web.json_response({"error": "Controller not ready"}, status=503)
 
     now = ctrl._get_local_now()
-    rate = ctrl._eur_czk_rate or 25.0
 
     # Current price (already CZK/kWh in _current_prices)
     current_price_czk = 0.0
@@ -217,6 +200,30 @@ async def api_status(request: web.Request) -> web.Response:
             ],
         }
 
+        # Solcast (optional weather-based source). Surface its status, the
+        # per-day totals it contributed to the consensus, and the shared
+        # free-tier API budget used so far today.
+        solcast_client = getattr(ctrl, "_solcast_forecast", None)
+        if solcast_client is not None and getattr(solcast_client, "enabled", False):
+            ingested = getattr(ctrl._solar_forecast, "_solcast_forecast", {}) or {}
+            tomorrow_str = (now.date() + td(days=1)).strftime("%Y-%m-%d")
+
+            def _sc_total(dstr):
+                fc = ingested.get(dstr)
+                return round(fc.total_kwh, 1) if fc else None
+
+            solar["solcast"] = {
+                "enabled": True,
+                "sites": len(getattr(solcast_client, "rooftop_ids", []) or []),
+                "quantile": getattr(solcast_client, "quantile", "p50"),
+                "today_kwh": _sc_total(today_str),
+                "tomorrow_kwh": _sc_total(tomorrow_str),
+                "requests_today": getattr(solcast_client, "_req_count", 0),
+                "daily_budget": getattr(solcast_client, "_max_requests_per_day", 9),
+            }
+        else:
+            solar["solcast"] = {"enabled": False}
+
     # Charging schedule
     schedule = {
         "charging_blocks": len(ctrl._combined_charging_blocks),
@@ -253,8 +260,12 @@ async def api_status(request: web.Request) -> web.Response:
         profile = getattr(ctrl._optimizer, '_base_load_profile', None)
         profile_summary = profile.summary() if profile else "Not built"
         reserve_info = getattr(ctrl._optimizer, '_last_reserve_info', {})
+        # Which engine is actually loaded (reflects real state, not just config:
+        # MILP falls back to greedy if PuLP is missing).
+        engine = "milp" if type(ctrl._optimizer).__name__.startswith("MILP") else "greedy"
         optimizer_info = {
             "enabled": True,
+            "engine": engine,
             "charge_blocks_today": len(charge_today),
             "discharge_blocks_today": len(discharge_today),
             "sell_production_blocks_today": len(sell_production_today),
@@ -328,7 +339,6 @@ async def api_prices(request: web.Request) -> web.Response:
     if not ctrl or not ctrl._current_prices:
         return web.json_response({"prices": []})
 
-    rate = ctrl._eur_czk_rate or 25.0
     sell_fee = getattr(ctrl.config, 'sell_fee_czk', 0.5)
     batt_amort = getattr(ctrl.config, 'battery_amortisation_czk', 2.0)
     batt_cap = getattr(ctrl.config, 'battery_capacity', 10.0)
@@ -1070,6 +1080,7 @@ select, input {
         <div class="stat-value small" id="solarTomorrow">-- kWh</div>
       </div>
       <div class="stat-label" id="solarConf">Confidence: --</div>
+      <div class="stat-label" id="solcastInfo" style="margin-top:6px"></div>
     </div>
 
     <!-- Schedule -->
@@ -1100,7 +1111,7 @@ select, input {
       </div>
     </div>
     <div class="card">
-      <h2>Optimizer & Forecast</h2>
+      <h2>Optimizer & Forecast <span id="engineBadge" style="font-size:11px;padding:2px 7px;border-radius:6px;vertical-align:middle"></span></h2>
       <div id="optimizerInfo" style="font-size:13px;line-height:1.8">
         <div class="stat-label">Optimizer schedule</div>
         <div id="optimizerSummary" style="margin-bottom:8px">--</div>
@@ -1250,6 +1261,23 @@ function updateUI(d) {
       confText = 'Confidence: ' + (sf.confidence * 100).toFixed(0) + '% (no model)';
     }
     document.getElementById('solarConf').textContent = confText;
+
+    // Solcast (weather-based source) status + API budget.
+    const sc = sf.solcast;
+    const scEl = document.getElementById('solcastInfo');
+    if (scEl) {
+      if (sc && sc.enabled) {
+        const t = (sc.today_kwh != null ? sc.today_kwh : '--');
+        const tm = (sc.tomorrow_kwh != null ? sc.tomorrow_kwh : '--');
+        scEl.innerHTML =
+          '☀️ Solcast (' + sc.sites + ' site' + (sc.sites === 1 ? '' : 's') +
+          ', ' + sc.quantile + '): today ' + t + ' kWh, tomorrow ' + tm + ' kWh' +
+          ' <span style="color:var(--muted)">· ' + sc.requests_today + '/' +
+          sc.daily_budget + ' API calls today</span>';
+      } else {
+        scEl.innerHTML = '<span style="color:var(--muted)">Solcast: not configured</span>';
+      }
+    }
   }
 
   // Schedule
@@ -1279,6 +1307,17 @@ function updateUI(d) {
   // Optimizer
   if (d.optimizer) {
     const opt = d.optimizer;
+    // Engine badge (reflects the live engine, incl. MILP→greedy fallback).
+    const engEl = document.getElementById('engineBadge');
+    if (engEl) {
+      const eng = (opt.engine || 'greedy');
+      engEl.textContent = eng.toUpperCase();
+      engEl.style.background = eng === 'milp' ? 'rgba(74,222,128,0.18)' : 'rgba(148,163,184,0.18)';
+      engEl.style.color = eng === 'milp' ? 'var(--green)' : 'var(--muted)';
+      engEl.title = eng === 'milp'
+        ? 'MILP global optimiser (PuLP/CBC)'
+        : 'Greedy forward-simulation';
+    }
     const res = opt.reserve || {};
     let reserveHtml = '';
     if (res.next_recharge_ts) {

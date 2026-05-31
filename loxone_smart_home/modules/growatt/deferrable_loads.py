@@ -19,7 +19,7 @@ and the integration layer fires the command.
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 @dataclass
@@ -35,8 +35,8 @@ class DeferrableLoad:
     mqtt_topic_on: Optional[str] = None  # topic to publish "on" command
     mqtt_topic_off: Optional[str] = None  # topic to publish "off" command
     # Optional payloads — if None, simple value=1/value=0 JSON is used.
-    payload_on: Optional[str] = None
-    payload_off: Optional[str] = None
+    payload_on: Optional[Any] = None
+    payload_off: Optional[Any] = None
 
     def required_blocks(self, block_minutes: int = 15) -> int:
         """Number of 15-min blocks at nominal power to deliver the required kWh."""
@@ -46,6 +46,18 @@ class DeferrableLoad:
         # Round UP so we always deliver at least the requested energy.
         return max(1, int((self.energy_required_kwh / kwh_per_block) + 0.999))
 
+    def in_window(self, t: time) -> bool:
+        """True when local time `t` is inside the load's allowed window.
+
+        Windows may cross midnight (e.g. an EV charged 22:00→06:00): when
+        ``earliest_start > latest_end`` the window wraps, so a time is
+        in-window if it's at/after the start OR before the end. Shared by the
+        greedy scheduler and the MILP co-optimizer so both agree on membership.
+        """
+        if self.earliest_start <= self.latest_end:
+            return self.earliest_start <= t < self.latest_end
+        return t >= self.earliest_start or t < self.latest_end
+
 
 @dataclass
 class DeferrableLoadSchedule:
@@ -53,6 +65,7 @@ class DeferrableLoadSchedule:
 
     load_name: str
     blocks: List[Tuple[str, str]] = field(default_factory=list)  # ("HH:MM", "HH:MM")
+    block_datetimes: List[datetime] = field(default_factory=list)
     expected_cost_czk: float = 0.0  # total cost to run during these blocks
     naive_cost_czk: float = 0.0  # cost if run as soon as possible (for comparison)
     requested_blocks: int = 0  # blocks needed to fully deliver energy_required
@@ -86,7 +99,7 @@ class DeferrableLoadScheduler:
         self,
         load: DeferrableLoad,
         price_blocks: List[Tuple[datetime, float]],
-        distribution_func,
+        distribution_func: Callable[[int], float],
         sell_fee_czk: float = 0.0,
     ) -> DeferrableLoadSchedule:
         """Pick the cheapest blocks within the load's allowed window.
@@ -106,18 +119,11 @@ class DeferrableLoadScheduler:
         if n_needed <= 0:
             return DeferrableLoadSchedule(load_name=load.name)
 
-        # Filter to blocks within the allowed local-time window. Windows may
-        # cross midnight (e.g. an EV charged 22:00→06:00): when
-        # earliest_start > latest_end the window wraps, so a block is in-window
-        # if it's at/after the start OR before the end.
-        def _in_window(t: time) -> bool:
-            if load.earliest_start <= load.latest_end:
-                return load.earliest_start <= t < load.latest_end
-            return t >= load.earliest_start or t < load.latest_end
-
+        # Filter to blocks within the allowed local-time window (DeferrableLoad
+        # handles midnight-wrapping windows, e.g. an EV charged 22:00→06:00).
         candidates: List[Tuple[int, datetime, float]] = []  # (idx, ts, cost_per_kwh)
         for idx, (ts, spot) in enumerate(price_blocks):
-            if not _in_window(ts.time()):
+            if not load.in_window(ts.time()):
                 continue
             # Cost per kWh delivered = spot + distribution. Sell fee NA.
             cost_per_kwh = spot + distribution_func(ts.hour)
@@ -200,9 +206,11 @@ class DeferrableLoadScheduler:
 
         # Build schedule
         blocks: List[Tuple[str, str]] = []
+        block_datetimes: List[datetime] = []
         for _, ts, _ in chosen:
             end = ts + timedelta(minutes=15)
             blocks.append((ts.strftime("%H:%M"), end.strftime("%H:%M")))
+            block_datetimes.append(ts)
 
         shortfall = max(0, requested - len(chosen)) * kwh_per_block
         if shortfall > 0:
@@ -214,6 +222,7 @@ class DeferrableLoadScheduler:
         return DeferrableLoadSchedule(
             load_name=load.name,
             blocks=blocks,
+            block_datetimes=block_datetimes,
             expected_cost_czk=round(expected, 2),
             naive_cost_czk=round(naive, 2),
             requested_blocks=requested,
@@ -225,7 +234,7 @@ class DeferrableLoadScheduler:
         self,
         loads: List[DeferrableLoad],
         price_blocks: List[Tuple[datetime, float]],
-        distribution_func,
+        distribution_func: Callable[[int], float],
     ) -> List[DeferrableLoadSchedule]:
         """Schedule every load independently (no shared-power constraint).
 
@@ -240,28 +249,32 @@ class DeferrableLoadScheduler:
         self,
         schedules: List[DeferrableLoadSchedule],
         loads_by_name: Dict[str, DeferrableLoad],
-    ) -> Dict[int, float]:
-        """Build an hour→kWh dict the battery optimizer can ADD to its
+    ) -> Dict[Any, float]:
+        """Build a forecast overlay the battery optimizer can ADD to its
         consumption forecast.
 
         IMPORTANT unit convention: both optimizer engines treat
-        ``consumption_hourly[h]`` as a FULL-HOUR figure and divide it by 4 to
-        get the per-15-min-block energy. So a single scheduled 15-min block
-        carrying ``power*0.25`` kWh must be added to the hour as
-        ``power*0.25 * 4 == power*1.0`` (i.e. the *hourly-rate* contribution),
-        so that after the optimizer's ``/4`` the block sees the true
-        ``power*0.25`` kWh. Adding the raw per-block energy here would
-        under-count the load 4× for partial hours.
+        forecast values as FULL-HOUR figures and divide by 4 to get the
+        per-15-min-block energy. So a single scheduled 15-min block carrying
+        ``power*0.25`` kWh must be added as ``power*1.0`` on the exact block
+        timestamp, so after the optimizer's ``/4`` the block sees the true
+        ``power*0.25`` kWh without smearing the load across the rest of the
+        hour. Legacy schedules without datetimes fall back to hour keys.
         """
-        overlay: Dict[int, float] = {}
+        overlay: Dict[Any, float] = {}
         for sched in schedules:
             load = loads_by_name.get(sched.load_name)
             if not load:
                 continue
             # Per scheduled 15-min block, contribute the hourly-rate energy so
-            # the optimizer's /4 recovers power*0.25 kWh for that block.
-            hour_rate_per_block = load.power_kw * 0.25 * 4  # == power_kw
-            for start_str, _ in sched.blocks:
-                hour = int(start_str.split(":")[0])
-                overlay[hour] = overlay.get(hour, 0.0) + hour_rate_per_block
+            # the optimizer's /4 recovers power*0.25 kWh for that block. The
+            # hourly rate that yields power*0.25 kWh after /4 is exactly power.
+            hour_rate_per_block = load.power_kw
+            if sched.block_datetimes:
+                for ts in sched.block_datetimes:
+                    overlay[ts] = overlay.get(ts, 0.0) + hour_rate_per_block
+            else:
+                for start_str, _ in sched.blocks:
+                    hour = int(start_str.split(":")[0])
+                    overlay[hour] = overlay.get(hour, 0.0) + hour_rate_per_block
         return overlay

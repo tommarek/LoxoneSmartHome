@@ -81,7 +81,7 @@ def test_non_interruptible_picks_contiguous_run():
 
 
 def test_partial_window_schedules_what_fits():
-    prices = [1, 1]
+    prices = [1.0, 1.0]
     blocks = make_blocks(prices, start_hour=0)
     load = DeferrableLoad(
         name="ev", energy_required_kwh=10.0, power_kw=2.0,  # wants 10 blocks
@@ -115,6 +115,30 @@ def test_consumption_overlay_uses_hourly_rate_convention():
     # Verify the round-trip: optimizer's per-block view recovers true energy.
     assert overlay[10] / 4 == 1.0  # 2 blocks * power*0.25
     assert overlay[11] / 4 == 0.5  # 1 block * power*0.25
+
+
+def test_consumption_overlay_preserves_date_when_available():
+    load = DeferrableLoad(
+        name="ev", energy_required_kwh=1.0, power_kw=2.0,
+        earliest_start=time(0, 0), latest_end=time(23, 59),
+    )
+    today = datetime(2025, 6, 1, 10, 0)
+    tomorrow = datetime(2025, 6, 2, 10, 0)
+    sched = DeferrableLoadSchedule(
+        load_name="ev",
+        blocks=[("10:00", "10:15"), ("10:00", "10:15")],
+        block_datetimes=[today, tomorrow],
+    )
+
+    overlay = DeferrableLoadScheduler().consumption_overlay(
+        [sched], {"ev": load}
+    )
+
+    assert overlay[today] == 2.0
+    assert overlay[tomorrow] == 2.0
+    assert (today.date(), 10) not in overlay
+    assert (tomorrow.date(), 10) not in overlay
+    assert 10 not in overlay
 
 
 def test_overnight_window_crosses_midnight():

@@ -118,6 +118,11 @@ class SolarProductionModel:
     curtailed_filtered: int = 0
     date_range: str = ""
     built_at: Optional[datetime] = None
+    # Per-bin estimator quantile. 0.5 = median (default; unchanged behaviour).
+    # Higher (e.g. 0.7) recovers PV *potential* when curtailment thins out a
+    # bin's high-end clean samples — the surviving samples skew low because the
+    # sunniest hours are the ones most likely to have been curtailed.
+    quantile: float = 0.5
 
     @staticmethod
     def radiation_to_bucket(ghi: float) -> int:
@@ -144,9 +149,13 @@ class SolarProductionModel:
         """Temperature → bucket (5°C steps)."""
         return min(12, max(0, int((temp_c + 20) / 5)))
 
-    @staticmethod
-    def _compute_median(values: List[float]) -> float:
-        """Compute median with IQR outlier removal."""
+    def _compute_quantile(self, values: List[float]) -> float:
+        """Per-bin estimate at `self.quantile`, after IQR outlier removal.
+
+        `quantile=0.5` reproduces the median exactly (linear interpolation at
+        0.5 == median for both odd and even n), so the default is behaviour-
+        preserving; a higher quantile lifts the estimate toward potential.
+        """
         if not values:
             return 0.0
         if len(values) < 3:
@@ -155,10 +164,22 @@ class SolarProductionModel:
         q1 = sorted_vals[len(sorted_vals) // 4]
         q3 = sorted_vals[3 * len(sorted_vals) // 4]
         iqr = q3 - q1
-        filtered = [v for v in values if (q1 - 1.5 * iqr) <= v <= (q3 + 1.5 * iqr)]
+        filtered = sorted(
+            v for v in values if (q1 - 1.5 * iqr) <= v <= (q3 + 1.5 * iqr)
+        )
         if not filtered:
-            filtered = values
-        return statistics.median(filtered)
+            filtered = sorted_vals
+        q = min(1.0, max(0.0, self.quantile))
+        if q <= 0:
+            return filtered[0]
+        if q >= 1:
+            return filtered[-1]
+        # Linear-interpolated quantile.
+        idx = q * (len(filtered) - 1)
+        lo = int(idx)
+        hi = min(lo + 1, len(filtered) - 1)
+        frac = idx - lo
+        return filtered[lo] * (1 - frac) + filtered[hi] * frac
 
     def add_sample(self, rad_b: int, cloud_b: int, alt_b: int,
                    kwh: float) -> None:
@@ -178,7 +199,7 @@ class SolarProductionModel:
             median_dict.clear()
             for key, values in bins.items():
                 if values:
-                    med = self._compute_median(values)
+                    med = self._compute_quantile(values)
                     median_dict[key] = med
 
         all_medians = [v for v in self.median_2d.values() if v > 0]
@@ -276,11 +297,15 @@ class SolarForecast:
         longitude: float,
         confidence: float = 0.7,
         logger: Optional[logging.Logger] = None,
+        model_quantile: float = 0.5,
     ):
         self.arrays = arrays
         self.latitude = latitude
         self.longitude = longitude
         self.confidence = confidence
+        # Per-bin quantile for the learned production model (see
+        # SolarProductionModel.quantile). 0.5 keeps the historical median.
+        self.model_quantile = model_quantile
         self.logger = logger or logging.getLogger(__name__)
 
         # Cached forecasts
@@ -320,6 +345,7 @@ class SolarForecast:
             longitude=lon,
             confidence=getattr(config, "solar_forecast_confidence", 0.7),
             logger=logger,
+            model_quantile=getattr(config, "solar_model_quantile", 0.5),
         )
 
     # --- forecast.solar API ---
@@ -707,8 +733,12 @@ from(bucket: "{weather_bucket}")
 
             model.build()
 
-            # PASS 2: Filter curtailed hours and rebuild
-            model2 = SolarProductionModel(total_kwp=total_kwp)
+            # PASS 2: Filter curtailed hours and rebuild. Pass 1 stays at the
+            # median for stable curtailment detection; the FINAL model uses the
+            # configured quantile so the prediction can recover potential.
+            model2 = SolarProductionModel(
+                total_kwp=total_kwp, quantile=self.model_quantile
+            )
             curtailed = 0
             for hour_key, watts in solar_by_hour.items():
                 if hour_key not in ghi_by_hour or watts <= 0:
@@ -1292,6 +1322,85 @@ from(bucket: "{bucket}")
             out[h] = max(model_kwh, blended)
         return out
 
+    async def _hourly_mean_today(
+        self, influxdb_client: Any, bucket: str, field: str, current_hour: int,
+        target_date: date, local_tz: Any, lookback_hours: int, scale: float = 1.0,
+    ) -> Dict[int, float]:
+        """Hourly-mean of a `solar` field for completed hours of today.
+
+        Returns {hour: value*scale} for hours < current_hour on target_date.
+        """
+        out: Dict[int, float] = {}
+        try:
+            q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -{lookback_hours + 1}h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "{field}")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+            result = await influxdb_client.query(q)
+            if result:
+                for table in result:
+                    for record in table.records:
+                        t = record.get_time()
+                        if local_tz is not None and t.tzinfo is not None:
+                            t = t.astimezone(local_tz)
+                        if t.date() != target_date or t.hour >= current_hour:
+                            continue
+                        v = record.get_value()
+                        if isinstance(v, (int, float)):
+                            out[t.hour] = float(v) * scale
+        except Exception as e:
+            self.logger.debug(f"_hourly_mean_today({field}) failed: {e}")
+        return out
+
+    async def _state_by_hour_today(
+        self, influxdb_client: Any, bucket: str, field: str, current_hour: int,
+        target_date: date, local_tz: Any,
+    ) -> Dict[int, int]:
+        """Carry-forward an inverter_state on/off field to today's hours.
+
+        State is recorded only on change, so we read the last 24h of records
+        and, for each completed hour h of today, take the most recent value
+        at/before the END of that hour. Missing → 1 (enabled/on), matching the
+        training-filter convention.
+        """
+        out: Dict[int, int] = {}
+        try:
+            q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "{field}")
+  |> sort(columns: ["_time"])
+'''
+            result = await influxdb_client.query(q)
+            records: List[Tuple[datetime, int]] = []
+            if result:
+                for table in result:
+                    for record in table.records:
+                        t = record.get_time()
+                        if local_tz is not None and t.tzinfo is not None:
+                            t = t.astimezone(local_tz)
+                        v = record.get_value()
+                        if isinstance(v, (int, float)):
+                            records.append((t, int(round(float(v)))))
+            records.sort(key=lambda r: r[0])
+            for h in range(current_hour):
+                # End of hour h, local. Build a naive comparison via the record
+                # timestamps (already local). Last record at/before this wins.
+                last = 1
+                for t, v in records:
+                    if t.date() < target_date or (
+                        t.date() == target_date and t.hour <= h
+                    ):
+                        last = v
+                    else:
+                        break
+                out[h] = last
+        except Exception as e:
+            self.logger.debug(f"_state_by_hour_today({field}) failed: {e}")
+        return out
+
     async def compute_intraday_calibration(
         self,
         influxdb_client: Any,
@@ -1303,6 +1412,8 @@ from(bucket: "{bucket}")
         min_forecast_kwh: float = 0.3,
         clamp_low: float = 0.5,
         clamp_high: float = 3.0,
+        exclude_curtailed: bool = True,
+        min_usable_hours: int = 2,
     ) -> Optional[float]:
         """Return a scaling ratio that aligns today's forecast to recent actuals.
 
@@ -1311,6 +1422,15 @@ from(bucket: "{bucket}")
         get_hourly_production() said for those same hours. Returns a single
         scalar that the caller should multiply against the remaining-day
         forecast.
+
+        CURTAILMENT-AWARE: with `exclude_curtailed` (default True) any recent
+        hour whose production was *deliberately limited* — inverter switched
+        off by the price gate, export disabled, or the battery full with low
+        load (MPPT throttled) — is dropped from the comparison. Those actuals
+        reflect a dispatch DECISION, not the panels' potential; calibrating to
+        them would scale the potential forecast down to censored output and,
+        via the optimizer, cause needless grid charging. This mirrors the
+        filters the production-model training already applies.
 
         Returns None when there isn't enough useful data (night, very early
         morning, freshly-deployed, or all-tiny forecasts) — caller leaves
@@ -1372,15 +1492,87 @@ from(bucket: "{bucket}")
 
             forecast_today = self.get_hourly_production(target_date)
 
-            # Drop pre-dawn / dusk hours: if EITHER actual or forecast is
-            # tiny, the ratio is dominated by noise (e.g., sun hadn't yet
-            # risen → actual=0 with non-zero forecast pulls ratio to 0).
+            # Pull the signals needed to detect curtailed hours over the same
+            # window: SOC + house load (dense), and the export/inverter on-off
+            # state (sparse state-change records → carried forward).
+            soc_by_hour: Dict[int, float] = {}
+            load_by_hour: Dict[int, float] = {}
+            export_by_hour: Dict[int, int] = {}
+            inverter_on_by_hour: Dict[int, int] = {}
+            if exclude_curtailed:
+                soc_by_hour = await self._hourly_mean_today(
+                    influxdb_client, bucket, "SOC", current_hour, target_date,
+                    local_tz, lookback_hours, scale=1.0,
+                )
+                load_by_hour = await self._hourly_mean_today(
+                    influxdb_client, bucket, "INVPowerToLocalLoad", current_hour,
+                    target_date, local_tz, lookback_hours, scale=1 / 1000.0,
+                )
+                export_by_hour = await self._state_by_hour_today(
+                    influxdb_client, bucket, "export_enabled", current_hour,
+                    target_date, local_tz,
+                )
+                inverter_on_by_hour = await self._state_by_hour_today(
+                    influxdb_client, bucket, "inverter_on", current_hour,
+                    target_date, local_tz,
+                )
+
+            def _is_curtailed(h: int) -> bool:
+                if not exclude_curtailed:
+                    return False
+                # Inverter off (price gate) or export disabled → censored.
+                if inverter_on_by_hour.get(h, 1) == 0:
+                    return True
+                if export_by_hour.get(h, 1) == 0:
+                    return True
+                # Battery full + low load → MPPT throttled below potential.
+                fc = forecast_today.get(h, 0.0)
+                if (
+                    soc_by_hour.get(h, 50.0) >= 99.0
+                    and fc > 0
+                    and actual_by_hour[h] < fc * 0.6
+                    and load_by_hour.get(h, 0.0) < fc * 0.5
+                ):
+                    return True
+                return False
+
+            # Drop pre-dawn / dusk hours (tiny actual/forecast → noisy ratio)
+            # AND any hour whose output was deliberately curtailed.
+            all_recent = sorted(actual_by_hour.keys())
             usable_hours = [
-                h for h in sorted(actual_by_hour.keys())
+                h for h in all_recent
                 if actual_by_hour[h] >= 0.2 and forecast_today.get(h, 0.0) >= 0.2
+                and not _is_curtailed(h)
             ]
+            n_curtailed = sum(
+                1 for h in all_recent
+                if actual_by_hour[h] >= 0.2 and forecast_today.get(h, 0.0) >= 0.2
+                and _is_curtailed(h)
+            )
+            if n_curtailed:
+                self.logger.info(
+                    f"☀️  Intraday calibration: skipped {n_curtailed} curtailed "
+                    f"hour(s) (battery full / inverter off / export disabled)"
+                )
 
             if not usable_hours:
+                # Everything recent was curtailed (e.g. sunny + battery full all
+                # afternoon): the actuals don't reflect potential, so leave the
+                # forecast untouched rather than suppress it.
+                return None
+
+            # Require a minimum number of usable hours. After curtailment
+            # filtering, a single surviving hour is often an early-morning
+            # (low-sun-angle) sample with a large relative forecast error; one
+            # such hour would otherwise drive a wild (clamp-pinned) day-wide
+            # rescale. Calibrating to a single noisy sample is worse than not
+            # calibrating, so back off and leave the forecast as-is.
+            if len(usable_hours) < min_usable_hours:
+                self.logger.info(
+                    f"☀️  Intraday calibration: only {len(usable_hours)} usable "
+                    f"hour(s) after curtailment filtering (need "
+                    f"{min_usable_hours}) — leaving forecast unscaled"
+                )
                 return None
 
             # Restrict to the most recent `lookback_hours` USABLE hours.

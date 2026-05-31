@@ -25,6 +25,31 @@ class BlockDecision:
     net_value: float  # Value of this action (positive = saves money)
 
 
+def _forecast_value(forecast: Dict[Any, float], timestamp: datetime) -> float:
+    """Read a forecast value for a block.
+
+    Preferred keys are absolute enough for cross-day optimization:
+    - datetime: exact block timestamp
+    - (date, hour): date-aware hourly value
+    - "YYYY-MM-DD-HH": date-aware hourly string
+
+    Integer hour keys remain supported for existing single-day tests/callers.
+    """
+    exact = forecast.get(timestamp)
+    if exact is not None:
+        return exact
+
+    date_hour = forecast.get((timestamp.date(), timestamp.hour))
+    if date_hour is not None:
+        return date_hour
+
+    iso_hour = forecast.get(f"{timestamp.date().isoformat()}-{timestamp.hour:02d}")
+    if iso_hour is not None:
+        return iso_hour
+
+    return forecast.get(timestamp.hour, 0.0)
+
+
 # Margin (CZK/kWh) above which a sell-production swap is worthwhile.
 # Smaller spreads aren't worth the mode change (risk noise from forecast error).
 SELL_PRODUCTION_MARGIN_CZK = 0.3
@@ -106,6 +131,10 @@ class BatteryOptimizer:
     1. Score each block for charge/discharge/hold value
     2. Forward simulate, picking best feasible action per block
     """
+
+    # The greedy engine cannot co-optimize deferrable loads; the controller
+    # pre-schedules them and overlays the draw onto the consumption forecast.
+    CO_OPTIMIZES_DEFERRABLE = False
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
@@ -189,7 +218,6 @@ from(bucket: "{solar_bucket}")
 
             # Bin by (hour, is_weekend), excluding heating hours
             import statistics
-            from datetime import date as date_type
             bins: Dict[Tuple[int, bool], List[float]] = {}
             total = 0
             excluded = 0
@@ -366,7 +394,7 @@ from(bucket: "{solar_bucket}")
         self,
         blocks: List[Tuple[datetime, float]],
         prices: List[float],
-        solar_hourly: Dict[int, float],
+        solar_hourly: Dict[Any, float],
         battery_capacity_kwh: float,
         min_soc: float,
         max_soc: float,
@@ -396,8 +424,7 @@ from(bucket: "{solar_bucket}")
         next_recharge_idx = [n] * n
         # Scan backward: propagate the nearest recharge index
         for j in range(n - 1, -1, -1):
-            h_j = blocks[j][0].hour
-            solar_j = solar_hourly.get(h_j, 0)
+            solar_j = _forecast_value(solar_hourly, blocks[j][0])
             if solar_j > 1.0 or prices[j] <= price_threshold:
                 next_recharge_idx[j] = j
             elif j + 1 < n:
@@ -433,7 +460,7 @@ from(bucket: "{solar_bucket}")
                 price_rank = sum(1 for p in prices if p < prices[j]) / n if n > 0 else 0.5
                 if price_rank < 0.35:
                     incoming_kwh += kwh_per_block * efficiency
-                solar_block = solar_hourly.get(ts_j.hour, 0) / 4.0
+                solar_block = _forecast_value(solar_hourly, ts_j) / 4.0
                 if solar_block > 0:
                     incoming_kwh += solar_block * efficiency
 
@@ -459,8 +486,8 @@ from(bucket: "{solar_bucket}")
     def optimize(
         self,
         blocks: List[Tuple[datetime, float]],  # (timestamp, price_czk_kwh)
-        solar_hourly: Dict[int, float],  # hour -> kWh solar production
-        consumption_hourly: Dict[int, float],  # hour -> kWh consumption
+        solar_hourly: Dict[Any, float],  # hour/date-hour -> kWh solar production
+        consumption_hourly: Dict[Any, float],  # hour/date-hour -> kWh consumption
         distribution_func,  # (hour) -> distribution tariff CZK/kWh
         battery_capacity_kwh: float = 10.0,
         current_soc: float = 50.0,
@@ -477,8 +504,8 @@ from(bucket: "{solar_bucket}")
 
         Args:
             blocks: Price blocks as (timestamp, price_czk_kwh) sorted chronologically
-            solar_hourly: Hour -> expected solar kWh
-            consumption_hourly: Hour -> expected consumption kWh
+            solar_hourly: Hour or date-hour -> expected solar kWh
+            consumption_hourly: Hour or date-hour -> expected consumption kWh
             distribution_func: Callable(hour) -> distribution tariff CZK/kWh
             battery_capacity_kwh: Total battery capacity
             current_soc: Current battery state of charge %
@@ -497,7 +524,6 @@ from(bucket: "{solar_bucket}")
             return set(), set(), set(), []
 
         # Battery energy parameters
-        usable_capacity = battery_capacity_kwh * (max_soc - min_soc) / 100
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
         discharge_kwh_per_block = discharge_rate_kw * (discharge_power_pct / 100) * 0.25
 
@@ -560,9 +586,10 @@ from(bucket: "{solar_bucket}")
         running_best_sc = 0.0
         running_sc_kwh = 0.0
         for i in range(n - 1, -1, -1):
-            h_i = blocks[i][0].hour
-            solar_i = solar_hourly.get(h_i, 0) / 4.0
-            cons_i = consumption_hourly.get(h_i, 0) / 4.0
+            ts_i = blocks[i][0]
+            h_i = ts_i.hour
+            solar_i = _forecast_value(solar_hourly, ts_i) / 4.0
+            cons_i = _forecast_value(consumption_hourly, ts_i) / 4.0
             net_cons = max(0, cons_i - solar_i)
             if net_cons > 0:
                 # Net SC value after battery wear: avoided buy minus amortisation.
@@ -593,9 +620,8 @@ from(bucket: "{solar_bucket}")
         battery_gap_kwh = battery_capacity_kwh * (max_soc - current_soc) / 100
         expected_solar_charge = 0.0
         for ts, _ in blocks:
-            h = ts.hour
-            solar_h = solar_hourly.get(h, 0) / 4.0  # kWh per 15-min block
-            consumption_h = consumption_hourly.get(h, 0) / 4.0
+            solar_h = _forecast_value(solar_hourly, ts) / 4.0  # kWh per 15-min block
+            consumption_h = _forecast_value(consumption_hourly, ts) / 4.0
             net = solar_h - consumption_h
             if net > 0:
                 expected_solar_charge += net * efficiency
@@ -666,8 +692,8 @@ from(bucket: "{solar_bucket}")
         self,
         blocks: List[Tuple[datetime, float]],
         charge_block_set: Set[datetime],
-        solar_hourly: Dict[int, float],
-        consumption_hourly: Dict[int, float],
+        solar_hourly: Dict[Any, float],
+        consumption_hourly: Dict[Any, float],
         distribution_func,
         battery_capacity_kwh: float,
         current_soc: float,
@@ -716,8 +742,8 @@ from(bucket: "{solar_bucket}")
         for i, (ts, p) in enumerate(blocks):
             h = ts.hour
             sell_now[i] = p - distribution_func(h) - sell_fee_czk
-            s = solar_hourly.get(h, 0.0) / 4.0
-            c = consumption_hourly.get(h, 0.0) / 4.0
+            s = _forecast_value(solar_hourly, ts) / 4.0
+            c = _forecast_value(consumption_hourly, ts) / 4.0
             solar_excess[i] = max(0.0, s - c)
 
         # Future solar surplus suffix sums (kWh available from block i+1 onward)
@@ -847,8 +873,8 @@ from(bucket: "{solar_bucket}")
         blocks: List[Tuple[datetime, float]],
         charge_block_set: Set[datetime],
         sell_production_set: Set[datetime],
-        solar_hourly: Dict[int, float],
-        consumption_hourly: Dict[int, float],
+        solar_hourly: Dict[Any, float],
+        consumption_hourly: Dict[Any, float],
         distribution_func,
         battery_capacity_kwh: float,
         current_soc: float,
@@ -881,8 +907,8 @@ from(bucket: "{solar_bucket}")
             dist = distribution_func(hour)
 
             # Solar and consumption for this 15-min block (quarter of hourly value)
-            solar = solar_hourly.get(hour, 0.0) / 4.0
-            consumption = consumption_hourly.get(hour, 0.0) / 4.0
+            solar = _forecast_value(solar_hourly, timestamp) / 4.0
+            consumption = _forecast_value(consumption_hourly, timestamp) / 4.0
 
             # Net solar: excess solar charges battery automatically
             net_solar = solar - consumption  # Positive = excess, negative = deficit

@@ -31,9 +31,9 @@ and house load — and we maximise net cash. Modelling every flow explicitly
 
   Balances:
     solar:  solar_to_load + solar_to_batt + solar_to_grid + curtail == solar[i]
-    load:   solar_to_load + batt_to_load + grid_to_load          == consumption[i]
-    SOC:    soc[i+1] == soc[i] + (grid_charge + solar_to_batt)*η
-                                - batt_to_load - batt_to_grid
+    load:   solar_to_load + batt_to_load + grid_to_load == consumption[i] + deferrable[i]
+    SOC:    soc[i+1] == soc[i] + (grid_charge + solar_to_batt)*η_chg
+                                - (batt_to_load + batt_to_grid)/η_dis
     power:  grid_charge + solar_to_batt <= charge_max
             batt_to_load + batt_to_grid <= discharge_max * (1 - is_charge)
     reserve: soc[i+1] >= effective_min_soc[i]
@@ -44,6 +44,7 @@ and house load — and we maximise net cash. Modelling every flow explicitly
     - (grid_to_load + grid_charge) * (spot+dist) grid import cost
     - (batt_to_load + batt_to_grid) * amort      battery wear (once, on the way out)
     - curtail * CURTAIL_PENALTY                   prefer banking free solar
+    - switch_penalty * mode_changed              damp churn vs the last plan
     + soc[n] * terminal_value                     keep useful energy at horizon end
 
   Why this is correct for the Czech market:
@@ -57,13 +58,23 @@ and house load — and we maximise net cash. Modelling every flow explicitly
     - The grid_to_load path keeps the LP feasible at low SOC and makes the
       cost of emptying the battery (then re-importing) explicit, so the solver
       won't dump the battery to the grid when self-consumption is worth more.
+
+DEFERRABLE LOADS (EMHASS-style co-optimization).
+
+Controllable loads (EV, hot-water boost, …) are added as decision variables
+rather than pre-scheduled on grid price alone: a per-block binary says
+"run this load now", its draw enters the LOAD balance, and the solver places
+the required blocks where total cost is lowest — automatically charging into
+PV surplus and around battery dispatch. Interruptible loads use one binary
+per in-window block; non-interruptible loads use a single contiguous-run
+start variable. See `_add_deferrable_loads`.
 """
 
 from __future__ import annotations
 
 import logging
-from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 try:
     import pulp  # type: ignore
@@ -75,6 +86,7 @@ from .optimizer import (
     BlockDecision,
     SELL_PRODUCTION_MARGIN_CZK,
     SELL_PRODUCTION_MIN_EXCESS_KWH,
+    _forecast_value,
 )
 
 
@@ -86,6 +98,23 @@ CURTAIL_PENALTY = 0.01
 # Flows below this many kWh are treated as solver numerical noise, not a real
 # action, when classifying a block's headline action for the dashboard.
 ACTION_EPS = 5e-3
+
+# A grid-EXPORT (discharge-to-grid) block must move at least this fraction of
+# the grid-first power rate. The controller actuates discharge as on/off at a
+# fixed powerRate, so without a floor the solver scatters many trivial sub-rate
+# exports that the inverter would each run at full power (the shadow-run
+# defect). A floor keeps every export block "meaningful" (≥half rate) so
+# set-based actuation is faithful, while still allowing a partial final block
+# so the solver never has to BUY grid power just to top up for a full export.
+MIN_GRID_DISCHARGE_FRACTION = 0.5
+
+# Penalty (CZK per kWh) for missing the per-block reserve floor. The reserve is
+# a SOFT constraint: when the start SOC is below the computed reserve and the
+# charge rate physically can't catch up in time, a hard floor would make the
+# whole MILP infeasible (→ silent greedy fallback). Pricing the shortfall well
+# above any real arbitrage spread (~0-15 CZK/kWh) means the solver still honours
+# the reserve whenever it's reachable, but degrades gracefully when it isn't.
+RESERVE_SHORTFALL_PENALTY = 50.0
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
@@ -101,6 +130,11 @@ class MILPBatteryOptimizer:
     swap engines via a config flag without other code changes.
     """
 
+    # The controller checks this to decide whether to hand deferrable loads
+    # to the optimizer (co-optimize) or pre-schedule them and overlay the
+    # result onto the consumption forecast (greedy can't co-optimize).
+    CO_OPTIMIZES_DEFERRABLE = True
+
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
         # Re-use the greedy optimizer's reserve-SOC + bin-state helpers so
@@ -109,6 +143,16 @@ class MILPBatteryOptimizer:
         self._helper = BatteryOptimizer(logger=self.logger)
         self._last_decisions: List[BlockDecision] = []
         self._last_reserve_info: Dict = {}
+        # Deferrable-load placements from the most recent solve, exposed to
+        # the controller for dashboard + MQTT actuation. List[DeferrableLoadSchedule].
+        self._last_deferrable_schedules: List[Any] = []
+        # Headline action per block timestamp from the previous solve, used by
+        # the switch-penalty term to damp churn across re-evaluations.
+        self._prev_actions: Dict[datetime, str] = {}
+        # Per-load set of block timestamps chosen last solve, so the switch
+        # penalty can also damp deferrable-load re-planning (esp. relocating a
+        # non-interruptible run) across ticks. {load_name: {datetime, ...}}.
+        self._prev_deferrable_runs: Dict[str, Set[datetime]] = {}
 
     @property
     def _base_load_profile(self):
@@ -131,13 +175,20 @@ class MILPBatteryOptimizer:
                          distribution_func, battery_capacity_kwh, current_soc,
                          min_soc, max_soc, charge_rate_kw, discharge_rate_kw,
                          discharge_power_pct, efficiency, sell_fee_czk,
-                         battery_amortisation_czk):
+                         battery_amortisation_czk, deferrable_loads=None):
         """Run the greedy engine and adopt its decisions as our own.
 
         Used when the MILP solve is infeasible, times out, or raises, so the
         controller always receives a usable schedule (the documented
-        greedy-fallback contract).
+        greedy-fallback contract). The greedy engine cannot co-optimize
+        deferrable loads, so we pre-schedule them (cheapest in-window blocks)
+        and overlay their draw onto the consumption forecast before solving,
+        preserving deferrable behaviour even on the fallback path.
         """
+        if deferrable_loads:
+            consumption_hourly = self._overlay_deferrable_for_greedy(
+                deferrable_loads, blocks, distribution_func, consumption_hourly
+            )
         result = self._helper.optimize(
             blocks=blocks,
             solar_hourly=solar_hourly,
@@ -157,11 +208,45 @@ class MILPBatteryOptimizer:
         self._last_decisions = result[3]
         return result
 
+    def _overlay_deferrable_for_greedy(
+        self, deferrable_loads, blocks, distribution_func, consumption_hourly
+    ) -> Dict[Any, float]:
+        """Pre-schedule deferrable loads greedily and overlay onto consumption.
+
+        Returns a COPY of consumption_hourly with the scheduled per-block load
+        added, and stores the resulting schedules in
+        ``self._last_deferrable_schedules`` (same contract as the MILP path).
+        """
+        from .deferrable_loads import DeferrableLoadScheduler
+        scheduler = DeferrableLoadScheduler(self.logger)
+        schedules = scheduler.schedule_all(
+            list(deferrable_loads), blocks, distribution_func
+        )
+        self._last_deferrable_schedules = schedules
+        loads_by_name = {l.name: l for l in deferrable_loads}
+        overlay = scheduler.consumption_overlay(schedules, loads_by_name)
+        merged = dict(consumption_hourly)
+        for key, extra in overlay.items():
+            if isinstance(key, datetime):
+                # Resolve the existing base with the same key precedence as
+                # _forecast_value, using `is not None` so a real 0.0-kWh block
+                # isn't treated as missing (which `or` would, then wrongly pull
+                # in another day's hourly value).
+                base = merged.get(key)
+                if base is None:
+                    base = merged.get((key.date(), key.hour))
+                if base is None:
+                    base = merged.get(key.hour, 0.0)
+                merged[key] = base + extra
+            else:
+                merged[key] = merged.get(key, 0.0) + extra
+        return merged
+
     def optimize(
         self,
         blocks: List[Tuple[datetime, float]],
-        solar_hourly: Dict[int, float],
-        consumption_hourly: Dict[int, float],
+        solar_hourly: Dict[Any, float],
+        consumption_hourly: Dict[Any, float],
         distribution_func,
         battery_capacity_kwh: float = 10.0,
         current_soc: float = 50.0,
@@ -173,8 +258,14 @@ class MILPBatteryOptimizer:
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,
         battery_amortisation_czk: float = 2.0,
+        deferrable_loads: Optional[Sequence[Any]] = None,
+        switch_penalty_czk: float = 0.0,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Solve the full-horizon schedule via MILP (energy-flow model)."""
+        # Reset per-solve outputs so a fallback/early-return never leaks a
+        # stale deferrable plan from a previous solve.
+        self._last_deferrable_schedules = []
+
         if not PULP_AVAILABLE:
             self.logger.warning(
                 "PuLP not installed — MILP unavailable, falling back to greedy"
@@ -184,6 +275,7 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
+                deferrable_loads,
             )
 
         if not blocks:
@@ -198,6 +290,13 @@ class MILPBatteryOptimizer:
         max_battery_kwh = battery_capacity_kwh * max_soc / 100.0
         min_battery_kwh = battery_capacity_kwh * min_soc / 100.0
         start_battery_kwh = battery_capacity_kwh * current_soc / 100.0
+
+        # Split the round-trip efficiency symmetrically across the two legs so
+        # both charging and discharging incur loss (eta_chg * eta_dis ==
+        # efficiency). The greedy engine applies all loss on the charge leg;
+        # sqrt-splitting is closer to real inverter behaviour and makes the
+        # cost of a charge→discharge cycle independent of which leg you price.
+        eta = max(1e-3, efficiency) ** 0.5
 
         # Per-block price coefficients.
         prices = [p for _, p in blocks]
@@ -214,8 +313,8 @@ class MILPBatteryOptimizer:
         consumption_block: List[float] = []
         solar_excess: List[float] = []
         for ts, _ in blocks:
-            s = solar_hourly.get(ts.hour, 0.0) / 4.0
-            c = consumption_hourly.get(ts.hour, 0.0) / 4.0
+            s = _forecast_value(solar_hourly, ts) / 4.0
+            c = _forecast_value(consumption_hourly, ts) / 4.0
             solar_block.append(s)
             consumption_block.append(c)
             solar_excess.append(max(0.0, s - c))
@@ -249,6 +348,18 @@ class MILPBatteryOptimizer:
             pulp.LpVariable(f"soc_{i}", min_battery_kwh, max_battery_kwh)
             for i in range(n + 1)
         ]
+        # Soft-reserve shortfall (kWh the SOC falls below the reserve floor).
+        # The physical floor (min_battery_kwh) stays hard via the soc bounds;
+        # only the reserve margin above it is relaxable, at a steep penalty.
+        reserve_short = [pulp.LpVariable(f"rs_{i}", lowBound=0) for i in range(n)]
+
+        # Deferrable-load run variables + per-block draw expressions (kWh).
+        # `deferrable_penalty` damps re-planning of load placement across ticks.
+        deferrable_draw, deferrable_meta, deferrable_penalty = (
+            self._add_deferrable_loads(
+                prob, blocks, deferrable_loads, switch_penalty_czk
+            )
+        )
 
         prob += soc[0] == start_battery_kwh
 
@@ -258,8 +369,12 @@ class MILPBatteryOptimizer:
 
             # Solar balance: every kWh of solar is used, banked, exported, or curtailed.
             prob += solar_to_load[i] + solar_to_batt[i] + solar_to_grid[i] + curtail[i] == s
-            # Load balance: house draw served by solar, battery, and/or grid.
-            prob += solar_to_load[i] + batt_to_load[i] + grid_to_load[i] == c
+            # Load balance: house draw + any deferrable load running this block,
+            # served by solar, battery, and/or grid.
+            prob += (
+                solar_to_load[i] + batt_to_load[i] + grid_to_load[i]
+                == c + deferrable_draw[i]
+            )
 
             # Battery power limits. Inflow capped by charge rate; outflow capped
             # by full inverter power AND forbidden during a charge block (the
@@ -267,18 +382,27 @@ class MILPBatteryOptimizer:
             prob += grid_charge[i] + solar_to_batt[i] <= charge_max
             prob += batt_to_load[i] + batt_to_grid[i] <= batt_out_max * (1 - is_charge[i])
 
-            # SOC continuity: charge legs gain energy at efficiency; discharge
-            # legs deplete the battery 1:1 (wear is priced in the objective).
+            # SOC continuity: charge legs gain energy at η_chg; discharge legs
+            # deplete the battery at 1/η_dis (wear is priced in the objective).
             prob += soc[i + 1] == (
                 soc[i]
-                + (grid_charge[i] + solar_to_batt[i]) * efficiency
-                - batt_to_load[i] - batt_to_grid[i]
+                + (grid_charge[i] + solar_to_batt[i]) * eta
+                - (batt_to_load[i] + batt_to_grid[i]) / eta
             )
-            prob += soc[i + 1] >= eff_min_kwh[i]
+            # Soft reserve floor (see RESERVE_SHORTFALL_PENALTY).
+            prob += soc[i + 1] >= eff_min_kwh[i] - reserve_short[i]
 
             # Activation linking → mode indicators (grid-facing actions).
             prob += grid_charge[i] <= charge_max * is_charge[i]
+            # Grid EXPORT is semi-continuous: when a block discharges to grid it
+            # moves between half and full the grid-first power rate — never a
+            # trivial sub-rate trickle (see MIN_GRID_DISCHARGE_FRACTION). The
+            # range (vs a hard ==) lets the last block of a run export a partial
+            # amount, so the solver never buys grid power just to top up.
             prob += batt_to_grid[i] <= batt_to_grid_max * is_disch[i]
+            prob += batt_to_grid[i] >= (
+                MIN_GRID_DISCHARGE_FRACTION * batt_to_grid_max * is_disch[i]
+            )
             prob += solar_to_grid[i] <= max(s, 0.0) * is_sp[i]
             # One grid-facing mode per block.
             prob += is_charge[i] + is_disch[i] + is_sp[i] <= 1
@@ -308,6 +432,9 @@ class MILPBatteryOptimizer:
         )
         min_charge_cost = min(import_cost) if import_cost else 0.0
         if min_charge_cost > 0:
+            # Cap uses the ROUND-TRIP efficiency on purpose (not the per-leg
+            # `eta`): the break-even for "charge cheap now, use later" is the
+            # full charge→store→discharge cycle. Don't "fix" this to `eta`.
             terminal_value_per_kwh = min(
                 terminal_value_per_kwh, min_charge_cost / efficiency
             )
@@ -318,14 +445,28 @@ class MILPBatteryOptimizer:
         # battery vs importing and keeping SOC, and may leave the battery idle.
         terminal_value_per_kwh *= 0.99
 
-        prob += pulp.lpSum(
+        objective = pulp.lpSum(
             solar_to_grid[i] * export_now[i]
             + batt_to_grid[i] * export_now[i]
             - (grid_to_load[i] + grid_charge[i]) * import_cost[i]
             - (batt_to_load[i] + batt_to_grid[i]) * battery_amortisation_czk
             - curtail[i] * CURTAIL_PENALTY
+            - reserve_short[i] * RESERVE_SHORTFALL_PENALTY
             for i in range(n)
         ) + soc[n] * terminal_value_per_kwh
+
+        # Schedule-churn damping: a tiny cost for deviating from the previous
+        # plan's headline action, so noisy price/forecast updates don't reshuffle
+        # the schedule. Far below real spreads, so it only breaks ties.
+        if switch_penalty_czk > 0 and self._prev_actions:
+            objective -= self._switch_penalty_term(
+                blocks, is_charge, is_disch, is_sp, switch_penalty_czk
+            )
+        # Same idea for deferrable-load placement (built in _add_deferrable_loads).
+        if deferrable_penalty is not None:
+            objective -= deferrable_penalty
+
+        prob += objective
 
         # Solve (time-limited; off the event loop via the controller).
         solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=10)
@@ -341,6 +482,7 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
+                deferrable_loads,
             )
         if status_str != "Optimal":
             # Infeasible / Unbounded / Undefined / timed-out without an optimum:
@@ -354,6 +496,7 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
+                deferrable_loads,
             )
 
         # Materialise results.
@@ -367,6 +510,7 @@ class MILPBatteryOptimizer:
             return float(x) if x is not None else 0.0
 
         soc_v = [val(s) for s in soc]
+        new_actions: Dict[datetime, str] = {}
         for i, (ts, price) in enumerate(blocks):
             gc = val(grid_charge[i])
             bg = val(batt_to_grid[i])
@@ -387,6 +531,7 @@ class MILPBatteryOptimizer:
                 action = "sell_production"
                 sp_times.add(ts)
                 net_value = sg * export_now[i]
+            new_actions[ts] = action
 
             decisions.append(BlockDecision(
                 timestamp=ts,
@@ -401,9 +546,211 @@ class MILPBatteryOptimizer:
             ))
 
         self._last_decisions = decisions
+        self._prev_actions = new_actions
+        self._last_deferrable_schedules = self._extract_deferrable_schedules(
+            blocks, deferrable_meta, import_cost, val
+        )
         if effective_min_socs:
             self._helper._last_reserve_info["effective_min_soc"] = round(
                 effective_min_socs[0], 1
             )
 
         return charge_times, discharge_times, sp_times, decisions
+
+    # ── Deferrable-load co-optimization helpers ──────────────────────────
+
+    def _add_deferrable_loads(
+        self,
+        prob: Any,
+        blocks: List[Tuple[datetime, float]],
+        deferrable_loads: Optional[Sequence[Any]],
+        switch_penalty_czk: float = 0.0,
+    ) -> Tuple[List[Any], List[Dict[str, Any]], Any]:
+        """Add deferrable-load decision variables and constraints to `prob`.
+
+        Returns:
+            (draw_per_block, meta, penalty) where draw_per_block[i] is a PuLP
+            expression (or 0.0) for the deferrable kWh drawn in block i, meta is
+            a list of per-load dicts used afterwards to build the schedules, and
+            penalty is a (small) PuLP expression that damps re-planning the
+            chosen blocks vs the previous solve (or None when not applicable).
+        """
+        n = len(blocks)
+        draw_terms: List[List[Any]] = [[] for _ in range(n)]
+        meta: List[Dict[str, Any]] = []
+        penalty_terms: List[Any] = []
+        if not deferrable_loads:
+            return [0.0] * n, meta, None
+
+        for li, load in enumerate(deferrable_loads):
+            block_energy = load.power_kw * 0.25  # kWh delivered per running block
+            requested = load.required_blocks()
+            if block_energy <= 0 or requested <= 0:
+                continue
+
+            # In-window block indices (uses the load's own midnight-aware test).
+            win = [i for i in range(n) if load.in_window(blocks[i][0].time())]
+            if not win:
+                meta.append({
+                    "load": load, "requested": requested, "scheduled": 0,
+                    "block_energy": block_energy, "run": {}, "win": [],
+                })
+                continue
+            nb_eff = min(requested, len(win))
+
+            run_by_block: Dict[int, Any] = {}
+            placed = False
+            if not load.interruptible:
+                placed = self._add_contiguous_run(
+                    prob, blocks, li, win, nb_eff, run_by_block
+                )
+            if not placed:
+                # Interruptible (or non-interruptible with no contiguous slot):
+                # one binary per in-window block, deliver exactly nb_eff blocks.
+                run_vars = {
+                    i: pulp.LpVariable(f"dl{li}_{i}", cat="Binary") for i in win
+                }
+                prob += pulp.lpSum(run_vars.values()) == nb_eff
+                run_by_block = run_vars
+
+            for i, var in run_by_block.items():
+                draw_terms[i].append(var * block_energy)
+
+            # Anti-churn: bias toward the blocks this load ran last solve, so a
+            # (esp. non-interruptible) run isn't relocated by forecast jitter.
+            # Tiny magnitude → only breaks ties, never overrides a real saving.
+            prev = self._prev_deferrable_runs.get(load.name)
+            if switch_penalty_czk > 0 and prev:
+                for i, var in run_by_block.items():
+                    if blocks[i][0] in prev:
+                        penalty_terms.append(switch_penalty_czk * (1 - var))
+                    else:
+                        penalty_terms.append(switch_penalty_czk * var)
+
+            meta.append({
+                "load": load, "requested": requested, "scheduled": nb_eff,
+                "block_energy": block_energy, "run": run_by_block, "win": win,
+            })
+
+        draw = [pulp.lpSum(terms) if terms else 0.0 for terms in draw_terms]
+        penalty = pulp.lpSum(penalty_terms) if penalty_terms else None
+        return draw, meta, penalty
+
+    @staticmethod
+    def _add_contiguous_run(
+        prob: Any,
+        blocks: List[Tuple[datetime, float]],
+        li: int,
+        win: List[int],
+        nb_eff: int,
+        run_by_block: Dict[int, Any],
+    ) -> bool:
+        """Model a non-interruptible load as a single contiguous run.
+
+        Adds one binary start variable per feasible start position (a run of
+        nb_eff consecutive, in-window, 15-min-adjacent blocks), constrains
+        exactly one to be chosen, and fills run_by_block[i] with the affine
+        expression "is block i covered by the chosen run". Returns False if no
+        contiguous slot exists (caller then falls back to interruptible).
+        """
+        win_set = set(win)
+        starts: List[int] = []
+        for k in win:
+            run_idx = [k + m for m in range(nb_eff)]
+            if run_idx[-1] >= len(blocks):
+                continue
+            if any(j not in win_set for j in run_idx):
+                continue
+            contiguous = all(
+                (blocks[j + 1][0] - blocks[j][0]) == timedelta(minutes=15)
+                for j in run_idx[:-1]
+            )
+            if contiguous:
+                starts.append(k)
+        if not starts:
+            return False
+
+        start_vars = {
+            k: pulp.LpVariable(f"dls{li}_{k}", cat="Binary") for k in starts
+        }
+        prob += pulp.lpSum(start_vars.values()) == 1
+        for i in win:
+            covering = [
+                start_vars[k] for k in starts if k <= i < k + nb_eff
+            ]
+            run_by_block[i] = pulp.lpSum(covering) if covering else 0.0
+        return True
+
+    def _extract_deferrable_schedules(
+        self,
+        blocks: List[Tuple[datetime, float]],
+        meta: List[Dict[str, Any]],
+        import_cost: List[float],
+        val,
+    ) -> List[Any]:
+        """Build DeferrableLoadSchedule objects from the solved run variables."""
+        if not meta:
+            self._prev_deferrable_runs = {}
+            return []
+        from .deferrable_loads import DeferrableLoadSchedule
+
+        prev_runs: Dict[str, Set[datetime]] = {}
+        schedules: List[Any] = []
+        for m in meta:
+            load = m["load"]
+            block_energy = m["block_energy"]
+            win = m["win"]
+            run = m["run"]
+            chosen_idx = sorted(i for i in win if val(run[i]) > 0.5) if run else []
+
+            blocks_hhmm: List[Tuple[str, str]] = []
+            block_dts: List[datetime] = []
+            expected = 0.0
+            for i in chosen_idx:
+                ts = blocks[i][0]
+                end = ts + timedelta(minutes=15)
+                blocks_hhmm.append((ts.strftime("%H:%M"), end.strftime("%H:%M")))
+                block_dts.append(ts)
+                expected += import_cost[i] * block_energy
+
+            # Naive baseline: the earliest nb_eff in-window blocks (run ASAP).
+            naive_idx = win[: len(chosen_idx)]
+            naive = sum(import_cost[i] * block_energy for i in naive_idx)
+
+            prev_runs[load.name] = set(block_dts)
+            shortfall = max(0, m["requested"] - len(chosen_idx)) * block_energy
+            schedules.append(DeferrableLoadSchedule(
+                load_name=load.name,
+                blocks=blocks_hhmm,
+                block_datetimes=block_dts,
+                expected_cost_czk=round(expected, 2),
+                naive_cost_czk=round(naive, 2),
+                requested_blocks=m["requested"],
+                scheduled_blocks=len(chosen_idx),
+                energy_shortfall_kwh=round(shortfall, 3),
+            ))
+        self._prev_deferrable_runs = prev_runs
+        return schedules
+
+    def _switch_penalty_term(
+        self, blocks, is_charge, is_disch, is_sp, penalty: float
+    ) -> Any:
+        """Linear penalty for deviating from the previous plan's headline action.
+
+        For a block whose previous action was 'charge', the penalty is
+        penalty*(1 - is_charge); becoming idle/other costs `penalty`. Idle
+        blocks are penalised for becoming active. Only ties are affected
+        because `penalty` is far below real price spreads.
+        """
+        terms = []
+        for i, (ts, _) in enumerate(blocks):
+            prev = self._prev_actions.get(ts)
+            if prev == "charge":
+                terms.append(penalty * (1 - is_charge[i]))
+            elif prev == "discharge":
+                terms.append(penalty * (1 - is_disch[i]))
+            elif prev == "sell_production":
+                terms.append(penalty * (1 - is_sp[i]))
+            elif prev == "hold":
+                terms.append(penalty * (is_charge[i] + is_disch[i] + is_sp[i]))
+        return pulp.lpSum(terms)

@@ -22,14 +22,20 @@ from typing import Any, Dict, List, Optional
 
 try:
     import pandas as pd  # type: ignore
-    from sklearn.ensemble import RandomForestRegressor  # type: ignore
+    from sklearn.ensemble import (  # type: ignore
+        GradientBoostingRegressor,
+        RandomForestRegressor,
+    )
     from skforecast.recursive import ForecasterRecursive  # type: ignore
     SKFORECAST_AVAILABLE = True
 except Exception:
     try:
         # Older skforecast API (<0.13) used a different import path.
         from skforecast.ForecasterAutoreg import ForecasterAutoreg as ForecasterRecursive  # type: ignore
-        from sklearn.ensemble import RandomForestRegressor  # type: ignore
+        from sklearn.ensemble import (  # type: ignore
+            GradientBoostingRegressor,
+            RandomForestRegressor,
+        )
         import pandas as pd  # type: ignore
         SKFORECAST_AVAILABLE = True
     except Exception:
@@ -107,6 +113,22 @@ class MLConsumptionForecast:
                 "skforecast not installed — ML consumption forecaster disabled"
             )
             return False
+
+        # Quantile to forecast: 0.5 = median (RandomForest, the default). A
+        # higher value forecasts an upper bound on demand (quantile gradient
+        # boosting) so the optimizer keeps a larger reserve. Read defensively
+        # so a missing/old settings object just yields the median behaviour.
+        try:
+            quantile = float(
+                getattr(
+                    getattr(settings, "growatt", None),
+                    "ml_consumption_quantile",
+                    0.5,
+                )
+            )
+        except (TypeError, ValueError):
+            quantile = 0.5
+        quantile = min(0.95, max(0.5, quantile))
         try:
             import pandas as pd  # type: ignore
         except Exception:
@@ -221,9 +243,17 @@ from(bucket: "{bucket_solar}")
         exog = self._build_exog(y_full.index, temp_by_hour)
 
         def _fit_blocking():
-            regressor = RandomForestRegressor(
-                n_estimators=60, max_depth=10, n_jobs=-1, random_state=0
-            )
+            if quantile > 0.5:
+                # Native quantile regression for an upper-bound load forecast.
+                regressor = GradientBoostingRegressor(
+                    loss="quantile", alpha=quantile,
+                    n_estimators=100, max_depth=3,
+                    learning_rate=0.1, random_state=0,
+                )
+            else:
+                regressor = RandomForestRegressor(
+                    n_estimators=60, max_depth=10, n_jobs=-1, random_state=0
+                )
             # skforecast renamed the first constructor arg from `regressor`
             # (<=0.13) to `estimator` (>=0.14). Support both so the module
             # works across the version range pinned in requirements.
@@ -249,9 +279,13 @@ from(bucket: "{bucket_solar}")
         self._last_train_index_end = y_full.index[-1].to_pydatetime()
         self._exog_cols = list(exog.columns)
         self._schema_version = ML_MODEL_SCHEMA_VERSION
+        model_kind = (
+            f"quantile GBR (α={quantile:.2f})" if quantile > 0.5
+            else "median RandomForest"
+        )
         self.logger.info(
             f"ML consumption model trained: {len(y_full)} hours, "
-            f"lags=24, {len(self._exog_cols)} exog features"
+            f"lags=24, {len(self._exog_cols)} exog features, {model_kind}"
         )
         return True
 
@@ -272,11 +306,17 @@ from(bucket: "{bucket_solar}")
 
         Returns hour-of-target_date → kWh. Falls back to {} on failure.
         """
-        if not self.is_trained or self._last_train_index_end is None:
+        # Snapshot the model state up front. predict_hourly runs in a worker
+        # thread (asyncio.to_thread) while build_model may replace these
+        # attributes on the event loop; reading them once into locals avoids
+        # pairing a new forecaster with a stale training-end (or vice versa).
+        forecaster = self._forecaster
+        train_end = self._last_train_index_end
+        if forecaster is None or train_end is None:
             return {}
         try:
             import pandas as pd  # type: ignore
-            start = self._last_train_index_end + timedelta(hours=1)
+            start = train_end + timedelta(hours=1)
             # Forecast through 23:00 of target_date (last_train_index_end is
             # naive local, matching the optimizer's local-hour grid).
             target_end = datetime(
@@ -307,7 +347,7 @@ from(bucket: "{bucket_solar}")
                 for t in idx
             }
             exog = self._build_exog(idx, temps_lookup)
-            preds = self._forecaster.predict(steps=need_steps, exog=exog)
+            preds = forecaster.predict(steps=need_steps, exog=exog)
         except Exception as e:
             self.logger.debug(f"ML predict failed: {e}")
             return {}
@@ -319,6 +359,6 @@ from(bucket: "{bucket_solar}")
         if not result:
             self.logger.warning(
                 f"ML predict produced no hours for {target_date} "
-                f"(train-end {self._last_train_index_end}) — falling back"
+                f"(train-end {train_end}) — falling back"
             )
         return result

@@ -174,6 +174,16 @@ class GrowattConfig(BaseSettings):
         default=25, ge=10, le=100,
         description="Discharge power rate % (25% = gentle)"
     )
+    battery_charge_rate_kw: float = Field(
+        default=2.5, gt=0, le=50,
+        description="Max battery charge power (kW). Used by the optimizer to "
+                    "size per-block charge energy (kW * 0.25 kWh per 15-min block)."
+    )
+    battery_discharge_rate_kw: float = Field(
+        default=2.5, gt=0, le=50,
+        description="Max battery discharge power (kW) at full power. The "
+                    "optimizer scales grid export by discharge_power_rate."
+    )
 
     # Simple price thresholds (all in CZK/kWh for consistency)
     charge_price_max: float = Field(
@@ -302,6 +312,17 @@ class GrowattConfig(BaseSettings):
         default=6, ge=1, le=24,
         description="Hours between forecast.solar API updates"
     )
+    solar_model_quantile: float = Field(
+        default=0.5, ge=0.5, le=0.9,
+        description=(
+            "Per-bin quantile for the learned solar production model. 0.5 = "
+            "median (default, unchanged). Curtailment thins out a bin's "
+            "highest-production (sunniest) samples, biasing the median low, so "
+            "a higher value (e.g. 0.7) recovers true PV potential. Used only "
+            "for the final prediction model; curtailment detection stays at "
+            "the median."
+        ),
+    )
 
     # Consumption forecast
     consumption_forecast_enabled: bool = Field(
@@ -317,6 +338,15 @@ class GrowattConfig(BaseSettings):
             "to 'binned' if ML training fails or skforecast isn't installed."
         ),
     )
+    ml_consumption_quantile: float = Field(
+        default=0.5, ge=0.5, le=0.95,
+        description=(
+            "Quantile the ML consumption forecaster emits. 0.5 = median "
+            "(expected load). A higher value (e.g. 0.75) biases the forecast "
+            "upward so the optimizer keeps a larger reserve against "
+            "underestimating demand. Only used by the 'ml' engine."
+        ),
+    )
 
     # Solcast PV forecast (optional, replaces forecast.solar when configured).
     # Free tier: 10 API requests/day per rooftop site.
@@ -326,7 +356,19 @@ class GrowattConfig(BaseSettings):
     )
     solcast_rooftop_id: str = Field(
         default="",
-        description="Solcast rooftop site UUID (configured per-array on solcast.com)."
+        description="Solcast rooftop site UUID(s). For a home with multiple roof "
+                    "orientations, list one site per array, comma-separated "
+                    "(e.g. 'sw-uuid,se-uuid'); they are summed into total "
+                    "production. The free 10/day call budget is shared across sites."
+    )
+    solcast_quantile: str = Field(
+        default="p50",
+        pattern="^(p10|p50|p90)$",
+        description=(
+            "Which Solcast PV estimate to use: 'p50' (median, default), "
+            "'p10' (conservative/cloudy-biased — safer reserve sizing) or "
+            "'p90' (optimistic). Solcast returns all three per interval."
+        ),
     )
 
     # Deferrable loads — controllable appliances that can be time-shifted to
@@ -366,6 +408,16 @@ class GrowattConfig(BaseSettings):
             "default, fast) or 'milp' (PuLP-based global optimum, slower but "
             "more stable across re-evaluations). Falls back to 'greedy' if "
             "PuLP isn't installed or the MILP solve is infeasible/times out."
+        ),
+    )
+    milp_switch_penalty_czk: float = Field(
+        default=0.05, ge=0,
+        description=(
+            "MILP only: small cost (CZK) charged when a block's grid-facing "
+            "mode differs from the previously-solved plan, to damp schedule "
+            "churn on noisy price/forecast updates. 0 disables. Kept well "
+            "below real price spreads so it never overrides a genuine "
+            "arbitrage opportunity."
         ),
     )
 
