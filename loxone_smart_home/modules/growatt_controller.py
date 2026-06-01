@@ -2278,6 +2278,9 @@ from(bucket: "{bucket}")
                     target_date=today,
                     local_tz=self._local_tz,
                 )
+                # Surface the latest intraday calibration ratio for the dashboard
+                # (how far today's actual solar diverged from the forecast).
+                self._last_solar_calibration_ratio = calibration_ratio
 
             # Live persistence anchor: scale today's REMAINING hours up to
             # match current measured solar production. Inspired by EMHASS:

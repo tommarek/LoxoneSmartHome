@@ -652,6 +652,205 @@ from(bucket: "{bucket}")
         return web.json_response({"blocks": {}, "error": str(e)})
 
 
+async def api_consumption_actuals(request: web.Request) -> web.Response:
+    """Today's actual hourly household consumption (kWh) for the forecast-vs-
+    actual overlay on the chart. Mirrors api_solar_actuals but for load."""
+    ctrl = _get_controller(request)
+    if not ctrl or not getattr(ctrl, 'influxdb_client', None):
+        return web.json_response({"hourly": {}})
+
+    cache = getattr(ctrl, '_consumption_actuals_cache', None)
+    if cache:
+        ts, payload = cache
+        if (datetime.now() - ts).total_seconds() < 300:
+            return web.json_response(payload)
+
+    try:
+        bucket = ctrl.settings.influxdb.bucket_solar
+        q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+'''
+        r = await ctrl.influxdb_client.query(q)
+        hourly: Dict[str, float] = {}
+        try:
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo("Europe/Prague")
+        except Exception:
+            local_tz = None
+        local_now = datetime.now(local_tz) if local_tz else datetime.now()
+        today = local_now.date()
+        for table in r:
+            for record in table.records:
+                t = record.get_time()
+                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                    t = t.astimezone(local_tz)
+                if t.date() != today:
+                    continue
+                watts = record.get_value()
+                if isinstance(watts, (int, float)):
+                    hourly[t.strftime("%H:00")] = round(float(watts) / 1000.0, 3)  # kWh
+        payload = {"hourly": hourly}
+        ctrl._consumption_actuals_cache = (datetime.now(), payload)
+        return web.json_response(payload)
+    except Exception as e:
+        return web.json_response({"hourly": {}, "error": str(e)})
+
+
+def _avg_block_price(ctrl, blocks) -> Optional[float]:
+    """Average spot price (CZK/kWh) over a set of (start,end) blocks today."""
+    if not blocks or not ctrl._current_prices:
+        return None
+    vals = [ctrl._current_prices[b] for b in blocks if b in ctrl._current_prices]
+    return sum(vals) / len(vals) if vals else None
+
+
+async def api_insights(request: web.Request) -> web.Response:
+    """Aggregated 'more info' panel: economics, forecast accuracy, active
+    engines, command health, deferrable loads, and data freshness. Everything
+    here is derived from data the controller already holds — no new state."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"error": "Controller not ready"}, status=503)
+    now = ctrl._get_local_now()
+    out: Dict[str, Any] = {"timestamp": now.isoformat()}
+
+    # ---- Active engines (real runtime state, not just config) ----
+    opt = getattr(ctrl, "_optimizer", None)
+    engine = None
+    if opt is not None:
+        engine = "milp" if type(opt).__name__.startswith("MILP") else "greedy"
+    opt_cfg = getattr(ctrl.config, "optimizer_engine", "greedy")
+    ml = getattr(ctrl, "_ml_consumption_forecast", None)
+    ml_active = bool(ml and getattr(ml, "is_trained", False))
+    cons_cfg = getattr(ctrl.config, "consumption_forecast_engine", "binned")
+    out["engines"] = {
+        "optimizer": engine or "rule-based",
+        "optimizer_configured": opt_cfg,
+        "optimizer_fellback": bool(engine and engine != opt_cfg),
+        "consumption": "ml" if ml_active else "binned",
+        "consumption_configured": cons_cfg,
+        "consumption_fellback": bool(cons_cfg == "ml" and not ml_active),
+    }
+
+    # ---- Solcast free-tier budget ----
+    sc = getattr(ctrl, "_solcast_forecast", None)
+    if sc is not None and getattr(sc, "enabled", False):
+        out["solcast"] = {
+            "enabled": True,
+            "requests_today": getattr(sc, "_req_count", 0),
+            "daily_budget": getattr(sc, "_max_requests_per_day", 9),
+        }
+    else:
+        out["solcast"] = {"enabled": False}
+
+    # ---- Forecast accuracy (solar: actual-so-far vs forecast-for-same-hours) ----
+    sf = getattr(ctrl, "_solar_forecast", None)
+    accuracy: Dict[str, Any] = {
+        "solar_confidence": round(getattr(sf, "confidence", 0.0), 2) if sf else None,
+        "calibration_ratio": getattr(ctrl, "_last_solar_calibration_ratio", None),
+    }
+    try:
+        if sf and getattr(ctrl, "influxdb_client", None):
+            # Actual produced so far today (sum of elapsed hourly InputPower).
+            actuals = await api_solar_actuals(request)
+            import json as _json
+            act = _json.loads(actuals.body.decode()).get("hourly", {})
+            elapsed = {h: v for h, v in act.items() if int(h[:2]) <= now.hour}
+            actual_kwh = round(sum(elapsed.values()), 1)
+            today_str = now.date().strftime("%Y-%m-%d")
+            fc = sf._consensus.get(today_str)
+            fc_elapsed = None
+            if fc and fc.hourly:
+                fc_elapsed = round(
+                    sum(v for h, v in fc.hourly.items() if int(h) <= now.hour), 1
+                )
+            accuracy["solar_actual_kwh_so_far"] = actual_kwh
+            accuracy["solar_forecast_kwh_so_far"] = fc_elapsed
+            if fc_elapsed:
+                accuracy["solar_error_pct"] = round(
+                    (actual_kwh - fc_elapsed) / fc_elapsed * 100, 1
+                )
+    except Exception as e:
+        accuracy["error"] = str(e)
+    out["accuracy"] = accuracy
+
+    # ---- Command health ----
+    out["commands"] = {
+        "sent": getattr(ctrl, "_commands_sent_count", 0),
+        "skipped": getattr(ctrl, "_commands_skipped_count", 0),
+        "last_results": {
+            k: {"success": bool(v.get("success")), "message": v.get("message", "")}
+            for k, v in (getattr(ctrl, "_last_command_results", {}) or {}).items()
+        },
+    }
+
+    # ---- Deferrable loads ----
+    defs = getattr(ctrl, "_deferrable_loads", []) or []
+    scheds = {
+        getattr(s, "load_name", None): s
+        for s in (getattr(ctrl, "_deferrable_schedules", []) or [])
+    }
+    out["deferrable"] = [
+        {
+            "name": l.name,
+            "energy_kwh": getattr(l, "energy_required_kwh", None),
+            "power_kw": getattr(l, "power_kw", None),
+            "blocks": len(getattr(scheds.get(l.name), "blocks", []) or []),
+            "savings_czk": (
+                round(getattr(scheds[l.name], "savings_czk", 0.0), 2)
+                if l.name in scheds else None
+            ),
+        }
+        for l in defs
+    ]
+
+    # ---- Economics (today). plan_value is exact; the rest are estimates from
+    #      daily energy totals × representative prices and are flagged as such. ----
+    econ: Dict[str, Any] = {"estimated": True}
+    decisions = getattr(opt, "_last_decisions", []) if opt else []
+    if decisions:
+        econ["plan_value_czk"] = round(
+            sum((getattr(d, "net_value", 0) or 0) for d in decisions), 1
+        )
+    tel = _get_live_telemetry()
+    export_kwh = tel.get("EnergyToGridToday", 0) or 0
+    import_kwh = tel.get("EnergyToUserToday", 0) or 0
+    charge_kwh = tel.get("ChargeEnergyToday", 0) or 0
+    discharge_kwh = tel.get("DischargeEnergyToday", 0) or 0
+    prices = list(ctrl._current_prices.values()) if ctrl._current_prices else []
+    avg_price = sum(prices) / len(prices) if prices else None
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    dist_hi = getattr(ctrl.config, "distribution_tariff_high", 1.5)
+    avg_charge_price = _avg_block_price(ctrl, getattr(ctrl, "_combined_charging_blocks", set()))
+    avg_disch_price = _avg_block_price(ctrl, getattr(ctrl, "_discharge_periods_today", set()))
+    if avg_price is not None:
+        econ["export_revenue_czk"] = round(export_kwh * max(0.0, avg_price - sell_fee), 1)
+        econ["import_cost_czk"] = round(import_kwh * (avg_price + dist_hi), 1)
+    if avg_charge_price is not None and avg_disch_price is not None:
+        econ["arbitrage_czk"] = round(
+            discharge_kwh * avg_disch_price - charge_kwh * avg_charge_price, 1
+        )
+    econ["export_kwh"] = round(export_kwh, 1)
+    econ["import_kwh"] = round(import_kwh, 1)
+    out["economics"] = econ
+
+    # ---- Data freshness ----
+    def _age(ts):
+        try:
+            return round((now - ts).total_seconds()) if ts else None
+        except Exception:
+            return None
+    out["freshness"] = {
+        "prices_age_s": _age(getattr(ctrl, "_prices_updated", None)),
+        "has_tomorrow_prices": bool(getattr(ctrl, "_next_day_prices", {})),
+    }
+
+    return web.json_response(out)
+
+
 async def api_logs(request: web.Request) -> web.Response:
     """Get recent log entries."""
     count = int(request.query.get("count", "100"))
@@ -741,6 +940,8 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_get("/api/projection", api_projection)
     app.router.add_get("/api/solar_actuals", api_solar_actuals)
     app.router.add_get("/api/soc_actuals", api_soc_actuals)
+    app.router.add_get("/api/consumption_actuals", api_consumption_actuals)
+    app.router.add_get("/api/insights", api_insights)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
@@ -889,6 +1090,16 @@ body {
 }
 .soc-legend-item { display: inline-flex; align-items: center; gap: 6px; }
 .soc-legend-item svg { overflow: visible; }
+.alert-banner {
+  background: #4a2a14;
+  color: #fbbf24;
+  border: 1px solid #92400e;
+  border-radius: 6px;
+  padding: 8px 12px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
 .price-chart-label {
   font-size: 11px;
   color: var(--muted);
@@ -1196,6 +1407,46 @@ select, input {
     </div>
   </div>
 
+  <!-- Alerts strip -->
+  <div id="alertsStrip" style="margin-bottom:12px"></div>
+
+  <!-- Insights -->
+  <div class="grid" style="grid-template-columns:repeat(auto-fit, minmax(220px, 1fr));margin-bottom:12px">
+    <div class="card">
+      <h2>💰 Economics (today)</h2>
+      <div style="font-size:13px;line-height:1.9">
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Optimizer plan value</span><span id="econPlan" style="font-weight:700">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Export revenue (est.)</span><span id="econExport">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Import cost (est.)</span><span id="econImport">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Battery arbitrage (est.)</span><span id="econArbitrage">--</span></div>
+        <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="econNote">estimates from daily totals × prices</div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>🎯 Forecast Accuracy</h2>
+      <div style="font-size:13px;line-height:1.9">
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Solar so far (actual/forecast)</span><span id="accSolar">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Solar error</span><span id="accSolarErr">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Intraday calibration</span><span id="accCalib">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Solar confidence</span><span id="accConf">--</span></div>
+      </div>
+    </div>
+    <div class="card">
+      <h2>⚙️ Engines &amp; Sources</h2>
+      <div style="font-size:13px;line-height:1.9">
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Optimizer</span><span id="engOpt">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Consumption</span><span id="engCons">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Solcast budget</span><span id="engSolcast">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Last command</span><span id="engCmd">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Prices updated</span><span id="engFresh">--</span></div>
+      </div>
+    </div>
+    <div class="card" id="deferrableCard" style="display:none">
+      <h2>🔁 Deferrable Loads</h2>
+      <div id="deferrableList" style="font-size:13px;line-height:1.8">--</div>
+    </div>
+  </div>
+
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
     <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
@@ -1204,11 +1455,14 @@ select, input {
       <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> SOC — projected</span>
       <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2.5"/></svg> Solar — actual</span>
       <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> Solar — projected</span>
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#38bdf8" stroke-width="2.5"/></svg> Load — actual</span>
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#38bdf8" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> Load — projected</span>
     </div>
     <div class="price-chart-day" id="priceChartTodayWrap">
       <div class="price-chart-label" id="priceChartTodayLabel">Today</div>
       <div style="position:relative">
         <div class="price-chart" id="priceChartToday"></div>
+        <svg id="consLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="solarLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
       </div>
@@ -1217,6 +1471,7 @@ select, input {
       <div class="price-chart-label" id="priceChartTomorrowLabel">Tomorrow</div>
       <div style="position:relative">
         <div class="price-chart" id="priceChartTomorrow"></div>
+        <svg id="consLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="solarLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
       </div>
@@ -1458,11 +1713,12 @@ function updateUI(d) {
 
 async function fetchPrices() {
   try {
-    const [priceRes, projRes, actualsRes, socRes] = await Promise.all([
+    const [priceRes, projRes, actualsRes, socRes, consRes] = await Promise.all([
       fetch('/api/prices'),
       fetch('/api/projection'),
       fetch('/api/solar_actuals'),
       fetch('/api/soc_actuals'),
+      fetch('/api/consumption_actuals'),
     ]);
     const data = await priceRes.json();
     const projData = await projRes.json();
@@ -1474,6 +1730,10 @@ async function fetchPrices() {
       const socData = await socRes.json();
       socActuals = (socData && socData.blocks) || {};
     } catch (e) { socActuals = {}; }
+    try {
+      const consData = await consRes.json();
+      consActuals = (consData && consData.hourly) || {};
+    } catch (e) { consActuals = {}; }
     const todayPrices = data.prices || [];
     const tomorrowPrices = data.tomorrow || [];
     const allPrices = [...todayPrices, ...tomorrowPrices];
@@ -1490,6 +1750,7 @@ async function fetchPrices() {
 
     const timeline = projData.timeline || [];
     renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
+    renderEnergyLine(todayPrices, timeline, 'priceChartToday', 'consLineToday', true, 'consumption_kwh', consActuals, '#38bdf8');
     renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true);
     renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday', true);
 
@@ -1497,6 +1758,7 @@ async function fetchPrices() {
     if (data.has_tomorrow && tomorrowPrices.length) {
       tomorrowWrap.style.display = '';
       renderPriceChart(tomorrowPrices, 'priceChartTomorrow', todayPrices.length, maxAbs);
+      renderEnergyLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'consLineTomorrow', false, 'consumption_kwh', consActuals, '#38bdf8');
       renderSolarLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'solarLineTomorrow', false);
       renderSocLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'socLineTomorrow', false);
     } else {
@@ -1617,7 +1879,12 @@ function renderSocLine(prices, timeline, chartId, svgId, isToday) {
 // Solar production line: actual (solid) for elapsed hours, projected (dashed)
 // for the rest. Both aggregated to HOURLY kWh so the units match — projected
 // solar in the timeline is per-15-min block, actual solar is per hour.
-function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
+// Generic energy line (kWh/hour): actual (solid) for elapsed hours, projected
+// (dashed) for the rest — same split logic as the SOC line. `field` is the
+// projection timeline key (e.g. 'solar_kwh' / 'consumption_kwh'); `actualsMap`
+// is the "HH:00" -> kWh actuals; `color` the line colour. Both sources are
+// aggregated to hourly so units match (projection is per-15-min block).
+function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actualsMap, color) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
   if (!timeline.length || !prices.length) { svg.innerHTML = ''; return; }
@@ -1630,18 +1897,18 @@ function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
 
   const dayOf = prices[0].day;  // every bar in a given chart shares one day
 
-  // Projected hourly solar (kWh): sum the four 15-min blocks in each hour.
+  // Projected hourly value (kWh): sum the four 15-min blocks in each hour.
   const projHour = {};
   timeline.forEach(t => {
     if (t.day !== dayOf) return;
     const hr = parseInt(t.time.split(':')[0], 10);
-    projHour[hr] = (projHour[hr] || 0) + (t.solar_kwh || 0);
+    projHour[hr] = (projHour[hr] || 0) + (t[field] || 0);
   });
-  // Actual hourly solar (today only; keyed "HH:00").
+  // Actual hourly value (today only; keyed "HH:00").
   const actHour = {};
-  if (isToday) {
-    Object.keys(solarActuals).forEach(k => {
-      actHour[parseInt(k.split(':')[0], 10)] = solarActuals[k];
+  if (isToday && actualsMap) {
+    Object.keys(actualsMap).forEach(k => {
+      actHour[parseInt(k.split(':')[0], 10)] = actualsMap[k];
     });
   }
 
@@ -1666,7 +1933,7 @@ function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
     if (cur) curHr = parseInt(cur.start.split(':')[0], 10);
   }
 
-  // Shared scale; sit solar in the lower band so it reads under the SOC line.
+  // Sit energy lines in the lower band so they read under the SOC line.
   let maxKwh = 0.5;
   Object.values(projHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
   Object.values(actHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
@@ -1705,20 +1972,126 @@ function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
   let s = '';
   if (projPts.length >= 2) {
     s += '<polyline points="' + projPts.join(' ') + '" fill="none" ' +
-      'stroke="#fde047" stroke-width="2" stroke-opacity="0.45" ' +
+      'stroke="' + color + '" stroke-width="2" stroke-opacity="0.45" ' +
       'stroke-dasharray="4 3" stroke-linejoin="round" stroke-linecap="round"/>';
   }
   if (realPts.length >= 2) {
     s += '<polyline points="' + realPts.join(' ') + '" fill="none" ' +
-      'stroke="#fde047" stroke-width="2.5" stroke-opacity="0.9" ' +
+      'stroke="' + color + '" stroke-width="2.5" stroke-opacity="0.9" ' +
       'stroke-linejoin="round" stroke-linecap="round"/>';
   }
   svg.innerHTML = s;
 }
 
+function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
+  renderEnergyLine(prices, timeline, chartId, svgId, isToday,
+    'solar_kwh', solarActuals, '#fde047');
+}
+
 let priceData = [];
 let solarActuals = {};  // "HH:00" -> actual solar kWh (today only)
 let socActuals = {};    // "HH:MM" -> actual battery SOC% (today, elapsed blocks)
+let consActuals = {};   // "HH:00" -> actual household load kWh (today only)
+
+function fmtCzk(v) {
+  return (v == null) ? '--' : (v >= 0 ? '+' : '') + v.toFixed(1) + ' CZK';
+}
+
+async function fetchInsights() {
+  let d;
+  try { d = await (await fetch('/api/insights')).json(); }
+  catch (e) { return; }
+  if (!d || d.error) return;
+
+  // --- Economics ---
+  const ec = d.economics || {};
+  const planEl = document.getElementById('econPlan');
+  if (planEl) {
+    planEl.textContent = fmtCzk(ec.plan_value_czk);
+    planEl.style.color = (ec.plan_value_czk || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  setText('econExport', fmtCzk(ec.export_revenue_czk));
+  setText('econImport', ec.import_cost_czk == null ? '--' : '-' + ec.import_cost_czk.toFixed(1) + ' CZK');
+  setText('econArbitrage', fmtCzk(ec.arbitrage_czk));
+
+  // --- Forecast accuracy ---
+  const ac = d.accuracy || {};
+  const a = ac.solar_actual_kwh_so_far, f = ac.solar_forecast_kwh_so_far;
+  setText('accSolar', (a == null ? '--' : a + ' kWh') + ' / ' + (f == null ? '--' : f + ' kWh'));
+  const errEl = document.getElementById('accSolarErr');
+  if (errEl) {
+    if (ac.solar_error_pct == null) { errEl.textContent = '--'; }
+    else {
+      errEl.textContent = (ac.solar_error_pct > 0 ? '+' : '') + ac.solar_error_pct + '%';
+      errEl.style.color = Math.abs(ac.solar_error_pct) <= 15 ? 'var(--green)'
+        : Math.abs(ac.solar_error_pct) <= 35 ? '#f59e0b' : 'var(--red)';
+    }
+  }
+  setText('accCalib', ac.calibration_ratio == null ? '--' : '×' + Number(ac.calibration_ratio).toFixed(2));
+  setText('accConf', ac.solar_confidence == null ? '--' : Math.round(ac.solar_confidence * 100) + '%');
+
+  // --- Engines & sources ---
+  const en = d.engines || {};
+  const optTxt = (en.optimizer || '--').toUpperCase() +
+    (en.optimizer_fellback ? ' (fell back from ' + en.optimizer_configured + ')' : '');
+  setText('engOpt', optTxt);
+  const consTxt = (en.consumption || '--').toUpperCase() +
+    (en.consumption_fellback ? ' (fell back from ml)' : '');
+  setText('engCons', consTxt);
+  const sc = d.solcast || {};
+  setText('engSolcast', sc.enabled ? (sc.requests_today + '/' + sc.daily_budget + ' reqs') : 'off');
+  // last command (worst result wins for visibility)
+  const cmds = (d.commands && d.commands.last_results) || {};
+  const keys = Object.keys(cmds);
+  const cmdEl = document.getElementById('engCmd');
+  if (cmdEl) {
+    if (!keys.length) { cmdEl.textContent = '--'; }
+    else {
+      const failed = keys.filter(k => !cmds[k].success);
+      if (failed.length) { cmdEl.textContent = '⚠️ ' + failed[0] + ' failed'; cmdEl.style.color = 'var(--red)'; }
+      else { cmdEl.textContent = '✅ ' + (d.commands.sent || 0) + ' ok'; cmdEl.style.color = 'var(--green)'; }
+    }
+  }
+  const fr = d.freshness || {};
+  setText('engFresh', fr.prices_age_s == null ? '--'
+    : (fr.prices_age_s < 90 ? 'just now' : Math.round(fr.prices_age_s / 60) + ' min ago')
+      + (fr.has_tomorrow_prices ? ' · +tomorrow' : ''));
+
+  // --- Deferrable loads ---
+  const card = document.getElementById('deferrableCard');
+  const list = document.getElementById('deferrableList');
+  const defs = d.deferrable || [];
+  if (card && list) {
+    if (!defs.length) { card.style.display = 'none'; }
+    else {
+      card.style.display = '';
+      list.innerHTML = defs.map(l =>
+        '<div class="stat" style="display:flex;justify-content:space-between">' +
+        '<span>' + l.name + ' <span class="stat-label">(' + (l.energy_kwh ?? '?') + ' kWh)</span></span>' +
+        '<span>' + (l.blocks ? l.blocks + ' blk' + (l.savings_czk != null ? ' · ' + fmtCzk(l.savings_czk) : '') : 'not scheduled') + '</span></div>'
+      ).join('');
+    }
+  }
+
+  // --- Alerts strip ---
+  const alerts = [];
+  if (en.optimizer_fellback) alerts.push('Optimizer fell back to ' + en.optimizer + ' (PuLP/solver issue)');
+  if (en.consumption_fellback) alerts.push('ML consumption unavailable — using binned model');
+  if (Object.keys(cmds).some(k => !cmds[k].success)) alerts.push('A control command failed — check logs');
+  if (fr.prices_age_s != null && fr.prices_age_s > 7200) alerts.push('Prices are stale (' + Math.round(fr.prices_age_s / 3600) + 'h old)');
+  if (ac.solar_error_pct != null && Math.abs(ac.solar_error_pct) > 40) alerts.push('Solar forecast off by ' + ac.solar_error_pct + '% today');
+  const strip = document.getElementById('alertsStrip');
+  if (strip) {
+    strip.innerHTML = alerts.length
+      ? alerts.map(a => '<div class="alert-banner">⚠️ ' + a + '</div>').join('')
+      : '';
+  }
+}
+
+function setText(id, txt) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = txt;
+}
 
 function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   const chart = document.getElementById(mountId);
@@ -1993,11 +2366,13 @@ async function fetchLive() {
 fetchStatus();
 fetchLive();
 fetchPrices();
+fetchInsights();
 fetchLogs();
 connectSSE();
 setInterval(fetchStatus, 5000);
 setInterval(fetchLive, 3000);
 setInterval(fetchPrices, 60000);
+setInterval(fetchInsights, 30000);
 </script>
 </body>
 </html>
