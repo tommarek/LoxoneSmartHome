@@ -100,7 +100,7 @@ class AsyncInfluxDBClient:
                     url=self.settings.influxdb.url,
                     token=self.settings.influxdb.token,
                     org=self.settings.influxdb.org,
-                    timeout=20_000,  # ms — bound per-request latency (was library default)
+                    timeout=60_000,  # ms — bound per-request latency (was library default)
                 )
                 self.client_pool.append(client)
 
@@ -228,21 +228,23 @@ class AsyncInfluxDBClient:
                                 f"(write buffer full, InfluxDB unreachable)"
                             )
 
-    async def query(self, query: str) -> Any:
+    async def query(self, query: str, timeout: float = 60.0) -> Any:
         """Execute a query against InfluxDB.
 
         Hard-bounded by asyncio.wait_for so a stalled connection can never hang a
-        request handler (e.g. a dashboard endpoint) indefinitely — on timeout it
-        raises like any other query failure and callers degrade gracefully.
+        request handler indefinitely — on timeout it raises like any other query
+        failure and callers degrade gracefully. The default (60s) is generous
+        enough for the heavy multi-year model-build queries while still bounding
+        the worst case; pass a smaller timeout for latency-sensitive callers.
         """
         client = await self._get_client()
         try:
             return await asyncio.wait_for(
                 client.query_api().query(query=query, org=self.settings.influxdb.org),
-                timeout=25.0,
+                timeout=timeout,
             )
         except asyncio.TimeoutError:
-            self.logger.error("InfluxDB query timed out after 25s")
+            self.logger.error(f"InfluxDB query timed out after {timeout:.0f}s")
             raise
         except Exception as e:
             self.logger.error(f"Failed to query InfluxDB: {e}")
