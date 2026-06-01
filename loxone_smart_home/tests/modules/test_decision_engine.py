@@ -345,6 +345,55 @@ def test_optimizer_charge_skipped_when_block_not_scheduled(
     assert context.is_battery_charging_scheduled is False
 
 
+def test_optimizer_active_suppresses_price_based_discharge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """When the optimizer drives, the rule-based price-based discharge (4B) must
+    NOT fire for a block the optimizer left as hold — otherwise the inverter
+    exports to grid while the chart (optimizer schedule) shows it idle.
+    Regression for 'graph shows discharge disabled but battery still discharging'."""
+    block = ("20:30", "20:45")
+    thresholds = PriceThresholds(
+        charge_price_max=2.0, export_price_min=1.0, discharge_price_min=5.0,
+        discharge_profit_margin=1.5, battery_efficiency=0.87,
+    )
+    ctx = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=61.0,
+        current_time=datetime(2024, 6, 1, 20, 30),
+        current_mode="regular",
+        current_price=8.65,  # well above discharge threshold → 4B would fire
+        current_block_key=block,
+        prices_15min={block: 8.65, ("03:00", "03:15"): 1.0},
+        price_thresholds=thresholds,
+        min_soc=20.0,
+        optimizer_active=True,
+        optimizer_discharge_blocks=set(),  # optimizer did NOT schedule this block
+    )
+    assert decision_engine.decide(ctx) != "discharge_to_grid"
+
+
+def test_optimizer_scheduled_discharge_still_fires(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """A block the optimizer DID schedule for discharge still discharges (4A)."""
+    block = ("21:00", "21:15")
+    ctx = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=61.0,
+        current_time=datetime(2024, 6, 1, 21, 0),
+        current_mode="regular",
+        current_price=9.0,
+        current_block_key=block,
+        min_soc=20.0,
+        optimizer_active=True,
+        optimizer_discharge_blocks={block},
+    )
+    assert decision_engine.decide(ctx) == "discharge_to_grid"
+
+
 def test_priority_ordering() -> None:
     """Test that priorities are correctly ordered."""
     assert Priority.MANUAL_OVERRIDE < Priority.SCHEDULED_BATTERY_CHARGING

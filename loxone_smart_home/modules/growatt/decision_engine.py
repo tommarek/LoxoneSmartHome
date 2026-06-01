@@ -561,6 +561,15 @@ class GrowattDecisionEngine:
         Returns:
             True if battery should discharge to grid
         """
+        # FALLBACK ONLY: when the optimizer is the active engine it owns the
+        # discharge schedule (Priority 4A) — it reserves the battery for the
+        # highest-value blocks and protects the overnight reserve. This simple
+        # price-threshold path would otherwise discharge EXTRA blocks the
+        # optimizer deliberately left as "hold", so the chart (optimizer schedule)
+        # would show the inverter idle while it actually exports to grid.
+        if context.optimizer_active:
+            return False
+
         # Don't discharge if battery is too low
         if context.battery_soc <= context.min_soc:
             return False
