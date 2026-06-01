@@ -93,12 +93,29 @@ class DecisionContext:
     # Optimizer-scheduled sell-production blocks (export solar, battery passive)
     optimizer_sell_production_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_sell_production_scheduled: bool = False
+    # True when the MILP/greedy optimizer is the active scheduling engine. When
+    # set, the optimizer's per-block charge decisions (cheapest_blocks) are the
+    # single source of truth and are actuated WITHOUT the rule-based summer price
+    # gate — the optimizer already weighed charge cost vs discharge revenue, so a
+    # second heuristic gate would silently drop economically-correct charges.
+    optimizer_active: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        if self.is_summer_mode:
-            # Summer: only charge from grid when price is below summer threshold
-            # (e.g., negative prices = get paid to consume)
+        if self.optimizer_active:
+            # Optimizer owns charge economics: actuate exactly its scheduled
+            # charge blocks (cheapest_blocks holds the optimizer's charge set).
+            # No summer/price gate — the MILP/greedy solver already compared the
+            # charge cost against the later discharge revenue, so re-gating here
+            # would silently veto economically-correct charges (the cause of the
+            # "chart shows pre-discharge charging but the inverter never flips").
+            self.is_battery_charging_scheduled = bool(
+                self.current_block_key
+                and self.current_block_key in self.cheapest_blocks
+            )
+        elif self.is_summer_mode:
+            # Rule-based summer policy: only charge from grid when price is below
+            # the summer threshold (e.g., negative prices = get paid to consume).
             if self.current_block_key and self.cheapest_blocks:
                 in_cheapest = self.current_block_key in self.cheapest_blocks
                 current_czk = self.current_price  # Already CZK/kWh
@@ -109,7 +126,7 @@ class DecisionContext:
                 self.is_battery_charging_scheduled = in_cheapest and current_czk <= max_price
             else:
                 self.is_battery_charging_scheduled = False
-        # Check if current block is in the cheapest charging blocks
+        # Rule-based: charge during the cheapest blocks
         elif self.current_block_key and self.cheapest_blocks:
             self.is_battery_charging_scheduled = (
                 self.current_block_key in self.cheapest_blocks

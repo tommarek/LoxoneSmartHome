@@ -268,6 +268,83 @@ def test_charge_from_grid_detection(
     assert decision == "charge_from_grid"
 
 
+def test_optimizer_charge_actuates_despite_summer_gate(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """When the optimizer is the active engine, its scheduled charge blocks must
+    actuate even in summer at a positive price — the optimizer already weighed
+    charge cost vs discharge revenue, so the rule-based summer gate must NOT veto
+    them. Regression for the 'chart shows pre-discharge charging but the inverter
+    never flips' bug."""
+    block = ("18:30", "18:45")
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 6, 1, 18, 30),
+        current_mode="regular",
+        current_price=3.53,  # positive — would be blocked by the summer gate
+        current_block_key=block,
+        cheapest_blocks={block},  # optimizer's charge set
+        is_summer_mode=True,
+        optimizer_active=True,
+        price_thresholds=PriceThresholds(
+            charge_price_max=2.0, export_price_min=3.0, discharge_price_min=6.0,
+            discharge_profit_margin=1.5, battery_efficiency=0.87,
+            summer_charge_price_max=0.0,
+        ),
+    )
+    assert context.is_battery_charging_scheduled is True
+    assert decision_engine.decide(context) == "charge_from_grid"
+
+
+def test_summer_gate_still_blocks_rulebased_charge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """Without the optimizer, the rule-based summer policy still applies: a
+    positive-price block is NOT charged from grid in summer (only <= 0 CZK)."""
+    block = ("18:30", "18:45")
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 6, 1, 18, 30),
+        current_mode="regular",
+        current_price=3.53,
+        current_block_key=block,
+        cheapest_blocks={block},
+        is_summer_mode=True,
+        optimizer_active=False,
+        price_thresholds=PriceThresholds(
+            charge_price_max=2.0, export_price_min=3.0, discharge_price_min=6.0,
+            discharge_profit_margin=1.5, battery_efficiency=0.87,
+            summer_charge_price_max=0.0,
+        ),
+    )
+    assert context.is_battery_charging_scheduled is False
+    assert decision_engine.decide(context) != "charge_from_grid"
+
+
+def test_optimizer_charge_skipped_when_block_not_scheduled(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """With the optimizer active, a block NOT in its charge set is not charged,
+    even in winter (no rule-based fallback sneaks in)."""
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 10, 0),
+        current_mode="regular",
+        current_price=1.0,
+        current_block_key=("10:00", "10:15"),
+        cheapest_blocks={("03:00", "03:15")},  # different block scheduled
+        is_summer_mode=False,
+        optimizer_active=True,
+    )
+    assert context.is_battery_charging_scheduled is False
+
+
 def test_priority_ordering() -> None:
     """Test that priorities are correctly ordered."""
     assert Priority.MANUAL_OVERRIDE < Priority.SCHEDULED_BATTERY_CHARGING

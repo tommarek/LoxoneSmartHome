@@ -2702,9 +2702,15 @@ from(bucket: "{bucket}")
                     )
 
         # === STEP 3: Calculate pre-discharge charging ===
+        # ONLY for the rule-based engine. When the optimizer is active it already
+        # plans charge-before-discharge inside its energy-flow model (charge_times
+        # above), so a separate heuristic here just produces phantom charge blocks
+        # that the optimizer-driven decision engine never actuates (the chart then
+        # shows "pre-discharge charging" the inverter never enters). Let the
+        # optimizer be the single source of truth for charging.
         pre_discharge_blocks: List[Tuple[datetime, datetime, float]] = []
 
-        if discharge_blocks:
+        if discharge_blocks and not self._optimizer:
             # Group discharge blocks into consecutive periods
             discharge_groups = self._group_consecutive_blocks_datetime(discharge_blocks)
 
@@ -3496,6 +3502,9 @@ from(bucket: "{bucket}")
             optimizer_sell_production_blocks=(
                 self._sell_production_blocks_today.copy() if self._optimizer else set()
             ),
+            # When the optimizer drives, its charge blocks (in cheapest_blocks)
+            # are actuated without the rule-based summer price gate.
+            optimizer_active=bool(self._optimizer),
             # Solar schedule
             sunrise=sunrise,
             sunset=sunset,
