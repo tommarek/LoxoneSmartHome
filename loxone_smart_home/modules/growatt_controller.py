@@ -2494,6 +2494,10 @@ from(bucket: "{bucket}")
                 efficiency=self.config.battery_efficiency,
                 sell_fee_czk=self.config.sell_fee_czk,
                 battery_amortisation_czk=self.config.battery_amortisation_czk,
+                # Strict engine-agnostic rules the plan must respect so it never
+                # promises an export/PV action the hardware gates then block.
+                export_price_min=self.config.export_price_min,
+                inverter_off_price=self.config.inverter_off_price_threshold_czk,
             )
             # MILP-only knobs (the greedy engine doesn't accept these kwargs).
             if co_opt_deferrable:

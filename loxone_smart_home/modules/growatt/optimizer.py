@@ -513,8 +513,15 @@ from(bucket: "{solar_bucket}")
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,  # Fee per kWh sold to grid
         battery_amortisation_czk: float = 2.0,  # Battery wear cost per kWh
+        export_price_min: Optional[float] = None,  # strict export floor (CZK/kWh)
+        inverter_off_price: Optional[float] = None,  # strict PV-off price (CZK/kWh)
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Optimize charge/discharge schedule.
+
+        `export_price_min` / `inverter_off_price` are accepted for engine parity
+        with the MILP (the controller passes the same kwargs to either engine).
+        The greedy engine is the fallback; the controller's hardware export and
+        inverter-off gates enforce these strict rules at actuation time.
 
         Args:
             blocks: Price blocks as (timestamp, price_czk_kwh) sorted chronologically

@@ -95,22 +95,26 @@ class DecisionContext:
     is_optimizer_sell_production_scheduled: bool = False
     # True when the MILP/greedy optimizer is the active scheduling engine. When
     # set, the optimizer's per-block charge decisions (cheapest_blocks) are the
-    # single source of truth and are actuated WITHOUT the rule-based summer price
-    # gate — the optimizer already weighed charge cost vs discharge revenue, so a
-    # second heuristic gate would silently drop economically-correct charges.
+    # single source of truth: the model owns charge economics (including price),
+    # so the rule-based summer charge gate does NOT apply. The optimizer is kept
+    # correct (it never grid-charges at peak for the reserve) by the price-aware
+    # reserve penalty in the MILP — not by a seasonal heuristic.
     optimizer_active: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        # STRICT grid-charge price gate — applies even under the optimizer.
-        # The optimizer decides WHICH cheap blocks to charge, but it must never
-        # grid-charge above the configured ceiling (summer: summer_charge_price_max;
-        # default 0 = only free/negative). This is a hard safety rule: without it
-        # a bad solver plan (e.g. charging to meet the reserve at any cost) can
-        # grid-charge at the evening PEAK. The optimizer works WITHIN this rule.
-        if self.is_summer_mode:
-            # Rule-based summer policy: only charge from grid when price is below
-            # the summer threshold (e.g., negative prices = get paid to consume).
+        # CHARGE authority:
+        #  - Optimizer active → the model decides; actuate exactly its charge set
+        #    (cheapest_blocks). No seasonal/price gate — that's the model's job.
+        #  - Optimizer inactive (legacy fallback) → apply the rule-based summer
+        #    gate (summer: only grid-charge at/below summer_charge_price_max,
+        #    default 0 = free/negative) / cheapest-blocks logic.
+        if self.optimizer_active:
+            self.is_battery_charging_scheduled = bool(
+                self.current_block_key
+                and self.current_block_key in self.cheapest_blocks
+            )
+        elif self.is_summer_mode:
             if self.current_block_key and self.cheapest_blocks:
                 in_cheapest = self.current_block_key in self.cheapest_blocks
                 current_czk = self.current_price  # Already CZK/kWh
@@ -121,12 +125,10 @@ class DecisionContext:
                 self.is_battery_charging_scheduled = in_cheapest and current_czk <= max_price
             else:
                 self.is_battery_charging_scheduled = False
-        # Rule-based: charge during the cheapest blocks
         elif self.current_block_key and self.cheapest_blocks:
             self.is_battery_charging_scheduled = (
                 self.current_block_key in self.cheapest_blocks
             )
-        # No fallback to price threshold - only charge during cheapest blocks
         else:
             self.is_battery_charging_scheduled = False
 

@@ -108,19 +108,16 @@ ACTION_EPS = 5e-3
 # so the solver never has to BUY grid power just to top up for a full export.
 MIN_GRID_DISCHARGE_FRACTION = 0.5
 
-# Penalty (CZK per kWh) for missing the per-block reserve floor. The reserve is
-# a SOFT constraint: when the start SOC is below the computed reserve and the
-# charge rate physically can't catch up in time, a hard floor would make the
-# whole MILP infeasible (→ silent greedy fallback).
-#
-# This must NOT be set arbitrarily high: it is the marginal cost of NOT having
-# the reserve, i.e. importing that base-load energy later at typical prices
-# (~few CZK/kWh). If it is set far above spot prices, the solver will GRID-CHARGE
-# AT THE EVENING PEAK just to satisfy the reserve — a guaranteed loss. Keeping it
-# near realistic import cost means the solver fills the reserve only when charging
-# is genuinely cheap, and otherwise accepts a small shortfall (covered later by
-# cheaper grid import) rather than overpaying now.
-RESERVE_SHORTFALL_PENALTY = 50.0
+# Small floor (CZK per kWh) for the per-block reserve-shortfall penalty. The
+# reserve is a SOFT constraint (relaxable to avoid infeasibility → silent greedy
+# fallback). The ACTUAL penalty is computed per block as the cheapest upcoming
+# import cost (the true marginal cost of covering a shortfall later) — see
+# `reserve_penalty` in optimize(). This floor only gives the constraint minimal
+# teeth when future import is ~free, so the solver mildly prefers keeping the
+# reserve over a gratuitous violation. It must stay SMALL: a large value makes
+# the solver GRID-CHARGE AT THE EVENING PEAK to satisfy the reserve — the exact
+# money-losing bug this design fixes.
+RESERVE_SHORTFALL_FLOOR = 0.5
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
@@ -266,8 +263,19 @@ class MILPBatteryOptimizer:
         battery_amortisation_czk: float = 2.0,
         deferrable_loads: Optional[Sequence[Any]] = None,
         switch_penalty_czk: float = 0.0,
+        export_price_min: Optional[float] = None,
+        inverter_off_price: Optional[float] = None,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
-        """Solve the full-horizon schedule via MILP (energy-flow model)."""
+        """Solve the full-horizon schedule via MILP (energy-flow model).
+
+        Strict, engine-agnostic rules the plan must respect (so the plan never
+        promises an action the controller's hardware gates will then block):
+        - export_price_min: never export to grid (solar OR battery) in a block
+          whose spot price is below this floor (the export/transmission fee) —
+          never export at a net loss.
+        - inverter_off_price: when spot price is below this, the inverter is OFF
+          (PV disabled) — no solar, no charge/discharge, no export that block.
+        """
         # Reset per-solve outputs so a fallback/early-return never leaks a
         # stale deferrable plan from a previous solve.
         self._last_deferrable_schedules = []
@@ -320,6 +328,20 @@ class MILPBatteryOptimizer:
         sell_revenue = [export_now[i] - battery_amortisation_czk for i in range(n)]
         # Grid import cost per kWh (paid on both load and battery charge).
         import_cost = [prices[i] + dists[i] for i in range(n)]
+
+        # Price-aware reserve-shortfall penalty (CZK/kWh), per block. The cost of
+        # being below the reserve at block i is importing that base-load energy
+        # later, so the penalty is the CHEAPEST upcoming import cost from i on
+        # (floored at 0). This is the fix for the peak-charge incident: a flat
+        # penalty far above spot made the solver grid-charge at the evening peak
+        # to satisfy the reserve. Now, if a cheaper refill is coming, leaving the
+        # reserve briefly short is cheap → the solver won't overpay now; if no
+        # cheap refill exists, the penalty rises and the reserve is protected.
+        reserve_penalty = [0.0] * n
+        running_min = float("inf")
+        for i in range(n - 1, -1, -1):
+            running_min = min(running_min, import_cost[i])
+            reserve_penalty[i] = max(0.0, running_min)
 
         # Per-block raw solar / consumption / structural surplus.
         solar_block: List[float] = []
@@ -408,7 +430,7 @@ class MILPBatteryOptimizer:
                 + (grid_charge[i] + solar_to_batt[i]) * eta
                 - (batt_to_load[i] + batt_to_grid[i]) / eta
             )
-            # Soft reserve floor (see RESERVE_SHORTFALL_PENALTY).
+            # Soft reserve floor (penalised per-block by reserve_penalty).
             prob += soc[i + 1] >= eff_min_kwh[i] - reserve_short[i]
 
             # Activation linking → mode indicators (grid-facing actions).
@@ -437,6 +459,31 @@ class MILPBatteryOptimizer:
             # Never export from the battery at a loss.
             if sell_revenue[i] <= 0:
                 prob += is_disch[i] == 0
+
+            # STRICT RULE 1 — export floor: no grid export (solar OR battery)
+            # when the spot price is below the export/transmission fee, so we
+            # never export at a net loss. Engine-agnostic; mirrors the controller
+            # export gate so the plan matches actuation.
+            if export_price_min is not None and prices[i] < export_price_min:
+                prob += solar_to_grid[i] == 0
+                prob += batt_to_grid[i] == 0
+                prob += is_disch[i] == 0
+                prob += is_sp[i] == 0
+
+            # STRICT RULE 2 — PV/inverter OFF below a deeply-negative price: the
+            # whole inverter is off (PV disabled, battery idle), load served from
+            # grid. Mirrors the controller inverter-off gate so the plan never
+            # schedules solar/charge/discharge in a block the hardware powers down.
+            if inverter_off_price is not None and prices[i] < inverter_off_price:
+                prob += solar_to_load[i] == 0
+                prob += solar_to_batt[i] == 0
+                prob += solar_to_grid[i] == 0
+                prob += grid_charge[i] == 0
+                prob += batt_to_load[i] == 0
+                prob += batt_to_grid[i] == 0
+                prob += is_charge[i] == 0
+                prob += is_disch[i] == 0
+                prob += is_sp[i] == 0
             # Sell-production gates: only worthwhile above a volume floor AND a
             # swap margin (gate on the structural surplus s-c).
             if (
@@ -478,7 +525,7 @@ class MILPBatteryOptimizer:
             - (grid_to_load[i] + grid_charge[i]) * import_cost[i]
             - (batt_to_load[i] + batt_to_grid[i]) * battery_amortisation_czk
             - curtail[i] * CURTAIL_PENALTY
-            - reserve_short[i] * RESERVE_SHORTFALL_PENALTY
+            - reserve_short[i] * max(reserve_penalty[i], RESERVE_SHORTFALL_FLOOR)
             for i in range(n)
         ) + soc[n] * terminal_value_per_kwh
 

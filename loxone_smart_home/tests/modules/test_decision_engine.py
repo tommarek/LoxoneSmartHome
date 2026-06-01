@@ -268,32 +268,33 @@ def test_charge_from_grid_detection(
     assert decision == "charge_from_grid"
 
 
-def test_strict_grid_charge_ceiling_applies_even_under_optimizer(
+def test_optimizer_owns_charging_no_seasonal_gate(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """STRICT RULE: grid-charging must never occur above the configured ceiling
-    (summer: summer_charge_price_max), even when the optimizer scheduled the
-    block. Guards against a bad solver plan grid-charging at the evening peak."""
-    block = ("18:30", "18:45")
+    """When the optimizer is active it owns charge economics: the rule-based
+    summer/price gate does NOT apply, so a block the optimizer scheduled is
+    charged regardless of season. (Correctness against peak-charging is enforced
+    inside the MILP's price-aware reserve penalty, not by a seasonal heuristic.)"""
+    block = ("13:00", "13:15")
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
-        current_time=datetime(2024, 6, 1, 18, 30),
+        current_time=datetime(2024, 6, 1, 13, 0),
         current_mode="regular",
-        current_price=8.65,  # peak price — must NOT grid-charge here
+        current_price=1.2,  # positive; summer gate would block, optimizer won't
         current_block_key=block,
-        cheapest_blocks={block},  # optimizer scheduled it anyway
+        cheapest_blocks={block},  # optimizer's chosen charge block
         is_summer_mode=True,
         optimizer_active=True,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0, export_price_min=3.0, discharge_price_min=6.0,
+            charge_price_max=2.0, export_price_min=0.8, discharge_price_min=6.0,
             discharge_profit_margin=1.5, battery_efficiency=0.87,
             summer_charge_price_max=0.0,
         ),
     )
-    assert context.is_battery_charging_scheduled is False
-    assert decision_engine.decide(context) != "charge_from_grid"
+    assert context.is_battery_charging_scheduled is True
+    assert decision_engine.decide(context) == "charge_from_grid"
 
 
 def test_summer_gate_still_blocks_rulebased_charge(

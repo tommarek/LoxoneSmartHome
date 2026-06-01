@@ -191,8 +191,14 @@ class GrowattConfig(BaseSettings):
         description="Charge battery when price below this (CZK/kWh)"
     )
     export_price_min: float = Field(
-        default=1.0, gt=0,
-        description="Export solar production when price above this (CZK/kWh)"
+        default=0.8, gt=0,
+        description=(
+            "STRICT export floor (CZK/kWh): never export to grid (solar or "
+            "battery) when the spot price is below this — set to the export/"
+            "transmission fee so export is only allowed when net revenue >= 0. "
+            "Enforced both as a hardware gate and as a constraint the optimizer "
+            "plans within."
+        )
     )
     discharge_price_min: float = Field(
         default=5.0, gt=0,

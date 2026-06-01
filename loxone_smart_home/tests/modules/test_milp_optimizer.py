@@ -42,6 +42,72 @@ def test_returns_four_tuple_and_decision_per_block():
     assert len(decisions) == len(blocks)
 
 
+def test_does_not_grid_charge_at_peak_to_meet_reserve():
+    """Regression for the live peak-charge incident: an evening price peak
+    followed by cheap night blocks, with steady load creating a reserve need.
+    The price-aware reserve penalty must keep the optimizer from grid-charging
+    at the peak — any grid charge must land in the cheap blocks, never the peak."""
+    blocks = make_blocks([9.0] * 8 + [1.0] * 8, start_hour=18)  # peak then cheap
+    opt = MILPBatteryOptimizer()
+    charge, discharge, sp, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={},
+        consumption_hourly={h: 1.0 for h in range(24)},  # steady load → reserve need
+        distribution_func=flat_dist(1.0),
+        current_soc=25.0, min_soc=20.0, max_soc=100.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+    )
+    price_by_ts = dict(blocks)
+    peak = [d for d in decisions if price_by_ts[d.timestamp] >= 9.0]
+    # The incident signature was SOC RISING across the peak (grid-charged to ~80%).
+    # The correct plan net-discharges (or holds) across the peak and refills from
+    # the cheap blocks — so SOC must not rise across the peak window.
+    assert peak[-1].soc_after <= peak[0].soc_before + 1.0, (
+        "battery must not grid-charge UP during the evening peak for the reserve"
+    )
+
+
+def test_no_grid_export_below_export_floor():
+    """STRICT export floor: with a positive battery-export margin but a spot
+    price below the export floor, the optimizer schedules NO grid export."""
+    blocks = make_blocks([4.0] * 8, start_hour=18)
+    opt = MILPBatteryOptimizer()
+    charge, discharge, sp, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={h: 8.0 for h in range(24)},
+        consumption_hourly={h: 0.5 for h in range(24)},
+        distribution_func=flat_dist(1.0),
+        current_soc=90.0, min_soc=20.0, max_soc=100.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        battery_amortisation_czk=0.0,  # export would otherwise be very attractive
+        export_price_min=5.0,          # floor ABOVE the 4.0 spot → no export
+    )
+    assert discharge == set(), "no battery export below the export floor"
+    assert sp == set(), "no sell-production below the export floor"
+
+
+def test_inverter_off_below_threshold():
+    """STRICT PV-off: in a block whose spot price is below the inverter-off
+    price (deeply negative), the inverter is off — no charge/discharge/sell —
+    even though a negative price would otherwise make grid-charging attractive."""
+    blocks = make_blocks([-3.0] * 4 + [5.0] * 4, start_hour=12)
+    opt = MILPBatteryOptimizer()
+    charge, discharge, sp, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={h: 8.0 for h in range(24)},
+        consumption_hourly={h: 1.0 for h in range(24)},
+        distribution_func=flat_dist(1.0),
+        current_soc=50.0, min_soc=20.0, max_soc=100.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        inverter_off_price=-2.0,
+    )
+    price_by_ts = dict(blocks)
+    for ts in (t for t in price_by_ts if price_by_ts[t] < -2.0):
+        assert ts not in charge and ts not in discharge and ts not in sp, (
+            "inverter must be off (no battery/export) below the off-price"
+        )
+
+
 def test_charges_when_cheap_then_discharges_when_expensive():
     # First 8 blocks dirt cheap (charge), last 8 very expensive (discharge).
     blocks = make_blocks([-0.5] * 8 + [15.0] * 8)
