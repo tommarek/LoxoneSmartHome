@@ -111,10 +111,13 @@ MIN_GRID_DISCHARGE_FRACTION = 0.5
 # Penalty (CZK per kWh) for missing the per-block reserve floor. The reserve is
 # a SOFT constraint: when the start SOC is below the computed reserve and the
 # charge rate physically can't catch up in time, a hard floor would make the
-# whole MILP infeasible (→ silent greedy fallback). Pricing the shortfall well
-# above any real arbitrage spread (~0-15 CZK/kWh) means the solver still honours
-# the reserve whenever it's reachable, but degrades gracefully when it isn't.
-RESERVE_SHORTFALL_PENALTY = 50.0
+# whole MILP infeasible (→ silent greedy fallback). The penalty must dominate
+# every term in the objective so the solver only ever leaves the reserve unmet
+# when it is physically unreachable — never as a deliberate arbitrage/self-
+# consumption trade. Day-ahead spot + distribution rarely exceeds ~30 CZK/kWh
+# even on extreme evening spikes, so 1000 CZK/kWh sits far above any realistic
+# import cost or sell revenue while keeping the constraint soft (no infeasibility).
+RESERVE_SHORTFALL_PENALTY = 1000.0
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
@@ -281,6 +284,13 @@ class MILPBatteryOptimizer:
         if not blocks:
             return set(), set(), set(), []
 
+        # Clamp the live SOC into the configured [min, max] window before
+        # pinning soc[0]. Telemetry can report e.g. 100% while max_soc=90;
+        # an out-of-bounds start makes soc[0] == start_battery_kwh infeasible
+        # against the soc variable bounds, silently forcing greedy fallback
+        # every tick.
+        current_soc = max(min_soc, min(max_soc, current_soc))
+
         n = len(blocks)
         charge_max = charge_rate_kw * 0.25
         # House self-consumption can use the full inverter; grid EXPORT is
@@ -381,6 +391,12 @@ class MILPBatteryOptimizer:
             # inverter can't charge and discharge at once).
             prob += grid_charge[i] + solar_to_batt[i] <= charge_max
             prob += batt_to_load[i] + batt_to_grid[i] <= batt_out_max * (1 - is_charge[i])
+            # A single inverter can't charge and discharge at once. Discharge
+            # (to load or grid) is already gated by is_charge above; gate solar
+            # banking by (1-is_disch) so the battery can't simultaneously bank
+            # solar AND discharge. Solar banking stays allowed on hold/charge
+            # blocks (is_disch=0), so this never blocks legitimate banking.
+            prob += solar_to_batt[i] <= charge_max * (1 - is_disch[i])
 
             # SOC continuity: charge legs gain energy at η_chg; discharge legs
             # deplete the battery at 1/η_dis (wear is priced in the objective).
@@ -403,12 +419,15 @@ class MILPBatteryOptimizer:
             prob += batt_to_grid[i] >= (
                 MIN_GRID_DISCHARGE_FRACTION * batt_to_grid_max * is_disch[i]
             )
-            # Solar may be exported in a sell-production block OR alongside a
-            # battery discharge block: the real `discharge_to_grid` mode is
-            # grid-first and exports solar excess too, so the plan must allow it
-            # (otherwise the planned energy flows diverge from actuation on
-            # discharge blocks that coincide with solar).
-            prob += solar_to_grid[i] <= max(s, 0.0) * (is_sp[i] + is_disch[i])
+            # Surplus PV always feeds to grid on a grid-tie inverter, regardless
+            # of the battery mode — so allow solar export up to the block's
+            # surplus in ANY block. The solver still prefers self-consumption and
+            # battery charging (higher per-kWh value); it only spills to grid the
+            # excess that can't be used, and curtails (penalty) only when export
+            # is unprofitable (negative price). Gating this to is_sp/is_disch
+            # forced realistic full-battery surplus into curtailment and
+            # understated export revenue on hold/charge blocks.
+            prob += solar_to_grid[i] <= max(s, 0.0)
             # One grid-facing mode per block.
             prob += is_charge[i] + is_disch[i] + is_sp[i] <= 1
 
@@ -520,22 +539,37 @@ class MILPBatteryOptimizer:
             gc = val(grid_charge[i])
             bg = val(batt_to_grid[i])
             sg = val(solar_to_grid[i])
+            bl = val(batt_to_load[i])
             action = "hold"
             net_value = 0.0
-            # Classify the headline action by the largest grid-facing flow,
-            # ignoring sub-watt-hour solver noise.
-            if gc > ACTION_EPS and gc >= bg and gc >= sg:
+            # Classify the headline action by the solver's own mutually-exclusive
+            # mode indicators (is_charge/is_disch/is_sp, gated <=1), NOT by the
+            # largest grid flow. Surplus PV spills to grid on ANY block (the
+            # export bound is relaxed to all blocks), so a magnitude test like
+            # `gc >= sg` would mislabel a genuine charge/discharge block as
+            # hold whenever concurrent solar export exceeds the battery flow,
+            # dropping it from charge_times/discharge_times and from actuation.
+            if val(is_charge[i]) > 0.5 and gc > ACTION_EPS:
                 action = "charge"
                 charge_times.add(ts)
                 net_value = -gc * import_cost[i]
-            elif bg > ACTION_EPS and bg >= sg:
+            elif val(is_disch[i]) > 0.5 and bg > ACTION_EPS:
                 action = "discharge"
                 discharge_times.add(ts)
                 net_value = bg * sell_revenue[i]
-            elif sg > ACTION_EPS:
+            elif val(is_sp[i]) > 0.5 and sg > ACTION_EPS:
+                # Only a block the solver actually put into sell-production mode
+                # is actuated as such (grid_first, stop_soc=max_soc); ordinary
+                # sunny hold blocks that merely spill surplus stay "hold".
                 action = "sell_production"
                 sp_times.add(ts)
                 net_value = sg * export_now[i]
+            elif bl > ACTION_EPS:
+                # Battery self-consumption: no grid-facing action (stays "hold",
+                # which maps to load_first and is what the inverter already does),
+                # but credit the avoided import (net of battery wear) so net_value
+                # isn't understated as 0 on genuinely active blocks.
+                net_value = bl * (import_cost[i] - battery_amortisation_czk)
             new_actions[ts] = action
 
             decisions.append(BlockDecision(
@@ -609,6 +643,16 @@ class MILPBatteryOptimizer:
                 placed = self._add_contiguous_run(
                     prob, blocks, li, win, nb_eff, run_by_block
                 )
+                if not placed:
+                    # No contiguous slot fits in the window — fall back to
+                    # interruptible (scattered) scheduling. Warn, because the
+                    # actuation layer will run this nominally non-interruptible
+                    # load in pieces (mirrors the greedy scheduler's warning).
+                    self.logger.warning(
+                        f"Deferrable load {load.name!r} non-interruptible but no "
+                        f"contiguous {nb_eff}-block run fits its window — "
+                        f"scheduling interruptibly (scattered)"
+                    )
             if not placed:
                 # Interruptible (or non-interruptible with no contiguous slot):
                 # one binary per in-window block, deliver exactly nb_eff blocks.
@@ -718,8 +762,24 @@ class MILPBatteryOptimizer:
                 block_dts.append(ts)
                 expected += import_cost[i] * block_energy
 
-            # Naive baseline: the earliest nb_eff in-window blocks (run ASAP).
-            naive_idx = win[: len(chosen_idx)]
+            # Naive baseline: run ASAP. For a non-interruptible load the
+            # baseline must match the chosen plan's contiguity (earliest
+            # contiguous run) — otherwise savings_czk is mis-stated against a
+            # cheaper scattered baseline the load could never actually run.
+            k = len(chosen_idx)
+            if load.interruptible:
+                naive_idx = win[:k]
+            else:
+                naive_idx = win[:k]
+                for s in range(len(win) - k + 1):
+                    cand = win[s : s + k]
+                    if all(
+                        (blocks[cand[j + 1]][0] - blocks[cand[j]][0])
+                        == timedelta(minutes=15)
+                        for j in range(len(cand) - 1)
+                    ):
+                        naive_idx = cand
+                        break
             naive = sum(import_cost[i] * block_energy for i in naive_idx)
 
             prev_runs[load.name] = set(block_dts)

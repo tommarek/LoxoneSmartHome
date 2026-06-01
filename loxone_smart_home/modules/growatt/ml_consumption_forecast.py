@@ -44,7 +44,9 @@ except Exception:
 
 # Bumped if the feature set or training logic changes incompatibly.
 # v2: training/prediction now bucket InfluxDB UTC timestamps into local time.
-ML_MODEL_SCHEMA_VERSION = 2
+# v3: inverter_on carry-forward also converts change records to local (was
+#     comparing local hour-keys against UTC change timestamps).
+ML_MODEL_SCHEMA_VERSION = 3
 
 
 class MLConsumptionForecast:
@@ -200,7 +202,7 @@ from(bucket: "{bucket_solar}")
             _carry_forward_hourly, MAX_REALISTIC_HOURLY_KWH,
         )
         inverter_on_by_hour = _carry_forward_hourly(
-            inverter_on_result, cons_by_hour.keys()
+            inverter_on_result, cons_by_hour.keys(), local_tz
         )
 
         # Build cleaned training series (intersection + filters).

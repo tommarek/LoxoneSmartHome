@@ -17,6 +17,7 @@ and the integration layer fires the command.
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -44,7 +45,7 @@ class DeferrableLoad:
             return 0
         kwh_per_block = self.power_kw * (block_minutes / 60.0)
         # Round UP so we always deliver at least the requested energy.
-        return max(1, int((self.energy_required_kwh / kwh_per_block) + 0.999))
+        return max(1, math.ceil(self.energy_required_kwh / kwh_per_block))
 
     def in_window(self, t: time) -> bool:
         """True when local time `t` is inside the load's allowed window.

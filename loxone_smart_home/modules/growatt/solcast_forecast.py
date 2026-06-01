@@ -128,7 +128,11 @@ class SolcastForecast:
             self._req_day = today_utc
             self._req_count = 0
         n_sites = len(self.rooftop_ids)
-        if not force and self._req_count + n_sites > self._max_requests_per_day:
+        # This day cap is absolute and is NOT bypassed by `force` (which only
+        # overrides the interval throttle). The free-tier 10/day quota is a hard
+        # account limit — letting a forced refresh blow past it would burn the
+        # budget and get later calls rejected by the API.
+        if self._req_count + n_sites > self._max_requests_per_day:
             self.logger.debug(
                 "Solcast daily request budget would be exceeded by a "
                 f"{n_sites}-site refresh — using cache"

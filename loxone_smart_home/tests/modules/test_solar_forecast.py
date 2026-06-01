@@ -260,7 +260,7 @@ class TestCalibration:
         # Day 1: 36/40 = 0.90, Day 2: 40/45 = 0.89, Day 3: 48/50 = 0.96
         # Weighted: (0.90*1 + 0.89*2 + 0.96*3) / 6 = 0.924
         assert forecast.confidence != 0.7
-        assert 0.8 < forecast.confidence < 1.0
+        assert forecast.confidence == pytest.approx(0.924, abs=0.01)
 
     @pytest.mark.asyncio
     async def test_calibration_fallback_no_forecast(self, forecast) -> None:
@@ -692,6 +692,21 @@ class TestIntradayCalibration:
         assert out[10] == pytest.approx(0.5)
         # Hour 11+ untouched
         assert out[11] == 0.5
+
+    def test_persistence_current_hour_scaled_by_remaining_minutes(self, forecast) -> None:
+        """Half-elapsed current hour anchors only its remaining half to live
+        power, so an instantaneous kW peak isn't booked as a full hour of kWh."""
+        model = {h: 0.5 for h in range(6, 20)}
+        out = forecast.apply_live_persistence(
+            model, live_power_kw=3.65, current_hour=8, blend_horizon_hours=2,
+            minutes_elapsed=30,
+        )
+        # Hour 8 (α=1, remaining=0.5): 0.5*0.5 (elapsed, model) + 3.65*0.5 (live)
+        # = 0.25 + 1.825 = 2.075 — well below the 3.65 the old full-hour code gave.
+        assert out[8] == pytest.approx(2.075)
+        # Future hours are full hours ahead → unaffected by minutes_elapsed.
+        assert out[9] == pytest.approx(2.075)
+        assert out[10] == pytest.approx(0.5)
 
     def test_persistence_never_lowers_forecast(self, forecast) -> None:
         """If model already predicts higher than live, keep the model

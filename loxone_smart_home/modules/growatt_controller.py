@@ -140,7 +140,13 @@ class GrowattController(BaseModule):
         self._last_evaluation_hour: Optional[int] = None
         self._last_evaluation_reason: Optional[str] = None
         self._evaluation_lock = asyncio.Lock()
+        # Serializes _calculate_cross_day_optimal_schedule: the periodic tick,
+        # next-day price fetch, pre-midnight refresh and model-rebuild task can
+        # all call it concurrently, and it writes the shared schedule sets that
+        # the inverter on/off gate and decision engine then read.
+        self._schedule_lock = asyncio.Lock()
         self._periodic_check_task: Optional[asyncio.Task[None]] = None
+        self._models_task: Optional[asyncio.Task[None]] = None
 
         # Initialize state tracking
         self._current_inverter_state = None
@@ -1409,7 +1415,15 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
             temps: Dict[int, float] = {}
             for table in result:
                 for record in table.records:
-                    hour = record.get_time().hour
+                    # Bucket on the LOCAL hour: both the binned and ML
+                    # consumption models train on local-hour bins (their
+                    # _to_local fix), and predict_hourly is queried by local
+                    # hour. Keying these temps in UTC would shift each hour's
+                    # temperature by the UTC offset (1-2h) vs. the model's bins.
+                    t = record.get_time()
+                    if getattr(t, "tzinfo", None) is not None:
+                        t = t.astimezone(self._local_tz)
+                    hour = t.hour
                     val = record.get_value()
                     if isinstance(val, (int, float)):
                         # Last reading wins per hour (more recent = more relevant)
@@ -1576,8 +1590,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         self.logger.info("Growatt controller started with event-driven evaluation")
 
         # === PHASE 3: Build models in background (minutes) ===
-        # Models improve optimizer quality but aren't needed for basic operation
-        asyncio.create_task(self._build_models_background())
+        # Models improve optimizer quality but aren't needed for basic operation.
+        # Keep a strong reference: the event loop only holds a weak ref, so an
+        # un-stored task can be GC'd mid-run (these are long InfluxDB queries).
+        # stop() cancels it so a late-finishing build can't re-issue inverter
+        # commands after safe-shutdown or touch a disconnected client.
+        self._models_task = asyncio.create_task(self._build_models_background())
 
     async def _build_models_background(self) -> None:
         """Build ML models in background without blocking controller operation.
@@ -1592,7 +1610,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             if self._solar_forecast:
                 try:
                     success = await self._solar_forecast.build_production_model(
-                        self.influxdb_client, self.settings
+                        self.influxdb_client, self.settings, local_tz=self._local_tz
                     )
                     if success and self._solar_forecast._production_model:
                         m = self._solar_forecast._production_model
@@ -1615,7 +1633,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             if self._consumption_forecast:
                 try:
                     success = await self._consumption_forecast.build_model(
-                        self.influxdb_client, self.settings
+                        self.influxdb_client, self.settings,
+                        local_tz=self._local_tz,
                     )
                     if success:
                         summary = self._consumption_forecast.get_model_summary()
@@ -1681,6 +1700,16 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except asyncio.CancelledError:
                 pass
             self._periodic_check_task = None
+
+        # Cancel background model-build task (long InfluxDB queries that, if left
+        # running, could re-issue a mode evaluation after safe-shutdown).
+        if self._models_task and not self._models_task.done():
+            self._models_task.cancel()
+            try:
+                await self._models_task
+            except asyncio.CancelledError:
+                pass
+            self._models_task = None
 
         # Cancel price fetch task
         if self._price_fetch_task and not self._price_fetch_task.done():
@@ -2098,6 +2127,21 @@ from(bucket: "{bucket}")
     async def _calculate_cross_day_optimal_schedule(
         self, suppress_print: bool = False, force_table: bool = False
     ) -> None:
+        """Serialize schedule recomputation behind _schedule_lock.
+
+        Multiple tasks invoke this concurrently (periodic tick, next-day price
+        fetch, pre-midnight refresh, model rebuild); the lock prevents their
+        reads/writes of the shared schedule sets from interleaving into a torn
+        schedule that the inverter on/off gate and decision engine would act on.
+        """
+        async with self._schedule_lock:
+            await self._calculate_cross_day_optimal_schedule_impl(
+                suppress_print=suppress_print, force_table=force_table
+            )
+
+    async def _calculate_cross_day_optimal_schedule_impl(
+        self, suppress_print: bool = False, force_table: bool = False
+    ) -> None:
         """Calculate optimal charging/discharge schedule across entire available price window.
 
         This is the core cross-day optimization method that:
@@ -2259,6 +2303,7 @@ from(bucket: "{bucket}")
             if self._solar_forecast and live_solar_kw > 0:
                 scaled_today = self._solar_forecast.apply_live_persistence(
                     scaled_today, live_solar_kw, current_hour=now.hour,
+                    minutes_elapsed=now.minute,
                 )
                 self.logger.info(
                     f"☀️  Live solar persistence: anchoring near-future forecast "
@@ -2278,14 +2323,10 @@ from(bucket: "{bucket}")
 
             ml_cf = getattr(self, '_ml_consumption_forecast', None)
             if ml_cf and ml_cf.is_trained and forecast_temps:
-                # NOTE: forecast_temps is keyed by UTC hour (see
-                # _fetch_recent_hourly_temps, kept UTC for consistency with the
-                # binned model which trains on UTC-hour bins). The ML model
-                # trains/predicts in local hours, so its temperature exog is
-                # shifted by the UTC offset (1-2h). Temperature is a weak
-                # feature here (lags + hour-of-day dominate) and the ML engine
-                # is opt-in/experimental, so this is an accepted limitation; the
-                # ML *output* is correctly local-hour keyed for the optimizer.
+                # forecast_temps is keyed by LOCAL hour (see
+                # _fetch_recent_hourly_temps), matching the local-hour bins both
+                # the ML and binned models train on — so the temperature exog
+                # lines up with the model and the local-hour optimizer output.
                 try:
                     # Recursive RF inference is CPU-bound — run off the loop.
                     today_hourly = await asyncio.to_thread(
@@ -2361,16 +2402,29 @@ from(bucket: "{bucket}")
             deferrable_for_milp: List[DeferrableLoad] = []
             if self._deferrable_scheduler and self._deferrable_loads:
                 try:
-                    active_window_start = now - timedelta(hours=24)
+                    # Bound memory: drop blocks older than any plausible cycle.
+                    safety_cutoff = now - timedelta(hours=48)
                     self._deferrable_completed_blocks = {
                         (name, ts) for name, ts in self._deferrable_completed_blocks
-                        if ts >= active_window_start
+                        if ts >= safety_cutoff
                     }
                     adjusted_loads: List[DeferrableLoad] = []
                     for load in self._deferrable_loads:
+                        # Count only energy delivered in this load's CURRENT
+                        # delivery cycle. A flat 24h window mis-counts a window
+                        # that wraps midnight (e.g. EV 22:00-06:00): early blocks
+                        # age out mid-cycle and the load gets re-scheduled for
+                        # energy it already received (extra grid import). The
+                        # cycle starts at the most recent `earliest_start`
+                        # boundary at/before now.
+                        cycle_start = datetime.combine(
+                            now.date(), load.earliest_start, tzinfo=self._local_tz
+                        )
+                        if cycle_start > now:
+                            cycle_start -= timedelta(days=1)
                         completed = sum(
-                            1 for name, _ts in self._deferrable_completed_blocks
-                            if name == load.name
+                            1 for name, ts in self._deferrable_completed_blocks
+                            if name == load.name and ts >= cycle_start
                         )
                         delivered_kwh = completed * load.power_kw * 0.25
                         remaining_kwh = max(0.0, load.energy_required_kwh - delivered_kwh)
@@ -3148,7 +3202,9 @@ from(bucket: "{bucket}")
             if prices:
                 # Store next day's prices converted to CZK/kWh
                 from .growatt.price_utils import convert_price_dict
-                rate = self._eur_czk_rate or self.config.eur_czk_rate
+                # Refresh the rate (cached daily) so tomorrow's prices use the
+                # same live EUR/CZK as today's, not the stale config fallback.
+                rate = await self._get_eur_czk_rate()
                 self._next_day_prices = convert_price_dict(prices, rate)
                 self._next_day_prices_date = tomorrow_date
                 self._next_day_prices_fetched = True
@@ -3250,30 +3306,39 @@ from(bucket: "{bucket}")
                         should_export = current_price_czk >= context.price_thresholds.export_price_min
                         if should_export != self._current_inverter_state.export_enabled:
                             if should_export:
-                                await self._mode_manager.enable_export()
+                                export_ok = await self._mode_manager.enable_export()
                             else:
-                                await self._mode_manager.disable_export()
-                            # Update tracked state (InverterState is frozen, must recreate)
-                            self._current_inverter_state = InverterState(
-                                inverter_mode=self._current_inverter_state.inverter_mode,
-                                stop_soc=self._current_inverter_state.stop_soc,
-                                power_rate=self._current_inverter_state.power_rate,
-                                time_start=self._current_inverter_state.time_start,
-                                time_stop=self._current_inverter_state.time_stop,
-                                ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
-                                export_enabled=should_export,
-                                timestamp=self._get_local_now(),
-                                source="export_price_update",
-                                # Preserve gate-controlled power state; the frozen
-                                # dataclass defaults inverter_on=True otherwise.
-                                inverter_on=self._current_inverter_state.inverter_on,
-                            )
-                            await self._write_inverter_state_point(source="export_price_update")
-                            state_str = "ENABLED" if should_export else "DISABLED"
-                            self.logger.info(
-                                f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
-                                f"threshold: {context.price_thresholds.export_price_min:.2f})"
-                            )
+                                export_ok = await self._mode_manager.disable_export()
+                            if not export_ok:
+                                # Command failed — leave tracked state unchanged so
+                                # the next re-evaluation retries (mirrors the
+                                # inverter on/off gate). Advancing it here would
+                                # desync tracked vs hardware and never re-fire.
+                                self.logger.warning(
+                                    "Export state change failed; will retry next evaluation"
+                                )
+                            else:
+                                # Update tracked state (InverterState is frozen, must recreate)
+                                self._current_inverter_state = InverterState(
+                                    inverter_mode=self._current_inverter_state.inverter_mode,
+                                    stop_soc=self._current_inverter_state.stop_soc,
+                                    power_rate=self._current_inverter_state.power_rate,
+                                    time_start=self._current_inverter_state.time_start,
+                                    time_stop=self._current_inverter_state.time_stop,
+                                    ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
+                                    export_enabled=should_export,
+                                    timestamp=self._get_local_now(),
+                                    source="export_price_update",
+                                    # Preserve gate-controlled power state; the frozen
+                                    # dataclass defaults inverter_on=True otherwise.
+                                    inverter_on=self._current_inverter_state.inverter_on,
+                                )
+                                await self._write_inverter_state_point(source="export_price_update")
+                                state_str = "ENABLED" if should_export else "DISABLED"
+                                self.logger.info(
+                                    f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
+                                    f"threshold: {context.price_thresholds.export_price_min:.2f})"
+                                )
 
                 # Inverter on/off gate: power the inverter off when the spot
                 # price is below the configured threshold (with hysteresis)
@@ -3851,7 +3916,8 @@ from(bucket: "{bucket}")
                 if self._consumption_forecast and self._consumption_forecast.needs_rebuild():
                     try:
                         await self._consumption_forecast.build_model(
-                            self.influxdb_client, self.settings
+                            self.influxdb_client, self.settings,
+                            local_tz=self._local_tz,
                         )
                     except Exception as e:
                         self.logger.warning(f"Consumption model rebuild failed: {e}")
@@ -3986,11 +4052,15 @@ from(bucket: "{bucket}")
                             self._discharge_periods_today = (
                                 self._discharge_periods_tomorrow.copy()
                             )
+                            self._sell_production_blocks_today = (
+                                self._sell_production_blocks_tomorrow.copy()
+                            )
 
                             # Clear tomorrow's schedules
                             self._cheapest_charging_blocks_tomorrow = set()
                             self._pre_discharge_blocks_tomorrow = set()
                             self._discharge_periods_tomorrow = set()
+                            self._sell_production_blocks_tomorrow = set()
 
                             # Clear queues
                             self._queued_tomorrow_charging = []

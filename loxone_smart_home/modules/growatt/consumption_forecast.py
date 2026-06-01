@@ -117,7 +117,7 @@ class ConsumptionModel:
 
 
 def _carry_forward_hourly(
-    result: Any, hour_keys: Any
+    result: Any, hour_keys: Any, local_tz: Any = None
 ) -> Dict[str, int]:
     """Reconstruct effective hourly state from sparse state-change records.
 
@@ -133,7 +133,12 @@ def _carry_forward_hourly(
             for record in table.records:
                 val = record.get_value()
                 if isinstance(val, (int, float)):
-                    changes.append((record.get_time(), int(val)))
+                    ct = record.get_time()
+                    if local_tz is not None and getattr(
+                        ct, "tzinfo", None
+                    ) is not None:
+                        ct = ct.astimezone(local_tz)
+                    changes.append((ct.replace(tzinfo=None), int(val)))
     out: Dict[str, int] = {}
     if not changes or not hour_keys:
         return out
@@ -167,7 +172,7 @@ def _carry_forward_hourly(
 # previously cached models (e.g., new training-data filters). On version
 # mismatch the controller forces a fresh rebuild, even if the cached
 # model is younger than rebuild_interval_days.
-MODEL_SCHEMA_VERSION = 3
+MODEL_SCHEMA_VERSION = 4
 
 # Upper bound for a "real household" hourly consumption sample (kWh).
 # INVPowerToLocalLoad reports grid passthrough when the inverter is in
@@ -202,7 +207,9 @@ class ConsumptionForecast:
         age = (datetime.now() - self._last_model_build).total_seconds()
         return age > self.rebuild_interval_days * 86400
 
-    async def build_model(self, influxdb_client: Any, settings: Any) -> bool:
+    async def build_model(
+        self, influxdb_client: Any, settings: Any, local_tz: Any = None
+    ) -> bool:
         """Build consumption model from historical InfluxDB data.
 
         Queries up to 365 days of hourly consumption + temperature data,
@@ -218,6 +225,16 @@ class ConsumptionForecast:
         """
         try:
             self.logger.info("Building consumption model from historical data...")
+
+            def _to_local(t: datetime) -> datetime:
+                # Bucket InfluxDB's UTC timestamps into the optimizer's local
+                # wall-clock so the (temp, hour, weekend) bins are keyed by the
+                # same local hours predict_hourly is queried with. Without it
+                # the consumption peak lands 1-2h off and weekend/weekday can
+                # misclassify near midnight. Mirrors the ML model's _to_local.
+                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                    t = t.astimezone(local_tz)
+                return t
 
             # Query hourly consumption (local load power, averaged per hour)
             consumption_query = f'''
@@ -259,7 +276,7 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             consumption_by_hour: Dict[str, float] = {}  # "YYYY-MM-DD-HH" -> watts
             for table in consumption_result:
                 for record in table.records:
-                    t = record.get_time()
+                    t = _to_local(record.get_time())
                     key = t.strftime("%Y-%m-%d-%H")
                     consumption_by_hour[key] = record.get_value()
 
@@ -267,13 +284,13 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             temp_by_hour: Dict[str, float] = {}
             for table in temperature_result:
                 for record in table.records:
-                    t = record.get_time()
+                    t = _to_local(record.get_time())
                     key = t.strftime("%Y-%m-%d-%H")
                     temp_by_hour[key] = record.get_value()
 
             # Resolve inverter on/off state per hour from sparse change records.
             inverter_on_by_hour = _carry_forward_hourly(
-                inverter_on_result, consumption_by_hour.keys()
+                inverter_on_result, consumption_by_hour.keys(), local_tz
             )
 
             # Build model bins

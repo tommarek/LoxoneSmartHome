@@ -211,8 +211,12 @@ class GrowattConfig(BaseSettings):
 
     # Dynamic charge block count
     dynamic_charge_blocks: bool = Field(
-        default=True,
-        description="Auto-adjust charge block count based on price spread"
+        default=False,
+        description=(
+            "Auto-adjust charge block count based on price spread. Defaults OFF "
+            "so the rule-based path keeps the fixed battery_charge_blocks count "
+            "unless explicitly opted in (enabling it changes grid-charge volume)."
+        )
     )
     min_charge_blocks: int = Field(
         default=4, ge=0, le=96,
@@ -504,12 +508,104 @@ class GrowattConfig(BaseSettings):
         gross JSON/shape errors here at startup instead.
         """
         import json
+        from datetime import time as _time
         try:
             parsed = json.loads(v)
         except (ValueError, TypeError) as e:
             raise ValueError(f"deferrable_loads_json is not valid JSON: {e}")
         if not isinstance(parsed, list):
             raise ValueError("deferrable_loads_json must be a JSON array")
+        for i, entry in enumerate(parsed):
+            if not isinstance(entry, dict):
+                raise ValueError(
+                    f"deferrable_loads_json entry {i} must be an object"
+                )
+            if not isinstance(entry.get("name"), str) or not entry["name"]:
+                raise ValueError(
+                    f"deferrable_loads_json entry {i} needs a non-empty string 'name'"
+                )
+            name = entry["name"]
+            for key in ("energy_required_kwh", "power_kw"):
+                if key not in entry:
+                    raise ValueError(
+                        f"deferrable_loads_json entry {name!r} is missing required '{key}'"
+                    )
+                try:
+                    num = float(entry[key])
+                except (ValueError, TypeError):
+                    raise ValueError(
+                        f"deferrable_loads_json entry {name!r}: '{key}' must be a number"
+                    )
+                # power_kw drives blocks_needed (energy / power) and energy_required_kwh
+                # must be deliverable — both must be strictly positive, else scheduling
+                # would divide by zero / never complete. Fail fast at startup.
+                if num <= 0:
+                    raise ValueError(
+                        f"deferrable_loads_json entry {name!r}: '{key}' must be > 0 "
+                        f"(got {entry[key]!r})"
+                    )
+            # Optional time windows default to a full day in the controller, but
+            # if present they must be parseable by time.fromisoformat (HH:MM).
+            for key in ("earliest_start", "latest_end"):
+                if key in entry:
+                    try:
+                        _time.fromisoformat(entry[key])
+                    except (ValueError, TypeError):
+                        raise ValueError(
+                            f"deferrable_loads_json entry {name!r}: '{key}' must be "
+                            f"an HH:MM time string (got {entry[key]!r})"
+                        )
+        return v
+
+    @field_validator("solar_arrays")
+    @classmethod
+    def validate_solar_arrays(cls, v: str) -> str:
+        """Fail fast on malformed solar-arrays JSON.
+
+        SolarForecast.from_config parses this at startup; a typo would
+        otherwise surface deep inside model building only when
+        solar_forecast_enabled is true. Catch gross JSON/shape errors here.
+        """
+        import json
+        try:
+            parsed = json.loads(v)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"solar_arrays is not valid JSON: {e}")
+        if not isinstance(parsed, list) or not parsed:
+            raise ValueError("solar_arrays must be a non-empty JSON array")
+        for a in parsed:
+            if not isinstance(a, dict) or not {
+                "name", "declination", "azimuth", "kwp"
+            } <= set(a):
+                raise ValueError(
+                    "each solar_arrays entry needs name/declination/azimuth/kwp"
+                )
+        return v
+
+    @field_validator("low_tariff_hours")
+    @classmethod
+    def validate_low_tariff_hours(cls, v: str) -> str:
+        """Validate the comma-separated 'start-end' low-tariff hour ranges.
+
+        Consumed by the controller's cost math whenever it runs (not gated by
+        a feature flag), so a malformed value should fail at startup rather
+        than raise mid-decision.
+        """
+        for part in v.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                start_s, end_s = part.split("-")
+                start, end = int(start_s), int(end_s)
+            except ValueError:
+                raise ValueError(
+                    f"low_tariff_hours range {part!r} must be 'start-end' integers"
+                )
+            if not (0 <= start <= 24 and 0 <= end <= 24 and start < end):
+                raise ValueError(
+                    f"low_tariff_hours range {part!r} must satisfy 0<=start<end<=24"
+                )
         return v
 
     @field_validator("max_charge_blocks")

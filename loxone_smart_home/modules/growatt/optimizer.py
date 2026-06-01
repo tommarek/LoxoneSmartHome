@@ -433,36 +433,50 @@ from(bucket: "{solar_bucket}")
         for block_idx in range(n):
             block_ts = blocks[block_idx][0]
 
-            # Find hours until next recharge
+            # Reserve at this block must bridge net load from the NEXT block
+            # until the next recharge. next_recharge_idx[block_idx+1] is the
+            # first recharge at/after block_idx+1; the [block_idx+1, window_end)
+            # horizon excludes the recharge block itself (it refills mid-block),
+            # so when the very next block is already a recharge the reserve is
+            # 0 — intended: the upcoming block tops the battery back up.
             recharge_j = next_recharge_idx[min(block_idx + 1, n - 1)] if block_idx + 1 < n else n
-            if recharge_j < n:
-                delta = (blocks[recharge_j][0] - block_ts).total_seconds() / 3600
-                hours_until = max(1, int(delta))
-            else:
-                delta = (blocks[-1][0] - block_ts).total_seconds() / 3600
-                hours_until = max(1, int(delta))
+            window_end = recharge_j if recharge_j < n else n
 
-            # Sum base load for hours until recharge
+            # Net energy the battery must hold to cover consumption until the
+            # next recharge. Work in per-BLOCK units over the SAME
+            # [block_idx+1, window_end) horizon for load, solar and grid credit
+            # so they can't disagree. Per block, solar first offsets the
+            # concurrent base load; only the deficit must come from the battery
+            # (charged at a discharge loss → /efficiency) and only the surplus
+            # charges it (at a charge loss → *efficiency). This avoids the old
+            # double-count where full solar was credited as incoming charge while
+            # the full load was still booked into the reserve.
             gross_reserve_kwh = 0.0
-            for offset in range(hours_until):
-                future_hour = (block_ts.hour + offset) % 24
-                future_weekend = (block_ts + timedelta(hours=offset)).weekday() >= 5
-                gross_reserve_kwh += self._base_load_profile.get(future_hour, future_weekend)
-
-            gross_reserve_kwh = gross_reserve_kwh / efficiency
-
-            # Subtract incoming energy before recharge
             incoming_kwh = 0.0
-            for j in range(block_idx + 1, n):
+            has_cheap_topup = False
+            for j in range(block_idx + 1, window_end):
                 ts_j = blocks[j][0]
-                if recharge_j < n and j >= recharge_j:
-                    break
+                base_block = self._base_load_profile.get(
+                    ts_j.hour, ts_j.weekday() >= 5
+                ) / 4.0
+                solar_block = max(0.0, _forecast_value(solar_hourly, ts_j) / 4.0)
+                net = base_block - solar_block
+                if net > 0:
+                    gross_reserve_kwh += net / efficiency
+                else:
+                    incoming_kwh += (-net) * efficiency
+
+                # A cheap-ish grid block before the recharge gives ONE top-up
+                # opportunity. Only note it here — crediting a fresh full charge
+                # block per cheap block (the old behaviour) over-credited
+                # incoming on price-flat nights, zeroing the reserve and letting
+                # discharge drain the battery with nothing left for base load.
                 price_rank = sum(1 for p in prices if p < prices[j]) / n if n > 0 else 0.5
                 if price_rank < 0.35:
-                    incoming_kwh += kwh_per_block * efficiency
-                solar_block = _forecast_value(solar_hourly, ts_j) / 4.0
-                if solar_block > 0:
-                    incoming_kwh += solar_block * efficiency
+                    has_cheap_topup = True
+
+            if has_cheap_topup:
+                incoming_kwh += kwh_per_block * efficiency
 
             reserve_kwh = max(0, gross_reserve_kwh - incoming_kwh)
             reserve_kwh = min(reserve_kwh, max_reserve)
@@ -1014,30 +1028,33 @@ from(bucket: "{solar_bucket}")
                     soc += solar_to_batt / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
             elif action == "discharge":
-                # Cap the battery-side drain to energy available ABOVE the
-                # per-block dynamic reserve, so a discharge block can't push SOC
-                # below effective_min_soc (the value calc respects this via
-                # discharge_possible; the state update must too). The deficit
-                # branch below may still draw to the hardware floor to serve load.
-                grid_discharge = min(
-                    discharge_kwh_per_block,
-                    max(0.0, battery_kwh - min_battery_kwh),
-                )
-                if net_from_solar >= 0:
-                    soc -= grid_discharge / battery_capacity_kwh * 100
-                else:
-                    total_drain = grid_discharge + abs(net_from_solar)
-                    soc -= total_drain / battery_capacity_kwh * 100
-                soc = max(min_soc, soc)
+                # `discharge_possible` is the GRID-DELIVERED energy and already
+                # respects the per-block dynamic reserve (battery_kwh-min)*eff,
+                # so it can't push SOC below effective_min_soc. Delivering that
+                # to the grid drains battery_delivered/efficiency of stored
+                # energy (inverter/round-trip loss). Mirrors the MILP, which
+                # drains battery by grid_export / eta.
+                battery_drain = discharge_possible / efficiency
+                if net_from_solar < 0:
+                    # House deficit is also served from the battery (also lossy).
+                    # This adds on top of the grid-export drain, so the combined
+                    # drain can exceed (battery_kwh - min_battery_kwh); clamp the
+                    # final SOC at the per-block dynamic reserve, not the hw floor.
+                    battery_drain += abs(net_from_solar) / efficiency
+                soc -= battery_drain / battery_capacity_kwh * 100
+                soc = max(effective_min_soc, soc)
             elif action == "sell_production":
                 # Solar excess flows to grid (battery does NOT charge from it).
-                # Battery only drains if loads exceed solar (auto-SC).
+                # Battery only drains if loads exceed solar (auto-SC), and only
+                # down to the dynamic reserve — preserve overnight energy the
+                # same way the discharge branch does (was: hardware floor).
                 if net_from_solar < 0:
-                    draw = min(abs(net_from_solar),
-                               battery_capacity_kwh * (soc - min_soc) / 100)
-                    if draw > 0:
-                        soc -= draw / battery_capacity_kwh * 100
-                        soc = max(min_soc, soc)
+                    need = abs(net_from_solar) / efficiency  # battery-side, lossy
+                    avail = max(0.0, battery_kwh - min_battery_kwh)
+                    battery_drain = min(need, avail)
+                    if battery_drain > 0:
+                        soc -= battery_drain / battery_capacity_kwh * 100
+                        soc = max(effective_min_soc, soc)
                 # net_from_solar >= 0: solar covers loads, excess to grid, SOC unchanged.
             else:  # hold
                 if net_from_solar > 0:
@@ -1047,11 +1064,16 @@ from(bucket: "{solar_bucket}")
                         soc += solar_to_batt / battery_capacity_kwh * 100
                         soc = min(max_soc, soc)
                 else:
-                    draw = min(abs(net_from_solar),
-                               battery_capacity_kwh * soc / 100 - battery_capacity_kwh * min_soc / 100)
+                    # Pure self-consumption: serve the deficit from the battery
+                    # down to the per-block DYNAMIC reserve (not the hardware
+                    # floor) so holding preserves overnight energy. Battery-side
+                    # draw is lossy, matching the value model.
+                    need = abs(net_from_solar) / efficiency
+                    avail = max(0.0, battery_kwh - min_battery_kwh)
+                    draw = min(need, avail)
                     if draw > 0:
                         soc -= draw / battery_capacity_kwh * 100
-                        soc = max(min_soc, soc)
+                        soc = max(effective_min_soc, soc)
 
             decision = BlockDecision(
                 timestamp=timestamp,

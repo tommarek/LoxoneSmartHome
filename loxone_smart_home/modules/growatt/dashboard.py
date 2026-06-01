@@ -595,6 +595,63 @@ from(bucket: "{bucket}")
         return web.json_response({"hourly": {}, "error": str(e)})
 
 
+async def api_soc_actuals(request: web.Request) -> web.Response:
+    """Today's actual battery SOC per 15-min block (for the real-vs-projected
+    SOC overlay). Lets the chart show what the battery ACTUALLY did for hours
+    that have already elapsed, instead of only the optimizer's projection.
+
+    Cached ~90 s per controller so the elapsed-hours line stays reasonably
+    fresh without hammering InfluxDB on every dashboard refresh.
+    """
+    ctrl = _get_controller(request)
+    if not ctrl or not getattr(ctrl, 'influxdb_client', None):
+        return web.json_response({"blocks": {}})
+
+    cache = getattr(ctrl, '_soc_actuals_cache', None)
+    if cache:
+        ts, payload = cache
+        if (datetime.now() - ts).total_seconds() < 90:
+            return web.json_response(payload)
+
+    try:
+        bucket = ctrl.settings.influxdb.bucket_solar
+        # `last` (not mean) per window: SOC is a level, so the value at the end
+        # of each block is what we want to plot, matching the projection grid.
+        q = f'''
+from(bucket: "{bucket}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
+  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)
+'''
+        r = await ctrl.influxdb_client.query(q)
+        blocks: Dict[str, float] = {}
+        # InfluxDB timestamps are UTC-aware; bucket by LOCAL "HH:MM" so the
+        # actuals line up with the optimizer's local-time projection grid (and
+        # the 15-min price bars). Fall back to naive/UTC without zoneinfo.
+        try:
+            from zoneinfo import ZoneInfo
+            local_tz = ZoneInfo("Europe/Prague")
+        except Exception:
+            local_tz = None
+        local_now = datetime.now(local_tz) if local_tz else datetime.now()
+        today = local_now.date()
+        for table in r:
+            for record in table.records:
+                t = record.get_time()
+                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                    t = t.astimezone(local_tz)
+                if t.date() != today:
+                    continue
+                soc = record.get_value()
+                if isinstance(soc, (int, float)):
+                    blocks[t.strftime("%H:%M")] = round(float(soc), 1)  # percent
+        payload = {"blocks": blocks}
+        ctrl._soc_actuals_cache = (datetime.now(), payload)
+        return web.json_response(payload)
+    except Exception as e:
+        return web.json_response({"blocks": {}, "error": str(e)})
+
+
 async def api_logs(request: web.Request) -> web.Response:
     """Get recent log entries."""
     count = int(request.query.get("count", "100"))
@@ -683,6 +740,7 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_get("/api/prices", api_prices)
     app.router.add_get("/api/projection", api_projection)
     app.router.add_get("/api/solar_actuals", api_solar_actuals)
+    app.router.add_get("/api/soc_actuals", api_soc_actuals)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
@@ -822,6 +880,15 @@ body {
   gap: 1px;
   margin-top: 8px;
 }
+.soc-legend {
+  display: flex;
+  gap: 16px;
+  margin: 4px 0 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.soc-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.soc-legend-item svg { overflow: visible; }
 .price-chart-label {
   font-size: 11px;
   color: var(--muted);
@@ -1132,10 +1199,17 @@ select, input {
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
     <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
+    <div class="soc-legend">
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2.5"/></svg> SOC — actual (elapsed)</span>
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> SOC — projected</span>
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2.5"/></svg> Solar — actual</span>
+      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> Solar — projected</span>
+    </div>
     <div class="price-chart-day" id="priceChartTodayWrap">
       <div class="price-chart-label" id="priceChartTodayLabel">Today</div>
       <div style="position:relative">
         <div class="price-chart" id="priceChartToday"></div>
+        <svg id="solarLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
       </div>
     </div>
@@ -1143,6 +1217,7 @@ select, input {
       <div class="price-chart-label" id="priceChartTomorrowLabel">Tomorrow</div>
       <div style="position:relative">
         <div class="price-chart" id="priceChartTomorrow"></div>
+        <svg id="solarLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
       </div>
     </div>
@@ -1383,10 +1458,11 @@ function updateUI(d) {
 
 async function fetchPrices() {
   try {
-    const [priceRes, projRes, actualsRes] = await Promise.all([
+    const [priceRes, projRes, actualsRes, socRes] = await Promise.all([
       fetch('/api/prices'),
       fetch('/api/projection'),
       fetch('/api/solar_actuals'),
+      fetch('/api/soc_actuals'),
     ]);
     const data = await priceRes.json();
     const projData = await projRes.json();
@@ -1394,6 +1470,10 @@ async function fetchPrices() {
       const actualsData = await actualsRes.json();
       solarActuals = (actualsData && actualsData.hourly) || {};
     } catch (e) { solarActuals = {}; }
+    try {
+      const socData = await socRes.json();
+      socActuals = (socData && socData.blocks) || {};
+    } catch (e) { socActuals = {}; }
     const todayPrices = data.prices || [];
     const tomorrowPrices = data.tomorrow || [];
     const allPrices = [...todayPrices, ...tomorrowPrices];
@@ -1410,20 +1490,22 @@ async function fetchPrices() {
 
     const timeline = projData.timeline || [];
     renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
-    renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday');
+    renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true);
+    renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday', true);
 
     const tomorrowWrap = document.getElementById('priceChartTomorrowWrap');
     if (data.has_tomorrow && tomorrowPrices.length) {
       tomorrowWrap.style.display = '';
       renderPriceChart(tomorrowPrices, 'priceChartTomorrow', todayPrices.length, maxAbs);
-      renderSocLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'socLineTomorrow');
+      renderSolarLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'solarLineTomorrow', false);
+      renderSocLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'socLineTomorrow', false);
     } else {
       tomorrowWrap.style.display = 'none';
     }
   } catch (e) { console.error('fetchPrices error:', e); }
 }
 
-function renderSocLine(prices, timeline, chartId, svgId) {
+function renderSocLine(prices, timeline, chartId, svgId, isToday) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
   if (!timeline.length || !prices.length) { svg.innerHTML = ''; return; }
@@ -1434,51 +1516,209 @@ function renderSocLine(prices, timeline, chartId, svgId) {
   const h = chart.offsetHeight;
   if (!w || !h) return;
 
-  // Build SOC lookup: "HH:MM|day" -> soc%
+  // Build projected-SOC lookup: "HH:MM|day" -> soc%
   const socMap = {};
   timeline.forEach(t => { socMap[t.time + '|' + t.day] = t.soc; });
 
-  // Build points for the polyline. Track which price-bar index produced each
-  // point so we can place start/middle/end SOC% labels on actual rendered bars.
-  const points = [];
-  const labelMeta = [];  // parallel array: { soc: number } per point
+  // Index of the current (in-progress) block; everything before it has already
+  // elapsed and gets the REAL measured SOC, everything from it onward stays the
+  // optimizer's projection. -1 when no bar is current (e.g. tomorrow chart).
+  const curIdx = isToday ? prices.findIndex(p => p.is_current) : -1;
   const barWidth = w / prices.length;
+  const toXY = (i, soc) => {
+    const x = i * barWidth + barWidth / 2;
+    const y = h - (soc / 100 * h);  // SOC 100% = top, 0% = bottom
+    return x.toFixed(1) + ',' + y.toFixed(1);
+  };
+
+  // Pass 1 — real (elapsed) points: actual measured SOC for past/current blocks.
+  const realPts = [];
+  let nowLabel = null;  // { x, y, soc } at the live edge
   prices.forEach((p, i) => {
-    const key = p.start + '|' + p.day;
-    const soc = socMap[key];
-    if (soc != null) {
-      const x = i * barWidth + barWidth / 2;
-      const y = h - (soc / 100 * h);  // SOC 100% = top, 0% = bottom
-      points.push(x.toFixed(1) + ',' + y.toFixed(1));
-      labelMeta.push({ soc: soc });
+    const isPastOrNow = isToday && curIdx !== -1 && i <= curIdx;
+    const actual = isToday ? socActuals[p.start] : undefined;
+    if (isPastOrNow && actual != null) {
+      const pt = toXY(i, actual);
+      realPts.push(pt);
+      if (i === curIdx) {
+        const c = pt.split(',');
+        nowLabel = { x: parseFloat(c[0]), y: parseFloat(c[1]), soc: actual };
+      }
     }
   });
 
-  if (points.length < 2) { svg.innerHTML = ''; return; }
-
-  // Draw SOC line + percentage labels at key points
-  let svgContent = '<polyline points="' + points.join(' ') + '" ' +
-    'fill="none" stroke="#f97316" stroke-width="2" stroke-opacity="0.8" ' +
-    'stroke-linejoin="round" stroke-linecap="round"/>';
-
-  // SOC% labels at start, middle, end of THIS chart's points
-  const labelIndices = [0, Math.floor(points.length / 2), points.length - 1];
-  labelIndices.forEach(idx => {
-    const meta = labelMeta[idx];
-    if (!meta) return;
-    const coords = points[idx].split(',');
-    const x = parseFloat(coords[0]);
-    const y = parseFloat(coords[1]) - 6;
-    svgContent += '<text x="' + x + '" y="' + Math.max(12, y) + '" ' +
-      'font-size="10" fill="#f97316" text-anchor="middle" font-weight="600">' +
-      meta.soc + '%</text>';
+  // Pass 2 — projected (future) points. When we have a real segment they start
+  // at the current block (so the solid line owns the past); otherwise — no
+  // telemetry yet today, or the tomorrow chart — the projection spans the whole
+  // day so the chart never goes blank (preserves the original behaviour).
+  const hasReal = realPts.length >= 2;
+  const projPts = [];
+  prices.forEach((p, i) => {
+    const proj = socMap[p.start + '|' + p.day];
+    if (proj == null) return;
+    const inFuture = !hasReal || curIdx === -1 || i >= curIdx;
+    if (inFuture) projPts.push(toXY(i, proj));
   });
+
+  // Keep the line continuous: the dashed (projected) segment should start where
+  // the solid (real) segment ends.
+  if (realPts.length >= 1 && projPts.length >= 1) {
+    // Ensure the dashed segment starts where the solid one ends.
+    if (projPts[0] !== realPts[realPts.length - 1]) {
+      projPts.unshift(realPts[realPts.length - 1]);
+    }
+  }
+
+  if (realPts.length < 2 && projPts.length < 2) { svg.innerHTML = ''; return; }
+
+  let svgContent = '';
+  // Projected (future) — dashed, translucent.
+  if (projPts.length >= 2) {
+    svgContent += '<polyline points="' + projPts.join(' ') + '" ' +
+      'fill="none" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" ' +
+      'stroke-dasharray="4 3" stroke-linejoin="round" stroke-linecap="round"/>';
+  }
+  // Real (elapsed) — solid, brighter, drawn on top.
+  if (realPts.length >= 2) {
+    svgContent += '<polyline points="' + realPts.join(' ') + '" ' +
+      'fill="none" stroke="#f97316" stroke-width="2.5" stroke-opacity="0.95" ' +
+      'stroke-linejoin="round" stroke-linecap="round"/>';
+  }
+
+  // SOC% labels: start + end of whatever line is shown, plus a highlighted
+  // "now" marker at the real/projected boundary.
+  const labelAt = (pt, soc, weight) => {
+    const c = pt.split(',');
+    const x = parseFloat(c[0]);
+    const y = Math.max(12, parseFloat(c[1]) - 6);
+    return '<text x="' + x + '" y="' + y + '" font-size="10" fill="#f97316" ' +
+      'text-anchor="middle" font-weight="' + weight + '">' + Math.round(soc) + '%</text>';
+  };
+  const allPts = realPts.concat(projPts);
+  if (allPts.length) {
+    const firstSoc = isToday && socActuals[prices[0].start] != null
+      ? socActuals[prices[0].start] : (socMap[prices[0].start + '|' + prices[0].day]);
+    const lastProj = projPts.length ? projPts[projPts.length - 1] : realPts[realPts.length - 1];
+    const lastSoc = socMap[prices[prices.length - 1].start + '|' + prices[prices.length - 1].day];
+    if (firstSoc != null) svgContent += labelAt(allPts[0], firstSoc, '600');
+    if (lastSoc != null) svgContent += labelAt(lastProj, lastSoc, '600');
+  }
+  if (nowLabel) {
+    svgContent += '<circle cx="' + nowLabel.x + '" cy="' + nowLabel.y + '" r="3" ' +
+      'fill="#f97316"/>';
+    svgContent += '<text x="' + nowLabel.x + '" y="' + Math.max(12, nowLabel.y - 9) + '" ' +
+      'font-size="10" fill="#f97316" text-anchor="middle" font-weight="700">' +
+      Math.round(nowLabel.soc) + '%</text>';
+  }
 
   svg.innerHTML = svgContent;
 }
 
+// Solar production line: actual (solid) for elapsed hours, projected (dashed)
+// for the rest. Both aggregated to HOURLY kWh so the units match — projected
+// solar in the timeline is per-15-min block, actual solar is per hour.
+function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
+  const svg = document.getElementById(svgId);
+  if (!svg) return;
+  if (!timeline.length || !prices.length) { svg.innerHTML = ''; return; }
+
+  const chart = document.getElementById(chartId);
+  if (!chart) { svg.innerHTML = ''; return; }
+  const w = chart.offsetWidth;
+  const h = chart.offsetHeight;
+  if (!w || !h) return;
+
+  const dayOf = prices[0].day;  // every bar in a given chart shares one day
+
+  // Projected hourly solar (kWh): sum the four 15-min blocks in each hour.
+  const projHour = {};
+  timeline.forEach(t => {
+    if (t.day !== dayOf) return;
+    const hr = parseInt(t.time.split(':')[0], 10);
+    projHour[hr] = (projHour[hr] || 0) + (t.solar_kwh || 0);
+  });
+  // Actual hourly solar (today only; keyed "HH:00").
+  const actHour = {};
+  if (isToday) {
+    Object.keys(solarActuals).forEach(k => {
+      actHour[parseInt(k.split(':')[0], 10)] = solarActuals[k];
+    });
+  }
+
+  // Map hour -> centre x of that hour's price bars.
+  const barWidth = w / prices.length;
+  const hourBars = {};
+  prices.forEach((p, i) => {
+    const hr = parseInt(p.start.split(':')[0], 10);
+    (hourBars[hr] = hourBars[hr] || []).push(i);
+  });
+  const centerX = hr => {
+    const idxs = hourBars[hr];
+    if (!idxs) return null;
+    const mid = idxs.reduce((a, b) => a + b, 0) / idxs.length;
+    return mid * barWidth + barWidth / 2;
+  };
+
+  // Current hour boundary (today only).
+  let curHr = -1;
+  if (isToday) {
+    const cur = prices.find(p => p.is_current);
+    if (cur) curHr = parseInt(cur.start.split(':')[0], 10);
+  }
+
+  // Shared scale; sit solar in the lower band so it reads under the SOC line.
+  let maxKwh = 0.5;
+  Object.values(projHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
+  Object.values(actHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
+  const yOf = v => h - (v / maxKwh) * h * 0.55;
+
+  const hours = Array.from(new Set(
+    Object.keys(projHour).concat(Object.keys(actHour)).map(Number)
+  )).sort((a, b) => a - b);
+
+  // Pass 1 — actual (elapsed) hours.
+  const realPts = [];
+  hours.forEach(hr => {
+    const x = centerX(hr);
+    if (x == null) return;
+    const isPastOrNow = isToday && curHr !== -1 && hr <= curHr;
+    if (isPastOrNow && actHour[hr] != null) {
+      realPts.push(x.toFixed(1) + ',' + yOf(actHour[hr]).toFixed(1));
+    }
+  });
+  // Pass 2 — projected hours (future, or full span when no actuals/tomorrow).
+  const hasReal = realPts.length >= 2;
+  const projPts = [];
+  hours.forEach(hr => {
+    const x = centerX(hr);
+    if (x == null || projHour[hr] == null) return;
+    const inFuture = !hasReal || curHr === -1 || hr >= curHr;
+    if (inFuture) projPts.push(x.toFixed(1) + ',' + yOf(projHour[hr]).toFixed(1));
+  });
+  if (realPts.length >= 1 && projPts.length >= 1 &&
+      projPts[0] !== realPts[realPts.length - 1]) {
+    projPts.unshift(realPts[realPts.length - 1]);
+  }
+
+  if (realPts.length < 2 && projPts.length < 2) { svg.innerHTML = ''; return; }
+
+  let s = '';
+  if (projPts.length >= 2) {
+    s += '<polyline points="' + projPts.join(' ') + '" fill="none" ' +
+      'stroke="#fde047" stroke-width="2" stroke-opacity="0.45" ' +
+      'stroke-dasharray="4 3" stroke-linejoin="round" stroke-linecap="round"/>';
+  }
+  if (realPts.length >= 2) {
+    s += '<polyline points="' + realPts.join(' ') + '" fill="none" ' +
+      'stroke="#fde047" stroke-width="2.5" stroke-opacity="0.9" ' +
+      'stroke-linejoin="round" stroke-linecap="round"/>';
+  }
+  svg.innerHTML = s;
+}
+
 let priceData = [];
 let solarActuals = {};  // "HH:00" -> actual solar kWh (today only)
+let socActuals = {};    // "HH:MM" -> actual battery SOC% (today, elapsed blocks)
 
 function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   const chart = document.getElementById(mountId);

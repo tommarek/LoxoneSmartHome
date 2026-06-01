@@ -506,14 +506,11 @@ class GrowattDecisionEngine:
             if "-" in range_str:
                 parts = range_str.split("-")
                 start_h, end_h = int(parts[0]), int(parts[1])
-                if start_h <= end_h:
-                    # Normal range, e.g. "22-24" or "0-6".
-                    if start_h <= hour < end_h:
-                        return thresholds.distribution_tariff_low
-                else:
-                    # Wrap-around range, e.g. "22-6" → 22,23,0..5.
-                    if hour >= start_h or hour < end_h:
-                        return thresholds.distribution_tariff_low
+                # Ranges are validated start<end (validate_low_tariff_hours), so
+                # they never wrap midnight — express an overnight window as two
+                # ranges, e.g. "22-24,0-6".
+                if start_h <= hour < end_h:
+                    return thresholds.distribution_tariff_low
         return thresholds.distribution_tariff_high
 
     @staticmethod

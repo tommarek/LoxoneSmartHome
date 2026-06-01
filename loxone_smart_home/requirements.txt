@@ -25,23 +25,23 @@ websockets>=12.0
 pytz==2023.3
 astral==3.2  # For sunrise/sunset calculations
 
-# CEZ Distribution HDO tariff schedule
-cez-distribution-hdo==0.3.0
-
 # Data processing
-pandas>=2.2.0
-numpy>=2.0.0
-scipy>=1.13.0
+# Upper bounds pin the NumPy-2 / pandas-2 / scipy-1 major lines so a future
+# `docker-compose build` (no lockfile) can't pull an incompatible major and
+# silently break the optimizer/forecaster at runtime.
+pandas>=2.2.0,<3.0.0
+numpy>=2.0.0,<3.0.0
+scipy>=1.13.0,<2.0.0
 
 # MILP optimization — global-optimum battery schedule solver
-pulp>=2.7.0
+pulp>=2.7.0,<4.0
 
 # ML forecasting — autoregressive consumption model
 # Optional: falls back to temperature-binned median if init fails.
 # skforecast >=0.14 guarantees the `skforecast.recursive.ForecasterRecursive`
 # import path used by ml_consumption_forecast (0.13 relocated it and breaks
 # both import fallbacks). Server runs 0.22.
-scikit-learn>=1.3.0
+scikit-learn>=1.3.0,<2.0.0
 skforecast>=0.14,<1.0
 
 # Weather API specific

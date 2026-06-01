@@ -36,6 +36,9 @@ class ModeManager:
             adapter: InverterAdapter for time helpers and inverter queries
         """
         self.logger = logger
+        # The shared AsyncMQTTClient instance. It reconnects internally (the
+        # object is created once in BaseModule.__init__ and never rebound), so
+        # holding the reference is safe — there is no live client to track.
         self.mqtt_client = mqtt_client
         self.config = config
         self._optional_config = optional_config
@@ -440,10 +443,15 @@ class ModeManager:
             f"Topic: {self.config.battery_first_topic}"
         )
 
-    async def set_export(self, enabled: bool) -> None:
-        """Set export state. Uses edge-triggered topics for external systems."""
+    async def set_export(self, enabled: bool) -> bool:
+        """Set export state. Uses edge-triggered topics for external systems.
+
+        Returns True if export is in the desired state after this call (already
+        there, simulated, or the command succeeded), False if the command
+        failed. Callers must not advance tracked state unless this returns True.
+        """
         if self._export_enabled == enabled:
-            return
+            return True
 
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -453,7 +461,7 @@ class ModeManager:
                 f"{emoji} [SIMULATE] EXPORT {state} (simulated at {current_time})"
             )
             self._export_enabled = enabled
-            return
+            return True
 
         # Edge-triggered topics
         payload = {"value": True}
@@ -469,7 +477,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to enable export")
-                return  # Don't update state if command failed
+                return False  # Don't update state if command failed
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬆️ EXPORT ENABLED at {current_time} → Topic: {topic}")
@@ -483,20 +491,21 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to disable export")
-                return  # Don't update state if command failed
+                return False  # Don't update state if command failed
 
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"⬇️ EXPORT DISABLED at {current_time} → Topic: {topic}")
 
         self._export_enabled = enabled
+        return True
 
-    async def enable_export(self) -> None:
-        """Enable electricity export to grid."""
-        await self.set_export(True)
+    async def enable_export(self) -> bool:
+        """Enable electricity export to grid. Returns True on success."""
+        return await self.set_export(True)
 
-    async def disable_export(self) -> None:
-        """Disable electricity export to grid."""
-        await self.set_export(False)
+    async def disable_export(self) -> bool:
+        """Disable electricity export to grid. Returns True on success."""
+        return await self.set_export(False)
 
     async def set_inverter_power(self, on: bool) -> bool:
         """Power the inverter on or off via Modbus holding register 0.

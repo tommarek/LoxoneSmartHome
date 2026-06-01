@@ -387,7 +387,15 @@ class SolarForecast:
                         watt_hours = data.get("result", {}).get("watt_hours_period", {})
 
                         for timestamp_str, wh in watt_hours.items():
-                            # Format: "YYYY-MM-DD HH:MM:SS"
+                            # forecast.solar returns naive "YYYY-MM-DD HH:MM:SS"
+                            # timestamps already in the SITE's local timezone
+                            # (derived from lat/lon) — which for this deployment
+                            # is the Europe/Prague zone used for all scheduling.
+                            # So the naive date/hour below IS the local grid, no
+                            # conversion needed (cf. OpenMeteo timezone=auto and
+                            # Solcast's explicit tz conversion). If forecast.solar
+                            # ever changed its default to UTC this would shift by
+                            # the local offset; that contract is assumed here.
                             dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
                             date_str = dt.strftime("%Y-%m-%d")
                             hour = dt.hour
@@ -504,7 +512,7 @@ class SolarForecast:
     # --- Learned production model ---
 
     async def build_production_model(
-        self, influxdb_client: Any, settings: Any
+        self, influxdb_client: Any, settings: Any, local_tz: Any = None
     ) -> bool:
         """Train solar production model from ALL historical data.
 
@@ -515,12 +523,29 @@ class SolarForecast:
         Args:
             influxdb_client: Async InfluxDB client
             settings: App settings (for bucket names)
+            local_tz: Local timezone used to bucket InfluxDB's UTC timestamps
+                into LOCAL hour keys. Critical: ``_sun_position`` treats its
+                ``hour`` arg as local solar time (noon at 12), and prediction
+                (``predict_from_model``) keys on local hours, so training MUST
+                bucket on the same local clock — otherwise the sun-altitude
+                bucket learned at a UTC hour is applied at a different physical
+                instant, shifting the whole production curve by the UTC offset.
+                Mirrors the consumption/ML forecasters' ``_to_local`` fix.
 
         Returns:
             True if model was built successfully
         """
         try:
             self.logger.info("Building solar production model from historical data...")
+
+            def _to_local(t: datetime) -> datetime:
+                # Convert tz-aware UTC timestamps to local before bucketing so
+                # hour keys (and the sun position derived from them) match the
+                # local-time basis used at prediction time. Naive timestamps are
+                # assumed already-local and passed through.
+                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                    return t.astimezone(local_tz)
+                return t
 
             # Query hourly solar production
             solar_query = f'''
@@ -576,73 +601,36 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             solar_by_hour: Dict[str, float] = {}
             for table in solar_result:
                 for record in table.records:
-                    key = record.get_time().strftime("%Y-%m-%d-%H")
+                    key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
                     solar_by_hour[key] = record.get_value()
 
             soc_by_hour: Dict[str, float] = {}
             if soc_result:
                 for table in soc_result:
                     for record in table.records:
-                        key = record.get_time().strftime("%Y-%m-%d-%H")
+                        key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
                         soc_by_hour[key] = record.get_value()
 
             load_by_hour: Dict[str, float] = {}
             if load_result:
                 for table in load_result:
                     for record in table.records:
-                        key = record.get_time().strftime("%Y-%m-%d-%H")
+                        key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
                         load_by_hour[key] = record.get_value()
 
-            # Carry-forward state intervals: state-change records span until
-            # the next change. For each solar-data hour key we want the
-            # effective state DURING that hour. `min` over (state-entering,
-            # any changes within the hour) means a partial-disabled hour
-            # still counts as disabled. Hours predating the first record
-            # stay missing — `_by_hour.get(key, 1)` callers default to
-            # "enabled/on" so they fall through to the SOC-based heuristic.
-            def _carry_forward_hourly(
-                result: Any, hour_keys: Any
-            ) -> Dict[str, int]:
-                changes: List[Tuple[datetime, int]] = []
-                if result:
-                    for table in result:
-                        for record in table.records:
-                            val = record.get_value()
-                            if isinstance(val, (int, float)):
-                                changes.append((record.get_time(), int(val)))
-                out: Dict[str, int] = {}
-                if not changes or not hour_keys:
-                    return out
-                ci = 0
-                last_state: Optional[int] = None
-                for key in sorted(hour_keys):
-                    hour_start = datetime.strptime(key, "%Y-%m-%d-%H")
-                    hour_end = hour_start + timedelta(hours=1)
-                    while (
-                        ci < len(changes)
-                        and changes[ci][0].replace(tzinfo=None) < hour_start
-                    ):
-                        last_state = changes[ci][1]
-                        ci += 1
-                    states_in_hour: List[int] = []
-                    if last_state is not None:
-                        states_in_hour.append(last_state)
-                    while (
-                        ci < len(changes)
-                        and changes[ci][0].replace(tzinfo=None) < hour_end
-                    ):
-                        last_state = changes[ci][1]
-                        states_in_hour.append(last_state)
-                        ci += 1
-                    if states_in_hour:
-                        out[key] = min(states_in_hour)
-                return out
+            # Carry-forward state intervals: state-change records span until the
+            # next change; for each solar-data hour we want the effective state
+            # DURING that hour. Shared with the consumption/ML forecasters — see
+            # consumption_forecast._carry_forward_hourly for the min-over-changes
+            # semantics (a partial-disabled hour counts as disabled; hours
+            # predating the first record stay missing so callers default to "on").
+            from .consumption_forecast import _carry_forward_hourly
 
             export_by_hour = _carry_forward_hourly(
-                export_result, solar_by_hour.keys()
+                export_result, solar_by_hour.keys(), local_tz
             )
             inverter_on_by_hour = _carry_forward_hourly(
-                inverter_on_result, solar_by_hour.keys()
+                inverter_on_result, solar_by_hour.keys(), local_tz
             )
 
             # Query each weather field separately for performance
@@ -674,12 +662,20 @@ from(bucket: "{weather_bucket}")
 '''
                     result = await influxdb_client.query(q)
                     if result:
+                        # Average across any duplicate series landing in the
+                        # same local hour (consistent with the `mean`
+                        # aggregateWindow above) — taking max biased cloud/
+                        # radiation toward the most extreme contributing record.
+                        sums: Dict[str, float] = {}
+                        counts: Dict[str, int] = {}
                         for table in result:
                             for record in table.records:
-                                key = record.get_time().strftime("%Y-%m-%d-%H")
+                                key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
                                 val = record.get_value() or 0
-                                if key not in target_dict or val > target_dict[key]:
-                                    target_dict[key] = val
+                                sums[key] = sums.get(key, 0.0) + val
+                                counts[key] = counts.get(key, 0) + 1
+                        for key, total in sums.items():
+                            target_dict[key] = total / counts[key]
                         self.logger.debug(f"Weather {field_name}: {len(target_dict)} hours loaded")
                 except Exception as e:
                     self.logger.warning(f"Failed to load weather {field_name}: {e}")
@@ -928,7 +924,11 @@ from(bucket: "{weather_bucket}")
                 continue
 
             # Temperature derating: silicon panels lose ~0.4%/°C above 25°C cell temp
-            temp = entry.get("temperature_2m", 25)
+            # OpenMeteo may return an explicit null for a missing hour; treat
+            # only None as missing (0 °C is a valid, falsy temperature).
+            temp = entry.get("temperature_2m")
+            if temp is None:
+                temp = 25
             cell_temp = temp + 25  # NOCT approximation: cell ≈ ambient + 25°C
             temp_factor = 1 + (-0.004) * (cell_temp - 25)
 
@@ -1108,7 +1108,7 @@ from(bucket: "{weather_bucket}")
         Args:
             influxdb_client: Async InfluxDB client
             bucket: Solar InfluxDB bucket name
-            days: Number of past days to compare (default 7)
+            days: Number of past days to compare (default 30)
         """
         try:
             # Get actual daily production using TodayGenerateEnergy (inverter's own
@@ -1144,7 +1144,11 @@ from(bucket: "{bucket}")
             # then persisted history from InfluxDB (survives restarts)
             persisted_history: Optional[Dict[str, DailyForecast]] = None
             ratios: list = []
-            for day_str, actual_kwh in actual_by_day.items():
+            # Iterate chronologically so the recency weighting below
+            # (weight = i + 1) actually tracks date order. `actual_by_day` is a
+            # plain dict in InfluxDB-record order; day_str is "YYYY-MM-DD" so
+            # lexicographic sort == chronological.
+            for day_str, actual_kwh in sorted(actual_by_day.items()):
                 forecast = (
                     self._consensus.get(day_str)
                     or self._model_forecast.get(day_str)
@@ -1174,10 +1178,16 @@ from(bucket: "{bucket}")
                 total_kwp = sum(a.kwp for a in self.arrays)
                 if total_kwp > 0 and actual_by_day:
                     avg_actual = sum(actual_by_day.values()) / len(actual_by_day)
+                    # Coarse bootstrap until real forecast-vs-actual history
+                    # accumulates: compare average daily yield to a good-day
+                    # peak (~5 kWh/kWp). This is deliberately conservative — on a
+                    # cloudy-average site the ratio is small and the result sits
+                    # at the 0.65 floor; it only rises above the floor on sites
+                    # whose average day is itself sunny. `confidence` merely
+                    # discounts NON-model sources, so a floor-biased estimate is
+                    # acceptable here.
                     typical_max = total_kwp * 5  # ~5 kWh/kWp on a good day
                     estimated_confidence = min(1.0, avg_actual / typical_max)
-                    # Floor at 0.65 — avg includes cloudy days but scheduling
-                    # decisions should be optimistic enough for sunny ones
                     self.confidence = max(0.65, estimated_confidence)
                     self.logger.info(
                         f"☀️ Calibration (insufficient forecast history, {len(ratios)} days): "
@@ -1283,6 +1293,7 @@ from(bucket: "{bucket}")
         current_hour: int,
         min_live_kw: float = 0.5,
         blend_horizon_hours: int = 2,
+        minutes_elapsed: int = 0,
     ) -> Dict[int, float]:
         """Anchor near-future forecast to live measured solar power.
 
@@ -1300,6 +1311,15 @@ from(bucket: "{bucket}")
         (live dropped to 0 for a minute) to suppress an otherwise-sunny
         forecast. Calibration handles the over-prediction direction.
 
+        `live_power_kw` is an *instantaneous* power reading (kW); a future
+        full hour at that power yields ≈ that many kWh. The CURRENT hour is
+        only partially ahead of us, so only its remaining fraction
+        (`1 - minutes_elapsed/60`) can be anchored to live power — the elapsed
+        part keeps the model's energy. Without this the snapshot kW is booked
+        as a whole hour of kWh, systematically over-forecasting the current
+        hour (worst near solar noon, where instantaneous kW peaks well above
+        the hour's average energy).
+
         Disabled when live_power_kw < min_live_kw (likely nighttime or
         fault — model forecast handles those correctly).
 
@@ -1309,6 +1329,7 @@ from(bucket: "{bucket}")
             current_hour: hour-of-day (0-23) we're currently in (local)
             min_live_kw: skip blending if live below this (night/fault)
             blend_horizon_hours: how far ahead the live anchor decays to 0
+            minutes_elapsed: minutes already elapsed in the current hour (0-59)
 
         Returns:
             Blended forecast dict (does not mutate input).
@@ -1322,7 +1343,17 @@ from(bucket: "{bucket}")
                 break
             alpha = max(0.0, 1.0 - h_offset / blend_horizon_hours)
             model_kwh = out.get(h, 0.0)
-            blended = alpha * live_power_kw + (1.0 - alpha) * model_kwh
+            if h_offset == 0:
+                # Current hour: only the remaining minutes can be anchored to
+                # live power; the elapsed share stays at the model's energy.
+                remaining = max(0.0, 1.0 - min(max(minutes_elapsed, 0), 60) / 60.0)
+                blended = (
+                    model_kwh * (1.0 - remaining)
+                    + alpha * live_power_kw * remaining
+                    + (1.0 - alpha) * model_kwh * remaining
+                )
+            else:
+                blended = alpha * live_power_kw + (1.0 - alpha) * model_kwh
             out[h] = max(model_kwh, blended)
         return out
 
