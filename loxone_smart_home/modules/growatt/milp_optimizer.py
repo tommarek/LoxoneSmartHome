@@ -108,16 +108,17 @@ ACTION_EPS = 5e-3
 # so the solver never has to BUY grid power just to top up for a full export.
 MIN_GRID_DISCHARGE_FRACTION = 0.5
 
-# Small floor (CZK per kWh) for the per-block reserve-shortfall penalty. The
-# reserve is a SOFT constraint (relaxable to avoid infeasibility → silent greedy
-# fallback). The ACTUAL penalty is computed per block as the cheapest upcoming
-# import cost (the true marginal cost of covering a shortfall later) — see
-# `reserve_penalty` in optimize(). This floor only gives the constraint minimal
-# teeth when future import is ~free, so the solver mildly prefers keeping the
-# reserve over a gratuitous violation. It must stay SMALL: a large value makes
-# the solver GRID-CHARGE AT THE EVENING PEAK to satisfy the reserve — the exact
-# money-losing bug this design fixes.
-RESERVE_SHORTFALL_FLOOR = 0.5
+# Per-block reserve-shortfall penalty (CZK per kWh). The overnight reserve is
+# now EMERGENT from the objective itself: the objective already prices every
+# future grid import, so the solver naturally keeps charge whenever importing
+# later would be expensive, and sells/discharges when that is more profitable —
+# which is exactly the right economics. A non-zero per-block penalty on top
+# DOUBLE-COUNTS and, because the reserve floor can sit above SOC for many
+# consecutive blocks, its per-block accumulation snowballs into "grid-charge at
+# the evening PEAK to satisfy the reserve" — a guaranteed loss (the live
+# incident). So this is 0: the only hard battery floor is min_soc (the soc var
+# lower bound); the reserve is the model's economic decision, not a heuristic.
+RESERVE_SHORTFALL_FLOOR = 0.0
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
@@ -329,20 +330,6 @@ class MILPBatteryOptimizer:
         # Grid import cost per kWh (paid on both load and battery charge).
         import_cost = [prices[i] + dists[i] for i in range(n)]
 
-        # Price-aware reserve-shortfall penalty (CZK/kWh), per block. The cost of
-        # being below the reserve at block i is importing that base-load energy
-        # later, so the penalty is the CHEAPEST upcoming import cost from i on
-        # (floored at 0). This is the fix for the peak-charge incident: a flat
-        # penalty far above spot made the solver grid-charge at the evening peak
-        # to satisfy the reserve. Now, if a cheaper refill is coming, leaving the
-        # reserve briefly short is cheap → the solver won't overpay now; if no
-        # cheap refill exists, the penalty rises and the reserve is protected.
-        reserve_penalty = [0.0] * n
-        running_min = float("inf")
-        for i in range(n - 1, -1, -1):
-            running_min = min(running_min, import_cost[i])
-            reserve_penalty[i] = max(0.0, running_min)
-
         # Per-block raw solar / consumption / structural surplus.
         solar_block: List[float] = []
         consumption_block: List[float] = []
@@ -525,7 +512,7 @@ class MILPBatteryOptimizer:
             - (grid_to_load[i] + grid_charge[i]) * import_cost[i]
             - (batt_to_load[i] + batt_to_grid[i]) * battery_amortisation_czk
             - curtail[i] * CURTAIL_PENALTY
-            - reserve_short[i] * max(reserve_penalty[i], RESERVE_SHORTFALL_FLOOR)
+            - reserve_short[i] * RESERVE_SHORTFALL_FLOOR
             for i in range(n)
         ) + soc[n] * terminal_value_per_kwh
 

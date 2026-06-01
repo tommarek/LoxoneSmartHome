@@ -103,13 +103,21 @@ class DecisionContext:
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        # CHARGE gate. The plan's end-state is "optimizer owns charge price", but
-        # that is gated on the MILP being proven never to grid-charge at a bad
-        # price. It is not there yet (a terminal-value/reserve interaction still
-        # schedules evening grid-charge when the window lacks cheap blocks), so
-        # the summer price ceiling is kept ACTIVE for both engines as a strict
-        # backstop until backtests confirm the optimizer is safe to run unguarded.
-        if self.is_summer_mode:
+        # CHARGE authority:
+        #  - Optimizer active → the model owns charge economics (incl. price):
+        #    actuate exactly its scheduled charge set. The MILP no longer
+        #    grid-charges at a bad price (its reserve is objective-driven, not a
+        #    penalty that snowballed into peak charging), so no seasonal gate is
+        #    needed — the model decides.
+        #  - Optimizer inactive (legacy fallback) → apply the rule-based summer
+        #    gate (only grid-charge at/below summer_charge_price_max, default 0)
+        #    / cheapest-blocks logic.
+        if self.optimizer_active:
+            self.is_battery_charging_scheduled = bool(
+                self.current_block_key
+                and self.current_block_key in self.cheapest_blocks
+            )
+        elif self.is_summer_mode:
             if self.current_block_key and self.cheapest_blocks:
                 in_cheapest = self.current_block_key in self.cheapest_blocks
                 current_czk = self.current_price  # Already CZK/kWh
