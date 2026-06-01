@@ -268,23 +268,24 @@ def test_charge_from_grid_detection(
     assert decision == "charge_from_grid"
 
 
-def test_optimizer_owns_charging_no_seasonal_gate(
+def test_summer_charge_ceiling_applies_under_optimizer_interim_backstop(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """When the optimizer is active it owns charge economics: the rule-based
-    summer/price gate does NOT apply, so a block the optimizer scheduled is
-    charged regardless of season. (Correctness against peak-charging is enforced
-    inside the MILP's price-aware reserve penalty, not by a seasonal heuristic.)"""
-    block = ("13:00", "13:15")
+    """INTERIM safety: until the MILP is proven never to grid-charge at a bad
+    price, the summer charge ceiling stays active even under the optimizer. A
+    positive-price block in summer is NOT grid-charged, regardless of the
+    optimizer scheduling it. (When the optimizer is proven safe in backtests this
+    becomes optimizer-owned; see plan.)"""
+    block = ("18:30", "18:45")
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
-        current_time=datetime(2024, 6, 1, 13, 0),
+        current_time=datetime(2024, 6, 1, 18, 30),
         current_mode="regular",
-        current_price=1.2,  # positive; summer gate would block, optimizer won't
+        current_price=6.0,  # peak; would be a losing grid-charge
         current_block_key=block,
-        cheapest_blocks={block},  # optimizer's chosen charge block
+        cheapest_blocks={block},  # optimizer scheduled it anyway
         is_summer_mode=True,
         optimizer_active=True,
         price_thresholds=PriceThresholds(
@@ -293,8 +294,8 @@ def test_optimizer_owns_charging_no_seasonal_gate(
             summer_charge_price_max=0.0,
         ),
     )
-    assert context.is_battery_charging_scheduled is True
-    assert decision_engine.decide(context) == "charge_from_grid"
+    assert context.is_battery_charging_scheduled is False
+    assert decision_engine.decide(context) != "charge_from_grid"
 
 
 def test_summer_gate_still_blocks_rulebased_charge(
