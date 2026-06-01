@@ -917,6 +917,16 @@ async def api_override_clear(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def api_reapply(request: web.Request) -> web.Response:
+    """Force a re-send of the current decided state to the inverter (manual
+    retry after a failed control command)."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"error": "Controller not ready"}, status=503)
+    result = await ctrl.reapply_current_state()
+    return web.json_response(result)
+
+
 async def dashboard_page(request: web.Request) -> web.Response:
     """Serve the main dashboard HTML page."""
     return web.Response(
@@ -946,6 +956,7 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
     app.router.add_delete("/api/override", api_override_clear)
+    app.router.add_post("/api/reapply", api_reapply)
 
     return app
 
@@ -1439,6 +1450,10 @@ select, input {
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Solcast budget</span><span id="engSolcast">--</span></div>
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Last command</span><span id="engCmd">--</span></div>
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Prices updated</span><span id="engFresh">--</span></div>
+        <div style="margin-top:10px">
+          <button id="reapplyBtn" onclick="reapplyState()" style="width:100%;padding:8px;border:1px solid var(--border);border-radius:6px;background:#1e3a5f;color:var(--accent);font-weight:600;cursor:pointer">🔄 Re-apply current state</button>
+          <div id="reapplyResult" style="font-size:12px;margin-top:6px;min-height:14px"></div>
+        </div>
       </div>
     </div>
     <div class="card" id="deferrableCard" style="display:none">
@@ -2091,6 +2106,37 @@ async function fetchInsights() {
 function setText(id, txt) {
   const el = document.getElementById(id);
   if (el) el.textContent = txt;
+}
+
+async function reapplyState() {
+  const btn = document.getElementById('reapplyBtn');
+  const res = document.getElementById('reapplyResult');
+  if (!btn) return;
+  btn.disabled = true;
+  const label = btn.textContent;
+  btn.textContent = '⏳ Re-applying…';
+  if (res) { res.textContent = ''; res.style.color = 'var(--muted)'; }
+  try {
+    const r = await fetch('/api/reapply', { method: 'POST' });
+    const d = await r.json();
+    if (res) {
+      if (d.success) {
+        res.style.color = 'var(--green)';
+        res.textContent = '✅ ' + (d.message || 'Re-applied') +
+          (d.mode ? ' (mode: ' + d.mode + ')' : '');
+      } else {
+        res.style.color = 'var(--red)';
+        res.textContent = '⚠️ ' + (d.message || 'Re-apply failed');
+      }
+    }
+    fetchInsights();  // refresh command-health display
+    fetchStatus();
+  } catch (e) {
+    if (res) { res.style.color = 'var(--red)'; res.textContent = '⚠️ ' + e; }
+  } finally {
+    btn.disabled = false;
+    btn.textContent = label;
+  }
 }
 
 function renderPriceChart(prices, mountId, idxOffset, maxAbs) {

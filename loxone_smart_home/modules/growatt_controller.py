@@ -4350,6 +4350,44 @@ from(bucket: "{bucket}")
                 "message": "No manual override was active"
             }
 
+    async def reapply_current_state(self) -> Dict[str, Any]:
+        """Force a re-send of the current decided mode + inverter commands to the
+        hardware, bypassing idempotency tracking. Use this when a control command
+        failed (or the inverter drifted out of sync) to push the intended state
+        again without waiting for the next 15-min tick.
+
+        Resets the per-command "last applied" markers so the next evaluation
+        re-issues every command (mirroring a fresh startup sync), then evaluates.
+        """
+        sent_before = self._commands_sent_count
+        try:
+            # Clear idempotency so every command is re-issued.
+            self._last_applied.clear()  # shared dict → also clears mode_manager
+            if self._mode_manager is not None:
+                self._mode_manager._inverter_on = None
+            if self._decision_engine is not None:
+                self._decision_engine._last_mode = None
+            self._current_mode = None
+
+            await self._evaluate_conditions("manual_reapply")
+
+            results = getattr(self, "_last_command_results", {}) or {}
+            failed = [k for k, v in results.items() if not v.get("success", True)]
+            return {
+                "success": not failed,
+                "mode": self._current_mode,
+                "commands_sent": self._commands_sent_count - sent_before,
+                "failed_commands": failed,
+                "message": (
+                    "Re-applied current state"
+                    + (f" ({len(failed)} command(s) failed: {', '.join(failed)})"
+                       if failed else " — all commands acknowledged")
+                ),
+            }
+        except Exception as e:
+            self.logger.error(f"Re-apply current state failed: {e}", exc_info=True)
+            return {"success": False, "message": f"Re-apply failed: {e}"}
+
     def get_manual_override_status(self) -> Dict[str, Any]:
         """Get current manual override status."""
         if not self._manual_override_period:
