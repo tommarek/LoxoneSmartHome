@@ -111,13 +111,16 @@ MIN_GRID_DISCHARGE_FRACTION = 0.5
 # Penalty (CZK per kWh) for missing the per-block reserve floor. The reserve is
 # a SOFT constraint: when the start SOC is below the computed reserve and the
 # charge rate physically can't catch up in time, a hard floor would make the
-# whole MILP infeasible (→ silent greedy fallback). The penalty must dominate
-# every term in the objective so the solver only ever leaves the reserve unmet
-# when it is physically unreachable — never as a deliberate arbitrage/self-
-# consumption trade. Day-ahead spot + distribution rarely exceeds ~30 CZK/kWh
-# even on extreme evening spikes, so 1000 CZK/kWh sits far above any realistic
-# import cost or sell revenue while keeping the constraint soft (no infeasibility).
-RESERVE_SHORTFALL_PENALTY = 1000.0
+# whole MILP infeasible (→ silent greedy fallback).
+#
+# This must NOT be set arbitrarily high: it is the marginal cost of NOT having
+# the reserve, i.e. importing that base-load energy later at typical prices
+# (~few CZK/kWh). If it is set far above spot prices, the solver will GRID-CHARGE
+# AT THE EVENING PEAK just to satisfy the reserve — a guaranteed loss. Keeping it
+# near realistic import cost means the solver fills the reserve only when charging
+# is genuinely cheap, and otherwise accepts a small shortfall (covered later by
+# cheaper grid import) rather than overpaying now.
+RESERVE_SHORTFALL_PENALTY = 50.0
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:

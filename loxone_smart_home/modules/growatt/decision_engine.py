@@ -102,18 +102,13 @@ class DecisionContext:
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        if self.optimizer_active:
-            # Optimizer owns charge economics: actuate exactly its scheduled
-            # charge blocks (cheapest_blocks holds the optimizer's charge set).
-            # No summer/price gate — the MILP/greedy solver already compared the
-            # charge cost against the later discharge revenue, so re-gating here
-            # would silently veto economically-correct charges (the cause of the
-            # "chart shows pre-discharge charging but the inverter never flips").
-            self.is_battery_charging_scheduled = bool(
-                self.current_block_key
-                and self.current_block_key in self.cheapest_blocks
-            )
-        elif self.is_summer_mode:
+        # STRICT grid-charge price gate — applies even under the optimizer.
+        # The optimizer decides WHICH cheap blocks to charge, but it must never
+        # grid-charge above the configured ceiling (summer: summer_charge_price_max;
+        # default 0 = only free/negative). This is a hard safety rule: without it
+        # a bad solver plan (e.g. charging to meet the reserve at any cost) can
+        # grid-charge at the evening PEAK. The optimizer works WITHIN this rule.
+        if self.is_summer_mode:
             # Rule-based summer policy: only charge from grid when price is below
             # the summer threshold (e.g., negative prices = get paid to consume).
             if self.current_block_key and self.cheapest_blocks:

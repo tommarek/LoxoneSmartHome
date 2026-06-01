@@ -268,14 +268,12 @@ def test_charge_from_grid_detection(
     assert decision == "charge_from_grid"
 
 
-def test_optimizer_charge_actuates_despite_summer_gate(
+def test_strict_grid_charge_ceiling_applies_even_under_optimizer(
     decision_engine: GrowattDecisionEngine
 ) -> None:
-    """When the optimizer is the active engine, its scheduled charge blocks must
-    actuate even in summer at a positive price — the optimizer already weighed
-    charge cost vs discharge revenue, so the rule-based summer gate must NOT veto
-    them. Regression for the 'chart shows pre-discharge charging but the inverter
-    never flips' bug."""
+    """STRICT RULE: grid-charging must never occur above the configured ceiling
+    (summer: summer_charge_price_max), even when the optimizer scheduled the
+    block. Guards against a bad solver plan grid-charging at the evening peak."""
     block = ("18:30", "18:45")
     context = DecisionContext(
         manual_override_active=False,
@@ -283,9 +281,9 @@ def test_optimizer_charge_actuates_despite_summer_gate(
         battery_soc=50.0,
         current_time=datetime(2024, 6, 1, 18, 30),
         current_mode="regular",
-        current_price=3.53,  # positive — would be blocked by the summer gate
+        current_price=8.65,  # peak price — must NOT grid-charge here
         current_block_key=block,
-        cheapest_blocks={block},  # optimizer's charge set
+        cheapest_blocks={block},  # optimizer scheduled it anyway
         is_summer_mode=True,
         optimizer_active=True,
         price_thresholds=PriceThresholds(
@@ -294,8 +292,8 @@ def test_optimizer_charge_actuates_despite_summer_gate(
             summer_charge_price_max=0.0,
         ),
     )
-    assert context.is_battery_charging_scheduled is True
-    assert decision_engine.decide(context) == "charge_from_grid"
+    assert context.is_battery_charging_scheduled is False
+    assert decision_engine.decide(context) != "charge_from_grid"
 
 
 def test_summer_gate_still_blocks_rulebased_charge(
