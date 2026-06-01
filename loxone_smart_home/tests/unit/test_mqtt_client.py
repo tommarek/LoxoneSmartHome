@@ -88,10 +88,13 @@ class TestAsyncMQTTClient:
         # AsyncMQTTClient queues messages rather than publishing directly
         await mqtt_client.publish("test/topic", "test message", retain=True)
 
-        # Verify message was queued
+        # Verify message was queued. Items are
+        # (topic, payload, retain, qos, enqueue_monotonic).
         assert mqtt_client.publish_queue.qsize() == 1
-        queued_item = await mqtt_client.publish_queue.get()
-        assert queued_item == ("test/topic", "test message", True)
+        topic, payload, retain, qos, ts = await mqtt_client.publish_queue.get()
+        assert (topic, payload, retain) == ("test/topic", "test message", True)
+        assert qos == 1
+        assert isinstance(ts, float)
 
     @pytest.mark.asyncio
     async def test_publish_without_connection(self, mqtt_client: AsyncMQTTClient) -> None:

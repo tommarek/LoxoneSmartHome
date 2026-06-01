@@ -54,8 +54,11 @@ class DashboardLogHandler(logging.Handler):
                 "message": msg,
             }
             _log_buffer.append(entry)
-            # Notify SSE clients
-            for q in _sse_clients:
+            # Notify SSE clients. Iterate a copy: emit() can fire from the worker
+            # thread used by asyncio.to_thread(optimize), while api_logs_stream
+            # mutates _sse_clients on the event loop — iterating the live list
+            # could raise mid-iteration.
+            for q in list(_sse_clients):
                 try:
                     q.put_nowait(entry)
                 except asyncio.QueueFull:
@@ -306,7 +309,9 @@ async def api_status(request: web.Request) -> web.Response:
     return web.json_response({
         "timestamp": now.isoformat(),
         "mode": ctrl._current_mode,
-        "battery_soc": _get_live_soc() or ctrl._battery_soc,
+        "battery_soc": (
+            _get_live_soc() if _get_live_soc() is not None else ctrl._battery_soc
+        ),
         "current_price": {
             "czk_kwh": round(current_price_czk, 2),
             "block": current_block,
@@ -1503,7 +1508,6 @@ select, input {
         <option value="regular">Regular</option>
         <option value="charge_from_grid">Charge from Grid</option>
         <option value="discharge_to_grid">Discharge to Grid</option>
-        <option value="high_load_protected">High Load Protected</option>
         <option value="sell_production">Sell Production</option>
       </select>
       <select id="overrideDuration">

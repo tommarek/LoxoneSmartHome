@@ -100,6 +100,7 @@ class AsyncInfluxDBClient:
                     url=self.settings.influxdb.url,
                     token=self.settings.influxdb.token,
                     org=self.settings.influxdb.org,
+                    timeout=20_000,  # ms — bound per-request latency (was library default)
                 )
                 self.client_pool.append(client)
 
@@ -137,14 +138,19 @@ class AsyncInfluxDBClient:
         if timestamp:
             point = point.time(timestamp, WritePrecision.NS)  # type: ignore[no-untyped-call]
 
-        # Add to buffer
+        # Add to buffer, then flush AFTER releasing the lock if it's full.
+        # _flush_buffer() re-acquires buffer_lock, and asyncio.Lock is NOT
+        # re-entrant — flushing while holding the lock here would deadlock the
+        # entire writer (which is exactly what happens under a DB slowdown when
+        # the buffer fills). Append first so the point is never lost.
+        need_flush = False
         async with self.buffer_lock:
-            if len(self.write_buffer) >= self.max_buffer_size:
-                # Buffer full, flush immediately
-                await self._flush_buffer()
-
             self.write_buffer.append((bucket, point))
             self.writes_queued += 1
+            need_flush = len(self.write_buffer) >= self.max_buffer_size
+
+        if need_flush:
+            await self._flush_buffer()
 
         self.logger.debug(
             f"Queued point for {bucket}/{measurement}, buffer size: {len(self.write_buffer)}"
@@ -203,13 +209,41 @@ class AsyncInfluxDBClient:
                     self.logger.error(
                         f"Failed to write batch to {bucket} after " f"{max_retries} attempts: {e}"
                     )
-                    # Could implement dead letter queue here
+                    # Bounded re-queue instead of silently dropping: keep the most
+                    # recent points for a later flush, but never let the buffer
+                    # grow without bound (a permanent outage would otherwise OOM).
+                    async with self.buffer_lock:
+                        room = self.max_buffer_size - len(self.write_buffer)
+                        if room > 0:
+                            for p in reversed(points[-room:]):
+                                self.write_buffer.appendleft((bucket, p))
+                            if len(points) > room:
+                                self.logger.warning(
+                                    f"Dropped {len(points) - room} oldest "
+                                    f"{bucket} points (write buffer full)"
+                                )
+                        else:
+                            self.logger.warning(
+                                f"Dropped {len(points)} {bucket} points "
+                                f"(write buffer full, InfluxDB unreachable)"
+                            )
 
     async def query(self, query: str) -> Any:
-        """Execute a query against InfluxDB."""
+        """Execute a query against InfluxDB.
+
+        Hard-bounded by asyncio.wait_for so a stalled connection can never hang a
+        request handler (e.g. a dashboard endpoint) indefinitely — on timeout it
+        raises like any other query failure and callers degrade gracefully.
+        """
         client = await self._get_client()
         try:
-            return await client.query_api().query(query=query, org=self.settings.influxdb.org)
+            return await asyncio.wait_for(
+                client.query_api().query(query=query, org=self.settings.influxdb.org),
+                timeout=25.0,
+            )
+        except asyncio.TimeoutError:
+            self.logger.error("InfluxDB query timed out after 25s")
+            raise
         except Exception as e:
             self.logger.error(f"Failed to query InfluxDB: {e}")
             raise

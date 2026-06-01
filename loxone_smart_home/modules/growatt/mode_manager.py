@@ -116,10 +116,11 @@ class ModeManager:
                     f"Sending {command_description}: topic={topic}"
                 )
 
-            # Send the command
+            # Send the command, then register + await its response. This is
+            # race-safe because mqtt_client.publish() only ENQUEUES the message
+            # (the actual wire-send happens later in the publisher loop), so the
+            # pending command is registered before the broker can reply.
             await self.mqtt_client.publish(topic, json.dumps(payload))
-
-            # Wait for result with configured timeout
             result = await self._adapter._wait_for_command_result(
                 command_type, timeout=self.config.command_timeout
             )
@@ -294,20 +295,24 @@ class ModeManager:
 
         await self.ensure_exclusive("battery_first", previous_mode=previous_mode)
 
-        if stop_soc != 90:
-            stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
-            stopsoc_payload = {"value": stop_soc}
-            self.logger.debug(f"Setting battery-first stopSOC to {stop_soc}%")
-            success, _ = await self._execute_command_with_retry(
-                stopsoc_topic,
-                stopsoc_payload,
-                "batteryfirst/set/stopsoc",
-                f"battery-first stopSOC set to {stop_soc}%"
-            )
-            if not success:
-                self.logger.error("Failed to set battery-first stopSOC, aborting mode change")
-                return
-            await asyncio.sleep(self.config.command_delay)
+        # Always send stopSOC (matching set_grid_first). The previous `!= 90`
+        # skip assumed the inverter's resting default is 90% with no tracking of
+        # the actual hardware value — if a prior charge cycle left stopSOC at
+        # 100, a later stop_soc=90 would be silently skipped and the battery
+        # would charge past the intended target.
+        stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
+        stopsoc_payload = {"value": stop_soc}
+        self.logger.debug(f"Setting battery-first stopSOC to {stop_soc}%")
+        success, _ = await self._execute_command_with_retry(
+            stopsoc_topic,
+            stopsoc_payload,
+            "batteryfirst/set/stopsoc",
+            f"battery-first stopSOC set to {stop_soc}%"
+        )
+        if not success:
+            self.logger.error("Failed to set battery-first stopSOC, aborting mode change")
+            return
+        await asyncio.sleep(self.config.command_delay)
 
         if power_rate != 100:
             powerrate_topic = "energy/solar/command/batteryfirst/set/powerrate"

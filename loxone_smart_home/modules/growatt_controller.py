@@ -43,6 +43,17 @@ from .growatt.command_queue import CommandQueue
 from .growatt.schedule_coordinator import ScheduleCoordinator
 
 
+def _block_key(start_dt: datetime, end_dt: datetime) -> Tuple[str, str]:
+    """Build an (start, end) HH:MM block key matching the price-table /
+    current-block-key convention: a block that ends at next-day midnight uses
+    the '24:00' sentinel (not '00:00'), so the last block of the day (23:45)
+    matches `_current_prices` / `current_block_key` and is actually actuated."""
+    end_str = "24:00" if (
+        end_dt.hour == 0 and end_dt.minute == 0 and end_dt.date() > start_dt.date()
+    ) else end_dt.strftime("%H:%M")
+    return (start_dt.strftime("%H:%M"), end_str)
+
+
 class GrowattController(BaseModule):
     """Growatt controller that manages battery charging based on energy prices."""
 
@@ -549,12 +560,11 @@ class GrowattController(BaseModule):
         # Battery status
         summary_parts.append(f"Battery: {self._battery_soc:.0f}%")
 
-        # Current price
-        time_str = f"{current_hour:02d}:{current_minute:02d}"
-        end_minute = (current_minute + 15) % 60
-        end_hour = current_hour if end_minute > current_minute else (current_hour + 1) % 24
-        end_str = f"{end_hour:02d}:{end_minute:02d}"
-        block_key = (time_str, end_str)
+        # Current price — use the shared block-key helper so the last block of
+        # the day (23:45) resolves with the '24:00' sentinel and matches.
+        from datetime import timedelta as _td
+        _start = now.replace(minute=(current_minute // 15) * 15, second=0, microsecond=0)
+        block_key = _block_key(_start, _start + _td(minutes=15))
 
         if block_key in self._current_prices:
             price_czk = self._current_prices[block_key]
@@ -1583,6 +1593,13 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # Start periodic evaluation loop BEFORE model builds
         # Controller is now operational with price data + SOC
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
+        # Supervise it: if it ever dies with an exception (outside its own
+        # per-iteration try/except), log loudly and restart — otherwise the
+        # controller would silently stop evaluating while the process still
+        # looks healthy.
+        self._periodic_check_task.add_done_callback(
+            self._make_task_guard("periodic_evaluation", self._periodic_evaluation_loop)
+        )
 
         # Perform initial evaluation (mode decision with available data)
         await self._evaluate_conditions("startup")
@@ -1596,6 +1613,31 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # stop() cancels it so a late-finishing build can't re-issue inverter
         # commands after safe-shutdown or touch a disconnected client.
         self._models_task = asyncio.create_task(self._build_models_background())
+        # One-shot: just surface a crash (no restart — a failed build degrades to
+        # the existing/binned models, which is handled inside the builder).
+        self._models_task.add_done_callback(self._make_task_guard("model_builds", None))
+
+    def _make_task_guard(self, name: str, restart):
+        """Done-callback factory for long-lived background tasks: log loudly on an
+        unexpected death and, if `restart` is given and we're still running,
+        recreate the task (with the same guard) so a transient crash can't leave
+        the controller silently brain-dead."""
+        def _cb(task: "asyncio.Task[Any]") -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            self.logger.error(
+                f"Background task '{name}' died: {exc!r}", exc_info=exc
+            )
+            if restart is not None and self._running:
+                self.logger.warning(f"Restarting background task '{name}'")
+                new_task = asyncio.create_task(restart())
+                new_task.add_done_callback(self._make_task_guard(name, restart))
+                if name == "periodic_evaluation":
+                    self._periodic_check_task = new_task
+        return _cb
 
     async def _build_models_background(self) -> None:
         """Build ML models in background without blocking controller operation.
@@ -2425,9 +2467,16 @@ from(bucket: "{bucket}")
                         )
                         if cycle_start > now:
                             cycle_start -= timedelta(days=1)
+                        # Count only blocks that have FULLY ELAPSED (start+15min
+                        # <= now). A block is recorded as soon as the load is
+                        # active at its start, so the in-progress block hasn't
+                        # delivered its energy yet — counting it would under-state
+                        # remaining_kwh and cut an interruptible load one block short.
+                        block_elapsed_cutoff = now - timedelta(minutes=15)
                         completed = sum(
                             1 for name, ts in self._deferrable_completed_blocks
-                            if name == load.name and ts >= cycle_start
+                            if name == load.name
+                            and ts >= cycle_start and ts <= block_elapsed_cutoff
                         )
                         delivered_kwh = completed * load.power_kw * 0.25
                         remaining_kwh = max(0.0, load.energy_required_kwh - delivered_kwh)
@@ -2699,14 +2748,14 @@ from(bucket: "{bucket}")
                     self.logger.info(
                         f"   Tomorrow: {len(discharge_tomorrow)} blocks in {len(groups)} period(s)"
                     )
-                for group in groups:
-                    start = group[0][0]
-                    end = group[-1][1]
-                    avg_price = sum(p for _, _, p in group) / len(group)
-                    self.logger.info(
-                        f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
-                        f"{avg_price:.3f} CZK/kWh avg"
-                    )
+                    for group in groups:
+                        start = group[0][0]
+                        end = group[-1][1]
+                        avg_price = sum(p for _, _, p in group) / len(group)
+                        self.logger.info(
+                            f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
+                            f"{avg_price:.3f} CZK/kWh avg"
+                        )
 
         # === STEP 3: Calculate pre-discharge charging ===
         # ONLY for the rule-based engine. When the optimizer is active it already
@@ -2802,37 +2851,37 @@ from(bucket: "{bucket}")
 
         # Today's schedules (apply immediately)
         self._cheapest_charging_blocks_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in charging_today
         }
         self._pre_discharge_blocks_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in pre_discharge_today
         }
         self._discharge_periods_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in discharge_today
         }
         self._sell_production_blocks_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in sell_production_today
         }
 
         # Tomorrow's schedules (queue for midnight)
         self._cheapest_charging_blocks_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in charging_tomorrow
         }
         self._pre_discharge_blocks_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in pre_discharge_tomorrow
         }
         self._discharge_periods_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in discharge_tomorrow
         }
         self._sell_production_blocks_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in sell_production_tomorrow
         }
 
@@ -3268,14 +3317,31 @@ from(bucket: "{bucket}")
         """Handle manual override changes."""
         await self._evaluate_conditions("manual_override")
 
-    async def _evaluate_conditions(self, reason: str) -> None:
+    async def _evaluate_conditions(self, reason: str, force: bool = False) -> None:
         """Re-evaluate decision tree when conditions change.
 
         Args:
             reason: What triggered the re-evaluation
+            force: If True, clear ALL idempotency tracking inside the lock first,
+                so every command is re-issued even when the decided state is
+                unchanged (a manual "re-apply current state" / hardware re-sync).
+                Done under the lock so the reset+evaluate is atomic w.r.t. the
+                periodic triggers.
         """
         async with self._evaluation_lock:
             try:
+                if force:
+                    # Mirror a fresh startup sync: every gate diffs against these,
+                    # so nulling them makes _apply_decided_mode / the export and
+                    # inverter-on/off gates treat the state as new and re-send.
+                    self._last_applied.clear()  # shared dict → also clears mode_manager
+                    if self._mode_manager is not None:
+                        self._mode_manager._inverter_on = None
+                    if self._decision_engine is not None:
+                        self._decision_engine._last_mode = None
+                    self._current_mode = None
+                    self._current_inverter_state = None
+
                 self._last_evaluation_reason = reason
 
                 # Build complete decision context with price data
@@ -4014,9 +4080,17 @@ from(bucket: "{bucket}")
                             self.logger.info("📋 Displaying tomorrow's schedule:")
                             await self._calculate_cross_day_optimal_schedule(force_table=True)
 
-                # Check for midnight - update date display
-                if now.hour == 0 and now.minute == 0:
-                    # Only process once per midnight
+                # Initialize the rollover marker on the first tick so startup
+                # doesn't fire a spurious day-rollover.
+                if last_midnight_check is None:
+                    last_midnight_check = now.date()
+
+                # Day rollover — fire once when the local DATE changes, not at an
+                # exact 00:00 minute. The 60s loop is `sleep(60) + work`, so its
+                # phase drifts and can skip the 00:00 tick entirely; an exact
+                # equality check would then miss the rollover and leave
+                # yesterday's prices/schedule active for the whole day.
+                if last_midnight_check != now.date():
                     current_midnight = now.date()
                     if last_midnight_check != current_midnight:
                         last_midnight_check = current_midnight
@@ -4356,27 +4430,21 @@ from(bucket: "{bucket}")
         failed (or the inverter drifted out of sync) to push the intended state
         again without waiting for the next 15-min tick.
 
-        Resets the per-command "last applied" markers so the next evaluation
-        re-issues every command (mirroring a fresh startup sync), then evaluates.
+        The idempotency reset + re-evaluation happen atomically under the
+        evaluation lock (force=True), so a concurrent periodic tick can't run on
+        half-reset state, and every command (mode, stop-SOC, power, export,
+        inverter on/off) is re-issued even when the decided state is unchanged.
         """
         sent_before = self._commands_sent_count
         try:
-            # Clear idempotency so every command is re-issued.
-            self._last_applied.clear()  # shared dict → also clears mode_manager
-            if self._mode_manager is not None:
-                self._mode_manager._inverter_on = None
-            if self._decision_engine is not None:
-                self._decision_engine._last_mode = None
-            self._current_mode = None
-
-            await self._evaluate_conditions("manual_reapply")
+            await self._evaluate_conditions("manual_reapply", force=True)
 
             results = getattr(self, "_last_command_results", {}) or {}
             failed = [k for k, v in results.items() if not v.get("success", True)]
             return {
                 "success": not failed,
                 "mode": self._current_mode,
-                "commands_sent": self._commands_sent_count - sent_before,
+                "commands_sent": max(0, self._commands_sent_count - sent_before),
                 "failed_commands": failed,
                 "message": (
                     "Re-applied current state"

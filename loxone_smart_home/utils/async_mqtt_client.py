@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Dict, Optional, Set
 
 from asyncio_mqtt import Client, MqttError
@@ -31,8 +32,14 @@ class AsyncMQTTClient:
         self._pre_registered_subscriptions: Dict[str, Set[Callable[[str, Any], Any]]] = {}
         self._pre_registration_lock = asyncio.Lock()
 
-        # Publish queue for reliability
-        self.publish_queue: asyncio.Queue[tuple[str, Any, bool]] = asyncio.Queue()
+        # Publish queue for reliability. Items are (topic, payload, retain, qos,
+        # enqueue_monotonic). Bounded + TTL'd so a long broker outage can't grow
+        # it without bound or replay stale inverter commands on reconnect.
+        self.publish_queue: "asyncio.Queue[tuple[str, Any, bool, int, float]]" = (
+            asyncio.Queue()
+        )
+        self._max_publish_queue = 1000
+        self._publish_ttl_s = 120.0
 
         # Background tasks
         self._read_task: Optional[asyncio.Task[None]] = None
@@ -181,26 +188,48 @@ class AsyncMQTTClient:
 
     async def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 1) -> None:
         """Queue a message for publishing with reliability."""
-        await self.publish_queue.put((topic, payload, retain))
+        # Bound the queue: under a sustained broker outage, drop the OLDEST queued
+        # message rather than grow without limit (commands are regenerated each
+        # cycle, so the newest intent matters most).
+        if self.publish_queue.qsize() >= self._max_publish_queue:
+            try:
+                self.publish_queue.get_nowait()
+                self.logger.warning(
+                    "Publish queue full — dropped oldest queued message"
+                )
+            except asyncio.QueueEmpty:
+                pass
+        await self.publish_queue.put((topic, payload, retain, qos, time.monotonic()))
 
     async def _publish_loop(self) -> None:
         """Background task to publish queued messages."""
         while self._running:
             try:
                 # Wait for message with timeout to allow periodic checks
-                topic, payload, retain = await asyncio.wait_for(
+                topic, payload, retain, qos, ts = await asyncio.wait_for(
                     self.publish_queue.get(), timeout=1.0
                 )
 
+                # Drop stale commands instead of replaying them after a long
+                # outage (a stale schedule re-applied to the inverter is worse
+                # than a dropped one — the next cycle re-issues the current one).
+                age = time.monotonic() - ts
+                if age > self._publish_ttl_s:
+                    self.logger.warning(
+                        f"Dropping stale MQTT message to {topic} ({age:.0f}s old)"
+                    )
+                    continue
+
                 # Ensure we're connected
                 if not self._connected:
-                    # Re-queue the message
-                    await self.publish_queue.put((topic, payload, retain))
+                    # Re-queue the message, preserving its enqueue time so it can
+                    # still expire (don't reset the TTL on every retry).
+                    await self.publish_queue.put((topic, payload, retain, qos, ts))
                     await asyncio.sleep(0.1)
                     continue
 
                 # Publish with retry
-                await self._publish_with_retry(topic, payload, retain)
+                await self._publish_with_retry(topic, payload, retain, qos)
 
             except asyncio.TimeoutError:
                 continue
@@ -208,14 +237,14 @@ class AsyncMQTTClient:
                 self.logger.error(f"Error in publish loop: {e}", exc_info=True)
 
     async def _publish_with_retry(
-        self, topic: str, payload: Any, retain: bool, max_retries: int = 3
+        self, topic: str, payload: Any, retain: bool, qos: int = 1, max_retries: int = 3
     ) -> None:
         """Publish a message with retry logic."""
         for attempt in range(max_retries):
             try:
                 async with self.connection_lock:
                     if self.client and self._connected:
-                        await self.client.publish(topic, payload, retain=retain)
+                        await self.client.publish(topic, payload, retain=retain, qos=qos)
 
                 self.messages_published += 1
                 self.logger.debug(f"Published to {topic}: {payload}")

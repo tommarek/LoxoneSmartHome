@@ -497,7 +497,7 @@ class MILPBatteryOptimizer:
             # `eta`): the break-even for "charge cheap now, use later" is the
             # full charge→store→discharge cycle. Don't "fix" this to `eta`.
             terminal_value_per_kwh = min(
-                terminal_value_per_kwh, min_charge_cost / efficiency
+                terminal_value_per_kwh, min_charge_cost / max(1e-3, efficiency)
             )
         # Slightly discount the (estimated, future) terminal value so a
         # CERTAIN present-block self-consumption saving always wins ties

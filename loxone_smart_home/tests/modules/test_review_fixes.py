@@ -170,3 +170,23 @@ def test_milp_clamps_soc_above_max_instead_of_infeasible():
     assert decisions[0].soc_before <= 90.0 + 1e-6
     for d in decisions:
         assert 20.0 - 1e-6 <= d.soc_after <= 90.0 + 1e-6
+
+
+def test_block_key_uses_2400_sentinel_for_midnight_end():
+    """Regression: the last block of the day (23:45) must key its end as
+    '24:00', not '00:00', so it matches _current_prices / current_block_key and
+    is actually actuated. (Pre-existing bug found in review.)"""
+    from datetime import datetime
+    from modules.growatt_controller import _block_key
+    # Block ending at next-day midnight → '24:00' sentinel.
+    assert _block_key(
+        datetime(2026, 6, 1, 23, 45), datetime(2026, 6, 2, 0, 0)
+    ) == ("23:45", "24:00")
+    # Ordinary intraday block → plain HH:MM.
+    assert _block_key(
+        datetime(2026, 6, 1, 10, 0), datetime(2026, 6, 1, 10, 15)
+    ) == ("10:00", "10:15")
+    # A genuine same-day 00:00 start (not a midnight end) is unaffected.
+    assert _block_key(
+        datetime(2026, 6, 1, 0, 0), datetime(2026, 6, 1, 0, 15)
+    ) == ("00:00", "00:15")
