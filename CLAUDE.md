@@ -63,7 +63,7 @@ The Docker image runs `run_integrated.py`, which launches **both** the async mai
 | `main.py` | async modules only (UDP, MQTT, weather, Growatt) | headless debugging |
 | `run_web_service.py` | FastAPI web/dashboard only (needs `WEB_SERVICE_ENABLED=true`) | dashboard/API work |
 
-Ports: `2000/udp` (Loxone UDP listener), `8080` (web service + dashboard + JSON API, e.g. `/api/status`, `/api/live`, `/api/solar_actuals`). The `selfhosted` Caddy reverse-proxies `8080` to `energy.markovi.online`.
+Ports: `2000/udp` (Loxone UDP listener), `8080` (FastAPI web service from `run_web_service.py` — the `web/` app), and `5555` (the Growatt **monitoring dashboard** in `modules/growatt/dashboard.py` + its JSON API: `/api/status`, `/api/live`, `/api/insights`, `/api/prices`, `/api/projection`, `/api/solar_actuals`, `/api/soc_actuals`, `/api/consumption_actuals`, …). The `selfhosted` Caddy reverse-proxies **`5555`** to `energy.markovi.online` (see `selfhosted/caddy/Caddyfile`, `{$DOMAIN_ENERGY}` block) — so the **monitoring dashboard is the public page**; `8080` is a separate app and is **not** publicly exposed. Both 8080 and 5555 are launched by `run_integrated.py`.
 
 ## Testing
 
