@@ -186,6 +186,16 @@ class AsyncMQTTClient:
             f"reconnects={self.reconnect_attempts}"
         )
 
+    @property
+    def is_connected(self) -> bool:
+        """True when the client currently holds a live broker connection.
+
+        Callers that must not credit a fire-and-forget command as delivered
+        (e.g. deferrable-load completion accounting) can gate on this so a
+        command queued during a broker outage is not counted as actuated.
+        """
+        return self._connected
+
     async def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 1) -> None:
         """Queue a message for publishing with reliability."""
         # Bound the queue: under a sustained broker outage, drop the OLDEST queued

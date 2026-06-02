@@ -398,3 +398,85 @@ def test_mutual_exclusion_no_block_does_two_things():
     assert not (charge & discharge)
     assert not (charge & sp)
     assert not (discharge & sp)
+
+
+def test_hold_idle_when_battery_preserved_and_grid_serves_load():
+    """When the solver serves the house from GRID while keeping the battery
+    above its floor for a higher-value later use, those blocks are classified
+    "hold_idle" (actuated as battery_hold) — not plain "hold" (load_first,
+    which would drain the battery). Scenario: cheap-to-import NOW (self-consuming
+    is a loss vs amortisation) and an expensive discharge opportunity LATER, with
+    the battery already full so it can't charge."""
+    blocks = make_blocks([0.5] * 4 + [10.0] * 4, start_hour=0)
+    opt = MILPBatteryOptimizer()
+    charge, discharge, sp, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={},
+        consumption_hourly={h: 1.0 for h in range(24)},
+        distribution_func=flat_dist(0.5),
+        current_soc=90.0, min_soc=20.0, max_soc=90.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        battery_amortisation_czk=2.0, sell_fee_czk=0.5,
+    )
+    cheap_cutoff = blocks[4][0]
+    cheap = [d for d in decisions if d.timestamp < cheap_cutoff]
+    assert any(d.action == "hold_idle" for d in cheap), (
+        f"expected a hold_idle block in the cheap window: "
+        f"{[d.action for d in decisions]}"
+    )
+    # hold_idle blocks are not grid-facing — never in charge/discharge/sell sets.
+    hold_ts = {d.timestamp for d in decisions if d.action == "hold_idle"}
+    assert not (hold_ts & charge)
+    assert not (hold_ts & discharge)
+    assert not (hold_ts & sp)
+    # And the battery is genuinely preserved (above min) on those blocks.
+    for d in decisions:
+        if d.action == "hold_idle":
+            assert d.soc_before > 20.0
+
+
+def test_self_consumption_stays_hold_not_hold_idle():
+    """A block where the battery clearly, profitably serves the house
+    (self-consumption) stays action "hold" (load_first), never "hold_idle".
+    Prices low enough that EXPORT is never profitable (so the battery won't
+    sell), but higher NOW than later so self-consuming the present load clearly
+    beats holding (which would only buy cheaper grid later) → the now-blocks
+    self-consume from the battery."""
+    blocks = make_blocks([1.4] * 4 + [0.1] * 4, start_hour=0)
+    opt = MILPBatteryOptimizer()
+    _, _, _, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={},
+        consumption_hourly={h: 1.0 for h in range(24)},
+        distribution_func=flat_dist(1.0),
+        current_soc=60.0, min_soc=20.0, max_soc=90.0,
+        battery_amortisation_czk=1.0, sell_fee_czk=0.5,
+    )
+    expensive_cutoff = blocks[4][0]
+    expensive = [d for d in decisions if d.timestamp < expensive_cutoff]
+    # The expensive blocks self-consume from the battery → plain "hold".
+    assert any(d.action == "hold" for d in expensive), (
+        [d.action for d in decisions]
+    )
+    assert all(d.action != "hold_idle" for d in expensive), (
+        [d.action for d in decisions]
+    )
+
+
+def test_summarize_reports_hold_idle_count():
+    blocks = make_blocks([0.5] * 4 + [10.0] * 4, start_hour=0)
+    opt = MILPBatteryOptimizer()
+    _, _, _, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={},
+        consumption_hourly={h: 1.0 for h in range(24)},
+        distribution_func=flat_dist(0.5),
+        current_soc=90.0, min_soc=20.0, max_soc=90.0,
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        battery_amortisation_czk=2.0,
+    )
+    s = opt.summarize(decisions)
+    assert "hold_idle_blocks" in s
+    assert s["hold_idle_blocks"] == sum(
+        1 for d in decisions if d.action == "hold_idle"
+    )

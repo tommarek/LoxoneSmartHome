@@ -214,3 +214,84 @@ class TestAsyncMQTTClient:
         # Should raise the exception from the callback
         with pytest.raises(Exception, match="Callback error"):
             await mqtt_client._execute_callback(callback, "test/topic", "payload")
+
+    @pytest.mark.asyncio
+    async def test_publish_queue_bounded_drops_oldest(
+        self, mqtt_client: AsyncMQTTClient
+    ) -> None:
+        """Under a sustained outage the queue must stay bounded by dropping the
+        OLDEST message, keeping the newest intent."""
+        mqtt_client._max_publish_queue = 3
+        for i in range(3):
+            await mqtt_client.publish(f"topic/{i}", f"msg{i}")
+        assert mqtt_client.publish_queue.qsize() == 3
+
+        # One more over the bound drops the oldest (topic/0), not the newest.
+        await mqtt_client.publish("topic/3", "msg3")
+        assert mqtt_client.publish_queue.qsize() == 3
+        topics = []
+        while not mqtt_client.publish_queue.empty():
+            topic, *_ = mqtt_client.publish_queue.get_nowait()
+            topics.append(topic)
+        assert topics == ["topic/1", "topic/2", "topic/3"]
+
+    @pytest.mark.asyncio
+    async def test_publish_loop_drops_stale_message(
+        self, mqtt_client: AsyncMQTTClient
+    ) -> None:
+        """A message older than the TTL is dropped, not published."""
+        mqtt_client._publish_ttl_s = 120.0
+        mqtt_client._running = True
+        mqtt_client._connected = True
+        mqtt_client._publish_with_retry = AsyncMock()
+
+        # Enqueue a message whose enqueue time is 200s in the past (stale).
+        import time as _time
+        stale_ts = _time.monotonic() - 200.0
+        await mqtt_client.publish_queue.put(("t", "p", False, 1, stale_ts))
+
+        # Run a single loop iteration, then stop.
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            mqtt_client._running = False
+
+        with patch.object(mqtt_client.logger, "warning") as mock_warning:
+            await asyncio.gather(mqtt_client._publish_loop(), _stop_soon())
+
+        # The stale message is dropped (never published) and a warning is logged.
+        mqtt_client._publish_with_retry.assert_not_called()
+        assert any("stale" in str(c).lower() for c in mock_warning.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_publish_loop_requeue_preserves_enqueue_time(
+        self, mqtt_client: AsyncMQTTClient
+    ) -> None:
+        """When disconnected, a message is re-queued with its ORIGINAL enqueue
+        timestamp so the TTL keeps counting (not reset on each retry)."""
+        mqtt_client._publish_ttl_s = 120.0
+        mqtt_client._running = True
+        mqtt_client._connected = False  # force the re-queue branch
+
+        import time as _time
+        original_ts = _time.monotonic() - 10.0  # 10s old, still within TTL
+        await mqtt_client.publish_queue.put(("t", "p", False, 1, original_ts))
+
+        async def _stop_soon() -> None:
+            await asyncio.sleep(0.05)
+            mqtt_client._running = False
+
+        await asyncio.gather(mqtt_client._publish_loop(), _stop_soon())
+
+        # Message is back on the queue with the SAME ts (TTL not reset).
+        assert not mqtt_client.publish_queue.empty()
+        _, _, _, _, ts = mqtt_client.publish_queue.get_nowait()
+        assert ts == original_ts
+
+    @pytest.mark.asyncio
+    async def test_is_connected_property(self, mqtt_client: AsyncMQTTClient) -> None:
+        """is_connected reflects the live connection flag (used to gate
+        fire-and-forget deferrable-load completion accounting)."""
+        mqtt_client._connected = False
+        assert mqtt_client.is_connected is False
+        mqtt_client._connected = True
+        assert mqtt_client.is_connected is True

@@ -92,11 +92,14 @@ def test_partial_window_schedules_what_fits():
     assert len(sched.blocks) == 2
 
 
-def test_consumption_overlay_uses_hourly_rate_convention():
-    # The optimizer treats consumption_hourly[h] as a FULL-HOUR figure and
-    # divides by 4 per 15-min block. So each scheduled block must contribute
-    # the hourly-RATE energy (power_kw), not the per-block energy, so that
-    # after the optimizer's /4 the block sees the true power*0.25 kWh.
+def test_consumption_overlay_skips_legacy_blocks_without_datetimes():
+    # A schedule carrying `blocks` but no `block_datetimes` cannot be safely
+    # mapped to the optimizer's per-block consumption grid: the only key
+    # available is the integer hour, and the optimizer applies an hourly value
+    # to EACH of the four 15-min blocks in that hour (then /4), which would
+    # multiply a single hour's deferrable draw four-fold and over-charge the
+    # battery from grid. All real producers populate block_datetimes, so this
+    # case is skipped (with a warning) rather than double-counted.
     load = DeferrableLoad(
         name="ev", energy_required_kwh=2.0, power_kw=2.0,
         earliest_start=time(0, 0), latest_end=time(23, 59),
@@ -108,13 +111,8 @@ def test_consumption_overlay_uses_hourly_rate_convention():
     overlay = DeferrableLoadScheduler().consumption_overlay(
         [sched], {"ev": load}
     )
-    # 2 blocks in hour 10 * power(2.0) = 4.0; after optimizer /4 → 1.0 kWh
-    # (= 2 blocks * 0.5 kWh actual). 1 block in hour 11 → 2.0 (/4 = 0.5).
-    assert overlay[10] == 4.0
-    assert overlay[11] == 2.0
-    # Verify the round-trip: optimizer's per-block view recovers true energy.
-    assert overlay[10] / 4 == 1.0  # 2 blocks * power*0.25
-    assert overlay[11] / 4 == 0.5  # 1 block * power*0.25
+    # No datetimes → no overlay contribution (no integer-hour double-count).
+    assert overlay == {}
 
 
 def test_consumption_overlay_preserves_date_when_available():

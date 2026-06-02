@@ -121,11 +121,13 @@ def _carry_forward_hourly(
 ) -> Dict[str, int]:
     """Reconstruct effective hourly state from sparse state-change records.
 
-    Mirror of solar_forecast._carry_forward_hourly. State-change records span
-    until the next change. For each hour key we want the effective state
-    DURING that hour: min over (state-entering, any changes within the hour),
-    so a partially-disabled hour still counts as disabled. Hours predating
-    the first record stay missing — caller defaults to "enabled".
+    This is the canonical implementation; solar_forecast.py and
+    ml_consumption_forecast.py import it from here for export/inverter-on
+    reconstruction. State-change records span until the next change. For each
+    hour key we want the effective state DURING that hour: min over
+    (state-entering, any changes within the hour), so a partially-disabled hour
+    still counts as disabled. Hours predating the first record stay missing —
+    caller defaults to "enabled".
     """
     changes: List[Tuple[datetime, int]] = []
     if result:
@@ -139,6 +141,12 @@ def _carry_forward_hourly(
                     ) is not None:
                         ct = ct.astimezone(local_tz)
                     changes.append((ct.replace(tzinfo=None), int(val)))
+    # The forward-only pointer below assumes globally ascending time, but a Flux
+    # query with varying tags returns one table PER tag set (sort() only orders
+    # within a table), so the concatenated list is per-table runs interleaved in
+    # time. Sort once here so correctness never depends on InfluxDB returning a
+    # single, pre-sorted series.
+    changes.sort(key=lambda c: c[0])
     out: Dict[str, int] = {}
     if not changes or not hour_keys:
         return out

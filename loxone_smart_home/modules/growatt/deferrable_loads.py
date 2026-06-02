@@ -23,6 +23,30 @@ from datetime import datetime, time, timedelta
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
+def earliest_contiguous_run(timestamps: List[datetime], k: int) -> List[int]:
+    """Positions [start, start+k) of the earliest contiguous run of *k*
+    15-minute blocks within *timestamps* (assumed sorted ascending).
+
+    Used to build the "run as soon as possible" cost baseline for
+    non-interruptible deferrable loads in both the greedy scheduler and the
+    MILP extractor, so the two engines compute ``naive_cost_czk`` identically.
+    Falls back to the first *k* positions when no fully-contiguous run of
+    length *k* exists (or when there are fewer than *k* blocks).
+    """
+    if k <= 0:
+        return []
+    n = len(timestamps)
+    if n < k:
+        return list(range(n))
+    for s in range(n - k + 1):
+        if all(
+            (timestamps[s + j + 1] - timestamps[s + j]) == timedelta(minutes=15)
+            for j in range(k - 1)
+        ):
+            return list(range(s, s + k))
+    return list(range(k))
+
+
 @dataclass
 class DeferrableLoad:
     """Specification of a controllable load that can be time-shifted."""
@@ -194,15 +218,8 @@ class DeferrableLoadScheduler:
         else:
             # Naive baseline must match the chosen plan's contiguity: the
             # earliest contiguous N-block run (else savings_czk is mis-stated).
-            naive_blocks = by_time[:n_needed]
-            for i in range(len(by_time) - n_needed + 1):
-                window = by_time[i : i + n_needed]
-                if all(
-                    (b[1] - a[1]).total_seconds() == 15 * 60
-                    for a, b in zip(window, window[1:])
-                ):
-                    naive_blocks = window
-                    break
+            positions = earliest_contiguous_run([c[1] for c in by_time], n_needed)
+            naive_blocks = [by_time[p] for p in positions]
         naive = sum(c[2] for c in naive_blocks) * kwh_per_block if naive_blocks else 0.0
 
         # Build schedule
@@ -260,7 +277,15 @@ class DeferrableLoadScheduler:
         ``power*0.25`` kWh must be added as ``power*1.0`` on the exact block
         timestamp, so after the optimizer's ``/4`` the block sees the true
         ``power*0.25`` kWh without smearing the load across the rest of the
-        hour. Legacy schedules without datetimes fall back to hour keys.
+        hour.
+
+        All current producers populate ``block_datetimes`` in lock-step with
+        ``blocks`` (see :meth:`schedule`), so the overlay is keyed purely by
+        block timestamp. A schedule that has ``blocks`` but no
+        ``block_datetimes`` would have to be hand-built; we skip and warn
+        rather than fall back to an integer-hour key, which double-counts when
+        several scheduled blocks share an hour (each gets divided by 4 and
+        applied to all four quarters of that hour).
         """
         overlay: Dict[Any, float] = {}
         for sched in schedules:
@@ -274,8 +299,10 @@ class DeferrableLoadScheduler:
             if sched.block_datetimes:
                 for ts in sched.block_datetimes:
                     overlay[ts] = overlay.get(ts, 0.0) + hour_rate_per_block
-            else:
-                for start_str, _ in sched.blocks:
-                    hour = int(start_str.split(":")[0])
-                    overlay[hour] = overlay.get(hour, 0.0) + hour_rate_per_block
+            elif sched.blocks:
+                self.logger.warning(
+                    f"Deferrable load {sched.load_name!r}: schedule has blocks "
+                    f"but no block_datetimes — skipping overlay to avoid "
+                    f"double-counting consumption"
+                )
         return overlay

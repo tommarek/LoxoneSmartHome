@@ -30,12 +30,12 @@ class PriceThresholds:
     discharge_price_min: float  # Discharge battery when price above this
     discharge_profit_margin: float  # Required profit margin (e.g., 1.5 = 50% profit)
     battery_efficiency: float  # Battery round-trip efficiency
-    target_soc: float = 100.0  # Target SOC when charging from grid
     summer_charge_price_max: float = 0.0  # Max CZK/kWh to charge in summer (0 = only negative)
-    distribution_tariff_high: float = 1.5  # High tariff distribution cost CZK/kWh
-    distribution_tariff_low: float = 0.5  # Low tariff distribution cost CZK/kWh
-    low_tariff_hours: str = "0-6,22-24"  # Comma-separated hour ranges for low tariff
-    eur_czk_rate: float = 25.0  # EUR to CZK exchange rate
+    # Defaults mirror GrowattConfig (config/settings.py) so a default-constructed
+    # PriceThresholds computes the real D57d schedule, not a placeholder.
+    distribution_tariff_high: float = 0.913  # High tariff distribution cost CZK/kWh
+    distribution_tariff_low: float = 0.116  # Low tariff distribution cost CZK/kWh
+    low_tariff_hours: str = "0-10,11-12,13-14,15-17,18-24"  # Hour ranges for low tariff
 
 
 @dataclass
@@ -80,8 +80,10 @@ class DecisionContext:
     sunrise: Optional[time] = None
     sunset: Optional[time] = None
     is_summer_mode: bool = False
-    eur_czk_rate: float = 25.0  # EUR to CZK exchange rate
     is_battery_charging_scheduled: bool = False
+    # Configured discharge power rate (%) — used only for explanation text so it
+    # matches the value the controller actually applies.
+    discharge_power_pct: float = 25.0
     # High load details (which loads are active)
     high_load_details: Dict[str, Any] = field(default_factory=dict)
     # Battery SOC limits (from config, avoids hardcoding)
@@ -93,6 +95,11 @@ class DecisionContext:
     # Optimizer-scheduled sell-production blocks (export solar, battery passive)
     optimizer_sell_production_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_sell_production_scheduled: bool = False
+    # Optimizer-scheduled battery-hold blocks: preserve the battery (no discharge),
+    # serve the house from grid. Actuated as the battery_hold mode so the hardware
+    # matches the optimizer's "hold" plan instead of draining via load_first.
+    optimizer_hold_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_hold_scheduled: bool = False
     # True when the MILP/greedy optimizer is the active scheduling engine. When
     # set, the optimizer's per-block charge decisions (cheapest_blocks) are the
     # single source of truth: the model owns charge economics (including price),
@@ -145,6 +152,12 @@ class DecisionContext:
         if self.current_block_key and self.optimizer_sell_production_blocks:
             self.is_optimizer_sell_production_scheduled = (
                 self.current_block_key in self.optimizer_sell_production_blocks
+            )
+
+        # Check if optimizer scheduled a battery-hold for this block
+        if self.current_block_key and self.optimizer_hold_blocks:
+            self.is_optimizer_hold_scheduled = (
+                self.current_block_key in self.optimizer_hold_blocks
             )
 
 
@@ -216,6 +229,12 @@ MODE_DEFINITIONS = {
         "inverter_mode": "grid_first",
         "stop_soc": "max_soc",  # Don't discharge battery
         "ac_charge": False
+    },
+    "battery_hold": {
+        "description": "Preserve battery — serve house from grid (no discharge)",
+        "inverter_mode": "load_first",
+        "stop_soc": "max_soc",  # Prevent discharge (same mechanism as high-load)
+        "ac_charge": False
     }
 }
 
@@ -275,7 +294,9 @@ class GrowattDecisionEngine:
                     and ctx.is_battery_charging_scheduled
                 ),
                 action="charge_from_grid",
-                explanation="Cheapest electricity blocks - charging battery to 100%"
+                explanation=lambda ctx: (
+                    f"Cheapest electricity blocks - charging battery to {ctx.max_soc:.0f}%"
+                )
             ),
 
             # Priority 3: High Load Protection - Prevent ALL battery discharge
@@ -303,7 +324,7 @@ class GrowattDecisionEngine:
                 explanation=lambda ctx: (
                     f"Optimizer scheduled discharge: "
                     f"{ctx.current_price:.2f} CZK/kWh, "
-                    f"discharging at 25% power"
+                    f"discharging at {ctx.discharge_power_pct:.0f}% power"
                 )
             ),
 
@@ -326,6 +347,26 @@ class GrowattDecisionEngine:
                 )
             ),
 
+            # Priority 4C: Optimizer-scheduled battery HOLD — preserve the battery
+            # (no discharge), serve the house from grid. Sits below charge/
+            # discharge/sell (mutually exclusive by construction) and above the
+            # default load_first, which would otherwise DRAIN the battery,
+            # diverging from the optimizer's "hold" plan. Yields to high loads
+            # (high_load_protected, priority 3, already holds identically).
+            DecisionNode(
+                name="Optimizer Battery Hold",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_hold_scheduled
+                    and not ctx.high_loads_active
+                ),
+                action="battery_hold",
+                explanation=lambda ctx: (
+                    "Optimizer preserves battery — house served from grid, "
+                    "no discharge this block"
+                )
+            ),
+
             # Priority 4B: Price-based battery discharge (fallback when no optimizer)
             DecisionNode(
                 name="Battery Discharge Control",
@@ -335,7 +376,7 @@ class GrowattDecisionEngine:
                 explanation=lambda ctx: (
                     f"Battery discharge profitable: "
                     f"{ctx.current_price:.2f} CZK/kWh meets spread requirement, "
-                    f"discharging at 25% power"
+                    f"discharging at {ctx.discharge_power_pct:.0f}% power"
                 )
             ),
 
@@ -541,7 +582,7 @@ class GrowattDecisionEngine:
         if details.get("ev_charging"):
             parts.append(f"EV charging: {details['ev_power']:.0f}W")
         detail = " + ".join(parts) if parts else "High loads active"
-        return f"{detail} — no discharge (100% stop SOC)"
+        return f"{detail} — no discharge ({ctx.max_soc:.0f}% stop SOC)"
 
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on simple price thresholds.

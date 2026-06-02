@@ -561,6 +561,17 @@ class GrowattConfig(BaseSettings):
                             f"deferrable_loads_json entry {name!r}: '{key}' must be "
                             f"an HH:MM time string (got {entry[key]!r})"
                         )
+            # A load we can switch ON but not OFF would be energised at its
+            # window start and then left running forever (the controller's stop
+            # path has no command to send). Reject it here so the whole feature
+            # fails fast at startup instead of the controller swallowing the
+            # error and silently disabling ALL deferrable loads.
+            if entry.get("mqtt_topic_on") and not entry.get("mqtt_topic_off"):
+                raise ValueError(
+                    f"deferrable_loads_json entry {name!r}: has 'mqtt_topic_on' "
+                    f"but no 'mqtt_topic_off' — a load that cannot be turned off "
+                    f"must not be controlled"
+                )
         return v
 
     @field_validator("solar_arrays")

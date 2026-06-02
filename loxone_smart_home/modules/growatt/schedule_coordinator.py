@@ -32,6 +32,9 @@ class ScheduleCoordinator:
         self.discharge_periods_tomorrow: Set[Tuple[str, str]] = set()
         self.sell_production_blocks_today: Set[Tuple[str, str]] = set()
         self.sell_production_blocks_tomorrow: Set[Tuple[str, str]] = set()
+        # Battery-hold blocks (preserve battery, serve house from grid). MILP-only.
+        self.hold_blocks_today: Set[Tuple[str, str]] = set()
+        self.hold_blocks_tomorrow: Set[Tuple[str, str]] = set()
         self.combined_charging_blocks: Set[Tuple[str, str]] = set()
         self.queued_tomorrow_charging: List[Tuple[datetime, datetime, float]] = []
         self.queued_tomorrow_pre_discharge: List[Tuple[datetime, datetime, float]] = []

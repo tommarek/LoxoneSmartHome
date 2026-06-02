@@ -65,7 +65,7 @@ def base_context() -> DecisionContext:
 def test_decision_engine_initialization(decision_engine: GrowattDecisionEngine) -> None:
     """Test that decision engine initializes correctly."""
     assert decision_engine is not None
-    assert len(decision_engine.decision_tree) == 8  # 8 decision nodes
+    assert len(decision_engine.decision_tree) == 9  # 9 decision nodes
     assert decision_engine._last_decision is None
 
 
@@ -392,6 +392,83 @@ def test_optimizer_scheduled_discharge_still_fires(
         optimizer_discharge_blocks={block},
     )
     assert decision_engine.decide(ctx) == "discharge_to_grid"
+
+
+def _hold_ctx(block, **overrides) -> DecisionContext:
+    base = dict(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=44.0,
+        current_time=datetime(2024, 6, 1, 2, 0),
+        current_mode="regular",
+        current_price=3.5,
+        current_block_key=block,
+        min_soc=20.0,
+        max_soc=90.0,
+        optimizer_active=True,
+        optimizer_hold_blocks={block},
+    )
+    base.update(overrides)
+    return DecisionContext(**base)
+
+
+def test_battery_hold_node_selected(decision_engine: GrowattDecisionEngine) -> None:
+    """A block the optimizer scheduled to hold actuates the battery_hold mode
+    (preserve battery, serve house from grid) instead of regular/load_first."""
+    block = ("02:00", "02:15")
+    assert decision_engine.decide(_hold_ctx(block)) == "battery_hold"
+
+
+def test_battery_hold_prevents_discharge_settings() -> None:
+    """battery_hold must use the same discharge-preventing settings as
+    high_load_protected (load_first + stop_soc max_soc + no AC charge)."""
+    bh = MODE_DEFINITIONS["battery_hold"]
+    hlp = MODE_DEFINITIONS["high_load_protected"]
+    assert bh["inverter_mode"] == "load_first"
+    assert bh["stop_soc"] == "max_soc"  # at/above current SOC → no discharge
+    assert bh["ac_charge"] is False
+    assert (bh["inverter_mode"], bh["stop_soc"], bh["ac_charge"]) == (
+        hlp["inverter_mode"], hlp["stop_soc"], hlp["ac_charge"]
+    )
+
+
+def test_battery_hold_yields_to_manual_override(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    block = ("02:00", "02:15")
+    ctx = _hold_ctx(block, manual_override_active=True, manual_override_mode="regular")
+    assert decision_engine.decide(ctx) == "regular"
+
+
+def test_battery_hold_yields_to_high_load_protection(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """During high loads, high_load_protected (priority 3) fires first — it holds
+    the battery identically, so the hold block is still protected."""
+    block = ("02:00", "02:15")
+    ctx = _hold_ctx(block, high_loads_active=True)
+    assert decision_engine.decide(ctx) == "high_load_protected"
+
+
+def test_battery_hold_yields_to_discharge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """If a block is (defensively) flagged for both discharge and hold, the
+    higher-priority discharge node wins."""
+    block = ("21:00", "21:15")
+    ctx = _hold_ctx(
+        block, current_time=datetime(2024, 6, 1, 21, 0), current_price=9.0,
+        battery_soc=61.0, optimizer_discharge_blocks={block},
+    )
+    assert decision_engine.decide(ctx) == "discharge_to_grid"
+
+
+def test_no_battery_hold_when_block_not_scheduled(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """A block NOT in the hold set falls through to regular (load_first)."""
+    ctx = _hold_ctx(("02:00", "02:15"), current_block_key=("03:00", "03:15"))
+    assert decision_engine.decide(ctx) == "regular"
 
 
 def test_priority_ordering() -> None:

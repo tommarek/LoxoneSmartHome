@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import pandas as pd  # type: ignore
@@ -59,6 +59,11 @@ class MLConsumptionForecast:
         self._last_train_index_end: Optional[datetime] = None
         self._exog_cols: List[str] = []
         self._schema_version: int = 0
+        # The (forecaster, training-end) pair read by predict_hourly, which runs
+        # in a worker thread (asyncio.to_thread). Published as one immutable
+        # tuple in a single assignment so a concurrent prediction can never
+        # observe a new forecaster paired with a stale training-end.
+        self._predict_state: Optional[Tuple[Any, datetime]] = None
         # Local timezone the training hours were bucketed in (so prediction
         # uses the same wall-clock convention the optimizer expects).
         self._local_tz = None
@@ -281,6 +286,9 @@ from(bucket: "{bucket_solar}")
         self._last_train_index_end = y_full.index[-1].to_pydatetime()
         self._exog_cols = list(exog.columns)
         self._schema_version = ML_MODEL_SCHEMA_VERSION
+        # Publish the worker-thread-visible pair LAST, as a single immutable
+        # tuple, so predict_hourly observes forecaster and training-end together.
+        self._predict_state = (forecaster, self._last_train_index_end)
         model_kind = (
             f"quantile GBR (α={quantile:.2f})" if quantile > 0.5
             else "median RandomForest"
@@ -308,14 +316,15 @@ from(bucket: "{bucket_solar}")
 
         Returns hour-of-target_date → kWh. Falls back to {} on failure.
         """
-        # Snapshot the model state up front. predict_hourly runs in a worker
-        # thread (asyncio.to_thread) while build_model may replace these
-        # attributes on the event loop; reading them once into locals avoids
-        # pairing a new forecaster with a stale training-end (or vice versa).
-        forecaster = self._forecaster
-        train_end = self._last_train_index_end
-        if forecaster is None or train_end is None:
+        # Read the model state as a SINGLE reference. predict_hourly runs in a
+        # worker thread (asyncio.to_thread) while build_model may replace the
+        # model on the event loop; reading the published (forecaster, train_end)
+        # tuple once guarantees the pair is consistent — a separate-attribute
+        # snapshot could observe a new forecaster with a stale training-end.
+        state = self._predict_state
+        if state is None:
             return {}
+        forecaster, train_end = state
         try:
             import pandas as pd  # type: ignore
             start = train_end + timedelta(hours=1)

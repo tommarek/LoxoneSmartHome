@@ -317,6 +317,10 @@ class GrowattController(BaseModule):
             spec = _json.loads(
                 getattr(self.config, "deferrable_loads_json", "[]") or "[]"
             )
+            # Shape and invariants (incl. mqtt_topic_on-requires-off) are enforced
+            # fail-fast by GrowattConfig.validate_deferrable_loads_json, so by the
+            # time we read the already-validated config string here we only need
+            # to build the dataclasses.
             for entry in spec:
                 self._deferrable_loads.append(DeferrableLoad(
                     name=entry["name"],
@@ -465,6 +469,22 @@ class GrowattController(BaseModule):
     @_sell_production_blocks_tomorrow.setter
     def _sell_production_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
         self._schedule.sell_production_blocks_tomorrow = value
+
+    @property
+    def _hold_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.hold_blocks_today
+
+    @_hold_blocks_today.setter
+    def _hold_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.hold_blocks_today = value
+
+    @property
+    def _hold_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.hold_blocks_tomorrow
+
+    @_hold_blocks_tomorrow.setter
+    def _hold_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.hold_blocks_tomorrow = value
 
     @property
     def _combined_charging_blocks(self) -> Set[Tuple[str, str]]:
@@ -1588,6 +1608,10 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except Exception as e:
                 self.logger.debug(f"Could not load initial SOC: {e}")
 
+        # Restore delivered deferrable-load blocks so a restart mid delivery-cycle
+        # doesn't re-schedule already-delivered energy (no-op unless configured).
+        await self._reload_deferrable_completed()
+
         # === PHASE 2: Go operational (controller responds to events) ===
 
         # Start periodic evaluation loop BEFORE model builds
@@ -2427,7 +2451,6 @@ from(bucket: "{bucket}")
                 distribution_tariff_high=self.config.distribution_tariff_high,
                 distribution_tariff_low=self.config.distribution_tariff_low,
                 low_tariff_hours=self.config.low_tariff_hours,
-                eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
             )
             dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
                 h, dist_thresholds
@@ -2546,7 +2569,14 @@ from(bucket: "{bucket}")
                 # Strict engine-agnostic rules the plan must respect so it never
                 # promises an export/PV action the hardware gates then block.
                 export_price_min=self.config.export_price_min,
-                inverter_off_price=self.config.inverter_off_price_threshold_czk,
+                # Use the gate's LOWER deadband edge (threshold - hysteresis) so
+                # the plan only assumes the inverter is OFF where the actuation
+                # gate definitely powers it off; otherwise the plan and hardware
+                # would disagree for prices inside the hysteresis band.
+                inverter_off_price=(
+                    self.config.inverter_off_price_threshold_czk
+                    - self.config.inverter_off_price_hysteresis_czk
+                ),
             )
             # MILP-only knobs (the greedy engine doesn't accept these kwargs).
             if co_opt_deferrable:
@@ -2559,6 +2589,13 @@ from(bucket: "{bucket}")
             charge_times, discharge_times, sell_production_times, decisions = (
                 await asyncio.to_thread(_optimize_call)
             )
+            # Battery-hold blocks: the optimizer chose to PRESERVE the battery and
+            # serve the house from grid (action "hold_idle"). Derived from the
+            # decisions (the 4-tuple contract is unchanged) and actuated as the
+            # battery_hold mode so the hardware matches the plan.
+            hold_idle_times = {
+                d.timestamp for d in decisions if d.action == "hold_idle"
+            }
             # With MILP co-optimization the deferrable placement is decided by
             # the solver; adopt it (for the dashboard + MQTT actuation).
             if co_opt_deferrable and self._deferrable_loads:
@@ -2575,10 +2612,12 @@ from(bucket: "{bucket}")
             summary = self._optimizer.summarize(decisions)
             sp_count = summary.get('sell_production_blocks', 0)
             sp_str = f", {sp_count} sell-production" if sp_count else ""
+            hold_idle_count = summary.get('hold_idle_blocks', 0)
+            hold_idle_str = f", {hold_idle_count} battery-hold" if hold_idle_count else ""
             self.logger.info(
                 f"🧠 Optimizer: {summary['charge_blocks']} charge, "
                 f"{summary['discharge_blocks']} discharge, "
-                f"{summary['hold_blocks']} hold{sp_str} blocks "
+                f"{summary['hold_blocks']} hold{hold_idle_str}{sp_str} blocks "
                 f"(avg charge: {summary['avg_charge_price']:.2f}, "
                 f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
             )
@@ -2599,6 +2638,8 @@ from(bucket: "{bucket}")
                 discharge_profit_margin=discharge_profit_margin
             )
             sell_production_times = set()
+            # Rule-based engine has no battery-hold concept (holds = load_first).
+            hold_idle_times: Set[datetime] = set()
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
@@ -2699,6 +2740,14 @@ from(bucket: "{bucket}")
         sell_production_tomorrow = [
             (s, e, p) for s, e, p in sell_production_blocks if s.date() > today
         ]
+
+        # Battery-hold blocks (preserve battery, serve house from grid)
+        hold_blocks = [
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
+            if start_dt in hold_idle_times
+        ]
+        hold_today = [(s, e, p) for s, e, p in hold_blocks if s.date() == today]
+        hold_tomorrow = [(s, e, p) for s, e, p in hold_blocks if s.date() > today]
         if (not suppress_print or force_table) and sell_production_blocks:
             self.logger.info(
                 f"☀️  Sell-production: {len(sell_production_blocks)} blocks "
@@ -2866,6 +2915,10 @@ from(bucket: "{bucket}")
             _block_key(s, e)
             for s, e, _ in sell_production_today
         }
+        self._hold_blocks_today = {
+            _block_key(s, e)
+            for s, e, _ in hold_today
+        }
 
         # Tomorrow's schedules (queue for midnight)
         self._cheapest_charging_blocks_tomorrow = {
@@ -2883,6 +2936,10 @@ from(bucket: "{bucket}")
         self._sell_production_blocks_tomorrow = {
             _block_key(s, e)
             for s, e, _ in sell_production_tomorrow
+        }
+        self._hold_blocks_tomorrow = {
+            _block_key(s, e)
+            for s, e, _ in hold_tomorrow
         }
 
         # Store queued schedules for midnight application
@@ -2946,6 +3003,67 @@ from(bucket: "{bucket}")
             )
         except Exception as e:
             self.logger.debug(f"Could not write inverter_state point: {e}")
+
+    async def _persist_deferrable_completed(
+        self, load_name: str, block_start: datetime
+    ) -> None:
+        """Persist a delivered deferrable-load block to InfluxDB.
+
+        Without this, ``_deferrable_completed_blocks`` is in-memory only, so a
+        restart mid delivery-cycle resets delivered energy to 0 and the load is
+        re-scheduled for energy it already received (extra paid grid import).
+        Best-effort: a failure here must never block actuation.
+        """
+        if not self.influxdb_client:
+            return
+        try:
+            await self.influxdb_client.write_point(
+                bucket=self.settings.influxdb.bucket_solar,
+                measurement="deferrable_completed",
+                tags={"load": load_name},
+                fields={"delivered": 1},
+                timestamp=block_start,
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not persist deferrable_completed point: {e}")
+
+    async def _reload_deferrable_completed(self) -> None:
+        """Rebuild ``_deferrable_completed_blocks`` from InfluxDB on startup so a
+        restart mid delivery-cycle does not re-schedule already-delivered energy.
+
+        Reloads the last 48h — the same safety window the runtime prune uses.
+        Best-effort: on any failure we keep the empty set (prior behaviour).
+        """
+        if not self.influxdb_client or not self._deferrable_loads:
+            return
+        try:
+            q = f'''
+from(bucket: "{self.settings.influxdb.bucket_solar}")
+  |> range(start: -48h)
+  |> filter(fn: (r) => r._measurement == "deferrable_completed" and r._field == "delivered")
+'''
+            result = await self.influxdb_client.query(q)
+            restored = 0
+            for table in result:
+                for record in table.records:
+                    name = record.values.get("load")
+                    ts = record.get_time()
+                    if not name or ts is None:
+                        continue
+                    # Stored at the local-time block start; convert back to local
+                    # tz-aware so it matches the runtime cycle_start comparisons.
+                    if getattr(ts, "tzinfo", None) is not None:
+                        ts = ts.astimezone(self._local_tz)
+                    block_start = ts.replace(second=0, microsecond=0)
+                    self._deferrable_completed_blocks.add((name, block_start))
+                    restored += 1
+            if restored:
+                self.logger.info(
+                    f"Restored {restored} delivered deferrable-load block(s) "
+                    f"from InfluxDB"
+                )
+        except Exception as e:
+            self.logger.debug(f"Could not reload deferrable_completed blocks: {e}")
 
     async def _store_schedule_to_influxdb(self) -> None:
         """Store current schedule data to InfluxDB for web service consumption."""
@@ -3526,7 +3644,6 @@ from(bucket: "{bucket}")
             distribution_tariff_high=self.config.distribution_tariff_high,
             distribution_tariff_low=self.config.distribution_tariff_low,
             low_tariff_hours=self.config.low_tariff_hours,
-            eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
         )
 
         # Calculate price ranking for current 15-minute block
@@ -3575,6 +3692,10 @@ from(bucket: "{bucket}")
             optimizer_sell_production_blocks=(
                 self._sell_production_blocks_today.copy() if self._optimizer else set()
             ),
+            # Optimizer battery-hold blocks (preserve battery, house from grid)
+            optimizer_hold_blocks=(
+                self._hold_blocks_today.copy() if self._optimizer else set()
+            ),
             # When the optimizer drives, its charge blocks (in cheapest_blocks)
             # are actuated without the rule-based summer price gate.
             optimizer_active=bool(self._optimizer),
@@ -3582,7 +3703,7 @@ from(bucket: "{bucket}")
             sunrise=sunrise,
             sunset=sunset,
             is_summer_mode=(await self._get_season_mode() == "summer"),
-            eur_czk_rate=self._eur_czk_rate or self.config.eur_czk_rate,
+            discharge_power_pct=float(self.config.discharge_power_rate),
         )
 
     async def _build_desired_state(
@@ -3647,6 +3768,7 @@ from(bucket: "{bucket}")
 
         # Determine export based on price
         export_enabled = True  # Default
+        context = None
         try:
             context = await self._build_decision_context()
             if context.price_thresholds and context.current_block_key in context.prices_15min:
@@ -3660,10 +3782,28 @@ from(bucket: "{bucket}")
         # mode change would reset it to the dataclass default (True),
         # causing spurious ON commands during deep-negative blocks where
         # the gate had correctly turned the inverter off.
-        current_inverter_on = (
-            self._current_inverter_state.inverter_on
-            if self._current_inverter_state else True
-        )
+        if self._current_inverter_state is not None:
+            current_inverter_on = self._current_inverter_state.inverter_on
+        else:
+            # Startup / force re-apply: there is no tracked state to preserve.
+            # Seed from the SAME price-threshold gate the steady-state loop uses
+            # so the very first Modbus write is the correct direction, instead of
+            # a blind ON that the gate would immediately reverse during a
+            # deep-negative-price block. Default ON (safe/normal) on any error or
+            # inside the hysteresis deadband.
+            current_inverter_on = True
+            try:
+                threshold = self.config.inverter_off_price_threshold_czk
+                hysteresis = self.config.inverter_off_price_hysteresis_czk
+                if (
+                    context is not None
+                    and context.price_thresholds
+                    and context.current_block_key in context.prices_15min
+                    and context.current_price < threshold - hysteresis
+                ):
+                    current_inverter_on = False
+            except Exception as e:
+                self.logger.debug(f"Could not seed inverter_on from price gate: {e}")
 
         return InverterState(
             inverter_mode=inverter_mode,
@@ -3703,6 +3843,12 @@ from(bucket: "{bucket}")
                     self.logger.info("✅ Rollback successful")
                 except Exception as rollback_error:
                     self.logger.error(f"❌ Rollback failed: {rollback_error}")
+                    # Hardware is now in a mixed/unknown state and tracked state
+                    # can no longer be trusted. Null it so the next evaluation
+                    # re-sends EVERY sub-command (old_state=None path) instead of
+                    # diffing against a stale tracked state that might match the
+                    # next desired value and skip the broken field forever.
+                    self._current_inverter_state = None
             raise
 
     async def _apply_state_changes(
@@ -3766,13 +3912,21 @@ from(bucket: "{bucket}")
                 new_state.time_start == "00:00" and new_state.time_stop == "23:59"
             )
 
+            # Raise on a failed mode command so the rollback wrapper fires and
+            # _apply_decided_mode does NOT commit desired_state — otherwise the
+            # controller's tracked mode would advance while the hardware stays in
+            # the old (wrong) mode and, since the next desired state matches the
+            # wrongly-tracked one, the change would never be retried. This is the
+            # most safety-critical path (it sets charge/discharge direction), so
+            # it must mirror the export/inverter-on/ac-charge hardening below.
+            mode_ok = True
             if new_state.inverter_mode == "load_first":
-                await self._mode_manager.set_load_first(
+                mode_ok = await self._mode_manager.set_load_first(
                     stop_soc=new_state.stop_soc,
                     previous_mode=previous_mode
                 )
             elif new_state.inverter_mode == "battery_first":
-                await self._mode_manager.set_battery_first(
+                mode_ok = await self._mode_manager.set_battery_first(
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
@@ -3781,7 +3935,7 @@ from(bucket: "{bucket}")
                     previous_mode=previous_mode
                 )
             elif new_state.inverter_mode == "grid_first":
-                await self._mode_manager.set_grid_first(
+                mode_ok = await self._mode_manager.set_grid_first(
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
@@ -3789,19 +3943,30 @@ from(bucket: "{bucket}")
                     immediate_activation=immediate_activation,
                     previous_mode=previous_mode
                 )
+            if not mode_ok:
+                raise RuntimeError(
+                    f"Failed to set inverter mode to {new_state.inverter_mode}"
+                )
 
             await asyncio.sleep(0.5)
 
-        # Export change
+        # Export change. Raise on a failed command so the rollback wrapper fires
+        # and _apply_decided_mode does NOT commit desired_state — otherwise the
+        # controller's tracked export_enabled would advance while the hardware
+        # never changed, and the steady-state export-price gate would then see
+        # tracked == desired and never retry (same desync class as inverter
+        # on/off below).
         if not old_state or old_state.export_enabled != new_state.export_enabled:
             self._commands_sent_count += 1
             if new_state.export_enabled:
-                await self._mode_manager.enable_export()
+                if not await self._mode_manager.enable_export():
+                    raise RuntimeError("Failed to enable export")
                 self.logger.debug(
                     f"⚡ Export to grid ENABLED (source: {new_state.source})"
                 )
             else:
-                await self._mode_manager.disable_export()
+                if not await self._mode_manager.disable_export():
+                    raise RuntimeError("Failed to disable export")
                 self.logger.debug(
                     f"⚡ Export to grid DISABLED (source: {new_state.source})"
                 )
@@ -3825,10 +3990,16 @@ from(bucket: "{bucket}")
                     f"{'ON' if new_state.inverter_on else 'OFF'}"
                 )
 
-        # AC charge change
+        # AC charge change. Raise on failure so the rollback wrapper fires and
+        # tracked ac_charge_enabled is not advanced past the hardware (same
+        # desync class as inverter on/off and export above).
         if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:
             self._commands_sent_count += 1
-            await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled)
+            if not await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled):
+                raise RuntimeError(
+                    f"Failed to set AC charge to "
+                    f"{'ENABLED' if new_state.ac_charge_enabled else 'DISABLED'}"
+                )
             if new_state.ac_charge_enabled:
                 self.logger.debug(
                     f"🔌 AC charging from grid ENABLED (source: {new_state.source})"
@@ -3911,12 +4082,28 @@ from(bucket: "{bucket}")
                 return json.dumps(default)
             return value if isinstance(value, str) else json.dumps(value)
 
+        simulate = self._optional_config.get("simulation_mode", False)
+        # A fire-and-forget MQTT publish only ENQUEUES; during a broker outage
+        # the command can be dropped silently. Only treat a load as actually
+        # actuated when we are either simulating or holding a live connection,
+        # so we never credit undelivered energy (which would under-schedule the
+        # load on the next solve). The next cycle re-issues ON until it sticks.
+        mqtt_live = simulate or bool(
+            self.mqtt_client and self.mqtt_client.is_connected
+        )
+
         for load_name in sorted(to_start):
             load = loads_by_name.get(load_name)
             if not load or not load.mqtt_topic_on:
                 continue
+            if not mqtt_live:
+                self.logger.warning(
+                    f"Deferrable load {load.name}: MQTT not connected — "
+                    "deferring ON command (will retry next cycle)"
+                )
+                continue
             payload = _payload(load.payload_on, {"value": 1})
-            if self._optional_config.get("simulation_mode", False):
+            if simulate:
                 self.logger.info(f"[SIMULATE] Deferrable load {load.name} ON")
             else:
                 assert self.mqtt_client is not None
@@ -3924,8 +4111,19 @@ from(bucket: "{bucket}")
             self._deferrable_active.add(load_name)
             self.logger.info(f"📋 Deferrable load {load.name}: ON")
 
-        for load_name in desired_active & self._deferrable_active:
-            self._deferrable_completed_blocks.add((load_name, current_block_start))
+        # Credit a block as delivered only when the load is active AND we have a
+        # live connection (or are simulating) — otherwise the ON command this
+        # cycle could have been dropped and the appliance never ran. Persist each
+        # newly-credited block so a mid-cycle restart does not re-schedule
+        # already-delivered energy (which would double-import from grid).
+        if mqtt_live:
+            for load_name in desired_active & self._deferrable_active:
+                key = (load_name, current_block_start)
+                if key not in self._deferrable_completed_blocks:
+                    self._deferrable_completed_blocks.add(key)
+                    await self._persist_deferrable_completed(
+                        load_name, current_block_start
+                    )
 
         for load_name in sorted(to_stop):
             load = loads_by_name.get(load_name)
@@ -3937,7 +4135,7 @@ from(bucket: "{bucket}")
                 self._deferrable_active.discard(load_name)
                 continue
             payload = _payload(load.payload_off, {"value": 0})
-            if self._optional_config.get("simulation_mode", False):
+            if simulate:
                 self.logger.info(f"[SIMULATE] Deferrable load {load.name} OFF")
             else:
                 assert self.mqtt_client is not None
@@ -4018,8 +4216,13 @@ from(bucket: "{bucket}")
                     except Exception as e:
                         self.logger.warning(f"ML consumption model rebuild failed: {e}")
 
-                # Check if it's time to start fetching next day's prices
-                if now.hour == self.config.price_fetch_hour and now.minute == 0:
+                # Check if it's time to start fetching next day's prices.
+                # Use `>=` (not minute == 0): the 60s loop is `sleep(60) + work`
+                # so its phase drifts and can skip an exact minute. The
+                # once-per-day date latch below (last_fetch_check) makes this
+                # fire at most once, so a skipped :00 minute just fires on the
+                # next tick instead of being lost for the whole day.
+                if now.hour >= self.config.price_fetch_hour:
                     current_fetch_check = now.date()
                     should_fetch = (
                         last_fetch_check != current_fetch_check
@@ -4045,8 +4248,10 @@ from(bucket: "{bucket}")
                             self._fetch_next_day_prices_task()
                         )
 
-                # Check for pre-midnight (23:55) - ensure next day prices are ready
-                if now.hour == 23 and now.minute == 55:
+                # Check for pre-midnight (>= 23:55) - ensure next day prices are
+                # ready. `>=` (not minute == 55) so loop drift can't skip the
+                # backstop; the date latch below fires it at most once per day.
+                if now.hour == 23 and now.minute >= 55:
                     current_pre_midnight_check = now.date()
                     if last_pre_midnight_check != current_pre_midnight_check:
                         last_pre_midnight_check = current_pre_midnight_check
@@ -4145,12 +4350,16 @@ from(bucket: "{bucket}")
                             self._sell_production_blocks_today = (
                                 self._sell_production_blocks_tomorrow.copy()
                             )
+                            self._hold_blocks_today = (
+                                self._hold_blocks_tomorrow.copy()
+                            )
 
                             # Clear tomorrow's schedules
                             self._cheapest_charging_blocks_tomorrow = set()
                             self._pre_discharge_blocks_tomorrow = set()
                             self._discharge_periods_tomorrow = set()
                             self._sell_production_blocks_tomorrow = set()
+                            self._hold_blocks_tomorrow = set()
 
                             # Clear queues
                             self._queued_tomorrow_charging = []

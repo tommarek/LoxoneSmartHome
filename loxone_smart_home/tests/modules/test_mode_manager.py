@@ -328,7 +328,11 @@ async def test_set_load_first_aborts_on_stopsoc_failure(mode_manager, mock_contr
     }
 
     # Try to set load_first
-    await mode_manager.set_load_first(stop_soc=100, previous_mode=None)
+    ok = await mode_manager.set_load_first(stop_soc=100, previous_mode=None)
+
+    # A failed command must report False so the controller does not advance
+    # tracked state past the hardware.
+    assert ok is False
 
     # Verify error was logged
     assert any("Failed to set load-first stopSOC" in str(call)
@@ -337,6 +341,48 @@ async def test_set_load_first_aborts_on_stopsoc_failure(mode_manager, mock_contr
     # Verify final success message was NOT logged
     assert not any("LOAD-FIRST MODE SET" in str(call)
                    for call in mode_manager.logger.info.call_args_list)
+
+
+@pytest.mark.asyncio
+async def test_mode_setters_return_bool_for_desync_protection(
+    mode_manager, mock_controller
+):
+    """The mode setters must return True only when the hardware command
+    actually succeeded, so the controller can raise (and trigger rollback)
+    rather than committing tracked state past a never-applied mode change."""
+    mode_manager._to_device_hhmm = MagicMock(side_effect=lambda x: x)
+    mode_manager._ensure_future_start = MagicMock(return_value=("12:00", "14:00"))
+    mode_manager.ensure_exclusive = AsyncMock()
+    mode_manager._query_inverter_state = AsyncMock(return_value={})
+    mock_controller.config.load_first_stopsoc_topic = "test/stopsoc"
+    mode_manager.disable_battery_first = AsyncMock()
+    mode_manager.disable_grid_first = AsyncMock()
+
+    # All commands succeed → True
+    mock_controller._wait_for_command_result.return_value = {
+        "success": True, "message": "ok"
+    }
+    assert await mode_manager.set_battery_first(
+        "12:00", "14:00", stop_soc=95, power_rate=50
+    ) is True
+    assert await mode_manager.set_grid_first(
+        "12:00", "14:00", stop_soc=20, power_rate=100
+    ) is True
+    assert await mode_manager.set_load_first(
+        stop_soc=20, previous_mode="grid_first"
+    ) is True
+
+    # Command fails → False (clear last-applied so the call is not skipped)
+    mode_manager._last_applied.clear()
+    mock_controller._wait_for_command_result.return_value = {
+        "success": False, "message": "Timeout"
+    }
+    assert await mode_manager.set_battery_first(
+        "12:00", "14:00", stop_soc=95, power_rate=50
+    ) is False
+    assert await mode_manager.set_grid_first(
+        "12:00", "14:00", stop_soc=20, power_rate=100
+    ) is False
 
 
 @pytest.mark.asyncio

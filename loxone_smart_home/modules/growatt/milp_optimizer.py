@@ -577,6 +577,7 @@ class MILPBatteryOptimizer:
             bg = val(batt_to_grid[i])
             sg = val(solar_to_grid[i])
             bl = val(batt_to_load[i])
+            gl = val(grid_to_load[i])
             action = "hold"
             net_value = 0.0
             # Classify the headline action by the solver's own mutually-exclusive
@@ -607,6 +608,16 @@ class MILPBatteryOptimizer:
                 # but credit the avoided import (net of battery wear) so net_value
                 # isn't understated as 0 on genuinely active blocks.
                 net_value = bl * (import_cost[i] - battery_amortisation_czk)
+            elif gl > ACTION_EPS and soc_v[i] > min_battery_kwh + ACTION_EPS:
+                # The solver is serving the house from the GRID while the battery
+                # sits above its floor with usable charge — i.e. it deliberately
+                # PRESERVES the battery this block (for a higher-value later use).
+                # This is a true "hold" that must be actuated as battery-hold
+                # (load_first + stop_soc=max_soc, no discharge), NOT plain
+                # load_first, which would drain the battery for the house. Without
+                # this the plan ("hold") and the hardware ("load_first drains")
+                # diverge.
+                action = "hold_idle"
             new_actions[ts] = action
 
             decisions.append(BlockDecision(
@@ -778,7 +789,10 @@ class MILPBatteryOptimizer:
         if not meta:
             self._prev_deferrable_runs = {}
             return []
-        from .deferrable_loads import DeferrableLoadSchedule
+        from .deferrable_loads import (
+            DeferrableLoadSchedule,
+            earliest_contiguous_run,
+        )
 
         prev_runs: Dict[str, Set[datetime]] = {}
         schedules: List[Any] = []
@@ -807,16 +821,8 @@ class MILPBatteryOptimizer:
             if load.interruptible:
                 naive_idx = win[:k]
             else:
-                naive_idx = win[:k]
-                for s in range(len(win) - k + 1):
-                    cand = win[s : s + k]
-                    if all(
-                        (blocks[cand[j + 1]][0] - blocks[cand[j]][0])
-                        == timedelta(minutes=15)
-                        for j in range(len(cand) - 1)
-                    ):
-                        naive_idx = cand
-                        break
+                positions = earliest_contiguous_run([blocks[i][0] for i in win], k)
+                naive_idx = [win[p] for p in positions]
             naive = sum(import_cost[i] * block_energy for i in naive_idx)
 
             prev_runs[load.name] = set(block_dts)
@@ -853,6 +859,8 @@ class MILPBatteryOptimizer:
                 terms.append(penalty * (1 - is_disch[i]))
             elif prev == "sell_production":
                 terms.append(penalty * (1 - is_sp[i]))
-            elif prev == "hold":
+            elif prev in ("hold", "hold_idle"):
+                # Both are non-grid-facing; penalise only a switch INTO a
+                # grid-facing action, same as a plain hold.
                 terms.append(penalty * (is_charge[i] + is_disch[i] + is_sp[i]))
         return pulp.lpSum(terms)

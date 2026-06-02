@@ -139,3 +139,48 @@ class TestGrowattConfig:
         """Test positive value constraints."""
         with pytest.raises(ValidationError):
             GrowattConfig(battery_capacity=-10.0)
+
+
+class TestDeferrableLoadsJsonValidator:
+    """Test the deferrable_loads_json field validator (fail-fast at startup)."""
+
+    def test_valid_passes_through_unchanged(self) -> None:
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 8.0, "power_kw": 3.0, '
+            '"earliest_start": "22:00", "latest_end": "06:00", '
+            '"mqtt_topic_on": "ev/on", "mqtt_topic_off": "ev/off"}]'
+        )
+        config = GrowattConfig(deferrable_loads_json=raw)
+        assert config.deferrable_loads_json == raw
+
+    def test_empty_array_is_valid(self) -> None:
+        config = GrowattConfig(deferrable_loads_json="[]")
+        assert config.deferrable_loads_json == "[]"
+
+    def test_load_with_only_required_fields_passes(self) -> None:
+        config = GrowattConfig(
+            deferrable_loads_json='[{"name": "wp", "energy_required_kwh": 2, "power_kw": 1}]'
+        )
+        assert "wp" in config.deferrable_loads_json
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "not json",                                   # invalid JSON
+            '{"name": "ev"}',                             # not a list
+            "[42]",                                       # entry not an object
+            '[{"energy_required_kwh": 1, "power_kw": 1}]',  # missing name
+            '[{"name": "", "energy_required_kwh": 1, "power_kw": 1}]',  # empty name
+            '[{"name": "ev", "power_kw": 1}]',            # missing energy_required_kwh
+            '[{"name": "ev", "energy_required_kwh": 1}]',  # missing power_kw
+            '[{"name": "ev", "energy_required_kwh": "x", "power_kw": 1}]',  # non-numeric
+            '[{"name": "ev", "energy_required_kwh": 0, "power_kw": 1}]',  # non-positive
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": -1}]',  # non-positive
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, "earliest_start": "25:00"}]',  # bad time
+            # mqtt_topic_on without mqtt_topic_off — cannot be turned off
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, "mqtt_topic_on": "ev/on"}]',
+        ],
+    )
+    def test_malformed_entries_raise(self, raw: str) -> None:
+        with pytest.raises(ValidationError):
+            GrowattConfig(deferrable_loads_json=raw)

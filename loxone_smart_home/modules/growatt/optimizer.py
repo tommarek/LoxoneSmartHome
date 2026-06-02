@@ -5,6 +5,7 @@ price curve, solar forecast, consumption forecast, and battery constraints to
 minimize total electricity cost.
 """
 
+import bisect
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -471,7 +472,10 @@ from(bucket: "{solar_bucket}")
                 # block per cheap block (the old behaviour) over-credited
                 # incoming on price-flat nights, zeroing the reserve and letting
                 # discharge drain the battery with nothing left for base load.
-                price_rank = sum(1 for p in prices if p < prices[j]) / n if n > 0 else 0.5
+                # bisect_left on the pre-sorted prices counts strictly-cheaper
+                # blocks in O(log n) — identical to the old O(n) rescan but
+                # without rescanning all prices for every (block_idx, j) pair.
+                price_rank = bisect.bisect_left(sorted_prices, prices[j]) / n if n > 0 else 0.5
                 if price_rank < 0.35:
                     has_cheap_topup = True
 
@@ -543,6 +547,13 @@ from(bucket: "{solar_bucket}")
         """
         if not blocks:
             return set(), set(), set(), []
+
+        # Clamp SOC into [min_soc, max_soc]. Live telemetry can report e.g. 100%
+        # while max_soc is 90 (documented real condition); an unclamped value
+        # makes battery_gap_kwh go negative. Downstream consumers floor at 0, but
+        # clamp here so both engines and all fallback paths (incl. the
+        # PuLP-missing greedy fallback) start from the same bounded SOC as MILP.
+        current_soc = max(min_soc, min(max_soc, current_soc))
 
         # Battery energy parameters
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
@@ -930,6 +941,15 @@ from(bucket: "{solar_bucket}")
             # Solar and consumption for this 15-min block (quarter of hourly value)
             solar = _forecast_value(solar_hourly, timestamp) / 4.0
             consumption = _forecast_value(consumption_hourly, timestamp) / 4.0
+            # When a block has no consumption forecast, fall back to the learned
+            # base load ONCE here so the action SCORING (net_solar below) and the
+            # SOC SIMULATION further down use the SAME house load — otherwise
+            # scoring would bank all solar as excess while the sim still drains
+            # the battery for base load. Weekday/weekend keys off THIS block.
+            if consumption <= 0:
+                consumption = self._base_load_profile.get(
+                    hour, timestamp.weekday() >= 5
+                ) / 4.0
 
             # Net solar: excess solar charges battery automatically
             net_solar = solar - consumption  # Positive = excess, negative = deficit
@@ -1020,10 +1040,10 @@ from(bucket: "{solar_bucket}")
                 net_value = (price_czk - dist - sell_fee_czk) * solar_excess_now
 
             # === SOC SIMULATION ===
+            # `consumption` already carries the base-load fallback applied above,
+            # so the simulated house load matches the scored net_solar exactly.
             solar_available = solar
-            house_load = consumption if consumption > 0 else (
-                self._base_load_profile.get(hour, first_block_ts.weekday() >= 5) / 4.0
-            )
+            house_load = consumption
             net_from_solar = solar_available - house_load
 
             if action == "charge":
@@ -1112,6 +1132,9 @@ from(bucket: "{solar_bucket}")
         charge_blocks = [d for d in decisions if d.action == "charge"]
         discharge_blocks = [d for d in decisions if d.action == "discharge"]
         hold_blocks = [d for d in decisions if d.action == "hold"]
+        # Battery-hold (preserve): grid serves the house, battery idle. Only the
+        # MILP emits this; greedy holds stay "hold" (load_first self-consume).
+        hold_idle_blocks = [d for d in decisions if d.action == "hold_idle"]
         sell_production_blocks = [d for d in decisions if d.action == "sell_production"]
 
         return {
@@ -1120,6 +1143,7 @@ from(bucket: "{solar_bucket}")
             "charge_blocks": len(charge_blocks),
             "discharge_blocks": len(discharge_blocks),
             "hold_blocks": len(hold_blocks),
+            "hold_idle_blocks": len(hold_idle_blocks),
             "avg_charge_price": (
                 sum(d.price_czk for d in charge_blocks) / len(charge_blocks)
                 if charge_blocks else 0

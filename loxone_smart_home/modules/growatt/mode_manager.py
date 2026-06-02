@@ -243,7 +243,7 @@ class ModeManager:
         self, start_hour: str, stop_hour: str, stop_soc: Optional[int] = None,
         power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False,
         immediate_activation: bool = False, previous_mode: Optional[str] = None
-    ) -> None:
+    ) -> bool:
         """Set battery-first mode for specified time window.
 
         Battery-first mode prioritizes charging battery from grid/solar.
@@ -252,6 +252,10 @@ class ModeManager:
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         immediate_activation: If True, set start time in past for immediate activation
         previous_mode: The previously active mode (if known). If None, disables both for safety.
+
+        Returns True if the mode is in the desired state after this call (a
+        benign skip, simulation, or every sub-command succeeded), False if any
+        sub-command failed. Callers must not advance tracked state unless True.
         """
         if stop_soc is None:
             stop_soc = int(self.config.max_soc)
@@ -269,7 +273,7 @@ class ModeManager:
                 f"Battery-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
                 "skipping."
             )
-            return
+            return True
 
         stop_soc = max(5, min(100, stop_soc))
         power_rate = max(1, min(100, power_rate))
@@ -279,7 +283,7 @@ class ModeManager:
             self.logger.debug(
                 f"Battery-first {adjusted_start}-{adjusted_stop} already applied, skipping"
             )
-            return
+            return True
 
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -289,7 +293,7 @@ class ModeManager:
                 f"powerRate={power_rate}%) at {current_time}"
             )
             self._last_applied["battery_first"] = sig
-            return
+            return True
 
         assert self.mqtt_client is not None
 
@@ -311,7 +315,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to set battery-first stopSOC, aborting mode change")
-            return
+            return False
         await asyncio.sleep(self.config.command_delay)
 
         if power_rate != 100:
@@ -326,7 +330,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to set battery-first powerRate, aborting mode change")
-                return
+                return False
             await asyncio.sleep(self.config.command_delay)
 
         # Use slot 1
@@ -346,7 +350,7 @@ class ModeManager:
                 "⚠️ Battery-first mode NOT activated. Inverter may still be in previous mode. "
                 "Check inverter display or query current state."
             )
-            return
+            return False
 
         self._battery_first_slots[1] = {
             "enabled": True,
@@ -372,18 +376,24 @@ class ModeManager:
             self.logger.info(f"   Battery-first: {state['battery_first']}")
         if state.get("grid_first"):
             self.logger.info(f"   Grid-first: {state['grid_first']}")
+        return True
 
-    async def set_ac_charge(self, enabled: bool) -> None:
-        """Set AC charging state (unified setter)."""
+    async def set_ac_charge(self, enabled: bool) -> bool:
+        """Set AC charging state (unified setter).
+
+        Returns True if AC charge is in the desired state after this call
+        (already there, simulated, or the command succeeded), False if the
+        command failed. Callers must not advance tracked state unless True.
+        """
         if self._ac_enabled == enabled:
-            return
+            return True
 
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             state = "ENABLED" if enabled else "DISABLED"
             self.logger.info(f"⚡ [SIMULATE] AC CHARGING {state} (simulated at {current_time})")
             self._ac_enabled = enabled
-            return
+            return True
 
         payload = {"value": 1 if enabled else 0}
         assert self.mqtt_client is not None
@@ -396,7 +406,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error(f"Failed to set AC charge to {state_text}")
-            return  # Don't update state if command failed
+            return False  # Don't update state if command failed
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         state = "ENABLED" if enabled else "DISABLED"
@@ -404,14 +414,15 @@ class ModeManager:
             f"⚡ AC CHARGING {state} at {current_time} → Topic: {self.config.ac_charge_topic}"
         )
         self._ac_enabled = enabled
+        return True
 
-    async def enable_ac_charge(self) -> None:
+    async def enable_ac_charge(self) -> bool:
         """Enable AC charging during battery-first mode."""
-        await self.set_ac_charge(True)
+        return await self.set_ac_charge(True)
 
-    async def disable_ac_charge(self) -> None:
+    async def disable_ac_charge(self) -> bool:
         """Disable AC charging."""
-        await self.set_ac_charge(False)
+        return await self.set_ac_charge(False)
 
     async def disable_battery_first(self) -> None:
         """Disable battery-first mode."""
@@ -558,7 +569,7 @@ class ModeManager:
         self, start_hour: str, stop_hour: str, stop_soc: int = 20, power_rate: int = 100,
         *, preserve_duration: bool = True, pre_scheduled: bool = False,
         immediate_activation: bool = False, previous_mode: Optional[str] = None
-    ) -> None:
+    ) -> bool:
         """Set grid-first mode for specified time window.
 
         Grid-first mode prioritizes selling to grid over charging battery.
@@ -567,6 +578,10 @@ class ModeManager:
         pre_scheduled: If True, command is being sent in advance (no time adjustment needed)
         immediate_activation: If True, set start time in past for immediate activation
         previous_mode: The previously active mode (if known). If None, disables both for safety.
+
+        Returns True if the mode is in the desired state after this call (a
+        benign skip, simulation, or every sub-command succeeded), False if any
+        sub-command failed. Callers must not advance tracked state unless True.
         """
         if pre_scheduled:
             adjusted_start, adjusted_stop = start_hour, stop_hour
@@ -582,7 +597,7 @@ class ModeManager:
                 f"Grid-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
                 "skipping."
             )
-            return
+            return True
 
         stop_soc = max(5, min(100, stop_soc))
         power_rate = max(1, min(100, power_rate))
@@ -593,7 +608,7 @@ class ModeManager:
                 f"Grid-first {adjusted_start}-{adjusted_stop} "
                 f"(stopSOC={stop_soc}, rate={power_rate}) already applied, skipping"
             )
-            return
+            return True
 
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
@@ -603,7 +618,7 @@ class ModeManager:
                 f"powerRate={power_rate}%, simulated at {current_time})"
             )
             self._last_applied["grid_first"] = sig
-            return
+            return True
 
         assert self.mqtt_client is not None
 
@@ -621,7 +636,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to set grid-first stopSOC, aborting mode change")
-            return
+            return False
 
         # Delay between commands
         await asyncio.sleep(self.config.command_delay)
@@ -636,7 +651,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to set grid-first powerRate, aborting mode change")
-            return
+            return False
 
         # Delay before enabling the mode
         await asyncio.sleep(self.config.command_delay)
@@ -664,7 +679,7 @@ class ModeManager:
                 "⚠️ Grid-first mode NOT activated. Inverter may still be in previous mode. "
                 "Check inverter display or query current state."
             )
-            return
+            return False
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -695,6 +710,7 @@ class ModeManager:
                 "Note: Grid-first command succeeded, but state query failed. "
                 "This is normal for some firmware versions."
             )
+        return True
 
     async def disable_grid_first(self) -> None:
         """Disable grid-first mode."""
@@ -723,7 +739,7 @@ class ModeManager:
 
     async def set_load_first(
         self, stop_soc: Optional[int] = None, previous_mode: Optional[str] = None
-    ) -> None:
+    ) -> bool:
         """Set load-first mode (default/neutral mode).
 
         This is the inverter's default state where it prioritizes powering loads.
@@ -739,6 +755,10 @@ class ModeManager:
         - If previous_mode is "battery_first": Only disable battery_first
         - If previous_mode is "grid_first": Only disable grid_first
         - If previous_mode is "load_first": No disable needed (already in that mode)
+
+        Returns True if the mode is in the desired state after this call
+        (simulation or every sub-command succeeded), False if the stopSOC
+        command failed. Callers must not advance tracked state unless True.
         """
         if stop_soc is None:
             stop_soc = int(self.config.min_soc)
@@ -754,7 +774,7 @@ class ModeManager:
                 f"(simulated at {current_time})"
             )
             self._last_applied["load_first"] = sig
-            return
+            return True
 
         # Disable the previous mode to achieve load-first
         if previous_mode is None:
@@ -800,7 +820,7 @@ class ModeManager:
             )
             if not success:
                 self.logger.error("Failed to set load-first stopSOC")
-                return  # Don't update state if command failed
+                return False  # Don't update state if command failed
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
@@ -809,6 +829,7 @@ class ModeManager:
 
         # Mark as successfully applied
         self._last_applied["load_first"] = sig
+        return True
 
     def get_ac_charge_enabled(self) -> bool:
         """Get current AC charge enabled state."""

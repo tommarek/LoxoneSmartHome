@@ -19,7 +19,18 @@ from aiohttp import web
 
 # Circular buffer for recent log messages
 _log_buffer: collections.deque = collections.deque(maxlen=500)
-_sse_clients: List[asyncio.Queue] = []
+# Each SSE client is (event_loop, queue): emit() can fire from a worker thread
+# (asyncio.to_thread(optimize) logs off the loop), and asyncio.Queue is not
+# thread-safe, so notifications are marshalled back onto the client's own loop.
+_sse_clients: List[tuple] = []
+
+
+def _safe_put(q: "asyncio.Queue", entry: dict) -> None:
+    """Best-effort enqueue, dropping the entry if the client's queue is full."""
+    try:
+        q.put_nowait(entry)
+    except asyncio.QueueFull:
+        pass
 
 
 class DashboardLogHandler(logging.Handler):
@@ -57,11 +68,14 @@ class DashboardLogHandler(logging.Handler):
             # Notify SSE clients. Iterate a copy: emit() can fire from the worker
             # thread used by asyncio.to_thread(optimize), while api_logs_stream
             # mutates _sse_clients on the event loop — iterating the live list
-            # could raise mid-iteration.
-            for q in list(_sse_clients):
+            # could raise mid-iteration. asyncio.Queue is not thread-safe, so
+            # always hand the put to the client's own loop via call_soon_threadsafe
+            # (safe to call from the loop thread too).
+            for loop, q in list(_sse_clients):
                 try:
-                    q.put_nowait(entry)
-                except asyncio.QueueFull:
+                    loop.call_soon_threadsafe(_safe_put, q, entry)
+                except RuntimeError:
+                    # Loop is closed/stopped — client is going away; skip it.
                     pass
         except Exception:
             pass
@@ -338,6 +352,84 @@ async def api_status(request: web.Request) -> web.Response:
     })
 
 
+def _build_price_rows(
+    ctrl, price_items, day, *, charging, pre_discharge, discharge,
+    sell_production, soc_lookup, sell_fee, batt_amort, inv_off_threshold,
+    cur_block=None, hold=frozenset(),
+):
+    """Build the per-block price rows for one day.
+
+    The today and tomorrow price tables are identical except for the source
+    price dict, the per-action block-sets, the soc_lookup day prefix, and
+    whether ``is_current`` can be True — so both call this single builder.
+    """
+    from .decision_engine import GrowattDecisionEngine, PriceThresholds
+    thresholds = PriceThresholds(
+        charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
+        discharge_profit_margin=4.0, battery_efficiency=0.85,
+        distribution_tariff_high=getattr(ctrl.config, 'distribution_tariff_high', 0.913),
+        distribution_tariff_low=getattr(ctrl.config, 'distribution_tariff_low', 0.116),
+        low_tariff_hours=getattr(
+            ctrl.config, 'low_tariff_hours', '0-10,11-12,13-14,15-17,18-24'
+        ),
+    )
+    rows = []
+    for (start, end), price_czk in sorted(price_items):
+        is_current = cur_block is not None and (start, end) == cur_block
+        is_charging = (start, end) in charging
+        is_pre_discharge = (start, end) in pre_discharge
+        is_discharge = (start, end) in discharge
+        is_sell_production = (start, end) in sell_production
+        is_hold = (start, end) in hold
+        is_inverter_off = (price_czk < inv_off_threshold) and not is_charging
+
+        status = "normal"
+        if is_charging and is_pre_discharge:
+            status = "pre_discharge_charge"
+        elif is_charging:
+            status = "charging"
+        elif is_discharge:
+            status = "discharge"
+        elif is_sell_production:
+            status = "sell_production"
+        elif is_hold:
+            status = "battery_hold"
+        elif is_inverter_off:
+            status = "inverter_off"
+
+        czk = round(price_czk, 2)  # Already CZK/kWh
+        proj = soc_lookup.get(f"{day}:{start}", {})
+        # Sell economics: what you actually get per kWh sold.
+        dist = GrowattDecisionEngine._get_distribution_tariff(
+            int(start.split(":")[0]), thresholds
+        )
+        net_sell = round(czk - dist - sell_fee - batt_amort, 2)
+
+        rows.append({
+            "start": start,
+            "end": end,
+            "day": day,
+            "czk_kwh": czk,
+            "net_sell_czk": net_sell,
+            "distribution_czk": round(dist, 2),
+            "is_charging": is_charging,
+            "is_pre_discharge": is_pre_discharge,
+            "is_discharge": is_discharge,
+            "is_sell_production": is_sell_production,
+            "is_hold": is_hold,
+            "is_inverter_off": is_inverter_off,
+            "is_current": is_current,
+            "status": status,
+            "projected_soc": proj.get("soc"),
+            "projected_kwh": proj.get("kwh"),
+            "projected_action": proj.get("action"),
+            "projected_solar": proj.get("solar_kwh"),
+            "projected_consumption": proj.get("consumption_kwh"),
+            "projected_net_flow": proj.get("net_flow_kwh"),
+        })
+    return rows
+
+
 async def api_prices(request: web.Request) -> web.Response:
     """Get today's 15-min price blocks."""
     ctrl = _get_controller(request)
@@ -384,129 +476,32 @@ async def api_prices(request: web.Request) -> web.Response:
         - getattr(ctrl.config, 'inverter_off_price_hysteresis_czk', 0.1)
     )
 
-    prices = []
-    for (start, end), price_czk in sorted(ctrl._current_prices.items()):
-        is_current = (start == cur_start and end == cur_end)
-        is_charging = (start, end) in ctrl._combined_charging_blocks
-        is_pre_discharge = (start, end) in pre_discharge
-        is_discharge = (start, end) in discharge
-        is_sell_production = (start, end) in sell_production
-        is_inverter_off = (price_czk < inv_off_threshold) and not is_charging
-
-        status = "normal"
-        if is_charging and is_pre_discharge:
-            status = "pre_discharge_charge"
-        elif is_charging:
-            status = "charging"
-        elif is_discharge:
-            status = "discharge"
-        elif is_sell_production:
-            status = "sell_production"
-        elif is_inverter_off:
-            status = "inverter_off"
-
-        czk = round(price_czk, 2)  # Already CZK/kWh
-        proj = soc_lookup.get(f"today:{start}", {})
-        # Sell economics: what you actually get per kWh sold
-        from .decision_engine import GrowattDecisionEngine, PriceThresholds
-        dist = GrowattDecisionEngine._get_distribution_tariff(
-            int(start.split(":")[0]),
-            PriceThresholds(
-                charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
-                discharge_profit_margin=4.0, battery_efficiency=0.85,
-                distribution_tariff_high=getattr(ctrl.config, 'distribution_tariff_high', 1.5),
-                distribution_tariff_low=getattr(ctrl.config, 'distribution_tariff_low', 0.5),
-                low_tariff_hours=getattr(ctrl.config, 'low_tariff_hours', '0-6,22-24'),
-            )
-        )
-        net_sell = round(czk - dist - sell_fee - batt_amort, 2)
-
-        prices.append({
-            "start": start,
-            "end": end,
-            "day": "today",
-            "czk_kwh": czk,
-            "net_sell_czk": net_sell,
-            "distribution_czk": round(dist, 2),
-            "is_charging": is_charging,
-            "is_pre_discharge": is_pre_discharge,
-            "is_discharge": is_discharge,
-            "is_sell_production": is_sell_production,
-            "is_inverter_off": is_inverter_off,
-            "is_current": is_current,
-            "status": status,
-            "projected_soc": proj.get("soc"),
-            "projected_kwh": proj.get("kwh"),
-            "projected_action": proj.get("action"),
-            "projected_solar": proj.get("solar_kwh"),
-            "projected_consumption": proj.get("consumption_kwh"),
-            "projected_net_flow": proj.get("net_flow_kwh"),
-        })
+    prices = _build_price_rows(
+        ctrl, ctrl._current_prices.items(), "today",
+        charging=ctrl._combined_charging_blocks,
+        pre_discharge=pre_discharge, discharge=discharge,
+        sell_production=sell_production, soc_lookup=soc_lookup,
+        sell_fee=sell_fee, batt_amort=batt_amort,
+        inv_off_threshold=inv_off_threshold,
+        cur_block=(cur_start, cur_end),
+        hold=getattr(ctrl, '_hold_blocks_today', set()),
+    )
 
     # Tomorrow's prices (if available)
     tomorrow_prices = []
     next_day = getattr(ctrl, '_next_day_prices', {})
     if next_day:
-        charge_tmrw = getattr(ctrl, '_cheapest_charging_blocks_tomorrow', set())
-        pre_dis_tmrw = getattr(ctrl, '_pre_discharge_blocks_tomorrow', set())
-        dis_tmrw = getattr(ctrl, '_discharge_periods_tomorrow', set())
-        sp_tmrw = getattr(ctrl, '_sell_production_blocks_tomorrow', set())
-
-        for (start, end), price_czk_t in sorted(next_day.items()):
-            is_charging = (start, end) in charge_tmrw
-            is_pre_discharge = (start, end) in pre_dis_tmrw
-            is_discharge = (start, end) in dis_tmrw
-            is_sell_production = (start, end) in sp_tmrw
-            is_inverter_off = (price_czk_t < inv_off_threshold) and not is_charging
-
-            status = "normal"
-            if is_charging and is_pre_discharge:
-                status = "pre_discharge_charge"
-            elif is_charging:
-                status = "charging"
-            elif is_discharge:
-                status = "discharge"
-            elif is_sell_production:
-                status = "sell_production"
-            elif is_inverter_off:
-                status = "inverter_off"
-
-            czk_t = round(price_czk_t, 2)  # Already CZK/kWh
-            proj_t = soc_lookup.get(f"tomorrow:{start}", {})
-            hour_t = int(start.split(":")[0])
-            dist_t = GrowattDecisionEngine._get_distribution_tariff(
-                hour_t,
-                PriceThresholds(
-                    charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
-                    discharge_profit_margin=4.0, battery_efficiency=0.85,
-                    distribution_tariff_high=getattr(ctrl.config, 'distribution_tariff_high', 1.5),
-                    distribution_tariff_low=getattr(ctrl.config, 'distribution_tariff_low', 0.5),
-                    low_tariff_hours=getattr(ctrl.config, 'low_tariff_hours', '0-6,22-24'),
-                )
-            )
-            net_sell_t = round(czk_t - dist_t - sell_fee - batt_amort, 2)
-
-            tomorrow_prices.append({
-                "start": start,
-                "end": end,
-                "day": "tomorrow",
-                "czk_kwh": czk_t,
-                "net_sell_czk": net_sell_t,
-                "distribution_czk": round(dist_t, 2),
-                "is_charging": is_charging,
-                "is_pre_discharge": is_pre_discharge,
-                "is_discharge": is_discharge,
-                "is_sell_production": is_sell_production,
-                "is_inverter_off": is_inverter_off,
-                "is_current": False,
-                "projected_soc": proj_t.get("soc"),
-                "projected_kwh": proj_t.get("kwh"),
-                "projected_action": proj_t.get("action"),
-                "projected_solar": proj_t.get("solar_kwh"),
-                "projected_consumption": proj_t.get("consumption_kwh"),
-                "projected_net_flow": proj_t.get("net_flow_kwh"),
-                "status": status,
-            })
+        tomorrow_prices = _build_price_rows(
+            ctrl, next_day.items(), "tomorrow",
+            charging=getattr(ctrl, '_cheapest_charging_blocks_tomorrow', set()),
+            pre_discharge=getattr(ctrl, '_pre_discharge_blocks_tomorrow', set()),
+            discharge=getattr(ctrl, '_discharge_periods_tomorrow', set()),
+            sell_production=getattr(ctrl, '_sell_production_blocks_tomorrow', set()),
+            soc_lookup=soc_lookup, sell_fee=sell_fee, batt_amort=batt_amort,
+            inv_off_threshold=inv_off_threshold,
+            hold=getattr(ctrl, '_hold_blocks_tomorrow', set()),
+            cur_block=None,  # never "current" for a future day
+        )
 
     return web.json_response({
         "prices": prices,
@@ -546,36 +541,39 @@ async def api_projection(request: web.Request) -> web.Response:
     return web.json_response({"timeline": timeline})
 
 
-async def api_solar_actuals(request: web.Request) -> web.Response:
-    """Today's actual hourly solar production (for forecast-vs-actual overlay).
+async def _today_local_actuals(
+    ctrl, *, field, every, agg_fn, time_fmt, value_fn, result_key, cache_attr, ttl,
+):
+    """Shared builder for the today-actuals endpoints (solar / SOC / consumption).
 
-    Cached ~5 min per controller to keep dashboard refreshes cheap.
+    Each endpoint queries one InfluxDB ``solar``-measurement field, buckets the
+    rows by LOCAL time so they line up with the optimizer's local-time grid, and
+    caches the payload per controller. They differ only in the field, aggregate
+    window/function, time format, value transform, result key, cache attribute
+    and TTL — all passed in here — so the query/timezone/cache logic lives once.
     """
-    ctrl = _get_controller(request)
     if not ctrl or not getattr(ctrl, 'influxdb_client', None):
-        return web.json_response({"hourly": {}})
+        return {result_key: {}}
 
-    # Tiny per-process cache: refresh at most every 5 min.
-    cache = getattr(ctrl, '_solar_actuals_cache', None)
+    cache = getattr(ctrl, cache_attr, None)
     if cache:
         ts, payload = cache
-        if (datetime.now() - ts).total_seconds() < 300:
-            return web.json_response(payload)
+        if (datetime.now() - ts).total_seconds() < ttl:
+            return payload
 
     try:
         bucket = ctrl.settings.influxdb.bucket_solar
         q = f'''
 from(bucket: "{bucket}")
   |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "{field}")
+  |> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false)
 '''
         r = await ctrl.influxdb_client.query(q)
-        hourly: Dict[str, float] = {}
-        # InfluxDB returns UTC-aware timestamps; bucket by LOCAL hour so the
-        # actuals line up with the optimizer's local-hour forecast (the
-        # tooltip compares them directly). Fall back to naive/UTC if the
-        # zoneinfo db isn't available.
+        out: Dict[str, float] = {}
+        # InfluxDB returns UTC-aware timestamps; bucket by LOCAL time so the
+        # actuals line up with the optimizer's local-time grid (the tooltip
+        # compares them directly). Fall back to naive/UTC without zoneinfo.
         try:
             from zoneinfo import ZoneInfo
             local_tz = ZoneInfo("Europe/Prague")
@@ -590,14 +588,28 @@ from(bucket: "{bucket}")
                     t = t.astimezone(local_tz)
                 if t.date() != today:
                     continue
-                watts = record.get_value()
-                if isinstance(watts, (int, float)):
-                    hourly[t.strftime("%H:00")] = round(float(watts) / 1000.0, 3)  # kWh
-        payload = {"hourly": hourly}
-        ctrl._solar_actuals_cache = (datetime.now(), payload)
-        return web.json_response(payload)
+                val = record.get_value()
+                if isinstance(val, (int, float)):
+                    out[t.strftime(time_fmt)] = value_fn(float(val))
+        payload = {result_key: out}
+        setattr(ctrl, cache_attr, (datetime.now(), payload))
+        return payload
     except Exception as e:
-        return web.json_response({"hourly": {}, "error": str(e)})
+        return {result_key: {}, "error": str(e)}
+
+
+async def api_solar_actuals(request: web.Request) -> web.Response:
+    """Today's actual hourly solar production (for forecast-vs-actual overlay).
+
+    Cached ~5 min per controller to keep dashboard refreshes cheap.
+    """
+    payload = await _today_local_actuals(
+        _get_controller(request),
+        field="InputPower", every="1h", agg_fn="mean", time_fmt="%H:00",
+        value_fn=lambda w: round(w / 1000.0, 3),  # W → kWh
+        result_key="hourly", cache_attr="_solar_actuals_cache", ttl=300,
+    )
+    return web.json_response(payload)
 
 
 async def api_soc_actuals(request: web.Request) -> web.Response:
@@ -605,103 +617,29 @@ async def api_soc_actuals(request: web.Request) -> web.Response:
     SOC overlay). Lets the chart show what the battery ACTUALLY did for hours
     that have already elapsed, instead of only the optimizer's projection.
 
-    Cached ~90 s per controller so the elapsed-hours line stays reasonably
-    fresh without hammering InfluxDB on every dashboard refresh.
+    `last` (not mean) per window: SOC is a level, so the value at the end of
+    each block is what we want to plot, matching the projection grid. Cached
+    ~90 s so the elapsed-hours line stays fresh without hammering InfluxDB.
     """
-    ctrl = _get_controller(request)
-    if not ctrl or not getattr(ctrl, 'influxdb_client', None):
-        return web.json_response({"blocks": {}})
-
-    cache = getattr(ctrl, '_soc_actuals_cache', None)
-    if cache:
-        ts, payload = cache
-        if (datetime.now() - ts).total_seconds() < 90:
-            return web.json_response(payload)
-
-    try:
-        bucket = ctrl.settings.influxdb.bucket_solar
-        # `last` (not mean) per window: SOC is a level, so the value at the end
-        # of each block is what we want to plot, matching the projection grid.
-        q = f'''
-from(bucket: "{bucket}")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
-  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)
-'''
-        r = await ctrl.influxdb_client.query(q)
-        blocks: Dict[str, float] = {}
-        # InfluxDB timestamps are UTC-aware; bucket by LOCAL "HH:MM" so the
-        # actuals line up with the optimizer's local-time projection grid (and
-        # the 15-min price bars). Fall back to naive/UTC without zoneinfo.
-        try:
-            from zoneinfo import ZoneInfo
-            local_tz = ZoneInfo("Europe/Prague")
-        except Exception:
-            local_tz = None
-        local_now = datetime.now(local_tz) if local_tz else datetime.now()
-        today = local_now.date()
-        for table in r:
-            for record in table.records:
-                t = record.get_time()
-                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
-                    t = t.astimezone(local_tz)
-                if t.date() != today:
-                    continue
-                soc = record.get_value()
-                if isinstance(soc, (int, float)):
-                    blocks[t.strftime("%H:%M")] = round(float(soc), 1)  # percent
-        payload = {"blocks": blocks}
-        ctrl._soc_actuals_cache = (datetime.now(), payload)
-        return web.json_response(payload)
-    except Exception as e:
-        return web.json_response({"blocks": {}, "error": str(e)})
+    payload = await _today_local_actuals(
+        _get_controller(request),
+        field="SOC", every="15m", agg_fn="last", time_fmt="%H:%M",
+        value_fn=lambda s: round(s, 1),  # percent
+        result_key="blocks", cache_attr="_soc_actuals_cache", ttl=90,
+    )
+    return web.json_response(payload)
 
 
 async def api_consumption_actuals(request: web.Request) -> web.Response:
     """Today's actual hourly household consumption (kWh) for the forecast-vs-
     actual overlay on the chart. Mirrors api_solar_actuals but for load."""
-    ctrl = _get_controller(request)
-    if not ctrl or not getattr(ctrl, 'influxdb_client', None):
-        return web.json_response({"hourly": {}})
-
-    cache = getattr(ctrl, '_consumption_actuals_cache', None)
-    if cache:
-        ts, payload = cache
-        if (datetime.now() - ts).total_seconds() < 300:
-            return web.json_response(payload)
-
-    try:
-        bucket = ctrl.settings.influxdb.bucket_solar
-        q = f'''
-from(bucket: "{bucket}")
-  |> range(start: -24h)
-  |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-'''
-        r = await ctrl.influxdb_client.query(q)
-        hourly: Dict[str, float] = {}
-        try:
-            from zoneinfo import ZoneInfo
-            local_tz = ZoneInfo("Europe/Prague")
-        except Exception:
-            local_tz = None
-        local_now = datetime.now(local_tz) if local_tz else datetime.now()
-        today = local_now.date()
-        for table in r:
-            for record in table.records:
-                t = record.get_time()
-                if local_tz is not None and getattr(t, "tzinfo", None) is not None:
-                    t = t.astimezone(local_tz)
-                if t.date() != today:
-                    continue
-                watts = record.get_value()
-                if isinstance(watts, (int, float)):
-                    hourly[t.strftime("%H:00")] = round(float(watts) / 1000.0, 3)  # kWh
-        payload = {"hourly": hourly}
-        ctrl._consumption_actuals_cache = (datetime.now(), payload)
-        return web.json_response(payload)
-    except Exception as e:
-        return web.json_response({"hourly": {}, "error": str(e)})
+    payload = await _today_local_actuals(
+        _get_controller(request),
+        field="INVPowerToLocalLoad", every="1h", agg_fn="mean", time_fmt="%H:00",
+        value_fn=lambda w: round(w / 1000.0, 3),  # W → kWh
+        result_key="hourly", cache_attr="_consumption_actuals_cache", ttl=300,
+    )
+    return web.json_response(payload)
 
 
 def _avg_block_price(ctrl, blocks) -> Optional[float]:
@@ -873,7 +811,10 @@ async def api_logs_stream(request: web.Request) -> web.StreamResponse:
     await response.prepare(request)
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=100)
-    _sse_clients.append(queue)
+    # Register with this request's running loop so the (cross-thread) log handler
+    # can marshal puts back onto it safely.
+    client = (asyncio.get_running_loop(), queue)
+    _sse_clients.append(client)
 
     try:
         while True:
@@ -883,7 +824,8 @@ async def api_logs_stream(request: web.Request) -> web.StreamResponse:
     except (asyncio.CancelledError, ConnectionResetError):
         pass
     finally:
-        _sse_clients.remove(queue)
+        if client in _sse_clients:
+            _sse_clients.remove(client)
 
     return response
 
@@ -1135,6 +1077,7 @@ body {
 .price-bar.pre-discharge { background: #c084fc !important; }
 .price-bar.discharge { background: var(--red) !important; }
 .price-bar.sell-production { background: #f97316 !important; }
+.price-bar.battery-hold { background: #0ea5e9 !important; }
 .price-bar.inverter-off {
   background: repeating-linear-gradient(
     45deg,
@@ -1176,6 +1119,7 @@ body {
 .chart-tooltip .tt-discharge { background: #4a1d1d; color: var(--red); }
 .chart-tooltip .tt-pre-discharge { background: #2d1b4e; color: #c084fc; }
 .chart-tooltip .tt-sell-production { background: #4a2a14; color: #f97316; }
+.chart-tooltip .tt-battery-hold { background: #0c2a3a; color: #0ea5e9; }
 .chart-tooltip .tt-inverter-off { background: #2a2a2a; color: #aaa; }
 .chart-tooltip .tt-current { background: #1e3a5f; color: var(--accent); }
 
@@ -2164,6 +2108,7 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
     else if (p.is_charging) cls = 'charging';
     else if (p.is_discharge) cls = 'discharge';
     else if (p.is_sell_production) cls = 'sell-production';
+    else if (p.is_hold) cls = 'battery-hold';
     else if (p.is_inverter_off) cls = 'inverter-off';
     if (p.is_current) cls += ' current';
 
@@ -2209,6 +2154,7 @@ function showTooltip(e, bar, tooltip) {
   else if (p.status === 'pre_discharge_charge') statusHtml += '<span class="tt-status tt-pre-discharge">PRE-DISCHARGE CHG</span>';
   else if (p.status === 'discharge') statusHtml += '<span class="tt-status tt-discharge">DISCHARGE</span>';
   else if (p.status === 'sell_production') statusHtml += '<span class="tt-status tt-sell-production">SELL PRODUCTION</span>';
+  else if (p.status === 'battery_hold') statusHtml += '<span class="tt-status tt-battery-hold">BATTERY HOLD</span>';
   else if (p.status === 'inverter_off') statusHtml += '<span class="tt-status tt-inverter-off">INVERTER OFF</span>';
 
   // Calculate actual price rank (1 = cheapest) within same day
