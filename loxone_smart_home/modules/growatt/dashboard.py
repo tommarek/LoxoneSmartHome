@@ -1111,10 +1111,16 @@ body {
   overflow-x: auto;
   overflow-y: visible;
   -webkit-overflow-scrolling: touch;
+  /* Let the browser own horizontal panning here (so dragging a bar scrolls the
+     chart) while vertical drags still scroll the page. */
+  touch-action: pan-x;
+  overscroll-behavior-x: contain;
   scrollbar-width: thin;
+  padding-bottom: 6px;
 }
-.chart-scroll::-webkit-scrollbar { height: 6px; }
-.chart-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.chart-scroll::-webkit-scrollbar { height: 8px; }
+.chart-scroll::-webkit-scrollbar-track { background: var(--bg); border-radius: 4px; }
+.chart-scroll::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 4px; opacity: 0.7; }
 .chart-content { position: relative; }
 .price-chart {
   height: 180px;
@@ -1123,15 +1129,42 @@ body {
   gap: 1px;
   margin-top: 8px;
 }
+/* "Now" divider drawn in the chart between elapsed and upcoming blocks. */
+.now-divider {
+  position: absolute;
+  top: 0; bottom: 0;
+  width: 0;
+  border-left: 2px dashed var(--accent);
+  opacity: 0.7;
+  pointer-events: none;
+}
+.now-divider::after {
+  content: "NOW";
+  position: absolute;
+  top: -2px; left: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.5px;
+}
 .soc-legend {
   display: flex;
-  gap: 16px;
-  margin: 4px 0 2px;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin: 6px 0 2px;
   font-size: 11px;
   color: var(--muted);
 }
-.soc-legend-item { display: inline-flex; align-items: center; gap: 6px; }
-.soc-legend-item svg { overflow: visible; }
+.soc-legend.legend-actions { margin-top: 8px; }
+.soc-legend-item { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.soc-legend-item svg { overflow: visible; flex: 0 0 auto; }
+.legend-swatch {
+  width: 12px; height: 12px; border-radius: 3px; flex: 0 0 auto;
+  display: inline-block;
+}
+.legend-swatch.striped {
+  background: repeating-linear-gradient(45deg,#555 0,#555 3px,#2a2a2a 3px,#2a2a2a 6px);
+}
 .alert-banner {
   background: #4a2a14;
   color: #fbbf24;
@@ -1189,7 +1222,7 @@ body {
   line-height: 1.6;
   box-shadow: 0 4px 16px rgba(0,0,0,0.5);
   pointer-events: none;
-  max-width: 260px;
+  max-width: min(260px, 92vw);
 }
 .chart-tooltip .tt-time { font-weight: 700; font-size: 14px; margin-bottom: 4px; }
 .chart-tooltip .tt-price { font-size: 18px; font-weight: 700; }
@@ -1577,13 +1610,25 @@ select, input {
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
     <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:2px">
+      &#128202; Drag sideways to scroll &middot; tap a bar for details &middot;
+      <b style="color:var(--accent)">NOW</b> line splits done vs planned
+    </div>
+    <!-- Overlay lines: one swatch per metric; solid = actual, dashed = forecast -->
     <div class="soc-legend">
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2.5"/></svg> SOC — actual (elapsed)</span>
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> SOC — projected</span>
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2.5"/></svg> Solar — actual</span>
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> Solar — projected</span>
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#38bdf8" stroke-width="2.5"/></svg> Load — actual</span>
-      <span class="soc-legend-item"><svg width="22" height="6"><line x1="0" y1="3" x2="22" y2="3" stroke="#38bdf8" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="4 3"/></svg> Load — projected</span>
+      <span class="soc-legend-item"><svg width="22" height="8"><line x1="0" y1="3" x2="11" y2="3" stroke="#f97316" stroke-width="2.5"/><line x1="11" y1="3" x2="22" y2="3" stroke="#f97316" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="3 2"/></svg> SOC %</span>
+      <span class="soc-legend-item"><svg width="22" height="8"><line x1="0" y1="3" x2="11" y2="3" stroke="#fde047" stroke-width="2.5"/><line x1="11" y1="3" x2="22" y2="3" stroke="#fde047" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="3 2"/></svg> Solar</span>
+      <span class="soc-legend-item"><svg width="22" height="8"><line x1="0" y1="3" x2="11" y2="3" stroke="#38bdf8" stroke-width="2.5"/><line x1="11" y1="3" x2="22" y2="3" stroke="#38bdf8" stroke-width="2" stroke-opacity="0.5" stroke-dasharray="3 2"/></svg> Load</span>
+      <span class="soc-legend-item" style="opacity:.85">&#9472; actual &middot; &#9476; forecast</span>
+    </div>
+    <!-- Bar action colours (what the battery is doing each 15-min block) -->
+    <div class="soc-legend legend-actions">
+      <span class="soc-legend-item"><span class="legend-swatch" style="background:var(--green)"></span> Charge</span>
+      <span class="soc-legend-item"><span class="legend-swatch" style="background:var(--red)"></span> Discharge</span>
+      <span class="soc-legend-item"><span class="legend-swatch" style="background:#f97316"></span> Sell solar</span>
+      <span class="soc-legend-item"><span class="legend-swatch" style="background:#0ea5e9"></span> Battery hold</span>
+      <span class="soc-legend-item"><span class="legend-swatch" style="background:#c084fc"></span> Pre-discharge</span>
+      <span class="soc-legend-item"><span class="legend-swatch striped"></span> Inverter off</span>
     </div>
     <div class="price-chart-day" id="priceChartTodayWrap">
       <div class="price-chart-label" id="priceChartTodayLabel">Today</div>
@@ -2299,7 +2344,7 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   // content overflows the .chart-scroll card and scrolls sideways. The overlay
   // renderers read the SAME width via dataset.contentW so the SVG SOC/solar/load
   // lines stay pinned to the bars at any scroll offset.
-  const MIN_BAR_W = 11, GAP = 1;
+  const MIN_BAR_W = 14, GAP = 1;
   const scrollEl = chart.closest('.chart-scroll');
   const viewW = (scrollEl ? scrollEl.clientWidth : chart.offsetWidth) || 0;
   const n = prices.length;
@@ -2311,13 +2356,47 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   if (content && content.classList.contains('chart-content')) content.style.width = contentW + 'px';
   chart.dataset.contentW = contentW;
 
-  // Attach tooltip events for THIS chart's bars
+  // "NOW" divider between elapsed and upcoming blocks, so it's obvious at a
+  // glance what already happened vs what's planned. Auto-centre it once.
+  const curIdx = prices.findIndex(p => p.is_current);
+  if (content && content.classList.contains('chart-content')) {
+    const oldDiv = content.querySelector('.now-divider');
+    if (oldDiv) oldDiv.remove();
+    if (curIdx >= 0) {
+      const div = document.createElement('div');
+      div.className = 'now-divider';
+      div.style.left = (curIdx * (barW + GAP)) + 'px';
+      content.appendChild(div);
+      if (scrollEl && contentW > viewW && scrollEl.clientWidth > 0
+          && chart.dataset.autoscrolled !== '1') {
+        scrollEl.scrollLeft = Math.max(0, curIdx * (barW + GAP) - viewW * 0.4);
+        chart.dataset.autoscrolled = '1';
+      }
+    }
+  }
+
+  // Attach tooltip events for THIS chart's bars. On touch we DON'T preventDefault
+  // (so dragging still scrolls the chart): a near-stationary touch is a tap →
+  // show the tooltip; a drag scrolls and hides any open tooltip.
   const tooltip = document.getElementById('chartTooltip');
   chart.querySelectorAll('.price-bar').forEach(bar => {
     bar.addEventListener('mouseenter', (e) => showTooltip(e, bar, tooltip));
     bar.addEventListener('mousemove', (e) => moveTooltip(e, tooltip));
     bar.addEventListener('mouseleave', () => tooltip.style.display = 'none');
-    bar.addEventListener('touchstart', (e) => { e.preventDefault(); showTooltip(e.touches[0], bar, tooltip); });
+    let tx = 0, ty = 0, moved = false;
+    bar.addEventListener('touchstart', (e) => {
+      const t = e.touches[0]; tx = t.clientX; ty = t.clientY; moved = false;
+    }, { passive: true });
+    bar.addEventListener('touchmove', (e) => {
+      const t = e.touches[0];
+      if (Math.abs(t.clientX - tx) > 8 || Math.abs(t.clientY - ty) > 8) {
+        moved = true;
+        tooltip.style.display = 'none';
+      }
+    }, { passive: true });
+    bar.addEventListener('touchend', () => {
+      if (!moved) showTooltip({ clientX: tx, clientY: ty }, bar, tooltip);
+    });
   });
 }
 
