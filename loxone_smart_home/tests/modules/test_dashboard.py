@@ -157,3 +157,76 @@ async def test_today_local_actuals_uses_cache_within_ttl():
         value_fn=lambda w: w, result_key="hourly", cache_attr="_test_cache", ttl=300,
     )
     assert payload == {"hourly": {"cached": 1.0}}
+
+
+# ---------------------------------------------------------------------------
+# Mobile-app / PWA structure
+# ---------------------------------------------------------------------------
+import json as _json
+
+from aiohttp.test_utils import TestClient, TestServer
+
+
+def test_dashboard_html_has_tab_app_shell():
+    html = dashboard.DASHBOARD_HTML
+    # Bottom tab bar + the four tab pages.
+    assert 'class="tabbar"' in html
+    for tab in ("tab-home", "tab-chart", "tab-insights", "tab-control"):
+        assert f'id="{tab}"' in html
+    # Exactly four tab pages, balanced with their closing tags.
+    assert html.count('class="tab-page') == 4
+    assert html.count("</section>") == 4
+    # showTab nav JS present.
+    assert "function showTab(" in html
+
+
+def test_dashboard_html_has_pwa_head_and_scroll_chart():
+    html = dashboard.DASHBOARD_HTML
+    assert 'rel="manifest" href="/manifest.webmanifest"' in html
+    assert 'name="theme-color"' in html
+    assert 'rel="apple-touch-icon"' in html
+    assert "serviceWorker" in html and "/sw.js" in html
+    # Horizontal-scroll chart wrappers + shared content-width for overlays.
+    assert 'class="chart-scroll"' in html
+    assert "dataset.contentW" in html
+
+
+def test_manifest_json_is_standalone_pwa():
+    m = _json.loads(dashboard.MANIFEST_JSON)
+    assert m["display"] == "standalone"
+    assert m["start_url"] == "/"
+    assert m["theme_color"] == "#0f1117"
+    assert any(i["src"] == "/icon-512.png" for i in m["icons"])
+
+
+def test_sw_and_icon_assets_present():
+    assert dashboard.SW_JS.strip()
+    assert "addEventListener('fetch'" in dashboard.SW_JS  # installable
+    assert dashboard.ICON_SVG.strip().startswith("<svg")
+    # Committed PNG icons load (180 is the iOS apple-touch-icon).
+    assert dashboard._ICON_180[:8] == b"\x89PNG\r\n\x1a\n"
+    assert dashboard._ICON_512[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+@pytest.mark.parametrize("path,ctype", [
+    ("/manifest.webmanifest", "application/manifest+json"),
+    ("/sw.js", "application/javascript"),
+    ("/icon.svg", "image/svg+xml"),
+    ("/icon-180.png", "image/png"),
+    ("/icon-512.png", "image/png"),
+])
+async def test_pwa_routes_serve_200(path, ctype):
+    app = dashboard.create_dashboard_app(_fake_ctrl())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get(path)
+        assert resp.status == 200
+        assert resp.headers["Content-Type"].startswith(ctype)
+
+
+async def test_dashboard_root_serves_html():
+    app = dashboard.create_dashboard_app(_fake_ctrl())
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/")
+        assert resp.status == 200
+        body = await resp.text()
+        assert 'class="tabbar"' in body

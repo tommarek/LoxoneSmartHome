@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import collections
+import pathlib
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -882,6 +883,52 @@ async def dashboard_page(request: web.Request) -> web.Response:
     )
 
 
+async def manifest_page(request: web.Request) -> web.Response:
+    """PWA web manifest (makes the dashboard installable)."""
+    return web.Response(
+        text=MANIFEST_JSON, content_type="application/manifest+json",
+        headers={"Cache-Control": "max-age=3600"},
+    )
+
+
+async def sw_page(request: web.Request) -> web.Response:
+    """Service worker — required for installability. No-cache so updates apply."""
+    return web.Response(
+        text=SW_JS, content_type="application/javascript",
+        headers={"Cache-Control": "no-cache", "Service-Worker-Allowed": "/"},
+    )
+
+
+async def icon_svg_page(request: web.Request) -> web.Response:
+    """Maskable app icon (Chrome/Android, favicon)."""
+    return web.Response(
+        text=ICON_SVG, content_type="image/svg+xml",
+        headers={"Cache-Control": "max-age=86400"},
+    )
+
+
+def _png_response(data: bytes) -> web.Response:
+    if not data:
+        return web.Response(status=404, text="icon not generated")
+    return web.Response(
+        body=data, content_type="image/png",
+        headers={"Cache-Control": "max-age=86400"},
+    )
+
+
+async def icon_180_page(request: web.Request) -> web.Response:
+    """Apple touch icon (iOS Add-to-Home-Screen)."""
+    return _png_response(_ICON_180)
+
+
+async def icon_192_page(request: web.Request) -> web.Response:
+    return _png_response(_ICON_192)
+
+
+async def icon_512_page(request: web.Request) -> web.Response:
+    return _png_response(_ICON_512)
+
+
 # --- Dashboard Setup ---
 
 def create_dashboard_app(controller=None) -> web.Application:
@@ -891,6 +938,13 @@ def create_dashboard_app(controller=None) -> web.Application:
         app["controller"] = controller
 
     app.router.add_get("/", dashboard_page)
+    # PWA assets
+    app.router.add_get("/manifest.webmanifest", manifest_page)
+    app.router.add_get("/sw.js", sw_page)
+    app.router.add_get("/icon.svg", icon_svg_page)
+    app.router.add_get("/icon-180.png", icon_180_page)
+    app.router.add_get("/icon-192.png", icon_192_page)
+    app.router.add_get("/icon-512.png", icon_512_page)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/prices", api_prices)
@@ -949,8 +1003,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Growatt Battery Dashboard</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#0f1117">
+<link rel="icon" type="image/svg+xml" href="/icon.svg">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Growatt">
+<meta name="application-name" content="Growatt">
 <style>
 :root {
   --bg: #0f1117;
@@ -970,11 +1033,15 @@ body {
   background: var(--bg);
   color: var(--text);
   min-height: 100vh;
+  font-size: 15px;
+  line-height: 1.5;
+  -webkit-text-size-adjust: 100%;
 }
 .header {
   background: var(--card);
   border-bottom: 1px solid var(--border);
   padding: 12px 16px;
+  padding-top: calc(12px + env(safe-area-inset-top));
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -994,7 +1061,13 @@ body {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.4; }
 }
-.container { max-width: 1200px; margin: 0 auto; padding: 12px; }
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 12px;
+  /* Clear the fixed bottom tab bar on mobile (removed at >=900px). */
+  padding-bottom: calc(72px + env(safe-area-inset-bottom));
+}
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
@@ -1031,8 +1104,19 @@ body {
 .mode-high_load_protected { background: #4a3b1d; color: var(--yellow); }
 .mode-sell_production { background: #3b1d4a; color: #c084fc; }
 
+/* Horizontal-scroll viewport for the price chart on narrow screens. The bars
+   AND the SVG overlays live inside .chart-content so they scroll together and
+   stay aligned. On wide screens the content fits and there is no scroll. */
+.chart-scroll {
+  overflow-x: auto;
+  overflow-y: visible;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+}
+.chart-scroll::-webkit-scrollbar { height: 6px; }
+.chart-scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.chart-content { position: relative; }
 .price-chart {
-  width: 100%;
   height: 180px;
   display: flex;
   align-items: flex-end;
@@ -1066,8 +1150,8 @@ body {
   justify-content: space-between;
 }
 .price-bar {
-  flex: 1;
-  min-width: 2px;
+  flex: 0 0 var(--bar-w, 2px);
+  width: var(--bar-w, 2px);
   border-radius: 2px 2px 0 0;
   position: relative;
   transition: opacity 0.2s;
@@ -1128,7 +1212,7 @@ body {
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px;
-  height: 300px;
+  height: min(50vh, 300px);
   overflow-y: auto;
   font-family: 'SF Mono', 'Fira Code', monospace;
   font-size: 11px;
@@ -1147,14 +1231,16 @@ body {
   gap: 8px;
   margin-top: 8px;
 }
+.override-panel > * { flex: 1 1 100%; }
 .btn {
-  padding: 8px 16px;
+  min-height: 44px;
+  padding: 10px 16px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--card);
   color: var(--text);
   cursor: pointer;
-  font-size: 13px;
+  font-size: 15px;
   font-weight: 500;
   transition: all 0.15s;
 }
@@ -1166,12 +1252,13 @@ body {
 .btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
 select, input {
-  padding: 6px 10px;
+  min-height: 44px;
+  padding: 10px 12px;
   border: 1px solid var(--border);
   border-radius: 6px;
   background: var(--bg);
   color: var(--text);
-  font-size: 13px;
+  font-size: 15px;
 }
 
 .soc-bar {
@@ -1207,10 +1294,72 @@ select, input {
 .tag-warn { background: #4a3b1d; color: var(--yellow); }
 .tag-info { background: #1e3a5f; color: #60a5fa; }
 
-@media (max-width: 600px) {
-  .grid { grid-template-columns: 1fr; }
-  .stat-value { font-size: 18px; }
-  .header h1 { font-size: 14px; }
+/* ===== App tabs ===== */
+.tab-page { display: none; }
+.tab-page.active { display: block; }
+.tabbar {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 150;
+  display: flex;
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tab-btn {
+  flex: 1;
+  min-width: 44px;
+  min-height: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: color 0.15s;
+}
+.tab-btn .tab-ico { font-size: 20px; line-height: 1; }
+.tab-btn.active { color: var(--accent); }
+.tab-btn:active { transform: scale(0.94); }
+
+/* ===== Grid hooks (replace per-section inline grid-template-columns) ===== */
+.power-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.two-col { display: grid; grid-template-columns: 1fr; gap: 12px; margin-bottom: 12px; }
+
+/* ===== Mobile-first breakpoints ===== */
+@media (min-width: 600px) {
+  .power-grid { grid-template-columns: repeat(4, 1fr); }
+  .stat-value { font-size: 24px; }
+}
+@media (min-width: 900px) {
+  .two-col { grid-template-columns: 1fr 1fr; }
+  /* Desktop: the tab bar becomes a static top strip directly under the (sticky)
+     header — placed before .container in the DOM — instead of a fixed bottom bar. */
+  .container { padding-bottom: 12px; }
+  .tabbar {
+    position: static;
+    bottom: auto;
+    border-top: none;
+    border-bottom: 1px solid var(--border);
+    padding-bottom: 0;
+    justify-content: center;
+    gap: 8px;
+  }
+  .tab-btn {
+    flex: 0 1 auto;
+    flex-direction: row;
+    gap: 8px;
+    min-height: 48px;
+    padding: 0 18px;
+    font-size: 13px;
+  }
+  .tab-btn .tab-ico { font-size: 16px; }
+  .tab-btn.active { border-bottom: 2px solid var(--accent); }
 }
 </style>
 </head>
@@ -1226,12 +1375,20 @@ select, input {
   <div style="font-size:12px;color:var(--muted)" id="lastUpdate">--</div>
 </div>
 
+<nav class="tabbar" id="tabbar">
+  <button class="tab-btn active" data-tab="home"><span class="tab-ico">&#9889;</span><span>Home</span></button>
+  <button class="tab-btn" data-tab="chart"><span class="tab-ico">&#128202;</span><span>Prices</span></button>
+  <button class="tab-btn" data-tab="insights"><span class="tab-ico">&#128161;</span><span>Insights</span></button>
+  <button class="tab-btn" data-tab="control"><span class="tab-ico">&#9881;&#65039;</span><span>Control</span></button>
+</nav>
+
 <div class="container">
+  <section class="tab-page active" id="tab-home">
   <!-- Live Power Flow -->
   <div class="card" style="margin-bottom:12px">
     <h2>Live Power Flow</h2>
     <div id="powerFlowNoData" style="color:var(--muted);text-align:center;padding:20px;display:none">Waiting for inverter telemetry...</div>
-    <div id="powerFlowGrid" style="display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;text-align:center">
+    <div id="powerFlowGrid" class="power-grid" style="text-align:center">
       <div>
         <div style="font-size:24px">&#9728;&#65039;</div>
         <div class="stat-label">Solar</div>
@@ -1341,8 +1498,11 @@ select, input {
     </div>
   </div>
 
+  </section>
+
+  <section class="tab-page" id="tab-insights">
   <!-- Decision Reasoning -->
-  <div class="grid" style="grid-template-columns: 1fr 1fr;">
+  <div class="two-col">
     <div class="card">
       <h2>Decision Reasoning</h2>
       <div id="decisionReason" style="font-size:13px;line-height:1.8">
@@ -1411,6 +1571,9 @@ select, input {
     </div>
   </div>
 
+  </section>
+
+  <section class="tab-page" id="tab-chart">
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
     <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
@@ -1424,25 +1587,27 @@ select, input {
     </div>
     <div class="price-chart-day" id="priceChartTodayWrap">
       <div class="price-chart-label" id="priceChartTodayLabel">Today</div>
-      <div style="position:relative">
+      <div class="chart-scroll"><div class="chart-content">
         <div class="price-chart" id="priceChartToday"></div>
         <svg id="consLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="solarLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineToday" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
-      </div>
+      </div></div>
     </div>
     <div class="price-chart-day" id="priceChartTomorrowWrap" style="display:none;margin-top:12px">
       <div class="price-chart-label" id="priceChartTomorrowLabel">Tomorrow</div>
-      <div style="position:relative">
+      <div class="chart-scroll"><div class="chart-content">
         <div class="price-chart" id="priceChartTomorrow"></div>
         <svg id="consLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="solarLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
         <svg id="socLineTomorrow" style="position:absolute;top:0;left:0;width:100%;height:100%;pointer-events:none;overflow:visible"></svg>
-      </div>
+      </div></div>
     </div>
   </div>
   <div class="chart-tooltip" id="chartTooltip"></div>
+  </section>
 
+  <section class="tab-page" id="tab-control">
   <!-- Override Controls -->
   <div class="card" style="margin-bottom:12px">
     <h2>Manual Override</h2>
@@ -1472,6 +1637,7 @@ select, input {
     <h2>Live Logs</h2>
     <div class="log-box" id="logBox"></div>
   </div>
+  </section>
 </div>
 
 <script>
@@ -1737,9 +1903,12 @@ function renderSocLine(prices, timeline, chartId, svgId, isToday) {
 
   const chart = document.getElementById(chartId);
   if (!chart) { svg.innerHTML = ''; return; }
-  const w = chart.offsetWidth;
+  // Use the chart's scroll-content width (set by renderPriceChart) so the line
+  // spans the full scrollable width and stays aligned with the bars.
+  const w = parseFloat(chart.dataset.contentW) || chart.offsetWidth;
   const h = chart.offsetHeight;
   if (!w || !h) return;
+  svg.setAttribute('width', w);
 
   // Build projected-SOC lookup: "HH:MM|day" -> soc%
   const socMap = {};
@@ -1854,9 +2023,12 @@ function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actu
 
   const chart = document.getElementById(chartId);
   if (!chart) { svg.innerHTML = ''; return; }
-  const w = chart.offsetWidth;
+  // Use the chart's scroll-content width (set by renderPriceChart) so the line
+  // spans the full scrollable width and stays aligned with the bars.
+  const w = parseFloat(chart.dataset.contentW) || chart.offsetWidth;
   const h = chart.offsetHeight;
   if (!w || !h) return;
+  svg.setAttribute('width', w);
 
   const dayOf = prices[0].day;  // every bar in a given chart shares one day
 
@@ -2122,6 +2294,23 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   });
   chart.innerHTML = html;
 
+  // Size the chart for horizontal scroll: each bar is at least MIN_BAR_W px.
+  // On a wide screen the bars fit the viewport (no scroll); on a phone the
+  // content overflows the .chart-scroll card and scrolls sideways. The overlay
+  // renderers read the SAME width via dataset.contentW so the SVG SOC/solar/load
+  // lines stay pinned to the bars at any scroll offset.
+  const MIN_BAR_W = 11, GAP = 1;
+  const scrollEl = chart.closest('.chart-scroll');
+  const viewW = (scrollEl ? scrollEl.clientWidth : chart.offsetWidth) || 0;
+  const n = prices.length;
+  const barW = Math.max(MIN_BAR_W, (viewW - (n - 1) * GAP) / n);
+  const contentW = Math.round(n * barW + (n - 1) * GAP);
+  chart.style.setProperty('--bar-w', barW + 'px');
+  chart.style.width = contentW + 'px';
+  const content = chart.parentElement; // .chart-content
+  if (content && content.classList.contains('chart-content')) content.style.width = contentW + 'px';
+  chart.dataset.contentW = contentW;
+
   // Attach tooltip events for THIS chart's bars
   const tooltip = document.getElementById('chartTooltip');
   chart.querySelectorAll('.price-bar').forEach(bar => {
@@ -2359,6 +2548,36 @@ async function fetchLive() {
   } catch (e) { console.error('fetchLive error:', e); }
 }
 
+// ===== App tab navigation =====
+function showTab(name) {
+  document.querySelectorAll('.tab-page').forEach(function(p) {
+    p.classList.toggle('active', p.id === 'tab-' + name);
+  });
+  document.querySelectorAll('.tab-btn').forEach(function(b) {
+    b.classList.toggle('active', b.dataset.tab === name);
+  });
+  try { localStorage.setItem('gw_tab', name); } catch (e) {}
+  if (name === 'chart') {
+    // The chart + its SVG overlays size from offsetWidth, which is 0 while the
+    // tab is hidden. Re-render once layout has settled so it isn't blank.
+    requestAnimationFrame(function() { try { fetchPrices(); } catch (e) {} });
+  }
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll('.tab-btn').forEach(function(b) {
+  b.addEventListener('click', function() { showTab(b.dataset.tab); });
+});
+showTab((function() {
+  try { return localStorage.getItem('gw_tab') || 'home'; } catch (e) { return 'home'; }
+})());
+
+// ===== PWA service worker =====
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('/sw.js').catch(function() {});
+  });
+}
+
 fetchStatus();
 fetchLive();
 fetchPrices();
@@ -2373,3 +2592,65 @@ setInterval(fetchInsights, 30000);
 </body>
 </html>
 """
+
+
+# --- PWA assets (manifest, service worker, icons) ---
+
+MANIFEST_JSON = json.dumps({
+    "name": "Growatt Battery Dashboard",
+    "short_name": "Growatt",
+    "description": "Solar battery optimization dashboard",
+    "start_url": "/",
+    "scope": "/",
+    "display": "standalone",
+    "orientation": "portrait",
+    "background_color": "#0f1117",
+    "theme_color": "#0f1117",
+    "icons": [
+        {"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml",
+         "purpose": "any maskable"},
+        {"src": "/icon-192.png", "sizes": "192x192", "type": "image/png",
+         "purpose": "any"},
+        {"src": "/icon-512.png", "sizes": "512x512", "type": "image/png",
+         "purpose": "any maskable"},
+    ],
+})
+
+# Minimal service worker: just enough to be installable. Pass-through fetch — we
+# deliberately DO NOT cache anything (the dashboard is all live data: /api/* and
+# the SSE log stream must never be served stale).
+SW_JS = """\
+self.addEventListener('install', function(e) { self.skipWaiting(); });
+self.addEventListener('activate', function(e) { e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', function(e) { /* network pass-through, no cache */ });
+"""
+
+# Maskable app icon: battery glyph on the dashboard's dark background, with a
+# safe-zone margin so the maskable crop never clips it.
+ICON_SVG = """\
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <rect width="512" height="512" rx="96" fill="#0f1117"/>
+  <rect x="150" y="150" width="180" height="240" rx="22" fill="none"
+        stroke="#4f8cff" stroke-width="20"/>
+  <rect x="214" y="120" width="52" height="34" rx="10" fill="#4f8cff"/>
+  <rect x="174" y="300" width="132" height="66" rx="8" fill="#22c55e"/>
+  <rect x="174" y="232" width="132" height="60" rx="8" fill="#22c55e" opacity="0.55"/>
+  <path d="M286 168 L214 286 L256 286 L238 372 L322 240 L274 240 Z"
+        fill="#eab308" stroke="#0f1117" stroke-width="8" stroke-linejoin="round"/>
+</svg>
+"""
+
+_STATIC_DIR = pathlib.Path(__file__).parent / "static"
+
+
+def _read_icon(name: str) -> bytes:
+    """Load a committed PNG icon; empty bytes if missing (route 404s gracefully)."""
+    try:
+        return (_STATIC_DIR / name).read_bytes()
+    except OSError:
+        return b""
+
+
+_ICON_180 = _read_icon("icon-180.png")
+_ICON_192 = _read_icon("icon-192.png")
+_ICON_512 = _read_icon("icon-512.png")
