@@ -419,15 +419,14 @@ def test_battery_hold_node_selected(decision_engine: GrowattDecisionEngine) -> N
     assert decision_engine.decide(_hold_ctx(block)) == "battery_hold"
 
 
-def test_battery_hold_holds_flat_settings() -> None:
-    """battery_hold uses load_first + AC-charge off (no discharge), but pins
-    stop_soc to the CURRENT SOC, not max_soc — in load_first the inverter
-    charges toward stop_soc, so max_soc would grid-charge the battery overnight
-    instead of holding it flat."""
+def test_battery_hold_allows_solar_charge_no_discharge() -> None:
+    """battery_hold uses battery_first + AC-charge OFF: the battery doesn't
+    discharge for the house (hold) and doesn't grid-charge, but solar may still
+    charge it up to max_soc (so daytime PV isn't capped/exported)."""
     bh = MODE_DEFINITIONS["battery_hold"]
-    assert bh["inverter_mode"] == "load_first"
-    assert bh["stop_soc"] == "current_soc"  # flat hold: no discharge, no charge
-    assert bh["ac_charge"] is False
+    assert bh["inverter_mode"] == "battery_first"  # prevents discharge, allows solar charge
+    assert bh["stop_soc"] == "max_soc"
+    assert bh["ac_charge"] is False  # no grid charge
 
 
 def test_battery_hold_yields_to_manual_override(

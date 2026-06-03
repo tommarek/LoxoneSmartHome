@@ -3734,15 +3734,6 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             stop_soc = int(self.config.min_soc)
         elif stop_soc_raw == "max_soc":
             stop_soc = int(self.config.max_soc)
-        elif stop_soc_raw == "current_soc":
-            # Pin stop_soc to the CURRENT SOC (floored) so the inverter neither
-            # discharges below it (the battery holds) NOR grid-charges up to it.
-            # In load_first the Growatt charges toward stop_soc, so "max_soc"
-            # would silently grid-charge overnight — flooring to the live SOC
-            # keeps the battery genuinely flat. Clamped to [min_soc, max_soc].
-            stop_soc = int(
-                max(self.config.min_soc, min(self.config.max_soc, self._battery_soc))
-            )
         elif stop_soc_raw == "configurable":
             # Use appropriate default based on mode type
             if mode == "discharge_to_grid":

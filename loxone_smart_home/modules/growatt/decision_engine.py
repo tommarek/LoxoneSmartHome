@@ -231,12 +231,15 @@ MODE_DEFINITIONS = {
         "ac_charge": False
     },
     "battery_hold": {
-        "description": "Preserve battery — serve house from grid (no discharge)",
-        "inverter_mode": "load_first",
-        # Pin to the CURRENT SOC, NOT max_soc: in load_first the Growatt charges
-        # toward stop_soc, so max_soc would grid-charge the battery overnight.
-        # current_soc holds it flat (no discharge below, no charge above).
-        "stop_soc": "current_soc",
+        "description": "Preserve battery — no discharge, but allow solar charging",
+        # battery_first prevents the battery from DISCHARGING for the house (the
+        # house is served from grid) — the "hold". With ac_charge OFF it does NOT
+        # grid-charge, but it STILL charges from surplus SOLAR up to stop_soc, so
+        # excess daytime PV is captured instead of being capped/exported. (The
+        # earlier load_first + current_soc approach blocked solar charging,
+        # because in load_first stop_soc is also the charge ceiling.)
+        "inverter_mode": "battery_first",
+        "stop_soc": "max_soc",  # solar may fill to full; ac_charge off = no grid charge
         "ac_charge": False
     }
 }
