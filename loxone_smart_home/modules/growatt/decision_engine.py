@@ -233,7 +233,10 @@ MODE_DEFINITIONS = {
     "battery_hold": {
         "description": "Preserve battery — serve house from grid (no discharge)",
         "inverter_mode": "load_first",
-        "stop_soc": "max_soc",  # Prevent discharge (same mechanism as high-load)
+        # Pin to the CURRENT SOC, NOT max_soc: in load_first the Growatt charges
+        # toward stop_soc, so max_soc would grid-charge the battery overnight.
+        # current_soc holds it flat (no discharge below, no charge above).
+        "stop_soc": "current_soc",
         "ac_charge": False
     }
 }

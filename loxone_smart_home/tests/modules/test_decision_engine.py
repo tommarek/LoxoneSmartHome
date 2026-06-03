@@ -419,17 +419,15 @@ def test_battery_hold_node_selected(decision_engine: GrowattDecisionEngine) -> N
     assert decision_engine.decide(_hold_ctx(block)) == "battery_hold"
 
 
-def test_battery_hold_prevents_discharge_settings() -> None:
-    """battery_hold must use the same discharge-preventing settings as
-    high_load_protected (load_first + stop_soc max_soc + no AC charge)."""
+def test_battery_hold_holds_flat_settings() -> None:
+    """battery_hold uses load_first + AC-charge off (no discharge), but pins
+    stop_soc to the CURRENT SOC, not max_soc — in load_first the inverter
+    charges toward stop_soc, so max_soc would grid-charge the battery overnight
+    instead of holding it flat."""
     bh = MODE_DEFINITIONS["battery_hold"]
-    hlp = MODE_DEFINITIONS["high_load_protected"]
     assert bh["inverter_mode"] == "load_first"
-    assert bh["stop_soc"] == "max_soc"  # at/above current SOC → no discharge
+    assert bh["stop_soc"] == "current_soc"  # flat hold: no discharge, no charge
     assert bh["ac_charge"] is False
-    assert (bh["inverter_mode"], bh["stop_soc"], bh["ac_charge"]) == (
-        hlp["inverter_mode"], hlp["stop_soc"], hlp["ac_charge"]
-    )
 
 
 def test_battery_hold_yields_to_manual_override(
