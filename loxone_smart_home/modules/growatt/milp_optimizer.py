@@ -305,10 +305,13 @@ class MILPBatteryOptimizer:
 
         n = len(blocks)
         charge_max = charge_rate_kw * 0.25
-        # House self-consumption can use the full inverter; grid EXPORT is
-        # throttled to discharge_power_pct (the Growatt grid-first power rate).
-        batt_to_grid_max = discharge_rate_kw * (discharge_power_pct / 100.0) * 0.25
+        # discharge_rate_kw is the ACTUAL grid-discharge power at the configured
+        # discharge_power_rate (~2.5 kW at 25% on this inverter), confirmed from
+        # telemetry. Both house self-consumption and grid export run at that rate
+        # — do NOT throttle grid export by discharge_power_pct again (that
+        # double-counted the power rate and modelled grid discharge 4x too slow).
         batt_out_max = discharge_rate_kw * 0.25
+        batt_to_grid_max = batt_out_max
         max_battery_kwh = battery_capacity_kwh * max_soc / 100.0
         min_battery_kwh = battery_capacity_kwh * min_soc / 100.0
         start_battery_kwh = battery_capacity_kwh * current_soc / 100.0

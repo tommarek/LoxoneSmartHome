@@ -181,8 +181,11 @@ class GrowattConfig(BaseSettings):
     )
     battery_discharge_rate_kw: float = Field(
         default=2.5, gt=0, le=50,
-        description="Max battery discharge power (kW) at full power. The "
-                    "optimizer scales grid export by discharge_power_rate."
+        description="Actual battery discharge power (kW) at the configured "
+                    "discharge_power_rate (~2.5 kW at 25% on this inverter). Used "
+                    "directly by the optimizer to size per-block discharge energy "
+                    "(kW * 0.25 kWh/block), symmetric with battery_charge_rate_kw. "
+                    "Keep it consistent with discharge_power_rate if you change it."
     )
 
     # Simple price thresholds (all in CZK/kWh for consistency)

@@ -834,14 +834,15 @@ class TestSellProduction:
             battery_amortisation_czk=2.0,
         )
 
-        # Morning blocks should DISCHARGE (sells battery + solar excess), not sell_production
-        morning_discharge = [d for d in decisions
-                             if d.action == "discharge" and 8 <= d.timestamp.hour < 12]
-        morning_sp = [d for d in decisions
-                      if d.action == "sell_production" and 8 <= d.timestamp.hour < 12]
-        assert len(morning_discharge) > 0, "Morning at 4 CZK should discharge"
-        assert morning_sp == [], (
-            "Discharge supersedes sell_production at 4 CZK morning"
+        # The 4 CZK blocks (hour 8) qualify for both — discharge must win there.
+        # (Later 3 CZK blocks may turn to sell_production once the faster, realistic
+        # discharge has drawn the battery down; that's expected, not the assertion.)
+        peak_blocks = [d for d in decisions if d.timestamp.hour == 8]
+        assert any(d.action == "discharge" for d in peak_blocks), (
+            "4 CZK morning should discharge"
+        )
+        assert all(d.action != "sell_production" for d in peak_blocks), (
+            "Discharge supersedes sell_production at 4 CZK"
         )
 
     def test_sells_when_huge_afternoon_solar_refills(

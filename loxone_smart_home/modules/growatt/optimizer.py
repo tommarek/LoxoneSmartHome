@@ -555,9 +555,14 @@ from(bucket: "{solar_bucket}")
         # PuLP-missing greedy fallback) start from the same bounded SOC as MILP.
         current_soc = max(min_soc, min(max_soc, current_soc))
 
-        # Battery energy parameters
+        # Battery energy parameters. discharge_rate_kw is the ACTUAL grid-discharge
+        # power at the configured discharge_power_rate (~2.5 kW at 25% on this
+        # inverter), so it is used directly — symmetric with charge_rate_kw. Do
+        # NOT multiply by discharge_power_pct again: that double-counted the power
+        # rate and modelled discharge 4x too slow, so the projected SOC barely
+        # dropped while the real battery fell ~2.5 kW.
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
-        discharge_kwh_per_block = discharge_rate_kw * (discharge_power_pct / 100) * 0.25
+        discharge_kwh_per_block = discharge_rate_kw * 0.25
 
         # Pre-compute block values (needed for reserve calculation below)
         prices = [p for _, p in blocks]
