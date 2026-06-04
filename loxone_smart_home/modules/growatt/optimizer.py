@@ -601,7 +601,8 @@ from(bucket: "{solar_bucket}")
         running_max = float('-inf')
         for i in range(n - 1, -1, -1):
             dist_i = distribution_func(blocks[i][0].hour)
-            sell_rev_i = prices[i] - dist_i - sell_fee_czk - battery_amortisation_czk
+            # Export pays no distribution — only the sell fee (+ battery wear).
+            sell_rev_i = prices[i] - sell_fee_czk - battery_amortisation_czk
             future_dist_i = distribution_func(future_min_price_hour[i])
             recharge_cost_i = (future_min_price[i] + future_dist_i) / efficiency
             # Mirror the per-block gate: discharges with non-positive sell_revenue
@@ -752,7 +753,7 @@ from(bucket: "{solar_bucket}")
 
         Per-block swap profit:
 
-            sell_now           = spot - dist - fees                  # solar→grid revenue
+            sell_now           = spot - fee                         # solar→grid revenue (no dist)
             grid_replacement   = (future_min_charge_spot + dist) / efficiency
             solar_replacement  = future_min_export_revenue if solar refills battery
             storage_value      = future_sc_value[i]  (already amort-adjusted)
@@ -778,7 +779,8 @@ from(bucket: "{solar_bucket}")
         solar_excess = [0.0] * n
         for i, (ts, p) in enumerate(blocks):
             h = ts.hour
-            sell_now[i] = p - distribution_func(h) - sell_fee_czk
+            # Export pays no distribution — only the sell fee.
+            sell_now[i] = p - sell_fee_czk
             s = _forecast_value(solar_hourly, ts) / 4.0
             c = _forecast_value(consumption_hourly, ts) / 4.0
             solar_excess[i] = max(0.0, s - c)
@@ -985,7 +987,8 @@ from(bucket: "{solar_bucket}")
             # discharge to grid when the sale itself is unprofitable. Round-trip
             # arbitrage with hypothetical future recharge does not justify
             # destroying value now — every discharged kWh wears the battery.
-            sell_revenue = price_czk - dist - sell_fee_czk - battery_amortisation_czk
+            # Export pays no distribution — only the sell fee (+ battery wear).
+            sell_revenue = price_czk - sell_fee_czk - battery_amortisation_czk
             future_recharge_hour = future_min_price_hour[i] if i < n else 0
             future_dist = distribution_func(future_recharge_hour)
             recharge_cost = (future_cheapest + future_dist) / efficiency
@@ -1041,8 +1044,9 @@ from(bucket: "{solar_bucket}")
             if timestamp in sell_production_set and action != "discharge":
                 action = "sell_production"
                 # Informational value: sell-now revenue × solar excess this block
+                # (export pays no distribution — only the sell fee).
                 solar_excess_now = max(0.0, solar - consumption)
-                net_value = (price_czk - dist - sell_fee_czk) * solar_excess_now
+                net_value = (price_czk - sell_fee_czk) * solar_excess_now
 
             # === SOC SIMULATION ===
             # `consumption` already carries the base-load fallback applied above,

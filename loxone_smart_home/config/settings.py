@@ -194,7 +194,7 @@ class GrowattConfig(BaseSettings):
         description="Charge battery when price below this (CZK/kWh)"
     )
     export_price_min: float = Field(
-        default=0.8, gt=0,
+        default=0.35, gt=0,
         description=(
             "STRICT export floor (CZK/kWh): never export to grid (solar or "
             "battery) when the spot price is below this — set to the export/"
@@ -436,22 +436,27 @@ class GrowattConfig(BaseSettings):
 
     # Sell economics
     sell_fee_czk: float = Field(
-        default=0.5, ge=0,
-        description="Fixed fee per kWh when selling to grid (CZK/kWh)"
+        default=0.35, ge=0,
+        description="Fixed fee per kWh when selling to grid (CZK/kWh). For this "
+                    "tariff (FVE buyback = OTE spot − 350 Kč/MWh) it is 0.35 and "
+                    "is the ONLY deduction on export — no distribution is charged."
     )
     battery_amortisation_czk: float = Field(
         default=2.0, ge=0,
         description="Battery wear cost per kWh discharged (CZK/kWh)"
     )
 
-    # Distribution tariff (Czech high/low tariff)
+    # Distribution tariff (Czech D57d high/low) — per-kWh IMPORT surcharge.
+    # Includes systémové služby (0.164 CZK/kWh, charged on every kWh) on top of
+    # the VT/NT distribution rate: VT 0.755+0.164=0.919, NT 0.116+0.164=0.281.
+    # Applies to IMPORT only; export pays no distribution (see sell_fee_czk).
     distribution_tariff_high: float = Field(
-        default=0.913, ge=0,
-        description="High tariff (VT) distribution cost (CZK/kWh)"
+        default=0.919, ge=0,
+        description="High tariff (VT) import distribution+system cost (CZK/kWh)"
     )
     distribution_tariff_low: float = Field(
-        default=0.116, ge=0,
-        description="Low tariff (NT) distribution cost (CZK/kWh)"
+        default=0.281, ge=0,
+        description="Low tariff (NT) import distribution+system cost (CZK/kWh)"
     )
     low_tariff_hours: str = Field(
         default="0-10,11-12,13-14,15-17,18-24",

@@ -301,11 +301,13 @@ class TestOptimizer15Min:
         assert discharge_at_18_19 >= discharge_at_17
 
     def test_discharge_economics_includes_recharge_dist(self, optimizer) -> None:
-        """Verify recharge cost includes future distribution tariff.
+        """Verify the RECHARGE (import) cost includes the distribution tariff.
 
-        With low distribution, discharge is profitable (low cost on both sides).
-        With very high distribution, sell revenue drops and recharge cost rises,
-        making discharge unprofitable.
+        Export pays no distribution, so sell revenue is independent of it; but
+        the future recharge is an IMPORT (price + distribution). With low
+        distribution the discharge→recharge round-trip is profitable; with very
+        high distribution the recharge cost exceeds the sell revenue, so it
+        should not discharge.
         """
         # High spot price evening, cheap recharge tomorrow
         prices = (
@@ -316,9 +318,8 @@ class TestOptimizer15Min:
         # Low consumption so base load doesn't drain battery before evening
         low_consumption = {h: 0.1 for h in range(24)}
 
-        # Low distribution: sell_revenue = 12.0 - 0.5 - 0.5 - 2.0 = 9.0
-        # recharge_cost = (0.5 + 0.5) / 0.85 = 1.18
-        # profit = 9.0 - 1.18 = 7.82 > 0 → should discharge
+        # Low distribution: sell_revenue = 12.0 - 0.5 - 2.0 = 9.5 (no dist on export)
+        # recharge_cost = (0.5 + 0.5) / 0.85 = 1.18 → profit 8.3 > 0 → discharge
         _, discharge_low_dist, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
@@ -330,14 +331,14 @@ class TestOptimizer15Min:
         )
         assert len(discharge_low_dist) > 0
 
-        # Very high distribution: sell_revenue = 12.0 - 5.0 - 0.5 - 2.0 = 4.5
-        # recharge_cost = (0.5 + 5.0) / 0.85 = 6.47
-        # profit = 4.5 - 6.47 = -1.97 < 0 → should NOT discharge
+        # Very high distribution: sell_revenue still 9.5 (export pays no dist), but
+        # recharge_cost = (0.5 + 10.0) / 0.85 = 12.35 > 9.5 → round-trip a loss →
+        # should NOT discharge (can't profitably refill).
         _, discharge_high_dist, _sp, _ = optimizer.optimize(
             blocks=blocks,
             solar_hourly={},
             consumption_hourly=low_consumption,
-            distribution_func=const_dist(5.0),
+            distribution_func=const_dist(10.0),
             current_soc=80.0,
             sell_fee_czk=0.5,
             battery_amortisation_czk=2.0,

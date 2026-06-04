@@ -48,13 +48,10 @@ def test_build_price_rows_basic_economics_and_status():
     assert charging_row["is_current"] is True
     assert discharge_row["status"] == "discharge"
     assert discharge_row["is_current"] is False
-    # net_sell = price - distribution - sell_fee - batt_amort (verified against
-    # the row's own resolved distribution, so it's not brittle to the tariff
-    # schedule). Distribution must be one of the two configured tariffs.
-    assert charging_row["distribution_czk"] in (0.91, 0.12)  # high/low, rounded
-    assert charging_row["net_sell_czk"] == round(
-        3.0 - charging_row["distribution_czk"] - 0.5 - 2.0, 2
-    )
+    # net_sell = price - sell_fee - batt_amort. Export pays NO distribution, so
+    # net_sell must NOT subtract the distribution tariff (which is import-only).
+    assert charging_row["distribution_czk"] in (0.91, 0.12)  # still shown for ref
+    assert charging_row["net_sell_czk"] == round(3.0 - 0.5 - 2.0, 2)
     assert charging_row["day"] == "today"
 
 

@@ -150,8 +150,9 @@ def test_never_discharges_when_revenue_negative():
 def test_solar_charges_battery_on_hold_blocks():
     # No grid charge needed: pure solar surplus should refill the battery so
     # SOC rises across hold blocks (the missing-solar-charge bug would keep
-    # SOC flat/declining). Prices flat & low so discharge/sellprod inactive.
-    blocks = make_blocks([1.0] * 8)
+    # SOC flat/declining). Prices flat & BELOW the export floor (0.35) so export
+    # is inactive and the surplus must store rather than sell.
+    blocks = make_blocks([0.2] * 8)
     opt = MILPBatteryOptimizer()
     _, _, _, decisions = opt.optimize(
         blocks=blocks,

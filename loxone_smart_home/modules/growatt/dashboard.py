@@ -400,11 +400,13 @@ def _build_price_rows(
 
         czk = round(price_czk, 2)  # Already CZK/kWh
         proj = soc_lookup.get(f"{day}:{start}", {})
-        # Sell economics: what you actually get per kWh sold.
+        # Distribution (import surcharge) — still shown per block for reference.
         dist = GrowattDecisionEngine._get_distribution_tariff(
             int(start.split(":")[0]), thresholds
         )
-        net_sell = round(czk - dist - sell_fee - batt_amort, 2)
+        # Sell economics: what you actually net per kWh sold from the battery.
+        # Export pays NO distribution — only the sell fee (+ battery wear).
+        net_sell = round(czk - sell_fee - batt_amort, 2)
 
         rows.append({
             "start": start,

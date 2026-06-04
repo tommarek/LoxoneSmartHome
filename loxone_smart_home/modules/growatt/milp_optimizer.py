@@ -39,8 +39,8 @@ and house load — and we maximise net cash. Modelling every flow explicitly
     reserve: soc[i+1] >= effective_min_soc[i]
 
   Objective (maximise):
-    + solar_to_grid * (spot - dist - fee)        solar export (no wear)
-    + batt_to_grid  * (spot - dist - fee)        battery export gross
+    + solar_to_grid * (spot - fee)               solar export (no dist, no wear)
+    + batt_to_grid  * (spot - fee)               battery export gross (no dist)
     - (grid_to_load + grid_charge) * (spot+dist) grid import cost
     - (batt_to_load + batt_to_grid) * amort      battery wear (once, on the way out)
     - curtail * CURTAIL_PENALTY                   prefer banking free solar
@@ -129,9 +129,10 @@ RESERVE_SHORTFALL_FLOOR = 0.0
 
 
 def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
-    """True when solar-export revenue (spot - dist - fee) doesn't clear the
-    swap-profit margin, so sell-production mode isn't worth the overhead."""
-    return (price - dist - sell_fee) <= SELL_PRODUCTION_MARGIN_CZK
+    """True when solar-export revenue (spot - fee) doesn't clear the swap-profit
+    margin, so sell-production mode isn't worth the overhead. Export pays no
+    distribution (dist kept in the signature for callers but not deducted)."""
+    return (price - sell_fee) <= SELL_PRODUCTION_MARGIN_CZK
 
 
 class MILPBatteryOptimizer:
@@ -333,8 +334,11 @@ class MILPBatteryOptimizer:
         # Per-block price coefficients.
         prices = [p for _, p in blocks]
         dists = [distribution_func(ts.hour) for ts, _ in blocks]
-        # Grid export gross (battery wear charged separately): spot - dist - fee.
-        export_now = [prices[i] - dists[i] - sell_fee_czk for i in range(n)]
+        # Grid export gross (battery wear charged separately). Export pays NO
+        # distribution — only the sell fee (FVE buyback = spot − fee). Distribution
+        # applies to IMPORT only. (Was spot − dist − fee, which under-valued export
+        # by the whole distribution tariff and made it hoard/curtail sellable solar.)
+        export_now = [prices[i] - sell_fee_czk for i in range(n)]
         # Battery export NET of wear (the "never export at a loss" gate).
         sell_revenue = [export_now[i] - battery_amortisation_czk for i in range(n)]
         # Grid import cost per kWh (paid on both load and battery charge).
