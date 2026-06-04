@@ -480,3 +480,34 @@ def test_summarize_reports_hold_idle_count():
     assert s["hold_idle_blocks"] == sum(
         1 for d in decisions if d.action == "hold_idle"
     )
+
+
+def test_surplus_solar_exports_as_sell_production_not_hold():
+    """Surplus solar at a HIGH price (with cheaper midday to recharge) must be
+    actuated as sell_production (export, battery passive) — NOT left as plain
+    'hold', which maps to load_first and would silently CHARGE the battery from
+    the surplus instead of selling it. Regression for the morning-solar bug."""
+    # high morning, cheap midday (free recharge), high evening
+    prices = [3.0] * 4 + [0.1] * 8 + [3.5] * 8
+    blocks = make_blocks(prices, start_hour=8)
+    # Moderate morning solar so the whole surplus fits the export cap (no leftover
+    # to charge); strong midday solar to refill the battery for the evening.
+    solar = {h: 3.0 for h in range(8, 10)}
+    solar.update({h: 10.0 for h in range(10, 16)})
+    consumption = {h: 0.5 for h in range(24)}
+    opt = MILPBatteryOptimizer()
+    charge, discharge, sp, decisions = opt.optimize(
+        blocks=blocks, solar_hourly=solar, consumption_hourly=consumption,
+        distribution_func=flat_dist(0.5), current_soc=20.0, min_soc=20.0,
+        max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
+        discharge_power_pct=100.0, sell_fee_czk=0.5, battery_amortisation_czk=2.0,
+    )
+    morning = [d for d in decisions if d.timestamp.hour == 8]
+    assert any(d.action == "sell_production" for d in morning), (
+        "high-price morning surplus must export as sell_production: "
+        f"{[(d.timestamp.strftime('%H:%M'), d.action) for d in decisions[:8]]}"
+    )
+    # Those export blocks must not be charging the battery (SOC not rising).
+    for d in morning:
+        if d.action == "sell_production":
+            assert d.soc_after <= d.soc_before + 0.5

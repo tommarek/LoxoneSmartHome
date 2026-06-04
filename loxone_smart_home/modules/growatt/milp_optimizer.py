@@ -99,6 +99,13 @@ CURTAIL_PENALTY = 0.01
 # action, when classifying a block's headline action for the dashboard.
 ACTION_EPS = 5e-3
 
+# Minimum surplus-solar export (kWh/block) for a battery-passive block to be
+# actuated as sell_production (grid_first) instead of plain hold (load_first).
+# Above this, exporting the surplus is worth switching the inverter to a true
+# export mode so load_first doesn't quietly charge the battery instead; below
+# it the amount is too small to bother (avoids mode churn). 0.1 kWh ≈ 400 W.
+SP_EXPORT_FLOOR_KWH = 0.1
+
 # A grid-EXPORT (discharge-to-grid) block must move at least this fraction of
 # the grid-first power rate. The controller actuates discharge as on/off at a
 # fixed powerRate, so without a floor the solver scatters many trivial sub-rate
@@ -579,6 +586,7 @@ class MILPBatteryOptimizer:
             gc = val(grid_charge[i])
             bg = val(batt_to_grid[i])
             sg = val(solar_to_grid[i])
+            sb = val(solar_to_batt[i])
             bl = val(batt_to_load[i])
             gl = val(grid_to_load[i])
             action = "hold"
@@ -599,9 +607,21 @@ class MILPBatteryOptimizer:
                 discharge_times.add(ts)
                 net_value = bg * sell_revenue[i]
             elif val(is_sp[i]) > 0.5 and sg > ACTION_EPS:
-                # Only a block the solver actually put into sell-production mode
-                # is actuated as such (grid_first, stop_soc=max_soc); ordinary
-                # sunny hold blocks that merely spill surplus stay "hold".
+                # A block the solver explicitly put into sell-production mode.
+                action = "sell_production"
+                sp_times.add(ts)
+                net_value = sg * export_now[i]
+            elif sg > SP_EXPORT_FLOOR_KWH and sb < ACTION_EPS:
+                # Surplus solar is being EXPORTED while the battery is NOT
+                # charging from it (the solver chose export over charge for this
+                # block). Plain "hold" maps to load_first, which charges the
+                # battery from surplus BEFORE it spills to grid — so it would
+                # silently store the solar instead of selling it (e.g. cheap-
+                # midday vs high-morning timing). Actuate sell_production
+                # (grid_first, battery passive) so the surplus is actually sold,
+                # matching the plan. Mirrors the battery_hold fix: honour the
+                # solver's solar-flow decision instead of letting the default
+                # load_first mode override it.
                 action = "sell_production"
                 sp_times.add(ts)
                 net_value = sg * export_now[i]
