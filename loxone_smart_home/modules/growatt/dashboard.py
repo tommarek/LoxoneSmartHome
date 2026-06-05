@@ -2054,6 +2054,16 @@ html { scroll-behavior: smooth; }
 .home-chart { position: relative; height: 134px; margin-top: 10px; }
 .home-chart .price-chart { height: 134px; margin-top: 0; gap: 0; }
 .home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; border-radius: 1px 1px 0 0; }
+/* Distribution-tariff segment stacked on top of the spot-price portion of a
+   bar. A translucent light wash pales whatever colour the bar is, so the bar
+   shows the REAL all-in price (spot + tariff) with the tariff part distinct. */
+.price-bar .bar-tariff {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  background: rgba(255, 255, 255, 0.40);
+  border-radius: inherit;
+  pointer-events: none;
+}
 .home-chart-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 .home-now-line { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--accent); opacity: .6; pointer-events: none; }
 .home-legend { display: flex; flex-wrap: wrap; gap: 3px 11px; margin-top: 9px; font-size: 10.5px; color: var(--muted); }
@@ -2607,6 +2617,14 @@ function homeBarClass(p) {
   else if (p.is_inverter_off) cls = 'inverter-off';
   return cls;
 }
+// Paler "tariff" segment stacked on top of a bar's spot portion. tFrac = the
+// tariff's share of the all-in bar height. Empty for negative/zero-tariff bars.
+function tariffSeg(p, buy) {
+  const dist = p.distribution_czk || 0;
+  if (!(buy > 0) || dist <= 0) return '';
+  const tFrac = Math.min(100, dist / buy * 100);
+  return '<div class="bar-tariff" style="height:' + tFrac.toFixed(1) + '%"></div>';
+}
 function renderHomeChart(prices, timeline) {
   const bars = document.getElementById('homeChartBars');
   const wrap = document.getElementById('homeChartWrap');
@@ -2614,14 +2632,17 @@ function renderHomeChart(prices, timeline) {
   if (!bars) return;
   if (!prices.length) { if (nodata) nodata.style.display = 'block'; if (wrap) wrap.style.display = 'none'; return; }
   if (nodata) nodata.style.display = 'none'; if (wrap) wrap.style.display = '';
-  const vals = prices.map(p => p.czk_kwh);
+  // Scale to the all-in price (spot + distribution tariff) so the bar height is
+  // the REAL cost and the tariff segment never overflows the chart.
+  const allIn = p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh;
+  const vals = prices.map(allIn);
   const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
   let html = '';
   prices.forEach(p => {
-    const v = p.czk_kwh, h = Math.abs(v) / maxAbs * 100;
+    const v = p.czk_kwh, buy = allIn(p), h = Math.abs(buy) / maxAbs * 100;
     let cls = homeBarClass(p); if (p.is_current) cls += ' current';
     if (v < 0) html += '<div class="price-bar ' + cls + '" style="height:' + h + '%;align-self:flex-start;opacity:.55"></div>';
-    else html += '<div class="price-bar ' + cls + '" style="height:' + Math.max(h, 3) + '%"></div>';
+    else html += '<div class="price-bar ' + cls + '" style="height:' + Math.max(h, 3) + '%">' + tariffSeg(p, buy) + '</div>';
   });
   bars.innerHTML = html;
 
@@ -2721,8 +2742,9 @@ async function fetchPrices() {
     document.getElementById('priceChartTitle').textContent =
       data.has_tomorrow ? 'Today + Tomorrow Prices & Battery SOC' : "Today's Prices & Battery SOC";
 
-    // Shared vertical scale so both charts are visually comparable
-    const allVals = allPrices.map(p => p.czk_kwh);
+    // Shared vertical scale so both charts are visually comparable. Use the
+    // all-in price (spot + tariff) so the stacked tariff segments never overflow.
+    const allVals = allPrices.map(p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh);
     const maxAbs = allVals.length
       ? Math.max(Math.abs(Math.min(...allVals)), Math.abs(Math.max(...allVals)), 1)
       : 1;
@@ -3149,16 +3171,19 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   if (!chart) return;
   if (!prices.length) { chart.innerHTML = '<div style="color:var(--muted)">No price data</div>'; return; }
 
+  // Scale to all-in (spot + distribution tariff) so the tariff segment fits.
+  const allIn = p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh;
   // Fall back to per-chart scale if caller didn't pass one
   if (!maxAbs) {
-    const vals = prices.map(p => p.czk_kwh);
+    const vals = prices.map(allIn);
     maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
   }
 
   let html = '';
   prices.forEach((p, i) => {
     const v = p.czk_kwh;
-    const h = Math.abs(v) / maxAbs * 100;
+    const buy = allIn(p);
+    const h = Math.abs(buy) / maxAbs * 100;
     const isNeg = v < 0;
     let cls = v < 0 ? 'negative' : v < 1.5 ? 'cheap' : v < 3 ? 'mid' : 'expensive';
     if (p.status === 'pre_discharge_charge') cls = 'pre-discharge';
@@ -3174,7 +3199,7 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
     if (isNeg) {
       html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + h + '%;align-self:flex-start;opacity:0.5;' + tmrwOpacity + '"></div>';
     } else {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '"></div>';
+      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '">' + tariffSeg(p, buy) + '</div>';
     }
   });
   chart.innerHTML = html;
