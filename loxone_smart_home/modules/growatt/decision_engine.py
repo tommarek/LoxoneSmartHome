@@ -636,7 +636,9 @@ class GrowattDecisionEngine:
         if not context.prices_15min:
             return False
 
-        cheapest_block_czk = min(context.prices_15min.values())
+        cheapest_block_key, cheapest_block_czk = min(
+            context.prices_15min.items(), key=lambda kv: kv[1]
+        )
 
         # Calculate required price based on profit margin
         required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
@@ -646,8 +648,20 @@ class GrowattDecisionEngine:
         # lose the distribution tariff savings from self-consuming now
         current_hour = context.current_time.hour
         current_dist = self._get_distribution_tariff(current_hour, context.price_thresholds)
-        # Cost to recharge 1 kWh (accounting for round-trip efficiency)
-        recharge_cost = cheapest_block_czk / context.price_thresholds.battery_efficiency
+        # Cost to recharge 1 kWh at the cheapest future block: its spot price PLUS
+        # that block's own distribution tariff (import pays distribution), all over
+        # round-trip efficiency. Omitting the recharge block's tariff understated
+        # the recharge cost and let discharge fire below true break-even.
+        try:
+            recharge_hour = int(cheapest_block_key[0].split(":")[0])
+        except (ValueError, IndexError, AttributeError, TypeError):
+            recharge_hour = current_hour
+        recharge_dist = self._get_distribution_tariff(
+            recharge_hour, context.price_thresholds
+        )
+        recharge_cost = (
+            cheapest_block_czk + recharge_dist
+        ) / context.price_thresholds.battery_efficiency
         self_consumption_floor = recharge_cost + current_dist
 
         # Effective threshold is the highest of all requirements

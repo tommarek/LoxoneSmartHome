@@ -166,7 +166,7 @@ class ModeManager:
         # Should never reach here, but just in case
         return (False, None)
 
-    async def ensure_exclusive(self, primary: str, previous_mode: Optional[str] = None) -> None:
+    async def ensure_exclusive(self, primary: str, previous_mode: Optional[str] = None) -> bool:
         """Ensure modes are mutually exclusive at the device level.
 
         Args:
@@ -177,16 +177,22 @@ class ModeManager:
         - If previous_mode is None (startup/unknown): Disable both modes for full reset
         - If previous_mode is known and != primary: Only disable that specific mode
         - If previous_mode == primary: No disable needed (already exclusive)
+
+        Returns:
+            True if every required disable succeeded (or none was needed), False
+            if any disable command failed — so the caller can abort and not
+            advance tracked state past a mode whose old slot is still enabled.
         """
+        ok = True
         if previous_mode is None:
             # Startup or unknown state - full reset for safety
             self.logger.info(
                 f"🔄 Ensuring exclusive mode for {primary}, "
                 f"full reset (unknown previous state)..."
             )
-            await self.disable_battery_first()
+            ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
-            await self.disable_grid_first()
+            ok = await self.disable_grid_first() and ok
             await asyncio.sleep(self.config.command_delay)
             self.logger.debug(f"Full reset completed before applying {primary}")
         elif previous_mode == primary:
@@ -195,12 +201,12 @@ class ModeManager:
         elif previous_mode == "battery_first":
             # Only disable battery_first
             self.logger.info(f"🔄 Disabling {previous_mode} before applying {primary}...")
-            await self.disable_battery_first()
+            ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
         elif previous_mode == "grid_first":
             # Only disable grid_first
             self.logger.info(f"🔄 Disabling {previous_mode} before applying {primary}...")
-            await self.disable_grid_first()
+            ok = await self.disable_grid_first()
             await asyncio.sleep(self.config.command_delay)
         elif previous_mode == "load_first":
             # Coming from load_first, no active slots to disable
@@ -210,10 +216,15 @@ class ModeManager:
             self.logger.warning(
                 f"Unknown previous mode '{previous_mode}', performing full reset..."
             )
-            await self.disable_battery_first()
+            ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
-            await self.disable_grid_first()
+            ok = await self.disable_grid_first() and ok
             await asyncio.sleep(self.config.command_delay)
+        if not ok:
+            self.logger.error(
+                f"ensure_exclusive({primary}): a disable command failed — the old "
+                "mode's slot may still be enabled; caller must not advance state."
+            )
 
         state = await self._query_inverter_state()
 
@@ -239,10 +250,13 @@ class ModeManager:
                             f"({slot.get('start')}-{slot.get('stop')})"
                         )
 
+        return ok
+
     async def set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: Optional[int] = None,
         power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False,
-        immediate_activation: bool = False, previous_mode: Optional[str] = None
+        immediate_activation: bool = False, previous_mode: Optional[str] = None,
+        force_power_rate: bool = False
     ) -> bool:
         """Set battery-first mode for specified time window.
 
@@ -269,9 +283,14 @@ class ModeManager:
             )
 
         if adjusted_start == adjusted_stop:
-            self.logger.debug(
-                f"Battery-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
-                "skipping."
+            # Defensive: the caller (_ensure_future_start) now prevents collapse
+            # by snapping the start back a minute, so this should be unreachable.
+            # Treat it as a benign no-op (return True) rather than a hard failure
+            # — raising would roll back the WHOLE state apply (export, inverter-on)
+            # for a transient near-boundary timing edge.
+            self.logger.warning(
+                f"Battery-first window collapsed ({adjusted_start}=={adjusted_stop}); "
+                "skipping actuation (benign no-op)."
             )
             return True
 
@@ -279,7 +298,12 @@ class ModeManager:
         power_rate = max(1, min(100, power_rate))
 
         sig = ("battery_first", adjusted_start, adjusted_stop, stop_soc, power_rate)
-        if self._last_applied.get("battery_first") == sig:
+        # force_power_rate must bypass this signature short-circuit: the same sig
+        # (e.g. 100%) can be stored from a previous battery_first while the
+        # inverter's actual powerRate was since clobbered by a grid_first
+        # discharge (separate _last_applied key). Skipping here would leave that
+        # stale rate in place — the exact stale-powerRate bug force was added for.
+        if self._last_applied.get("battery_first") == sig and not force_power_rate:
             self.logger.debug(
                 f"Battery-first {adjusted_start}-{adjusted_stop} already applied, skipping"
             )
@@ -297,7 +321,12 @@ class ModeManager:
 
         assert self.mqtt_client is not None
 
-        await self.ensure_exclusive("battery_first", previous_mode=previous_mode)
+        if not await self.ensure_exclusive("battery_first", previous_mode=previous_mode):
+            self.logger.error(
+                "Aborting set_battery_first: failed to disable the previous mode "
+                "(would leave both slots enabled / desynced)."
+            )
+            return False
 
         # Always send stopSOC (matching set_grid_first). The previous `!= 90`
         # skip assumed the inverter's resting default is 90% with no tracking of
@@ -318,7 +347,11 @@ class ModeManager:
             return False
         await asyncio.sleep(self.config.command_delay)
 
-        if power_rate != 100:
+        # Send powerRate when it's non-default (100) OR when the caller forces it
+        # (adaptive charging needs the exact rate written even at 100%, because
+        # the inverter otherwise keeps a stale rate from a previous grid-first
+        # discharge — the latent bug that pinned all "100%" charging at 25%).
+        if power_rate != 100 or force_power_rate:
             powerrate_topic = "energy/solar/command/batteryfirst/set/powerrate"
             powerrate_payload = {"value": power_rate}
             self.logger.debug(f"Setting battery-first powerRate to {power_rate}%")
@@ -424,14 +457,15 @@ class ModeManager:
         """Disable AC charging."""
         return await self.set_ac_charge(False)
 
-    async def disable_battery_first(self) -> None:
-        """Disable battery-first mode."""
+    async def disable_battery_first(self) -> bool:
+        """Disable battery-first mode. Returns True on success/sim, False on a
+        failed command (so ensure_exclusive can propagate the failure)."""
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(
                 f"🔋 [SIMULATE] BATTERY-FIRST MODE DISABLED (simulated at {current_time})"
             )
-            return
+            return True
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
@@ -443,7 +477,7 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to disable battery-first mode")
-            return  # Don't update state if command failed
+            return False  # Don't update state if command failed
 
         self._battery_first_slots[1] = {
             "enabled": False,
@@ -452,12 +486,17 @@ class ModeManager:
             "stop_soc": 90,
             "power_rate": 100
         }
+        # Clear the cached signature: the slot is now disabled, so a later
+        # set_battery_first with the SAME (start,stop,soc,rate) must not be
+        # short-circuited against a sig that no longer reflects an enabled slot.
+        self._last_applied.pop("battery_first", None)
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔋 BATTERY-FIRST MODE DISABLED at {current_time} → "
             f"Topic: {self.config.battery_first_topic}"
         )
+        return True
 
     async def set_export(self, enabled: bool) -> bool:
         """Set export state. Uses edge-triggered topics for external systems.
@@ -593,9 +632,13 @@ class ModeManager:
             )
 
         if adjusted_start == adjusted_stop:
-            self.logger.debug(
-                f"Grid-first window collapsed after bump ({adjusted_start}=={adjusted_stop}); "
-                "skipping."
+            # Defensive: the caller now prevents collapse by snapping the start
+            # back a minute, so this should be unreachable. Benign no-op (return
+            # True) rather than a hard failure that would roll back the whole
+            # state apply for a transient near-boundary timing edge.
+            self.logger.warning(
+                f"Grid-first window collapsed ({adjusted_start}=={adjusted_stop}); "
+                "skipping actuation (benign no-op)."
             )
             return True
 
@@ -622,7 +665,12 @@ class ModeManager:
 
         assert self.mqtt_client is not None
 
-        await self.ensure_exclusive("grid_first", previous_mode=previous_mode)
+        if not await self.ensure_exclusive("grid_first", previous_mode=previous_mode):
+            self.logger.error(
+                "Aborting set_grid_first: failed to disable the previous mode "
+                "(would leave both slots enabled / desynced)."
+            )
+            return False
 
         # First set the parameters before enabling the mode
         # Set stop SOC (battery level to stop discharging)
@@ -712,12 +760,13 @@ class ModeManager:
             )
         return True
 
-    async def disable_grid_first(self) -> None:
-        """Disable grid-first mode."""
+    async def disable_grid_first(self) -> bool:
+        """Disable grid-first mode. Returns True on success/sim, False on a
+        failed command (so ensure_exclusive can propagate the failure)."""
         if self._optional_config.get("simulation_mode", False):
             current_time = self._get_local_now().strftime("%H:%M:%S")
             self.logger.info(f"🔌 [SIMULATE] GRID-FIRST MODE DISABLED (simulated at {current_time})")
-            return
+            return True
 
         payload = {"start": "00:00", "stop": "00:00", "enabled": False, "slot": 1}
         assert self.mqtt_client is not None
@@ -729,13 +778,19 @@ class ModeManager:
         )
         if not success:
             self.logger.error("Failed to disable grid-first mode")
-            return  # Don't update state if command failed
+            return False  # Don't update state if command failed
+
+        # Clear the cached signature so a same-minute re-enable with an identical
+        # (start,stop,soc,rate) isn't short-circuited against a now-disabled slot
+        # (which would leave tracked=grid_first while the hardware slot is off).
+        self._last_applied.pop("grid_first", None)
 
         current_time = self._get_local_now().strftime("%H:%M:%S")
         self.logger.info(
             f"🔌 GRID-FIRST MODE DISABLED at {current_time} → "
             f"Topic: {self.config.grid_first_topic}"
         )
+        return True
 
     async def set_load_first(
         self, stop_soc: Optional[int] = None, previous_mode: Optional[str] = None
@@ -776,13 +831,17 @@ class ModeManager:
             self._last_applied["load_first"] = sig
             return True
 
-        # Disable the previous mode to achieve load-first
+        # Disable the previous mode to achieve load-first. Capture the disable
+        # results and abort on failure — otherwise the old battery_first/grid_first
+        # slot stays ENABLED while we report success, desyncing tracked vs hardware
+        # (mirrors set_battery_first/set_grid_first's ensure_exclusive hardening).
+        disable_ok = True
         if previous_mode is None:
             # Startup or unknown state - full reset for safety
             self.logger.info("🏠 Setting LOAD-FIRST mode (full reset - unknown previous state)")
-            await self.disable_battery_first()
+            disable_ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
-            await self.disable_grid_first()
+            disable_ok = await self.disable_grid_first() and disable_ok
             await asyncio.sleep(self.config.command_delay)
         elif previous_mode == "load_first":
             # Already in load_first, only update SOC if needed
@@ -790,22 +849,29 @@ class ModeManager:
         elif previous_mode == "battery_first":
             # Only disable battery_first
             self.logger.info(f"🏠 Setting LOAD-FIRST mode (disabling {previous_mode})")
-            await self.disable_battery_first()
+            disable_ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
         elif previous_mode == "grid_first":
             # Only disable grid_first
             self.logger.info(f"🏠 Setting LOAD-FIRST mode (disabling {previous_mode})")
-            await self.disable_grid_first()
+            disable_ok = await self.disable_grid_first()
             await asyncio.sleep(self.config.command_delay)
         else:
             # Unknown mode - full reset for safety
             self.logger.warning(
                 f"Unknown previous mode '{previous_mode}', performing full reset..."
             )
-            await self.disable_battery_first()
+            disable_ok = await self.disable_battery_first()
             await asyncio.sleep(self.config.command_delay)
-            await self.disable_grid_first()
+            disable_ok = await self.disable_grid_first() and disable_ok
             await asyncio.sleep(self.config.command_delay)
+
+        if not disable_ok:
+            self.logger.error(
+                "Aborting set_load_first: failed to disable the previous mode "
+                "(its slot may still be enabled; tracked state must not advance)."
+            )
+            return False
 
         # Set the stop SOC for load-first mode
         if hasattr(self.config, 'load_first_stopsoc_topic'):

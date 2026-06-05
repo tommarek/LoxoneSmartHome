@@ -117,10 +117,16 @@ def test_solar_arrays_validator_accepts_default():
     assert GrowattConfig.validate_solar_arrays(default) == default
 
 
-@pytest.mark.parametrize("bad", ["not json", "[]", '[{"name": 1}]', "{}"])
+@pytest.mark.parametrize("bad", ["not json", '[{"name": 1}]', "{}"])
 def test_solar_arrays_validator_rejects_bad(bad):
     with pytest.raises(ValueError):
         GrowattConfig.validate_solar_arrays(bad)
+
+
+def test_solar_arrays_validator_allows_empty():
+    # An empty array is valid: "no arrays configured" (solar forecast disabled).
+    # The gated consumer decides what to do; startup must not hard-fail.
+    assert GrowattConfig.validate_solar_arrays("[]") == "[]"
 
 
 def test_low_tariff_hours_validator_accepts_default():

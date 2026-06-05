@@ -483,32 +483,80 @@ def test_summarize_reports_hold_idle_count():
     )
 
 
-def test_surplus_solar_exports_as_sell_production_not_hold():
-    """Surplus solar at a HIGH price (with cheaper midday to recharge) must be
-    actuated as sell_production (export, battery passive) — NOT left as plain
-    'hold', which maps to load_first and would silently CHARGE the battery from
-    the surplus instead of selling it. Regression for the morning-solar bug."""
-    # high morning, cheap midday (free recharge), high evening
-    prices = [3.0] * 4 + [0.1] * 8 + [3.5] * 8
+def _sp_scenario(current_soc):
+    """Moderate morning (below battery-discharge break-even so the battery is
+    HELD, not discharged), cheap midday, high evening peak; surplus solar.
+    Morning 2.0 − fee 0.5 − amort 2.0 < 0 → no battery discharge, so the only
+    grid-facing morning action is exporting the surplus SOLAR (sell_production)
+    when full / banking it when not."""
+    prices = [2.0] * 4 + [0.1] * 8 + [4.0] * 8
     blocks = make_blocks(prices, start_hour=8)
-    # Moderate morning solar so the whole surplus fits the export cap (no leftover
-    # to charge); strong midday solar to refill the battery for the evening.
     solar = {h: 3.0 for h in range(8, 10)}
     solar.update({h: 10.0 for h in range(10, 16)})
     consumption = {h: 0.5 for h in range(24)}
     opt = MILPBatteryOptimizer()
-    charge, discharge, sp, decisions = opt.optimize(
+    _, _, _, decisions = opt.optimize(
         blocks=blocks, solar_hourly=solar, consumption_hourly=consumption,
-        distribution_func=flat_dist(0.5), current_soc=20.0, min_soc=20.0,
+        distribution_func=flat_dist(0.5), current_soc=current_soc, min_soc=20.0,
         max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
         discharge_power_pct=100.0, sell_fee_czk=0.5, battery_amortisation_czk=2.0,
     )
+    return decisions
+
+
+def test_surplus_solar_exports_as_sell_production_when_full():
+    """At/near FULL SOC the battery can't absorb more, so surplus solar exports
+    as sell_production (battery passive, SOC not rising)."""
+    decisions = _sp_scenario(current_soc=100.0)
     morning = [d for d in decisions if d.timestamp.hour == 8]
     assert any(d.action == "sell_production" for d in morning), (
-        "high-price morning surplus must export as sell_production: "
+        "full-battery morning surplus must export as sell_production: "
         f"{[(d.timestamp.strftime('%H:%M'), d.action) for d in decisions[:8]]}"
     )
-    # Those export blocks must not be charging the battery (SOC not rising).
     for d in morning:
         if d.action == "sell_production":
             assert d.soc_after <= d.soc_before + 0.5
+
+
+def test_surplus_solar_can_sell_at_mid_soc():
+    """sell_production is actuated as grid-first @ stop_soc=live SOC (battery
+    passive), so surplus solar can be EXPORTED at ANY SOC — there is no near-full
+    gate. With abundant solar the battery can't usefully bank, the mid-SOC plan
+    sells the morning surplus rather than curtailing it."""
+    decisions = _sp_scenario(current_soc=50.0)
+    morning = [d for d in decisions if d.timestamp.hour == 8]
+    assert any(d.action == "sell_production" for d in morning), (
+        "mid-SOC surplus must be sellable (no near-full gate): "
+        f"{[(d.timestamp.strftime('%H:%M'), d.action) for d in morning]}"
+    )
+
+
+def test_milp_discharge_rate_independent_of_discharge_power_pct():
+    """Regression guard for the '4x too slow discharge' fix (commit 7f2f31a):
+    the MILP discharge energy is discharge_rate_kw*0.25 per block and the energy
+    model deliberately IGNORES discharge_power_pct. A high evening spike with the
+    battery well above its floor must drain at the full rate at any pct, and the
+    two pct settings must produce an identical SOC drop. If the throttle factor
+    were re-introduced, pct=25 would drain ~4x slower and this test would fail."""
+    prices = [1.0] * 4 + [9.0] * 4  # cheap, then a high spike
+    blocks = make_blocks(prices, start_hour=18)
+    opt = MILPBatteryOptimizer()
+
+    def first_discharge_drop(pct):
+        _, _, _, decisions = opt.optimize(
+            blocks=blocks, solar_hourly={}, consumption_hourly={},
+            distribution_func=flat_dist(0.5), current_soc=90.0, min_soc=20.0,
+            max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
+            discharge_power_pct=pct, sell_fee_czk=0.5, battery_amortisation_czk=1.0,
+        )
+        disch = [d for d in decisions if d.action == "discharge"]
+        assert disch, f"expected a discharge block at pct={pct}"
+        return disch[0].soc_before - disch[0].soc_after
+
+    drop25 = first_discharge_drop(25.0)
+    drop100 = first_discharge_drop(100.0)
+    # discharge_power_pct must not change the modelled discharge rate.
+    assert abs(drop25 - drop100) < 0.01, (drop25, drop100)
+    # And it's the FULL rate: batt_to_grid_max=5.0*0.25=1.25 kWh → ~13% of a
+    # 10 kWh pack per block; a re-introduced 25% throttle would give only ~3.4%.
+    assert drop25 > 10.0, f"discharge drained only {drop25:.1f}% — rate throttled?"

@@ -7,9 +7,10 @@ minimize total electricity cost.
 
 import bisect
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 
 @dataclass
@@ -24,6 +25,97 @@ class BlockDecision:
     soc_before: float  # SOC % before action
     soc_after: float  # SOC % after action
     net_value: float  # Value of this action (positive = saves money)
+
+
+def compute_rate_ceiling(hardware_max_kw: float, max_power_kw: float) -> int:
+    """Adaptive powerRate% ceiling for the C-rate cap: the operational max power
+    (max_power_kw) as a fraction of the hardware max (hardware_max_kw, the
+    powerRate=100% reference). Single source of truth so the controller and the
+    dashboard endpoints can't drift on this formula (the denominator MUST be the
+    hardware max, or the actuated rate would mean a different physical power)."""
+    hw = hardware_max_kw or 1.0
+    return int(round(min(hardware_max_kw, max_power_kw) / hw * 100))
+
+
+def compute_charge_power_rates(
+    decisions: Sequence[BlockDecision],
+    battery_capacity_kwh: float,
+    charge_max_kw: float,
+    min_power_rate: int = 25,
+    action: str = "charge",
+    max_power_rate: int = 100,
+    efficiency: float = 0.85,
+) -> Dict[datetime, int]:
+    """Map each charge/discharge block → the inverter powerRate% to move the
+    planned energy over its contiguous window, at the gentlest rate that fits it.
+
+    The inverter runs a single powerRate (% of charge_max_kw) for the whole
+    slot, so we size the rate to the window's *average* required power — total
+    |ΔSOC| energy across the window / window duration. Long cheap/expensive
+    window → gentle; short window that must move a lot → up to max_power_rate.
+    Clamped to [min_power_rate, max_power_rate]; the max clamp enforces a C-rate
+    ceiling (e.g. 0.5C). The rate is sized from the GRID-side power the powerRate
+    actually governs (see _grid_kwh) — not raw battery ΔSOC — using `efficiency`
+    to convert, so it's dimensionally consistent with the grid-side charge_max_kw
+    and a co-served house load / solar co-charge doesn't skew it. Engine- and
+    direction-agnostic: pass action="charge" for the charge cap or
+    action="discharge" for the grid-first discharge cap (charge_max_kw is then
+    the discharge max).
+    """
+    block_max_kwh = charge_max_kw * 0.25
+    if block_max_kwh <= 0:
+        return {}
+    charge = sorted(
+        (d for d in decisions if d.action == action), key=lambda d: d.timestamp
+    )
+    rates: Dict[datetime, int] = {}
+    window: List[BlockDecision] = []
+
+    eta = max(1e-3, efficiency)
+
+    def _grid_kwh(d: BlockDecision) -> float:
+        """GRID-side power the inverter's powerRate actually governs for this
+        block — not the raw battery ΔSOC. charge_max_kw is a grid/AC-side figure,
+        so the basis must be grid-side too. The powerRate caps TOTAL battery
+        throughput (house self-consumption AND grid export both run at it — see
+        milp_optimizer's discharge model, confirmed from telemetry):
+        - charge: total charge INTO the battery = ΔSOC_gain / η (SOC rises at
+          input×η, so input = ΔSOC/η). This sizes from TOTAL battery charge
+          (AC grid + any DC solar banked the same block), symmetric with the
+          telemetry-confirmed discharge case below — the powerRate caps battery
+          throughput, not just the AC leg. Erring slightly fast here only fills
+          a cheap window sooner, and the max_power_rate clamp keeps it within the
+          C-rate ceiling; sizing from the grid leg alone would risk UNDER-filling
+          the short cheap windows this feature exists to capture.
+        - discharge: total battery OUTPUT = ΔSOC_drain × η (SOC drains at
+          output/η). Do NOT subtract co-served house load — it counts too.
+        """
+        dsoc = abs(d.soc_after - d.soc_before) / 100.0 * battery_capacity_kwh
+        if action == "discharge":
+            return dsoc * eta
+        return dsoc / eta
+
+    def _flush(win: List[BlockDecision]) -> None:
+        if not win:
+            return
+        energy = sum(_grid_kwh(d) for d in win)
+        duration_h = len(win) * 0.25
+        avg_kw = energy / duration_h if duration_h > 0 else charge_max_kw
+        rate = int(math.ceil(avg_kw / charge_max_kw * 100))
+        # Apply the floor first, then the ceiling — the C-rate ceiling
+        # (max_power_rate) is authoritative, so a min_power_rate above it can
+        # never push the actuated rate past the hardware/wear limit.
+        rate = min(int(max_power_rate), max(int(min_power_rate), rate))
+        for d in win:
+            rates[d.timestamp] = rate
+
+    for d in charge:
+        if window and (d.timestamp - window[-1].timestamp) > timedelta(minutes=15):
+            _flush(window)
+            window = []
+        window.append(d)
+    _flush(window)
+    return rates
 
 
 def _forecast_value(forecast: Dict[Any, float], timestamp: datetime) -> float:
@@ -54,6 +146,13 @@ def _forecast_value(forecast: Dict[Any, float], timestamp: datetime) -> float:
 # Margin (CZK/kWh) above which a sell-production swap is worthwhile.
 # Smaller spreads aren't worth the mode change (risk noise from forecast error).
 SELL_PRODUCTION_MARGIN_CZK = 0.3
+
+# Hardware reality (SPH grid-first): pure solar export with the battery passive
+# is only physical when the battery is near FULL — below this margin the inverter
+# banks surplus solar instead. Mirrors milp_optimizer.SP_MIN_SOC_MARGIN_PCT so
+# the greedy fallback's plan/SOC projection matches the hardware (and the
+# controller's sell_production→battery_hold actuation remap) at mid-SOC.
+SP_MIN_SOC_MARGIN_PCT = 2.0
 
 # Minimum forecast solar excess (kWh per 15-min block) required to trigger
 # sell_production. The mode locks the battery (stop_soc=max_soc), so on a
@@ -517,8 +616,10 @@ from(bucket: "{solar_bucket}")
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,  # Fee per kWh sold to grid
         battery_amortisation_czk: float = 2.0,  # Battery wear cost per kWh
+        battery_amortisation_export_czk: Optional[float] = None,  # export-only wear
         export_price_min: Optional[float] = None,  # strict export floor (CZK/kWh)
         inverter_off_price: Optional[float] = None,  # strict PV-off price (CZK/kWh)
+        sell_production_min_soc_margin: float = SP_MIN_SOC_MARGIN_PCT,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Optimize charge/discharge schedule.
 
@@ -564,6 +665,16 @@ from(bucket: "{solar_bucket}")
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
         discharge_kwh_per_block = discharge_rate_kw * 0.25
 
+        # Wear cost charged on battery→GRID export. Defaults to the shared wear
+        # cost; an explicit export override raises the hurdle for arbitrage
+        # cycling only (battery→house self-consumption keeps the base cost). When
+        # unset this equals battery_amortisation_czk, so output is unchanged.
+        amort_export = (
+            battery_amortisation_czk
+            if battery_amortisation_export_czk is None
+            else battery_amortisation_export_czk
+        )
+
         # Pre-compute block values (needed for reserve calculation below)
         prices = [p for _, p in blocks]
         sorted_prices = sorted(prices)
@@ -602,7 +713,7 @@ from(bucket: "{solar_bucket}")
         for i in range(n - 1, -1, -1):
             dist_i = distribution_func(blocks[i][0].hour)
             # Export pays no distribution — only the sell fee (+ battery wear).
-            sell_rev_i = prices[i] - sell_fee_czk - battery_amortisation_czk
+            sell_rev_i = prices[i] - sell_fee_czk - amort_export
             future_dist_i = distribution_func(future_min_price_hour[i])
             recharge_cost_i = (future_min_price[i] + future_dist_i) / efficiency
             # Mirror the per-block gate: discharges with non-positive sell_revenue
@@ -699,12 +810,12 @@ from(bucket: "{solar_bucket}")
             effective_min_socs, future_min_price, future_min_price_hour,
             future_max_discharge_value, future_sc_value, future_sc_kwh,
             sorted_prices, sell_fee_czk, battery_amortisation_czk,
-            first_block_ts,
+            first_block_ts, sell_production_min_soc_margin, amort_export,
         )
 
         # Pass 2: refine charge block selection using actual SOC trajectory
         refined_set = self._refine_charge_blocks(
-            blocks, charge_block_set, decisions, max_soc
+            blocks, charge_block_set, decisions, max_soc, charge_threshold
         )
         if refined_set != charge_block_set:
             moved = len(charge_block_set - refined_set)
@@ -720,7 +831,7 @@ from(bucket: "{solar_bucket}")
                 effective_min_socs, future_min_price, future_min_price_hour,
                 future_max_discharge_value, future_sc_value, future_sc_kwh,
                 sorted_prices, sell_fee_czk, battery_amortisation_czk,
-                first_block_ts,
+                first_block_ts, sell_production_min_soc_margin,
             )
 
         self._last_decisions = decisions
@@ -870,12 +981,17 @@ from(bucket: "{solar_bucket}")
         original_charge_set: Set[datetime],
         decisions: List[BlockDecision],
         max_soc: float,
+        charge_threshold: float,
     ) -> Set[datetime]:
         """Identify wasted charge blocks and replace with better candidates.
 
         A charge block is "wasted" if the battery was nearly full (from solar)
         and the charge action barely increased SOC. These wasted slots are
         replaced with the cheapest available hold blocks that had room to charge.
+
+        Replacements MUST still pass the profitability gate (price below
+        charge_threshold, or negative) — otherwise the refine step could inject a
+        loss-making grid charge just to "use up" a freed slot.
 
         Returns the original set if no improvement is possible.
         """
@@ -890,10 +1006,12 @@ from(bucket: "{solar_bucket}")
         if not wasted:
             return original_charge_set
 
-        # Find candidate replacement blocks: hold blocks with room to charge
+        # Find candidate replacement blocks: hold blocks with room to charge AND
+        # that pass the profitability gate (price below threshold, or negative).
         candidates = sorted(
             [(d.timestamp, d.price_czk) for d in decisions
-             if d.action == "hold" and d.soc_before < max_soc - 5],
+             if d.action == "hold" and d.soc_before < max_soc - 5
+             and (d.price_czk < charge_threshold or d.price_czk < 0)],
             key=lambda x: x[1]  # Cheapest first
         )
 
@@ -932,9 +1050,15 @@ from(bucket: "{solar_bucket}")
         sell_fee_czk: float,
         battery_amortisation_czk: float,
         first_block_ts: datetime,
+        sell_production_min_soc_margin: float = SP_MIN_SOC_MARGIN_PCT,
+        amort_export: Optional[float] = None,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Run a single forward simulation pass with given charge block set."""
         n = len(blocks)
+        # Export-only wear cost (battery→grid); falls back to the shared cost so
+        # an unset override leaves the self-consumption vs export trade unchanged.
+        if amort_export is None:
+            amort_export = battery_amortisation_czk
         soc = current_soc
         decisions: List[BlockDecision] = []
         charge_times: Set[datetime] = set()
@@ -988,7 +1112,7 @@ from(bucket: "{solar_bucket}")
             # arbitrage with hypothetical future recharge does not justify
             # destroying value now — every discharged kWh wears the battery.
             # Export pays no distribution — only the sell fee (+ battery wear).
-            sell_revenue = price_czk - sell_fee_czk - battery_amortisation_czk
+            sell_revenue = price_czk - sell_fee_czk - amort_export
             future_recharge_hour = future_min_price_hour[i] if i < n else 0
             future_dist = distribution_func(future_recharge_hour)
             recharge_cost = (future_cheapest + future_dist) / efficiency
@@ -1041,6 +1165,8 @@ from(bucket: "{solar_bucket}")
             # sells battery AND solar excess. Sell_production only sells
             # solar excess (battery passive). So when discharge fires, it
             # already covers what sell_production would do.
+            # sell_production is actuated as grid-first @ stop_soc=live SOC (battery
+            # passive), so the surplus exports at ANY SOC — no near-full gate.
             if timestamp in sell_production_set and action != "discharge":
                 action = "sell_production"
                 # Informational value: sell-now revenue × solar excess this block
@@ -1059,9 +1185,14 @@ from(bucket: "{solar_bucket}")
                 grid_charge = kwh_per_block
                 soc += (grid_charge * efficiency) / battery_capacity_kwh * 100
                 if net_from_solar > 0:
-                    solar_to_batt = min(net_from_solar * efficiency,
-                                        max_battery_kwh - battery_kwh)
-                    soc += solar_to_batt / battery_capacity_kwh * 100
+                    # Remaining headroom must exclude the grid charge just added,
+                    # else solar banking double-spends capacity and over-states
+                    # soc_after before the clamp.
+                    solar_to_batt = min(
+                        net_from_solar * efficiency,
+                        max_battery_kwh - (battery_kwh + grid_charge * efficiency),
+                    )
+                    soc += max(0.0, solar_to_batt) / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
             elif action == "discharge":
                 # `discharge_possible` is the GRID-DELIVERED energy and already
@@ -1072,11 +1203,17 @@ from(bucket: "{solar_bucket}")
                 # drains battery by grid_export / eta.
                 battery_drain = discharge_possible / efficiency
                 if net_from_solar < 0:
-                    # House deficit is also served from the battery (also lossy).
-                    # This adds on top of the grid-export drain, so the combined
-                    # drain can exceed (battery_kwh - min_battery_kwh); clamp the
-                    # final SOC at the per-block dynamic reserve, not the hw floor.
-                    battery_drain += abs(net_from_solar) / efficiency
+                    # The house deficit is ALSO served from the battery. Both the
+                    # grid-export drain and the deficit drain draw from the SAME
+                    # reserve headroom (battery_kwh - min_battery_kwh), so cap the
+                    # export drain against what's left after the deficit instead of
+                    # letting each independently drain to the floor (which the SOC
+                    # clamp would silently absorb — an energy-conservation leak).
+                    deficit_drain = abs(net_from_solar) / efficiency
+                    avail = max(0.0, battery_kwh - min_battery_kwh)
+                    battery_drain = min(
+                        battery_drain, max(0.0, avail - deficit_drain)
+                    ) + deficit_drain
                 soc -= battery_drain / battery_capacity_kwh * 100
                 soc = max(effective_min_soc, soc)
             elif action == "sell_production":

@@ -139,8 +139,12 @@ class SolcastForecast:
             )
             return dict(self._cached)
 
-        # Reserve the interval slot up front (gates the whole batch).
+        # Reserve the interval slot AND the whole batch's budget up front, before
+        # any await, so two concurrent refreshes can't both pass the gate and
+        # then over-spend the daily quota. Every site below counts (success or
+        # not), so no refund is needed.
         self._last_attempt = now_utc
+        self._req_count += n_sites
 
         params = {"format": "json", "hours": 48}
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -151,8 +155,8 @@ class SolcastForecast:
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for rid in self.rooftop_ids:
-                # Each site call counts against the daily budget (success or not).
-                self._req_count += 1
+                # Budget already reserved atomically above (self._req_count +=
+                # n_sites), so do NOT increment per-site here (double-count).
                 url = f"{self.BASE_URL}/{rid}/forecasts"
                 try:
                     async with session.get(url, params=params, headers=headers) as resp:

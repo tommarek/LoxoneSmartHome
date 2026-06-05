@@ -187,6 +187,70 @@ class GrowattConfig(BaseSettings):
                     "(kW * 0.25 kWh/block), symmetric with battery_charge_rate_kw. "
                     "Keep it consistent with discharge_power_rate if you change it."
     )
+    # --- Adaptive charge rate (opt-in, default OFF) -----------------------
+    # When enabled, the optimizer is allowed to charge faster than the gentle
+    # battery_charge_rate_kw (up to battery_charge_max_kw) and the controller
+    # sets the inverter powerRate% per charge window to the GENTLEST rate that
+    # still fills the window in time. Default OFF keeps production unchanged
+    # (fixed gentle ~25% charging).
+    adaptive_charge_rate: bool = Field(
+        default=False,
+        description="Let the optimizer pick the inverter charge powerRate per "
+                    "window (gentle unless a short cheap window needs full power)."
+    )
+    battery_charge_max_kw: float = Field(
+        default=9.8, gt=0, le=50,
+        description="True hardware max charge power (kW) at powerRate=100% "
+                    "(~9.8 kW = 4x the 2.44 kW measured at 25%). Used as the MILP "
+                    "charge cap AND the denominator for adaptive powerRate%, only "
+                    "when adaptive_charge_rate is on."
+    )
+    min_charge_power_rate: int = Field(
+        default=25, ge=10, le=100,
+        description="Floor for the adaptive charge powerRate% so charging never "
+                    "trickles below the gentle baseline."
+    )
+    # Operational power ceilings (kW) — cap the optimizer's adaptive charge/
+    # discharge speed below the raw hardware max to limit battery C-rate/wear.
+    # Default = hardware max (no extra cap). E.g. 5.3 kW ≈ 0.5C on a ~10.6 kWh
+    # pack. The powerRate% is still measured against battery_*_max_kw, so this
+    # caps both the plan (MILP rate) and the actuated powerRate.
+    max_charge_power_kw: float = Field(
+        default=9.8, gt=0, le=50,
+        description="Ceiling on adaptive charge power (kW); set below "
+                    "battery_charge_max_kw to limit C-rate. Only when "
+                    "adaptive_charge_rate is on."
+    )
+    max_discharge_power_kw: float = Field(
+        default=9.8, gt=0, le=50,
+        description="Ceiling on adaptive discharge power (kW); set below "
+                    "battery_discharge_max_kw to limit C-rate. Only when "
+                    "adaptive_discharge_rate is on."
+    )
+    # Symmetric adaptive discharge rate (opt-in, default OFF). Lets the optimizer
+    # discharge faster than the gentle ~2.5 kW to fully exploit a SHORT high-price
+    # spike it would otherwise under-drain. grid_first already writes powerRate
+    # (no guard), so only the MILP cap + per-window rate are needed.
+    adaptive_discharge_rate: bool = Field(
+        default=False,
+        description="Let the optimizer pick the inverter discharge powerRate per "
+                    "window (gentle unless a short expensive window needs full power)."
+    )
+    battery_discharge_max_kw: float = Field(
+        default=9.8, gt=0, le=50,
+        description="True hardware max discharge power (kW) at powerRate=100%. "
+                    "Used as the MILP discharge cap and the denominator for the "
+                    "adaptive discharge powerRate%, only when adaptive_discharge_rate "
+                    "is on."
+    )
+    sell_production_min_soc_margin: float = Field(
+        default=2.0, ge=0, le=20,
+        description="SOC margin below max_soc within which sell_production may "
+                    "actuate as true grid export. Below (max_soc - margin) the "
+                    "battery isn't full, so grid-first would bank surplus solar "
+                    "instead of exporting — so the controller actuates battery_hold "
+                    "(charge from solar) and the MILP won't plan sell_production."
+    )
 
     # Simple price thresholds (all in CZK/kWh for consistency)
     charge_price_max: float = Field(
@@ -445,6 +509,16 @@ class GrowattConfig(BaseSettings):
         default=2.0, ge=0,
         description="Battery wear cost per kWh discharged (CZK/kWh)"
     )
+    battery_amortisation_export_czk: Optional[float] = Field(
+        default=None, ge=0,
+        description="OPTIONAL extra-conservative wear cost per kWh applied ONLY to "
+                    "battery→grid EXPORT (arbitrage), not to battery→house self-"
+                    "consumption. Physically wear is identical, but exporting is a "
+                    "thinner, riskier bet (sell fee + price-spread speculation), so "
+                    "a higher value here raises the hurdle for cycling the battery "
+                    "purely to sell. None (default) = use battery_amortisation_czk "
+                    "for export too (single shared wear cost, original behaviour)."
+    )
 
     # Distribution tariff (Czech D57d high/low) — per-kWh IMPORT surcharge.
     # Includes systémové služby (0.164 CZK/kWh, charged on every kWh) on top of
@@ -596,8 +670,13 @@ class GrowattConfig(BaseSettings):
             parsed = json.loads(v)
         except (ValueError, TypeError) as e:
             raise ValueError(f"solar_arrays is not valid JSON: {e}")
-        if not isinstance(parsed, list) or not parsed:
-            raise ValueError("solar_arrays must be a non-empty JSON array")
+        if not isinstance(parsed, list):
+            raise ValueError("solar_arrays must be a JSON array")
+        # An empty array is valid: it just means "no arrays configured" (solar
+        # forecast disabled or using a non-array source). The gated consumer
+        # decides what to do; don't hard-fail startup here.
+        if not parsed:
+            return v
         for a in parsed:
             if not isinstance(a, dict) or not {
                 "name", "declination", "azimuth", "kwp"

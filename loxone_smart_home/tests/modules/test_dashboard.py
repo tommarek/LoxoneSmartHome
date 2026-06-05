@@ -14,8 +14,9 @@ from modules.growatt import dashboard
 
 
 class _FakeConfig:
-    distribution_tariff_high = 0.913
-    distribution_tariff_low = 0.116
+    # Mirror the real settings defaults (D57d: VT+system / NT+system).
+    distribution_tariff_high = 0.919
+    distribution_tariff_low = 0.281
     low_tariff_hours = "0-10,11-12,13-14,15-17,18-24"
 
 
@@ -50,9 +51,13 @@ def test_build_price_rows_basic_economics_and_status():
     assert discharge_row["is_current"] is False
     # net_sell = price - sell_fee - batt_amort. Export pays NO distribution, so
     # net_sell must NOT subtract the distribution tariff (which is import-only).
-    assert charging_row["distribution_czk"] in (0.91, 0.12)  # still shown for ref
+    # Hour 10 is a HIGH-tariff hour (ranges are half-open: 0-10 excludes 10),
+    # so the reference distribution must be exactly the high tariff (0.919→0.92).
+    assert charging_row["distribution_czk"] == 0.92
     assert charging_row["net_sell_czk"] == round(3.0 - 0.5 - 2.0, 2)
     assert charging_row["day"] == "today"
+    # Planned inverter powerRate is surfaced per row (None when no projection).
+    assert "projected_power_rate" in charging_row
 
 
 def test_build_price_rows_inverter_off_only_when_not_charging():
@@ -227,3 +232,73 @@ async def test_dashboard_root_serves_html():
         assert resp.status == 200
         body = await resp.text()
         assert 'class="tabbar"' in body
+
+
+def test_dashboard_has_live_header_strip_and_ptr():
+    html = dashboard.DASHBOARD_HTML
+    # Always-visible app bar with the live stat strip (solar/load/battery/grid).
+    assert 'class="appbar"' in html
+    assert 'class="statstrip"' in html
+    for sid in ("ssSolar", "ssLoad", "ssBatt", "ssGrid"):
+        assert f'id="{sid}"' in html
+    # Status dot (green/red/gray) + the renderer + dot state setter.
+    assert 'id="statusDot"' in html
+    assert "function setDot(" in html and "renderHeaderStrip" in html
+    # Pull-to-refresh element + handler + a manual refresh button.
+    assert 'class="ptr"' in html and "refreshAll" in html
+    assert 'id="refreshBtn"' in html
+    assert "touchmove" in html and "Release to refresh" in html
+
+
+# --- API/pages split (web-container decoupling) ---------------------------
+
+def _route_paths(app):
+    return {r.resource.canonical for r in app.router.routes()}
+
+
+def test_api_app_has_no_page_routes():
+    """The controller-backed API app must not serve pages — those live in the
+    standalone web container so it can restart without the controller."""
+    paths = _route_paths(dashboard.create_api_app(_fake_ctrl()))
+    assert "/api/settings" in paths and "/api/status" in paths
+    assert "/" not in paths and "/settings" not in paths
+
+
+def test_pages_app_has_no_direct_api_handlers():
+    """The pages app serves pages and proxies /api/* — it must NOT register the
+    real controller-backed handlers (it has no controller)."""
+    app = dashboard.create_pages_app("http://main:5556")
+    paths = _route_paths(app)
+    assert "/" in paths and "/settings" in paths
+    # The only /api route is the catch-all proxy, not the concrete endpoints.
+    assert "/api/status" not in paths
+    assert app["api_upstream"] == "http://main:5556"
+
+
+async def test_pages_app_proxies_api_to_upstream():
+    """End-to-end: GET + POST under /api on the pages app are forwarded to the
+    upstream and the response streamed back; method, body and status survive."""
+    from aiohttp import web as _web
+
+    async def _echo(request):
+        body = await request.text() if request.body_exists else ""
+        return _web.json_response(
+            {"method": request.method, "path": request.path, "body": body}
+        )
+
+    upstream = _web.Application()
+    upstream.router.add_route("*", "/api/{tail:.*}", _echo)
+
+    async with TestServer(upstream) as up_server:
+        up_url = f"http://127.0.0.1:{up_server.port}"
+        pages = dashboard.create_pages_app(up_url)
+        async with TestClient(TestServer(pages)) as client:
+            r = await client.get("/api/status")
+            assert r.status == 200
+            assert (await r.json()) == {
+                "method": "GET", "path": "/api/status", "body": ""
+            }
+            r2 = await client.post("/api/settings", json={"x": 1})
+            j2 = await r2.json()
+            assert j2["method"] == "POST" and j2["path"] == "/api/settings"
+            assert '"x": 1' in j2["body"]

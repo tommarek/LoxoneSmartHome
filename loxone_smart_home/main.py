@@ -23,7 +23,7 @@ from modules.ote_price_collector import OTEPriceCollector
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
 from modules.growatt.api import create_growatt_api
-from modules.growatt.dashboard import start_dashboard
+from modules.growatt.dashboard import start_api_dashboard
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
@@ -223,13 +223,19 @@ class LoxoneSmartHome:
             await self.start_api_server()
             logger.info("Legacy API server started on port 8080")
 
-        # Start monitoring dashboard on port 5555
+        # Start the controller-backed dashboard API on an internal port. The
+        # public pages (and /api proxy) are served by the separate loxone_web
+        # container so the UI can be restarted without bouncing the controller.
+        # DASHBOARD_API_PORT lets the combined/dev setup override it.
         if self.growatt_controller:
+            api_port = int(os.getenv("DASHBOARD_API_PORT", "5556"))
             try:
-                self.dashboard_runner = await start_dashboard(self.growatt_controller, port=5555)
-                logger.info("Monitoring dashboard started on port 5555")
+                self.dashboard_runner = await start_api_dashboard(
+                    self.growatt_controller, port=api_port
+                )
+                logger.info(f"Dashboard API started on port {api_port}")
             except Exception as e:
-                logger.warning(f"Failed to start dashboard: {e}")
+                logger.warning(f"Failed to start dashboard API: {e}")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""

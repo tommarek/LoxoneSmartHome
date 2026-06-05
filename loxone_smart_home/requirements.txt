@@ -16,10 +16,10 @@ schedule>=1.2.0
 requests>=2.31.0
 
 # Web framework
-fastapi>=0.104.1
-uvicorn>=0.24.0
+fastapi>=0.104.1,<1.0.0
+uvicorn>=0.24.0,<1.0.0
 python-multipart>=0.0.6
-websockets>=12.0
+websockets>=12.0,<15.0
 
 # Date/time handling
 pytz==2023.3
@@ -67,7 +67,7 @@ pytest-asyncio>=0.21.1
 black>=23.12.0
 flake8>=6.1.0
 mypy>=1.7.1
-pydantic>=2.5.2
-pydantic-settings>=2.1.0
+pydantic>=2.5.2,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
 types-requests>=2.31.0.10
 types-pytz>=2023.3.1.1

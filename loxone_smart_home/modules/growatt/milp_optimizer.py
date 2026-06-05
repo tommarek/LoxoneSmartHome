@@ -106,6 +106,13 @@ ACTION_EPS = 5e-3
 # it the amount is too small to bother (avoids mode churn). 0.1 kWh ≈ 400 W.
 SP_EXPORT_FLOOR_KWH = 0.1
 
+# Hardware reality (SPH grid-first): the inverter can only export-without-
+# charging when the battery is FULL. Below (max_soc - this margin) it banks
+# surplus solar into the battery instead, so the plan must NOT schedule
+# sell_production there — it would be physically impossible (and mislabel a
+# charge as a sale). Keep in sync with config.sell_production_min_soc_margin.
+SP_MIN_SOC_MARGIN_PCT = 2.0
+
 # A grid-EXPORT (discharge-to-grid) block must move at least this fraction of
 # the grid-first power rate. The controller actuates discharge as on/off at a
 # fixed powerRate, so without a floor the solver scatters many trivial sub-rate
@@ -125,6 +132,13 @@ MIN_GRID_DISCHARGE_FRACTION = 0.5
 # the evening PEAK to satisfy the reserve" — a guaranteed loss (the live
 # incident). So this is 0: the only hard battery floor is min_soc (the soc var
 # lower bound); the reserve is the model's economic decision, not a heuristic.
+#
+# IMPORTANT: keep this 0 until the reserve-floor loss convention is unified with
+# the MILP SOC dynamics. The shared _compute_reserve_soc_per_block helper models
+# losses with the FULL round-trip efficiency, while MILP SOC continuity uses the
+# sqrt-split per-leg eta — so eff_min_kwh and the soc it constrains use different
+# conventions. That mismatch is inert only because this penalty is 0; making it
+# nonzero would apply a (~sqrt-scale) mis-scaled soft floor.
 RESERVE_SHORTFALL_FLOOR = 0.0
 
 
@@ -154,6 +168,11 @@ class MILPBatteryOptimizer:
         from .optimizer import BatteryOptimizer
         self._helper = BatteryOptimizer(logger=self.logger)
         self._last_decisions: List[BlockDecision] = []
+        # Which engine produced _last_decisions: 'milp' (sqrt-split η per leg) or
+        # 'greedy' (full η on one leg). The controller/dashboard use this to pick
+        # the correct ΔSOC↔grid-side conversion for adaptive powerRate sizing —
+        # a MILP solve that fell back to greedy carries greedy's SOC convention.
+        self._last_engine: str = "milp"
         self._last_reserve_info: Dict = {}
         # Deferrable-load placements from the most recent solve, exposed to
         # the controller for dashboard + MQTT actuation. List[DeferrableLoadSchedule].
@@ -187,7 +206,9 @@ class MILPBatteryOptimizer:
                          distribution_func, battery_capacity_kwh, current_soc,
                          min_soc, max_soc, charge_rate_kw, discharge_rate_kw,
                          discharge_power_pct, efficiency, sell_fee_czk,
-                         battery_amortisation_czk, deferrable_loads=None):
+                         battery_amortisation_czk, deferrable_loads=None,
+                         sell_production_min_soc_margin=SP_MIN_SOC_MARGIN_PCT,
+                         battery_amortisation_export_czk=None):
         """Run the greedy engine and adopt its decisions as our own.
 
         Used when the MILP solve is infeasible, times out, or raises, so the
@@ -216,8 +237,15 @@ class MILPBatteryOptimizer:
             efficiency=efficiency,
             sell_fee_czk=sell_fee_czk,
             battery_amortisation_czk=battery_amortisation_czk,
+            battery_amortisation_export_czk=battery_amortisation_export_czk,
+            sell_production_min_soc_margin=sell_production_min_soc_margin,
         )
         self._last_decisions = result[3]
+        self._last_engine = "greedy"  # decisions now carry greedy's SOC convention
+        # Keep the switch-penalty anchor in sync with what we actually returned,
+        # so the NEXT solve doesn't penalise deviations from a stale MILP plan
+        # that was never applied (the fallback replaced it).
+        self._prev_actions = {d.timestamp: d.action for d in result[3]}
         return result
 
     def _overlay_deferrable_for_greedy(
@@ -266,14 +294,19 @@ class MILPBatteryOptimizer:
         max_soc: float = 100.0,
         charge_rate_kw: float = 2.5,
         discharge_rate_kw: float = 2.5,
+        # Accepted for engine-signature parity but IGNORED by the MILP energy
+        # model: batt_to_grid_max = discharge_rate_kw*0.25 (the '4x too slow'
+        # fix, commit 7f2f31a). Guarded by test_milp_discharge_rate_independent…
         discharge_power_pct: float = 25.0,
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,
         battery_amortisation_czk: float = 2.0,
+        battery_amortisation_export_czk: Optional[float] = None,
         deferrable_loads: Optional[Sequence[Any]] = None,
         switch_penalty_czk: float = 0.0,
         export_price_min: Optional[float] = None,
         inverter_off_price: Optional[float] = None,
+        sell_production_min_soc_margin: float = SP_MIN_SOC_MARGIN_PCT,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Solve the full-horizon schedule via MILP (energy-flow model).
 
@@ -298,7 +331,8 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads,
+                deferrable_loads, sell_production_min_soc_margin,
+                battery_amortisation_export_czk=battery_amortisation_export_czk,
             )
 
         if not blocks:
@@ -322,6 +356,9 @@ class MILPBatteryOptimizer:
         batt_to_grid_max = batt_out_max
         max_battery_kwh = battery_capacity_kwh * max_soc / 100.0
         min_battery_kwh = battery_capacity_kwh * min_soc / 100.0
+        # SOC at/above which sell_production (pure grid export, battery passive)
+        # is physically possible — below it the inverter banks surplus solar.
+        sp_min_kwh = battery_capacity_kwh * max(0.0, max_soc - sell_production_min_soc_margin) / 100.0
         start_battery_kwh = battery_capacity_kwh * current_soc / 100.0
 
         # Split the round-trip efficiency symmetrically across the two legs so
@@ -339,8 +376,16 @@ class MILPBatteryOptimizer:
         # applies to IMPORT only. (Was spot − dist − fee, which under-valued export
         # by the whole distribution tariff and made it hoard/curtail sellable solar.)
         export_now = [prices[i] - sell_fee_czk for i in range(n)]
+        # Wear cost charged on battery→GRID export. Defaults to the shared wear
+        # cost; an explicit export override raises the arbitrage hurdle without
+        # touching battery→house self-consumption. Unset → identical to before.
+        amort_export = (
+            battery_amortisation_czk
+            if battery_amortisation_export_czk is None
+            else battery_amortisation_export_czk
+        )
         # Battery export NET of wear (the "never export at a loss" gate).
-        sell_revenue = [export_now[i] - battery_amortisation_czk for i in range(n)]
+        sell_revenue = [export_now[i] - amort_export for i in range(n)]
         # Grid import cost per kWh (paid on both load and battery charge).
         import_cost = [prices[i] + dists[i] for i in range(n)]
 
@@ -351,6 +396,15 @@ class MILPBatteryOptimizer:
         for ts, _ in blocks:
             s = _forecast_value(solar_hourly, ts) / 4.0
             c = _forecast_value(consumption_hourly, ts) / 4.0
+            if c <= 0:
+                # Mirror the greedy engine AND the shared reserve helper: a
+                # missing/zero consumption entry falls back to the learned
+                # base-load profile, so the MILP load balance never sees 0 house
+                # load where the reserve floor (eff_min_kwh) assumed real base
+                # load — an intra-MILP + cross-engine inconsistency otherwise.
+                c = self._helper._base_load_profile.get(
+                    ts.hour, ts.weekday() >= 5
+                ) / 4.0
             solar_block.append(s)
             consumption_block.append(c)
             solar_excess.append(max(0.0, s - c))
@@ -380,6 +434,15 @@ class MILPBatteryOptimizer:
         is_charge = [pulp.LpVariable(f"ic_{i}", cat="Binary") for i in range(n)]
         is_disch  = [pulp.LpVariable(f"id_{i}", cat="Binary") for i in range(n)]
         is_sp     = [pulp.LpVariable(f"isp_{i}", cat="Binary") for i in range(n)]
+        # Physical battery-charging indicator (covers BOTH grid charge and solar
+        # banking). Makes total battery charge and total battery discharge
+        # mutually exclusive per block — a single inverter can't do both at once.
+        is_batt_chg = [pulp.LpVariable(f"bc_{i}", cat="Binary") for i in range(n)]
+        # Battery near-full indicator: only when SOC ≥ sp_min_kwh can a load_first
+        # (hold) block actually EXPORT surplus solar — below that the inverter
+        # banks it into the battery. Gates solar_to_grid so the plan matches that
+        # hardware reality (see the solar_to_grid bound below).
+        near_full = [pulp.LpVariable(f"nf_{i}", cat="Binary") for i in range(n)]
         soc = [
             pulp.LpVariable(f"soc_{i}", min_battery_kwh, max_battery_kwh)
             for i in range(n + 1)
@@ -412,17 +475,20 @@ class MILPBatteryOptimizer:
                 == c + deferrable_draw[i]
             )
 
-            # Battery power limits. Inflow capped by charge rate; outflow capped
-            # by full inverter power AND forbidden during a charge block (the
-            # inverter can't charge and discharge at once).
-            prob += grid_charge[i] + solar_to_batt[i] <= charge_max
-            prob += batt_to_load[i] + batt_to_grid[i] <= batt_out_max * (1 - is_charge[i])
-            # A single inverter can't charge and discharge at once. Discharge
-            # (to load or grid) is already gated by is_charge above; gate solar
-            # banking by (1-is_disch) so the battery can't simultaneously bank
-            # solar AND discharge. Solar banking stays allowed on hold/charge
-            # blocks (is_disch=0), so this never blocks legitimate banking.
-            prob += solar_to_batt[i] <= charge_max * (1 - is_disch[i])
+            # Battery power limits, mutually exclusive via is_batt_chg: ALL
+            # charge (grid + solar banking) is gated by is_batt_chg, ALL discharge
+            # (to load + to grid) by (1 - is_batt_chg). A single inverter can't
+            # charge and discharge at once — this also forbids the otherwise-legal
+            # hold-block combo of solar_to_batt>0 AND batt_to_load>0 (physically
+            # impossible). Grid charge is additionally capped by is_charge (the
+            # grid-facing mode indicator) further below.
+            prob += grid_charge[i] + solar_to_batt[i] <= charge_max * is_batt_chg[i]
+            prob += batt_to_load[i] + batt_to_grid[i] <= batt_out_max * (1 - is_batt_chg[i])
+            # sell_production actuates grid-first with the battery PASSIVE (it does
+            # NOT serve the house). Forbid batt_to_load on is_sp blocks so the plan
+            # can't bank self-consumption value the hardware won't realise (the
+            # deficit is served from grid there) — keeps plan and actuation aligned.
+            prob += batt_to_load[i] <= batt_out_max * (1 - is_sp[i])
 
             # SOC continuity: charge legs gain energy at η_chg; discharge legs
             # deplete the battery at 1/η_dis (wear is priced in the objective).
@@ -445,15 +511,30 @@ class MILPBatteryOptimizer:
             prob += batt_to_grid[i] >= (
                 MIN_GRID_DISCHARGE_FRACTION * batt_to_grid_max * is_disch[i]
             )
-            # Surplus PV always feeds to grid on a grid-tie inverter, regardless
-            # of the battery mode — so allow solar export up to the block's
-            # surplus in ANY block. The solver still prefers self-consumption and
-            # battery charging (higher per-kWh value); it only spills to grid the
-            # excess that can't be used, and curtails (penalty) only when export
-            # is unprofitable (negative price). Gating this to is_sp/is_disch
-            # forced realistic full-battery surplus into curtailment and
-            # understated export revenue on hold/charge blocks.
+            # Surplus PV can spill to grid, but only where the HARDWARE actually
+            # exports it — otherwise a plain hold block actuates load_first, which
+            # banks the surplus into the battery (SOC rises) instead of exporting,
+            # so a plan that exported it would diverge from reality. Surplus
+            # export is allowed up to the block's surplus when the block is a
+            # grid-facing mode (is_disch/is_sp) OR the battery is near full
+            # (near_full → load_first genuinely spills the excess), PLUS the
+            # always-physical overflow that exceeds the charge rate (can't be
+            # banked fast enough even at mid-SOC). Hard cap stays at the surplus.
+            phys_overflow = max(0.0, max(0.0, s - c) - charge_max)
+            prob += solar_to_grid[i] <= (
+                phys_overflow
+                + max(s, 0.0) * (near_full[i] + is_disch[i] + is_sp[i])
+            )
             prob += solar_to_grid[i] <= max(s, 0.0)
+            # NOTE: no combined AC grid-export cap (solar_to_grid + batt_to_grid)
+            # is modelled — the SPH battery DC rate (batt_to_grid_max) is already
+            # conservative vs the larger inverter AC rating, and structural solar
+            # surplus on a discharge block is small. If an inverter AC export
+            # limit is ever configured, add `solar_to_grid[i] + batt_to_grid[i]
+            # <= ac_export_max` here.
+            # near_full may only be 1 when SOC is genuinely near full (≥sp_min),
+            # so it can't be used to license mid-SOC export.
+            prob += soc[i] >= sp_min_kwh - max_battery_kwh * (1 - near_full[i])
             # One grid-facing mode per block.
             prob += is_charge[i] + is_disch[i] + is_sp[i] <= 1
 
@@ -494,6 +575,10 @@ class MILPBatteryOptimizer:
                 prob += is_sp[i] == 0
             else:
                 prob += solar_to_grid[i] >= SELL_PRODUCTION_MIN_EXCESS_KWH * is_sp[i]
+            # NOTE: no SOC gate on is_sp. sell_production is actuated as grid-first
+            # with stop_soc pinned to the LIVE SOC (controller _build_desired_state),
+            # so the battery stays passive and the surplus exports at ANY SOC — the
+            # solver may freely choose export vs banking per-block on economics.
 
         # Terminal value of leftover SOC = avoided future import (spot+dist-amort),
         # the TRUE worth of stored energy. Capped below the cheapest grid-charge
@@ -506,13 +591,17 @@ class MILPBatteryOptimizer:
             max(0.0, sc_values[len(sc_values) // 2]) if sc_values else 0.0
         )
         min_charge_cost = min(import_cost) if import_cost else 0.0
-        if min_charge_cost > 0:
-            # Cap uses the ROUND-TRIP efficiency on purpose (not the per-leg
-            # `eta`): the break-even for "charge cheap now, use later" is the
-            # full charge→store→discharge cycle. Don't "fix" this to `eta`.
-            terminal_value_per_kwh = min(
-                terminal_value_per_kwh, min_charge_cost / max(1e-3, efficiency)
-            )
+        # Cap uses the ROUND-TRIP efficiency on purpose (not the per-leg `eta`):
+        # the break-even for "charge cheap now, use later" is the full
+        # charge→store→discharge cycle. Don't "fix" this to `eta`. Apply the cap
+        # ALWAYS (not only when min_charge_cost > 0): on a deeply-negative-price
+        # day min(import_cost) can be ≤ 0 while the median stays positive, and the
+        # max(0.0, …) floor then correctly drives terminal value to 0 — otherwise
+        # the cap is skipped and SOC-hoarding (grid-charge to inflate end SOC)
+        # gets rewarded exactly when it shouldn't.
+        terminal_value_per_kwh = max(0.0, min(
+            terminal_value_per_kwh, min_charge_cost / max(1e-3, efficiency)
+        ))
         # Slightly discount the (estimated, future) terminal value so a
         # CERTAIN present-block self-consumption saving always wins ties
         # against hoarding energy for an uncertain later benefit. Without this
@@ -524,11 +613,15 @@ class MILPBatteryOptimizer:
             solar_to_grid[i] * export_now[i]
             + batt_to_grid[i] * export_now[i]
             - (grid_to_load[i] + grid_charge[i]) * import_cost[i]
-            - (batt_to_load[i] + batt_to_grid[i]) * battery_amortisation_czk
+            - batt_to_load[i] * battery_amortisation_czk
+            - batt_to_grid[i] * amort_export
             - curtail[i] * CURTAIL_PENALTY
             - reserve_short[i] * RESERVE_SHORTFALL_FLOOR
             for i in range(n)
-        ) + soc[n] * terminal_value_per_kwh
+        ) + soc[n] * terminal_value_per_kwh * eta
+        # ^ multiply by the discharge-leg loss: stored soc[n] can only deliver
+        #   soc[n]*eta to load/grid, so value it at the delivered rate (not the
+        #   full stored kWh), matching the SOC-continuity discharge term.
 
         # Schedule-churn damping: a tiny cost for deviating from the previous
         # plan's headline action, so noisy price/forecast updates don't reshuffle
@@ -557,7 +650,8 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads,
+                deferrable_loads, sell_production_min_soc_margin,
+                battery_amortisation_export_czk=battery_amortisation_export_czk,
             )
         if status_str != "Optimal":
             # Infeasible / Unbounded / Undefined / timed-out without an optimum:
@@ -571,7 +665,8 @@ class MILPBatteryOptimizer:
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
                 charge_rate_kw, discharge_rate_kw, discharge_power_pct,
                 efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads,
+                deferrable_loads, sell_production_min_soc_margin,
+                battery_amortisation_export_czk=battery_amortisation_export_czk,
             )
 
         # Materialise results.
@@ -616,16 +711,12 @@ class MILPBatteryOptimizer:
                 sp_times.add(ts)
                 net_value = sg * export_now[i]
             elif sg > SP_EXPORT_FLOOR_KWH and sb < ACTION_EPS:
-                # Surplus solar is being EXPORTED while the battery is NOT
-                # charging from it (the solver chose export over charge for this
-                # block). Plain "hold" maps to load_first, which charges the
-                # battery from surplus BEFORE it spills to grid — so it would
-                # silently store the solar instead of selling it (e.g. cheap-
-                # midday vs high-morning timing). Actuate sell_production
-                # (grid_first, battery passive) so the surplus is actually sold,
-                # matching the plan. Mirrors the battery_hold fix: honour the
-                # solver's solar-flow decision instead of letting the default
-                # load_first mode override it.
+                # Surplus solar is being EXPORTED while the battery is NOT charging
+                # from it — actuate sell_production (grid-first @ stop_soc=live SOC,
+                # battery passive) so the surplus is actually SOLD, at any SOC.
+                # Plain "hold" maps to load_first, which would charge the surplus
+                # into the battery before spilling to grid — silently storing it
+                # instead of selling. Honour the solver's solar-flow decision.
                 action = "sell_production"
                 sp_times.add(ts)
                 net_value = sg * export_now[i]
@@ -660,6 +751,7 @@ class MILPBatteryOptimizer:
             ))
 
         self._last_decisions = decisions
+        self._last_engine = "milp"
         self._prev_actions = new_actions
         self._last_deferrable_schedules = self._extract_deferrable_schedules(
             blocks, deferrable_meta, import_cost, val
@@ -754,6 +846,11 @@ class MILPBatteryOptimizer:
             meta.append({
                 "load": load, "requested": requested, "scheduled": nb_eff,
                 "block_energy": block_energy, "run": run_by_block, "win": win,
+                # True when a NON-interruptible load was scattered because no
+                # contiguous slot fit — its naive baseline must then use the
+                # scattered (interruptible) form, not a contiguous run it never
+                # actually ran, or savings_czk is mis-stated.
+                "scattered": (not load.interruptible) and (not placed),
             })
 
         draw = [pulp.lpSum(terms) if terms else 0.0 for terms in draw_terms]
@@ -830,6 +927,14 @@ class MILPBatteryOptimizer:
             run = m["run"]
             chosen_idx = sorted(i for i in win if val(run[i]) > 0.5) if run else []
 
+            # NOTE: expected_cost_czk / naive_cost_czk price each block's energy
+            # as 100% grid import (import_cost[i] * block_energy). This is a
+            # grid-priced UPPER BOUND for reporting only — it ignores that the
+            # deferrable draw may be served by PV surplus or battery in the solved
+            # plan. It does NOT enter the objective/dispatch. The relative
+            # savings_czk (naive − expected, same block_energy on both) stays
+            # meaningful as a scheduling-shift metric; only the absolute figures
+            # are overstated on PV/battery-served days.
             blocks_hhmm: List[Tuple[str, str]] = []
             block_dts: List[datetime] = []
             expected = 0.0
@@ -844,8 +949,16 @@ class MILPBatteryOptimizer:
             # baseline must match the chosen plan's contiguity (earliest
             # contiguous run) — otherwise savings_czk is mis-stated against a
             # cheaper scattered baseline the load could never actually run.
+            # k == nb_eff == min(requested, len(win)); on a SHORTFALL day
+            # (window shorter than requested) the optimizer runs all available
+            # blocks, so the ASAP baseline win[:k] spans the same blocks and
+            # reported savings collapse to ~0 — correct: there is no scheduling
+            # slack to exploit, so savings_czk reflects only the scheduled blocks.
             k = len(chosen_idx)
-            if load.interruptible:
+            # A non-interruptible load that was SCATTERED (no contiguous slot fit)
+            # actually ran in pieces, so its baseline must be the scattered ASAP
+            # form too — not a contiguous run it never performed.
+            if load.interruptible or m.get("scattered"):
                 naive_idx = win[:k]
             else:
                 positions = earliest_contiguous_run([blocks[i][0] for i in win], k)

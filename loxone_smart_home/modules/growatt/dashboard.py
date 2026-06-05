@@ -368,8 +368,8 @@ def _build_price_rows(
     thresholds = PriceThresholds(
         charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
         discharge_profit_margin=4.0, battery_efficiency=0.85,
-        distribution_tariff_high=getattr(ctrl.config, 'distribution_tariff_high', 0.913),
-        distribution_tariff_low=getattr(ctrl.config, 'distribution_tariff_low', 0.116),
+        distribution_tariff_high=ctrl.config.distribution_tariff_high,
+        distribution_tariff_low=ctrl.config.distribution_tariff_low,
         low_tariff_hours=getattr(
             ctrl.config, 'low_tariff_hours', '0-10,11-12,13-14,15-17,18-24'
         ),
@@ -429,6 +429,7 @@ def _build_price_rows(
             "projected_solar": proj.get("solar_kwh"),
             "projected_consumption": proj.get("consumption_kwh"),
             "projected_net_flow": proj.get("net_flow_kwh"),
+            "projected_power_rate": proj.get("power_rate"),
         })
     return rows
 
@@ -455,6 +456,30 @@ async def api_prices(request: web.Request) -> web.Response:
     if hasattr(ctrl, '_optimizer') and ctrl._optimizer:
         decisions = getattr(ctrl._optimizer, '_last_decisions', [])
         first_date = decisions[0].timestamp.date() if decisions else now.date()
+        # Planned inverter powerRate% per charge/discharge block (the speed the
+        # optimizer would run the slot at). Computed against the hardware max so
+        # it reads honestly even with adaptive off (gentle ≈ floor everywhere).
+        from modules.growatt.optimizer import compute_charge_power_rates
+        _cmax = getattr(ctrl.config, 'battery_charge_max_kw', 9.8)
+        _dmax = getattr(ctrl.config, 'battery_discharge_max_kw', 9.8)
+        from modules.growatt.optimizer import compute_rate_ceiling
+        _chg_cap = compute_rate_ceiling(_cmax, getattr(ctrl.config, 'max_charge_power_kw', _cmax))
+        _dis_cap = compute_rate_ceiling(_dmax, getattr(ctrl.config, 'max_discharge_power_kw', _dmax))
+        _engine_used = getattr(getattr(ctrl, '_optimizer', None), '_last_engine', 'greedy')
+        _eff = getattr(ctrl.config, 'battery_efficiency', 0.85)
+        _leg_eta = _eff ** 0.5 if _engine_used == 'milp' else _eff
+        charge_rates = compute_charge_power_rates(
+            decisions, batt_cap, _cmax,
+            int(getattr(ctrl.config, 'min_charge_power_rate', 25)),
+            action="charge", max_power_rate=_chg_cap,
+            efficiency=_leg_eta,
+        )
+        disch_rates = compute_charge_power_rates(
+            decisions, batt_cap, _dmax,
+            int(getattr(ctrl.config, 'discharge_power_rate', 25)),
+            action="discharge", max_power_rate=_dis_cap,
+            efficiency=_leg_eta,
+        )
         for d in decisions:
             day = "tomorrow" if d.timestamp.date() != first_date else "today"
             key = f"{day}:{d.timestamp.strftime('%H:%M')}"
@@ -467,6 +492,7 @@ async def api_prices(request: web.Request) -> web.Response:
                 "solar_kwh": round(d.solar_kwh, 2),
                 "consumption_kwh": round(d.consumption_kwh, 2),
                 "net_flow_kwh": round(net_flow, 2),
+                "power_rate": charge_rates.get(d.timestamp) or disch_rates.get(d.timestamp),
             }
 
     pre_discharge = getattr(ctrl, '_pre_discharge_blocks_today', set())
@@ -524,6 +550,25 @@ async def api_projection(request: web.Request) -> web.Response:
         return web.json_response({"timeline": []})
 
     battery_capacity = getattr(ctrl.config, 'battery_capacity', 10.0)
+    from modules.growatt.optimizer import compute_charge_power_rates
+    _cmax = getattr(ctrl.config, 'battery_charge_max_kw', 9.8)
+    _dmax = getattr(ctrl.config, 'battery_discharge_max_kw', 9.8)
+    from modules.growatt.optimizer import compute_rate_ceiling
+    _chg_cap = compute_rate_ceiling(_cmax, getattr(ctrl.config, 'max_charge_power_kw', _cmax))
+    _dis_cap = compute_rate_ceiling(_dmax, getattr(ctrl.config, 'max_discharge_power_kw', _dmax))
+    _engine_used = getattr(getattr(ctrl, '_optimizer', None), '_last_engine', 'greedy')
+    _eff = getattr(ctrl.config, 'battery_efficiency', 0.85)
+    _leg_eta = _eff ** 0.5 if _engine_used == 'milp' else _eff
+    charge_rates = compute_charge_power_rates(
+        decisions, battery_capacity, _cmax,
+        int(getattr(ctrl.config, 'min_charge_power_rate', 25)),
+        action="charge", max_power_rate=_chg_cap, efficiency=_leg_eta,
+    )
+    disch_rates = compute_charge_power_rates(
+        decisions, battery_capacity, _dmax,
+        int(getattr(ctrl.config, 'discharge_power_rate', 25)),
+        action="discharge", max_power_rate=_dis_cap, efficiency=_leg_eta,
+    )
     timeline = []
     for d in decisions:
         kwh = battery_capacity * d.soc_after / 100
@@ -539,6 +584,7 @@ async def api_projection(request: web.Request) -> web.Response:
             "solar_kwh": round(d.solar_kwh, 2),
             "consumption_kwh": round(d.consumption_kwh, 2),
             "net_flow_kwh": round(net_flow_kwh, 2),
+            "power_rate": charge_rates.get(d.timestamp) or disch_rates.get(d.timestamp),
         })
 
     return web.json_response({"timeline": timeline})
@@ -877,6 +923,46 @@ async def api_reapply(request: web.Request) -> web.Response:
     return web.json_response(result)
 
 
+async def api_settings_get(request: web.Request) -> web.Response:
+    """Return the grouped editable-settings schema with current values."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"error": "Controller not ready"}, status=503)
+    try:
+        return web.json_response({"groups": ctrl.get_settings_schema()})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_settings_post(request: web.Request) -> web.Response:
+    """Validate, persist and hot-apply edited settings."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"error": "Controller not ready"}, status=503)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"success": False, "message": "Invalid JSON body"},
+                                 status=400)
+    updates = body.get("updates", body) if isinstance(body, dict) else None
+    if not isinstance(updates, dict) or not updates:
+        return web.json_response(
+            {"success": False, "message": "Expected a non-empty object of settings"},
+            status=400,
+        )
+    result = await ctrl.apply_setting_overrides(updates)
+    status = 200 if result.get("success") else 400
+    return web.json_response(result, status=status)
+
+
+async def settings_page(request: web.Request) -> web.Response:
+    """Serve the settings editor page."""
+    return web.Response(
+        text=SETTINGS_HTML, content_type="text/html",
+        headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+    )
+
+
 async def dashboard_page(request: web.Request) -> web.Response:
     """Serve the main dashboard HTML page."""
     return web.Response(
@@ -933,20 +1019,13 @@ async def icon_512_page(request: web.Request) -> web.Response:
 
 # --- Dashboard Setup ---
 
-def create_dashboard_app(controller=None) -> web.Application:
-    """Create the dashboard web application."""
-    app = web.Application()
-    if controller:
-        app["controller"] = controller
+def _add_api_routes(app: "web.Application") -> None:
+    """Register the controller-backed JSON + control endpoints.
 
-    app.router.add_get("/", dashboard_page)
-    # PWA assets
-    app.router.add_get("/manifest.webmanifest", manifest_page)
-    app.router.add_get("/sw.js", sw_page)
-    app.router.add_get("/icon.svg", icon_svg_page)
-    app.router.add_get("/icon-180.png", icon_180_page)
-    app.router.add_get("/icon-192.png", icon_192_page)
-    app.router.add_get("/icon-512.png", icon_512_page)
+    These read live in-process controller state (and the in-process telemetry
+    cache), so they MUST run in the same process as the controller — i.e. the
+    main service, never the standalone web container.
+    """
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/live", api_live)
     app.router.add_get("/api/prices", api_prices)
@@ -960,43 +1039,427 @@ def create_dashboard_app(controller=None) -> web.Application:
     app.router.add_post("/api/override", api_override_set)
     app.router.add_delete("/api/override", api_override_clear)
     app.router.add_post("/api/reapply", api_reapply)
+    app.router.add_get("/api/settings", api_settings_get)
+    app.router.add_post("/api/settings", api_settings_post)
 
+
+def _add_page_routes(app: "web.Application") -> None:
+    """Register the static page + PWA-asset routes (no controller needed).
+
+    These serve only embedded HTML/JS/icons, so they can run in a standalone
+    web container that is restarted freely without touching the controller.
+    """
+    app.router.add_get("/", dashboard_page)
+    app.router.add_get("/settings", settings_page)
+    app.router.add_get("/manifest.webmanifest", manifest_page)
+    app.router.add_get("/sw.js", sw_page)
+    app.router.add_get("/icon.svg", icon_svg_page)
+    app.router.add_get("/icon-180.png", icon_180_page)
+    app.router.add_get("/icon-192.png", icon_192_page)
+    app.router.add_get("/icon-512.png", icon_512_page)
+
+
+def create_dashboard_app(controller=None) -> web.Application:
+    """Create the COMBINED dashboard app (pages + API in one process).
+
+    Used for single-process / dev runs (and back-compat). Production splits
+    these via create_api_app() + create_pages_app().
+    """
+    app = web.Application()
+    if controller:
+        app["controller"] = controller
+    _add_page_routes(app)
+    _add_api_routes(app)
     return app
+
+
+def create_api_app(controller) -> web.Application:
+    """API-only app for the main (controller) container."""
+    app = web.Application()
+    app["controller"] = controller
+    _add_api_routes(app)
+    return app
+
+
+def create_pages_app(api_upstream: str) -> web.Application:
+    """Pages-only app for the standalone web container.
+
+    Serves the embedded HTML/assets and reverse-proxies everything under
+    ``/api/`` to the main container's API app (``api_upstream``), so the
+    browser sees a single origin (no CORS) and the controller-backed data
+    still comes from the live service.
+    """
+    app = web.Application()
+    app["api_upstream"] = api_upstream.rstrip("/")
+    _add_page_routes(app)
+    # Catch-all proxy for the JSON + control API (incl. the SSE log stream).
+    app.router.add_route("*", "/api/{tail:.*}", _proxy_to_api)
+    return app
+
+
+# Hop-by-hop headers that must not be forwarded across the proxy (RFC 7230),
+# plus content framing headers we let aiohttp recompute for the new response.
+_HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "content-encoding",
+    "content-length",
+}
+
+
+async def _proxy_to_api(request: "web.Request") -> "web.StreamResponse":
+    """Stream-proxy a request to the main container's API app.
+
+    Streams the upstream response body chunk-by-chunk so Server-Sent Events
+    (``/api/logs/stream``) keep flowing instead of buffering forever.
+    """
+    import aiohttp
+
+    upstream = request.app["api_upstream"]
+    url = upstream + request.rel_url.raw_path_qs
+    fwd_headers = {
+        k: v for k, v in request.headers.items()
+        if k.lower() not in _HOP_BY_HOP and k.lower() != "host"
+    }
+    body = await request.read() if request.body_exists else None
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=5, sock_read=None)
+    session = aiohttp.ClientSession(timeout=timeout, auto_decompress=False)
+    try:
+        up = await session.request(
+            request.method, url, headers=fwd_headers, data=body,
+            allow_redirects=False,
+        )
+    except aiohttp.ClientError as e:
+        await session.close()
+        return web.json_response(
+            {"error": f"API upstream unreachable: {e}"}, status=502
+        )
+    try:
+        resp = web.StreamResponse(status=up.status)
+        for k, v in up.headers.items():
+            if k.lower() not in _HOP_BY_HOP:
+                resp.headers[k] = v
+        await resp.prepare(request)
+        async for chunk in up.content.iter_any():
+            await resp.write(chunk)
+        await resp.write_eof()
+        return resp
+    finally:
+        up.release()
+        await session.close()
 
 
 _dashboard_handler_installed = False
 
 
-async def start_dashboard(controller, port: int = 5555) -> "web.AppRunner":
-    """Start the dashboard web server.
+def _install_log_handler() -> None:
+    """Attach the SSE log-capture handler to the controller logger once.
 
-    Returns the AppRunner so the caller can ``await runner.cleanup()`` on
-    shutdown — otherwise the listener socket leaks and can block re-bind on a
-    fast restart.
+    Must run in the MAIN (controller) process — that's where the log records
+    originate and where the SSE buffer the API serves lives.
     """
     global _dashboard_handler_installed
+    if _dashboard_handler_installed:
+        return
+    growatt_logger = logging.getLogger("modules.base.GrowattController")
+    growatt_logger.handlers = [
+        h for h in growatt_logger.handlers
+        if not isinstance(h, DashboardLogHandler)
+    ]
+    handler = DashboardLogHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    growatt_logger.addHandler(handler)
+    _dashboard_handler_installed = True
+
+
+async def _serve_app(app: "web.Application", port: int, what: str) -> "web.AppRunner":
+    """Bind an aiohttp app on 0.0.0.0:port and return its runner."""
     logger = logging.getLogger(__name__)
-
-    # Install log handler only once (prevents duplicates on restart)
-    if not _dashboard_handler_installed:
-        growatt_logger = logging.getLogger("modules.base.GrowattController")
-        # Remove any existing DashboardLogHandlers first
-        growatt_logger.handlers = [
-            h for h in growatt_logger.handlers
-            if not isinstance(h, DashboardLogHandler)
-        ]
-        handler = DashboardLogHandler()
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        growatt_logger.addHandler(handler)
-        _dashboard_handler_installed = True
-
-    app = create_dashboard_app(controller)
     runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"Dashboard listening on http://0.0.0.0:{port}")
+    logger.info(f"{what} listening on http://0.0.0.0:{port}")
     return runner
+
+
+async def start_dashboard(controller, port: int = 5555) -> "web.AppRunner":
+    """Start the COMBINED dashboard (pages + API) in one process.
+
+    Back-compat / single-process dev entry. Production uses
+    start_api_dashboard() (main container) + start_pages_dashboard() (web
+    container) instead. Returns the AppRunner so the caller can
+    ``await runner.cleanup()`` on shutdown.
+    """
+    _install_log_handler()
+    return await _serve_app(create_dashboard_app(controller), port, "Dashboard")
+
+
+async def start_api_dashboard(controller, port: int = 5556) -> "web.AppRunner":
+    """Start the controller-backed API app (main container)."""
+    _install_log_handler()
+    return await _serve_app(create_api_app(controller), port, "Dashboard API")
+
+
+async def start_pages_dashboard(api_upstream: str, port: int = 5555) -> "web.AppRunner":
+    """Start the standalone pages app + API proxy (web container)."""
+    return await _serve_app(create_pages_app(api_upstream), port, "Dashboard pages")
+
+
+# --- Embedded Settings Editor ---
+
+SETTINGS_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Growatt Settings</title>
+<style>
+  :root{
+    --bg:#0f1216; --card:#1a1f27; --card2:#222834; --text:#e6e9ef; --muted:#8a93a6;
+    --accent:#4ea1ff; --green:#3ecf8e; --amber:#f5b942; --red:#ff6b6b; --border:#2a313d;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;font-size:15px}
+  a{color:var(--accent)}
+  .appbar{position:sticky;top:0;z-index:10;background:var(--card);
+    border-bottom:1px solid var(--border);padding:12px 16px;
+    display:flex;align-items:center;justify-content:space-between;gap:12px}
+  .appbar h1{font-size:17px;margin:0;font-weight:600}
+  .appbar .sub{font-size:12px;color:var(--muted)}
+  .back{color:var(--accent);text-decoration:none;font-size:14px}
+  .container{max-width:780px;margin:0 auto;padding:16px;padding-bottom:120px}
+  .group{background:var(--card);border:1px solid var(--border);border-radius:12px;
+    margin-bottom:16px;overflow:hidden}
+  .group > h2{margin:0;padding:14px 16px;font-size:15px;background:var(--card2);
+    border-bottom:1px solid var(--border)}
+  .group .gdesc{padding:8px 16px 0;font-size:12.5px;color:var(--muted)}
+  .field{display:flex;align-items:center;gap:12px;padding:12px 16px;
+    border-top:1px solid var(--border);flex-wrap:wrap}
+  .field:first-of-type{border-top:none}
+  .field .meta{flex:1 1 230px;min-width:200px}
+  .field .lbl{font-weight:500;display:flex;align-items:center;gap:8px}
+  .field .help{font-size:12px;color:var(--muted);margin-top:3px;line-height:1.4}
+  .field .ctl{flex:0 0 auto;display:flex;align-items:center;gap:8px}
+  .field input[type=number],.field input[type=text],.field select{
+    background:var(--bg);color:var(--text);border:1px solid var(--border);
+    border-radius:8px;padding:8px 10px;font-size:14px;width:130px;text-align:right}
+  .field input[type=text]{width:170px;text-align:left}
+  .field select{width:130px;text-align:left}
+  .field .unit{color:var(--muted);font-size:12.5px;min-width:48px}
+  .field.dirty{background:rgba(78,161,255,.07)}
+  .field.dirty input,.field.dirty select{border-color:var(--accent)}
+  .badge{font-size:10px;font-weight:700;letter-spacing:.04em;padding:2px 7px;
+    border-radius:999px;text-transform:uppercase}
+  .badge.restart{background:rgba(245,185,66,.16);color:var(--amber)}
+  .switch{position:relative;width:46px;height:26px}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;inset:0;background:var(--card2);border:1px solid var(--border);
+    border-radius:999px;cursor:pointer;transition:.15s}
+  .slider:before{content:"";position:absolute;height:18px;width:18px;left:3px;top:3px;
+    background:var(--muted);border-radius:50%;transition:.15s}
+  .switch input:checked + .slider{background:rgba(62,207,142,.25);border-color:var(--green)}
+  .switch input:checked + .slider:before{transform:translateX(20px);background:var(--green)}
+  .savebar{position:fixed;left:0;right:0;bottom:0;background:var(--card);
+    border-top:1px solid var(--border);padding:12px 16px;display:flex;
+    align-items:center;gap:12px;justify-content:space-between}
+  .savebar .info{font-size:13px;color:var(--muted)}
+  .btn{border:none;border-radius:10px;padding:11px 20px;font-size:15px;font-weight:600;
+    cursor:pointer}
+  .btn.primary{background:var(--accent);color:#05121f}
+  .btn.primary:disabled{opacity:.4;cursor:not-allowed}
+  .btn.ghost{background:transparent;color:var(--muted);border:1px solid var(--border)}
+  .toast{position:fixed;left:50%;bottom:78px;transform:translateX(-50%);
+    background:var(--card2);border:1px solid var(--border);border-radius:10px;
+    padding:12px 16px;max-width:90%;font-size:13.5px;box-shadow:0 6px 24px rgba(0,0,0,.4);
+    opacity:0;pointer-events:none;transition:opacity .2s}
+  .toast.show{opacity:1}
+  .toast.ok{border-color:var(--green)}
+  .toast.err{border-color:var(--red)}
+  .loading{padding:40px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body>
+<header class="appbar">
+  <div>
+    <h1>&#9881;&#65039; Settings</h1>
+    <div class="sub">Live edits to the battery controller</div>
+  </div>
+  <a class="back" href="/">&larr; Dashboard</a>
+</header>
+<div class="container" id="root"><div class="loading">Loading settings&hellip;</div></div>
+
+<div class="savebar">
+  <span class="info" id="saveInfo">No changes</span>
+  <div style="display:flex;gap:10px">
+    <button class="btn ghost" id="resetBtn">Reset</button>
+    <button class="btn primary" id="saveBtn" disabled>Save changes</button>
+  </div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const root = document.getElementById('root');
+const saveBtn = document.getElementById('saveBtn');
+const resetBtn = document.getElementById('resetBtn');
+const saveInfo = document.getElementById('saveInfo');
+let SCHEMA = [];
+const original = {};   // name -> original value
+const inputs = {};     // name -> input element
+
+function fmt(v){ return (v===null||v===undefined) ? '' : v; }
+
+function showToast(msg, kind){
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show ' + (kind||'');
+  setTimeout(()=>{ t.className = 'toast ' + (kind||''); }, kind==='err'?6000:4200);
+}
+
+function dirtyFields(){
+  const out = {};
+  for (const name in inputs){
+    const el = inputs[name];
+    let val;
+    if (el.type === 'checkbox') val = el.checked;
+    else val = el.value;
+    // Normalise for comparison
+    const orig = original[name];
+    let changed;
+    if (el.type === 'checkbox') changed = (val !== !!orig);
+    else if (el.dataset.type === 'str') changed = (String(val) !== String(fmt(orig)));
+    else changed = (val.trim() !== String(fmt(orig)).trim());
+    if (changed) out[name] = val;
+  }
+  return out;
+}
+
+function refreshDirty(){
+  const d = dirtyFields();
+  const n = Object.keys(d).length;
+  saveBtn.disabled = (n === 0);
+  saveInfo.textContent = n === 0 ? 'No changes' : (n + ' change' + (n>1?'s':''));
+  for (const name in inputs){
+    const fieldEl = inputs[name].closest('.field');
+    if (name in d) fieldEl.classList.add('dirty');
+    else fieldEl.classList.remove('dirty');
+  }
+}
+
+function makeControl(f){
+  let el;
+  if (f.type === 'bool'){
+    const wrap = document.createElement('label');
+    wrap.className = 'switch';
+    el = document.createElement('input');
+    el.type = 'checkbox';
+    el.checked = !!f.value;
+    const sl = document.createElement('span'); sl.className = 'slider';
+    wrap.appendChild(el); wrap.appendChild(sl);
+    el.dataset.type = f.type;
+    el.addEventListener('change', refreshDirty);
+    inputs[f.name] = el;
+    return wrap;
+  }
+  if (f.choices){
+    el = document.createElement('select');
+    f.choices.forEach(c => {
+      const o = document.createElement('option');
+      o.value = c; o.textContent = c;
+      if (String(c) === String(f.value)) o.selected = true;
+      el.appendChild(o);
+    });
+  } else if (f.type === 'str'){
+    el = document.createElement('input'); el.type = 'text';
+    el.value = fmt(f.value);
+  } else {
+    el = document.createElement('input'); el.type = 'number';
+    el.value = fmt(f.value);
+    el.step = (f.type === 'int') ? '1' : 'any';
+    if (f.min !== null && f.min !== undefined) el.min = f.min;
+    if (f.max !== null && f.max !== undefined) el.max = f.max;
+    if (f.name.indexOf('export_czk') >= 0) el.placeholder = '(shared)';
+  }
+  el.dataset.type = f.type;
+  el.addEventListener('input', refreshDirty);
+  el.addEventListener('change', refreshDirty);
+  inputs[f.name] = el;
+  return el;
+}
+
+function render(){
+  root.innerHTML = '';
+  SCHEMA.forEach(group => {
+    const g = document.createElement('div'); g.className = 'group';
+    const h = document.createElement('h2'); h.textContent = group.title; g.appendChild(h);
+    if (group.description){
+      const d = document.createElement('div'); d.className = 'gdesc'; d.textContent = group.description;
+      g.appendChild(d);
+    }
+    group.fields.forEach(f => {
+      original[f.name] = f.value;
+      const row = document.createElement('div'); row.className = 'field';
+      const meta = document.createElement('div'); meta.className = 'meta';
+      const lbl = document.createElement('div'); lbl.className = 'lbl';
+      lbl.appendChild(document.createTextNode(f.label));
+      if (!f.hot){
+        const b = document.createElement('span'); b.className='badge restart';
+        b.textContent='restart'; b.title='Takes effect after a container restart';
+        lbl.appendChild(b);
+      }
+      meta.appendChild(lbl);
+      if (f.help){
+        const hp = document.createElement('div'); hp.className='help'; hp.textContent=f.help;
+        meta.appendChild(hp);
+      }
+      const ctl = document.createElement('div'); ctl.className = 'ctl';
+      ctl.appendChild(makeControl(f));
+      if (f.unit){ const u=document.createElement('span'); u.className='unit'; u.textContent=f.unit; ctl.appendChild(u); }
+      row.appendChild(meta); row.appendChild(ctl);
+      g.appendChild(row);
+    });
+    root.appendChild(g);
+  });
+  refreshDirty();
+}
+
+async function load(){
+  try{
+    const r = await fetch('/api/settings');
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || 'Failed to load');
+    SCHEMA = j.groups || [];
+    render();
+  }catch(e){
+    root.innerHTML = '<div class="loading">Failed to load settings: ' + e.message + '</div>';
+  }
+}
+
+resetBtn.addEventListener('click', () => { load(); });
+
+saveBtn.addEventListener('click', async () => {
+  const updates = dirtyFields();
+  if (!Object.keys(updates).length) return;
+  saveBtn.disabled = true; saveInfo.textContent = 'Saving…';
+  try{
+    const r = await fetch('/api/settings', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({updates})
+    });
+    const j = await r.json();
+    if (!r.ok || !j.success) throw new Error(j.message || 'Save failed');
+    showToast(j.message || 'Saved', (j.restart_required && j.restart_required.length) ? 'ok' : 'ok');
+    await load();   // re-pull authoritative values
+  }catch(e){
+    showToast(e.message, 'err');
+    refreshDirty();
+  }
+});
+
+load();
+</script>
+</body>
+</html>"""
 
 
 # --- Embedded HTML Dashboard ---
@@ -1039,30 +1502,110 @@ body {
   line-height: 1.5;
   -webkit-text-size-adjust: 100%;
 }
-.header {
-  background: var(--card);
-  border-bottom: 1px solid var(--border);
-  padding: 12px 16px;
-  padding-top: calc(12px + env(safe-area-inset-top));
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
+/* ===== App bar (always-visible live header) ===== */
+.appbar {
   position: sticky;
   top: 0;
   z-index: 100;
+  background: linear-gradient(180deg, #1c2030 0%, var(--card) 100%);
+  border-bottom: 1px solid var(--border);
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.35);
 }
-.header h1 { font-size: 16px; font-weight: 600; }
-.header .status-dot {
-  width: 8px; height: 8px; border-radius: 50%;
-  background: var(--green);
-  display: inline-block;
-  margin-right: 8px;
-  animation: pulse 2s infinite;
+.appbar-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+}
+.brand { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.brand-name { font-size: 15px; font-weight: 700; letter-spacing: 0.2px; }
+.inv-state {
+  font-size: 10px; font-weight: 700; letter-spacing: 0.4px;
+  padding: 2px 7px; border-radius: 999px; text-transform: uppercase;
+}
+.appbar-meta { display: flex; align-items: center; gap: 10px; }
+.live-pill {
+  display: inline-flex; align-items: center; gap: 5px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+  color: var(--green); background: rgba(34,197,94,0.12);
+  padding: 3px 8px; border-radius: 999px; transition: opacity .3s, color .3s, background .3s;
+}
+.live-pill.stale { color: var(--muted); background: rgba(139,143,163,0.12); }
+.live-pill .live-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: currentColor;
+  animation: pulse 1.6s infinite;
+}
+.status-dot {
+  width: 11px; height: 11px; border-radius: 50%;
+  background: var(--muted); flex: 0 0 auto;
+  box-shadow: 0 0 0 0 rgba(0,0,0,0);
+  transition: background .3s, box-shadow .3s;
+}
+.status-dot.ok { background: var(--green); box-shadow: 0 0 8px rgba(34,197,94,0.7); animation: pulse 2.2s infinite; }
+.status-dot.off { background: var(--red); box-shadow: 0 0 8px rgba(239,68,68,0.7); }
+.status-dot.stale { background: var(--muted); }
+.refresh-btn {
+  background: none; border: none; color: var(--muted); cursor: pointer;
+  font-size: 16px; padding: 2px 4px; line-height: 1;
+  -webkit-tap-highlight-color: transparent;
+}
+.refresh-btn:active { color: var(--accent); }
+.refresh-btn.spinning { animation: spin .8s linear infinite; color: var(--accent); }
+@keyframes spin { to { transform: rotate(360deg); } }
+.last-update { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* ===== Live stat strip (the always-on glanceable summary) ===== */
+.statstrip {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+.statstrip.stale { opacity: 0.45; transition: opacity .3s; }
+.ss-item {
+  display: flex; align-items: center; gap: 8px;
+  background: rgba(255,255,255,0.03);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 7px 8px;
+  min-width: 0;
+}
+.ss-ico { font-size: 17px; line-height: 1; flex: 0 0 auto; }
+.ss-body { min-width: 0; }
+.ss-val {
+  font-size: 15px; font-weight: 800; line-height: 1.1;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+  transition: color .25s;
+}
+.ss-val.flash { animation: ssflash .6s ease-out; }
+@keyframes ssflash { 0% { background: rgba(79,140,255,0.25); } 100% { background: transparent; } }
+.ss-lbl { font-size: 10px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+@media (max-width: 380px) {
+  .ss-item { flex-direction: column; align-items: flex-start; gap: 1px; padding: 6px; }
+  .ss-ico { font-size: 14px; }
+  .ss-val { font-size: 14px; }
 }
 @keyframes pulse {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0.4; }
+  50% { opacity: 0.35; }
 }
+
+/* ===== Pull-to-refresh ===== */
+.ptr {
+  position: fixed; top: 0; left: 0; right: 0;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  height: 0; overflow: hidden; opacity: 0;
+  color: var(--muted); font-size: 12px; font-weight: 600;
+  z-index: 200; pointer-events: none;
+  padding-top: env(safe-area-inset-top);
+}
+.ptr .ptr-spin {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid var(--border); border-top-color: var(--accent);
+  transition: transform .1s;
+}
+.ptr.ready .ptr-spin { border-top-color: var(--green); }
+.ptr.refreshing .ptr-spin { animation: spin .7s linear infinite; }
 .container {
   max-width: 1200px;
   margin: 0 auto;
@@ -1396,19 +1939,74 @@ select, input {
   .tab-btn .tab-ico { font-size: 16px; }
   .tab-btn.active { border-bottom: 2px solid var(--accent); }
 }
+
+/* ===== Polish: card depth, tab transitions, smooth scrolling ===== */
+html { scroll-behavior: smooth; }
+.card { transition: border-color .2s ease, box-shadow .2s ease; }
+@media (hover: hover) and (min-width: 900px) {
+  .card:hover { border-color: #353a4d; box-shadow: 0 6px 20px rgba(0,0,0,0.35); }
+}
+.tab-page.active { animation: tabin .28s cubic-bezier(.22,.61,.36,1); }
+@keyframes tabin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+.btn, button { transition: transform .1s ease, filter .15s ease; }
+.btn:active { transform: scale(0.97); }
+.soc-fill { transition: width .5s cubic-bezier(.22,.61,.36,1), background .3s; }
+
+/* Compact Home "Today" chart: 96 bars fit the width (flex), no scroll. */
+.home-chart { position: relative; height: 134px; margin-top: 10px; }
+.home-chart .price-chart { height: 134px; margin-top: 0; gap: 0; }
+.home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; border-radius: 1px 1px 0 0; }
+.home-chart-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
+.home-now-line { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--accent); opacity: .6; pointer-events: none; }
+.home-legend { display: flex; flex-wrap: wrap; gap: 3px 11px; margin-top: 9px; font-size: 10.5px; color: var(--muted); }
+.home-legend .lg { display: inline-flex; align-items: center; gap: 4px; }
+.home-legend .lg i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+.home-legend .lg.line i { width: 13px; height: 0; border-top: 2px solid; border-radius: 0; }
+
+/* Today's money grid */
+.money-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-top: 10px; }
+.money-item { text-align: center; background: rgba(255,255,255,0.03); border: 1px solid var(--border); border-radius: 9px; padding: 9px 4px; }
+.money-val { font-size: 16px; font-weight: 800; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.money-lbl { font-size: 10px; color: var(--muted); margin-top: 2px; }
+@media (max-width: 430px) { .money-grid { grid-template-columns: 1fr 1fr; } }
 </style>
 </head>
 <body>
-<div class="header">
-  <div>
-    <span class="status-dot" id="statusDot"></span>
-    <h1 style="display:inline">Growatt Battery Dashboard</h1>
-    <span id="invPowerBadge"
-          style="display:none;margin-left:10px;padding:3px 9px;border-radius:8px;
-                 font-size:12px;font-weight:700;vertical-align:middle"></span>
+<div class="ptr" id="ptr"><div class="ptr-spin"></div><span class="ptr-label">Pull to refresh</span></div>
+
+<header class="appbar">
+  <div class="appbar-top">
+    <div class="brand">
+      <span class="status-dot stale" id="statusDot" title="Inverter status"></span>
+      <span class="brand-name">Growatt</span>
+      <span id="invPowerBadge" class="inv-state" style="display:none"></span>
+    </div>
+    <div class="appbar-meta">
+      <span class="live-pill" id="livePill"><span class="live-dot"></span>LIVE</span>
+      <span class="last-update" id="lastUpdate">--</span>
+      <a class="refresh-btn" href="/settings" title="Settings" aria-label="Settings" style="text-decoration:none">&#9881;&#65039;</a>
+      <button class="refresh-btn" id="refreshBtn" title="Refresh" aria-label="Refresh">&#8635;</button>
+    </div>
   </div>
-  <div style="font-size:12px;color:var(--muted)" id="lastUpdate">--</div>
-</div>
+  <div class="statstrip" id="statStrip">
+    <div class="ss-item">
+      <span class="ss-ico">&#9728;&#65039;</span>
+      <div class="ss-body"><div class="ss-val" id="ssSolar" style="color:var(--yellow)">--</div><div class="ss-lbl">Solar</div></div>
+    </div>
+    <div class="ss-item">
+      <span class="ss-ico">&#127968;</span>
+      <div class="ss-body"><div class="ss-val" id="ssLoad">--</div><div class="ss-lbl">Home load</div></div>
+    </div>
+    <div class="ss-item">
+      <span class="ss-ico">&#128267;</span>
+      <div class="ss-body"><div class="ss-val" id="ssBatt">--</div><div class="ss-lbl" id="ssBattLbl">Battery</div></div>
+    </div>
+    <div class="ss-item">
+      <span class="ss-ico" id="ssGridIco">&#9889;</span>
+      <div class="ss-body"><div class="ss-val" id="ssGrid">--</div><div class="ss-lbl" id="ssGridLbl">Grid</div></div>
+    </div>
+  </div>
+</header>
 
 <nav class="tabbar" id="tabbar">
   <button class="tab-btn active" data-tab="home"><span class="tab-ico">&#9889;</span><span>Home</span></button>
@@ -1419,33 +2017,36 @@ select, input {
 
 <div class="container">
   <section class="tab-page active" id="tab-home">
-  <!-- Live Power Flow -->
+  <!-- Today overview: compact full-day price + SOC, no horizontal scroll -->
   <div class="card" style="margin-bottom:12px">
-    <h2>Live Power Flow</h2>
-    <div id="powerFlowNoData" style="color:var(--muted);text-align:center;padding:20px;display:none">Waiting for inverter telemetry...</div>
-    <div id="powerFlowGrid" class="power-grid" style="text-align:center">
-      <div>
-        <div style="font-size:24px">&#9728;&#65039;</div>
-        <div class="stat-label">Solar</div>
-        <div class="stat-value small" id="pwSolar" style="color:var(--yellow)">-- W</div>
-      </div>
-      <div>
-        <div style="font-size:24px">&#128267;</div>
-        <div class="stat-label">Battery <span id="pwSocBadge" style="font-size:11px;color:var(--muted)">--%</span></div>
-        <div class="stat-value small" id="pwBattery" style="color:var(--green)">-- W</div>
-        <div class="soc-bar" style="margin-top:4px"><div class="soc-fill" id="pwSocBar" style="width:50%">50%</div></div>
-      </div>
-      <div>
-        <div style="font-size:24px">&#127968;</div>
-        <div class="stat-label">Home Load</div>
-        <div class="stat-value small" id="pwLoad" style="color:var(--accent)">-- W</div>
-      </div>
-      <div>
-        <div style="font-size:24px">&#9889;</div>
-        <div class="stat-label">Grid</div>
-        <div class="stat-value small" id="pwGrid" style="color:var(--muted)">-- W</div>
-      </div>
+    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+      <h2 style="margin:0">Today</h2>
+      <div id="homeNow" style="font-size:12px;color:var(--muted)">--</div>
     </div>
+    <div id="homeChartNoData" style="color:var(--muted);text-align:center;padding:24px;display:none">Loading…</div>
+    <div class="home-chart" id="homeChartWrap">
+      <div class="price-chart" id="homeChartBars"></div>
+      <svg id="homeConsLine" class="home-chart-svg"></svg>
+      <svg id="homeSolarLine" class="home-chart-svg"></svg>
+      <svg id="homeChartSoc" class="home-chart-svg"></svg>
+      <div class="home-now-line" id="homeNowLine"></div>
+    </div>
+    <div class="home-legend" id="homeLegend"></div>
+  </div>
+
+  <!-- Today's money -->
+  <div class="card" style="margin-bottom:12px">
+    <div style="display:flex;justify-content:space-between;align-items:baseline">
+      <h2 style="margin:0">&#128176; Today&#39;s money</h2>
+      <span id="moneyNet" style="font-size:21px;font-weight:800">--</span>
+    </div>
+    <div class="money-grid">
+      <div class="money-item"><div class="money-val" id="moneyEarned" style="color:var(--green)">--</div><div class="money-lbl">Earned · export</div></div>
+      <div class="money-item"><div class="money-val" id="moneySpent" style="color:var(--red)">--</div><div class="money-lbl">Spent · import</div></div>
+      <div class="money-item"><div class="money-val" id="moneyArb" style="color:var(--accent)">--</div><div class="money-lbl">Arbitrage</div></div>
+      <div class="money-item"><div class="money-val" id="moneyPlan">--</div><div class="money-lbl">Optimizer value</div></div>
+    </div>
+    <div class="stat-label" style="margin-top:8px;font-size:11px;opacity:.65" id="moneyNote">Net = earned − spent · estimated from today&#39;s totals × prices</div>
   </div>
 
   <!-- Energy Today -->
@@ -1507,16 +2108,17 @@ select, input {
     <!-- Solar Forecast -->
     <div class="card">
       <h2>Solar Forecast</h2>
-      <div class="stat">
-        <div class="stat-label">Today</div>
-        <div class="stat-value small" id="solarToday">-- kWh</div>
+      <div style="display:flex;gap:18px">
+        <div style="flex:1">
+          <div class="stat-label">Today</div>
+          <div class="stat-value" id="solarToday" style="color:var(--yellow)">-- kWh</div>
+        </div>
+        <div style="flex:1">
+          <div class="stat-label">Tomorrow</div>
+          <div class="stat-value" id="solarTomorrow">-- kWh</div>
+        </div>
       </div>
-      <div class="stat">
-        <div class="stat-label">Tomorrow</div>
-        <div class="stat-value small" id="solarTomorrow">-- kWh</div>
-      </div>
-      <div class="stat-label" id="solarConf">Confidence: --</div>
-      <div class="stat-label" id="solcastInfo" style="margin-top:6px"></div>
+      <div class="stat-label" id="solcastInfo" style="margin-top:8px"></div>
     </div>
 
     <!-- Schedule -->
@@ -1696,9 +2298,10 @@ async function fetchStatus() {
     const data = await res.json();
     lastData = data;
     updateUI(data);
-    document.getElementById('statusDot').style.background = 'var(--green)';
+    markFresh();
   } catch (e) {
-    document.getElementById('statusDot').style.background = 'var(--red)';
+    setDot('stale');
+    document.getElementById('livePill').classList.add('stale');
   }
 }
 
@@ -1707,21 +2310,24 @@ function updateUI(d) {
   const t = new Date(d.timestamp);
   document.getElementById('lastUpdate').textContent = t.toLocaleTimeString();
 
-  // Inverter on/off badge in header
+  // Inverter status → header dot (green=on, red=off, gray=unknown) + small pill
   const invBadge = document.getElementById('invPowerBadge');
   if (d.inverter && typeof d.inverter.on === 'boolean') {
     if (d.inverter.on) {
+      setDot('ok');
       invBadge.style.display = 'inline-block';
-      invBadge.style.background = '#164e2f';
+      invBadge.style.background = 'rgba(34,197,94,0.15)';
       invBadge.style.color = 'var(--green)';
-      invBadge.textContent = '⚡ INVERTER ON';
+      invBadge.textContent = 'ON';
     } else {
+      setDot('off');
       invBadge.style.display = 'inline-block';
-      invBadge.style.background = '#4a1d1d';
+      invBadge.style.background = 'rgba(239,68,68,0.15)';
       invBadge.style.color = 'var(--red)';
-      invBadge.textContent = '🛑 INVERTER OFF';
+      invBadge.textContent = 'OFF';
     }
   } else {
+    setDot('stale');
     invBadge.style.display = 'none';
   }
 
@@ -1766,13 +2372,6 @@ function updateUI(d) {
     document.getElementById('solarToday').textContent = d.solar_forecast.today_kwh + ' kWh';
     document.getElementById('solarTomorrow').textContent = d.solar_forecast.tomorrow_kwh + ' kWh';
     const sf = d.solar_forecast;
-    let confText = '';
-    if (sf.has_model) {
-      confText = 'Source: Learned model (' + sf.model_bins + ' bins)';
-    } else {
-      confText = 'Confidence: ' + (sf.confidence * 100).toFixed(0) + '% (no model)';
-    }
-    document.getElementById('solarConf').textContent = confText;
 
     // Solcast (weather-based source) status + API budget.
     const sc = sf.solcast;
@@ -1887,6 +2486,101 @@ function updateUI(d) {
   }
 }
 
+// ===== Compact Home "Today" overview chart =====
+function homeBarClass(p) {
+  const v = p.czk_kwh;
+  let cls = v < 0 ? 'negative' : v < 1.5 ? 'cheap' : v < 3 ? 'mid' : 'expensive';
+  if (p.status === 'pre_discharge_charge') cls = 'pre-discharge';
+  else if (p.is_charging) cls = 'charging';
+  else if (p.is_discharge) cls = 'discharge';
+  else if (p.is_sell_production) cls = 'sell-production';
+  else if (p.is_hold) cls = 'battery-hold';
+  else if (p.is_inverter_off) cls = 'inverter-off';
+  return cls;
+}
+function renderHomeChart(prices, timeline) {
+  const bars = document.getElementById('homeChartBars');
+  const wrap = document.getElementById('homeChartWrap');
+  const nodata = document.getElementById('homeChartNoData');
+  if (!bars) return;
+  if (!prices.length) { if (nodata) nodata.style.display = 'block'; if (wrap) wrap.style.display = 'none'; return; }
+  if (nodata) nodata.style.display = 'none'; if (wrap) wrap.style.display = '';
+  const vals = prices.map(p => p.czk_kwh);
+  const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
+  let html = '';
+  prices.forEach(p => {
+    const v = p.czk_kwh, h = Math.abs(v) / maxAbs * 100;
+    let cls = homeBarClass(p); if (p.is_current) cls += ' current';
+    if (v < 0) html += '<div class="price-bar ' + cls + '" style="height:' + h + '%;align-self:flex-start;opacity:.55"></div>';
+    else html += '<div class="price-bar ' + cls + '" style="height:' + Math.max(h, 3) + '%"></div>';
+  });
+  bars.innerHTML = html;
+
+  // Overlay lines, reusing the big chart's renderers so the Home chart shows the
+  // SAME solar + draw (consumption) + SOC, each as actual (solid, elapsed) +
+  // forecast (dashed, upcoming). Pin contentW to the fit width so the index-based
+  // x-positions land on the flex-filled bars.
+  bars.dataset.contentW = bars.offsetWidth || (wrap && wrap.offsetWidth) || 0;
+  const eMax = energyScaleMax(prices, timeline, true);
+  renderEnergyLine(prices, timeline, 'homeChartBars', 'homeConsLine', true, 'consumption_kwh', consActuals, '#38bdf8', eMax);
+  renderSolarLine(prices, timeline, 'homeChartBars', 'homeSolarLine', true, eMax);
+  renderSocLine(prices, timeline, 'homeChartBars', 'homeChartSoc', true);
+
+  const n = prices.length, curIdx = prices.findIndex(p => p.is_current);
+  const nowLine = document.getElementById('homeNowLine');
+  if (nowLine) {
+    if (curIdx >= 0) { nowLine.style.display = ''; nowLine.style.left = ((curIdx + 0.5) / n * 100) + '%'; }
+    else nowLine.style.display = 'none';
+  }
+
+  const cur = prices[curIdx] || prices[prices.length - 1];
+  const homeNow = document.getElementById('homeNow');
+  if (cur && homeNow) {
+    const act = (cur.projected_action || cur.status || 'hold').replace(/_/g, ' ');
+    const soc = cur.projected_soc != null ? Math.round(cur.projected_soc) + '%' : '--';
+    homeNow.innerHTML =
+      '<b style="color:var(--text)">' + cur.czk_kwh.toFixed(2) + ' CZK</b> &middot; ' +
+      '<span style="color:var(--green)">&#128267; ' + soc + '</span> &middot; ' + act;
+  }
+
+  const present = new Set(prices.map(homeBarClass));
+  const items = [
+    ['charging', '#22c55e', 'Charge'], ['discharge', '#ef4444', 'Discharge'],
+    ['sell-production', '#f97316', 'Sell'], ['battery-hold', '#0ea5e9', 'Hold'],
+    ['inverter-off', '#666', 'Off'],
+  ];
+  let lg = items.filter(it => present.has(it[0]))
+    .map(it => '<span class="lg"><i style="background:' + it[1] + '"></i>' + it[2] + '</span>').join('');
+  lg += '<span class="lg line"><i style="border-color:#22c55e"></i>SOC</span>'
+      + '<span class="lg line"><i style="border-color:#fde047"></i>Solar</span>'
+      + '<span class="lg line"><i style="border-color:#38bdf8"></i>Draw</span>'
+      + '<span class="lg" style="opacity:.7">— now · ·· later</span>';
+  const legEl = document.getElementById('homeLegend');
+  if (legEl) legEl.innerHTML = lg;
+}
+
+// ===== Today's money summary =====
+function renderHomeMoney(ec) {
+  ec = ec || {};
+  const earned = ec.export_revenue_czk, spent = ec.import_cost_czk;
+  const net = (earned != null && spent != null) ? (earned - spent) : null;
+  const netEl = document.getElementById('moneyNet');
+  if (netEl) {
+    if (net == null) { netEl.textContent = '--'; netEl.style.color = 'var(--muted)'; }
+    else { netEl.textContent = (net >= 0 ? '+' : '') + net.toFixed(1) + ' CZK'; netEl.style.color = net >= 0 ? 'var(--green)' : 'var(--red)'; }
+  }
+  const set = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
+  set('moneyEarned', earned == null ? '--' : '+' + earned.toFixed(1));
+  set('moneySpent', spent == null ? '--' : '-' + spent.toFixed(1));
+  const arb = ec.arbitrage_czk;
+  set('moneyArb', arb == null ? '--' : (arb >= 0 ? '+' : '') + arb.toFixed(1));
+  const plan = ec.plan_value_czk, planEl = document.getElementById('moneyPlan');
+  if (planEl) {
+    planEl.textContent = plan == null ? '--' : (plan >= 0 ? '+' : '') + plan.toFixed(1);
+    planEl.style.color = (plan || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+}
+
 async function fetchPrices() {
   try {
     const [priceRes, projRes, actualsRes, socRes, consRes] = await Promise.all([
@@ -1925,17 +2619,20 @@ async function fetchPrices() {
       : 1;
 
     const timeline = projData.timeline || [];
+    renderHomeChart(todayPrices, timeline);  // compact Home overview
+    const eMaxToday = energyScaleMax(todayPrices, timeline, true);
     renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
-    renderEnergyLine(todayPrices, timeline, 'priceChartToday', 'consLineToday', true, 'consumption_kwh', consActuals, '#38bdf8');
-    renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true);
+    renderEnergyLine(todayPrices, timeline, 'priceChartToday', 'consLineToday', true, 'consumption_kwh', consActuals, '#38bdf8', eMaxToday);
+    renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true, eMaxToday);
     renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday', true);
 
     const tomorrowWrap = document.getElementById('priceChartTomorrowWrap');
     if (data.has_tomorrow && tomorrowPrices.length) {
       tomorrowWrap.style.display = '';
+      const eMaxTomorrow = energyScaleMax(tomorrowPrices, timeline, false);
       renderPriceChart(tomorrowPrices, 'priceChartTomorrow', todayPrices.length, maxAbs);
-      renderEnergyLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'consLineTomorrow', false, 'consumption_kwh', consActuals, '#38bdf8');
-      renderSolarLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'solarLineTomorrow', false);
+      renderEnergyLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'consLineTomorrow', false, 'consumption_kwh', consActuals, '#38bdf8', eMaxTomorrow);
+      renderSolarLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'solarLineTomorrow', false, eMaxTomorrow);
       renderSocLine(tomorrowPrices, timeline, 'priceChartTomorrow', 'socLineTomorrow', false);
     } else {
       tomorrowWrap.style.display = 'none';
@@ -2063,7 +2760,32 @@ function renderSocLine(prices, timeline, chartId, svgId, isToday) {
 // projection timeline key (e.g. 'solar_kwh' / 'consumption_kwh'); `actualsMap`
 // is the "HH:00" -> kWh actuals; `color` the line colour. Both sources are
 // aggregated to hourly so units match (projection is per-15-min block).
-function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actualsMap, color) {
+// Shared kWh scale for a day's solar + consumption lines, so the two are drawn
+// against ONE ruler and their relative heights are meaningful (solar above
+// consumption == real surplus). Without this each line auto-scaled to its own
+// max and equal kWh values landed at wildly different heights.
+function energyScaleMax(prices, timeline, isToday) {
+  let mx = 0.5;
+  if (!prices.length) return mx;
+  const dayOf = prices[0].day;
+  ['solar_kwh', 'consumption_kwh'].forEach(field => {
+    const projHour = {};
+    timeline.forEach(t => {
+      if (t.day !== dayOf) return;
+      const hr = parseInt(t.time.split(':')[0], 10);
+      projHour[hr] = (projHour[hr] || 0) + (t[field] || 0);
+    });
+    Object.values(projHour).forEach(v => { if (v > mx) mx = v; });
+  });
+  if (isToday) {
+    [consActuals, solarActuals].forEach(m => {
+      if (m) Object.values(m).forEach(v => { if (v > mx) mx = v; });
+    });
+  }
+  return mx;
+}
+
+function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actualsMap, color, sharedMax) {
   const svg = document.getElementById(svgId);
   if (!svg) return;
   if (!timeline.length || !prices.length) { svg.innerHTML = ''; return; }
@@ -2116,9 +2838,15 @@ function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actu
   }
 
   // Sit energy lines in the lower band so they read under the SOC line.
+  // Prefer the shared scale (so solar + consumption share one ruler); fall back
+  // to self-scaling only when no shared max was supplied.
   let maxKwh = 0.5;
-  Object.values(projHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
-  Object.values(actHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
+  if (sharedMax && sharedMax > maxKwh) {
+    maxKwh = sharedMax;
+  } else {
+    Object.values(projHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
+    Object.values(actHour).forEach(v => { if (v > maxKwh) maxKwh = v; });
+  }
   const yOf = v => h - (v / maxKwh) * h * 0.55;
 
   const hours = Array.from(new Set(
@@ -2165,9 +2893,9 @@ function renderEnergyLine(prices, timeline, chartId, svgId, isToday, field, actu
   svg.innerHTML = s;
 }
 
-function renderSolarLine(prices, timeline, chartId, svgId, isToday) {
+function renderSolarLine(prices, timeline, chartId, svgId, isToday, sharedMax) {
   renderEnergyLine(prices, timeline, chartId, svgId, isToday,
-    'solar_kwh', solarActuals, '#fde047');
+    'solar_kwh', solarActuals, '#fde047', sharedMax);
 }
 
 let priceData = [];
@@ -2187,6 +2915,7 @@ async function fetchInsights() {
 
   // --- Economics ---
   const ec = d.economics || {};
+  renderHomeMoney(ec);  // compact Home money summary
   const planEl = document.getElementById('econPlan');
   if (planEl) {
     planEl.textContent = fmtCzk(ec.plan_value_czk);
@@ -2444,6 +3173,10 @@ function showTooltip(e, bar, tooltip) {
   if (p.projected_soc != null) {
     const projAction = p.projected_action || 'hold';
     const projColor = projAction === 'charge' ? 'var(--green)' : projAction === 'discharge' ? 'var(--red)' : 'var(--muted)';
+    // Planned inverter powerRate for charge/discharge blocks (e.g. "@ 75%").
+    const pr = p.projected_power_rate;
+    const rateStr = (pr != null && (projAction === 'charge' || projAction === 'discharge'))
+      ? ' <span style="color:var(--accent)">@ ' + pr + '%</span>' : '';
     const nf = p.projected_net_flow || 0;
     const nfSign = nf >= 0 ? '+' : '';
     const nfColor = nf > 0 ? 'var(--green)' : nf < 0 ? 'var(--red)' : 'var(--muted)';
@@ -2460,7 +3193,7 @@ function showTooltip(e, bar, tooltip) {
       }
     }
     projHtml = '<div style="margin-top:4px;padding-top:4px;border-top:1px solid var(--border)">' +
-      '<div class="tt-row"><span class="tt-label">Battery</span><span style="color:' + projColor + '">' + p.projected_soc + '% (' + p.projected_kwh + ' kWh) ' + projAction + '</span></div>' +
+      '<div class="tt-row"><span class="tt-label">Battery</span><span style="color:' + projColor + '">' + p.projected_soc + '% (' + p.projected_kwh + ' kWh) ' + projAction + rateStr + '</span></div>' +
       '<div class="tt-row"><span class="tt-label">Net flow</span><span style="color:' + nfColor + '">' + nfSign + nf.toFixed(2) + ' kWh</span></div>' +
       '<div class="tt-row"><span class="tt-label">Solar / Load</span><span>' + solarCell + ' / ' + cons.toFixed(2) + ' kWh</span></div>' +
       '</div>';
@@ -2571,51 +3304,80 @@ async function clearOverride() {
 }
 
 // Init
+// ===== Header live-strip + status helpers =====
+let _ssPrev = {};
+function fmtW(w) {
+  w = Math.round(w || 0);
+  const a = Math.abs(w);
+  if (a >= 1000) return (w / 1000).toFixed(a >= 10000 ? 0 : 1) + ' kW';
+  return w + ' W';
+}
+function setSS(id, text, color) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (_ssPrev[id] !== text) {
+    el.classList.remove('flash'); void el.offsetWidth; el.classList.add('flash');
+    _ssPrev[id] = text;
+  }
+  el.textContent = text;
+  if (color) el.style.color = color;
+}
+function renderHeaderStrip(pw) {
+  // Solar
+  setSS('ssSolar', pw.solar_w > 0 ? fmtW(pw.solar_w) : '0 W',
+        pw.solar_w > 30 ? 'var(--yellow)' : 'var(--muted)');
+  // Home load
+  setSS('ssLoad', fmtW(pw.load_w), 'var(--text)');
+  // Battery: SOC% as the headline, charge/discharge in the label
+  const soc = pw.soc;
+  setSS('ssBatt', soc + '%',
+        soc > 60 ? 'var(--green)' : soc > 30 ? 'var(--yellow)' : 'var(--red)');
+  let bl = 'idle';
+  if (pw.battery_charge_w > 30) bl = '▲ ' + fmtW(pw.battery_charge_w);
+  else if (pw.battery_discharge_w > 30) bl = '▼ ' + fmtW(pw.battery_discharge_w);
+  document.getElementById('ssBattLbl').textContent = bl;
+  // Grid: export (sell, green ▲) vs import (buy, red ▼)
+  let gv = '0 W', gc = 'var(--muted)', gl = 'Grid';
+  if (pw.grid_export_w > 50) {
+    gv = '▲ ' + fmtW(pw.grid_export_w); gc = 'var(--green)'; gl = 'Selling';
+  } else {
+    const imp = Math.max(0, pw.load_w + pw.battery_charge_w - pw.solar_w - pw.battery_discharge_w);
+    if (imp > 50) { gv = '▼ ' + fmtW(imp); gc = 'var(--red)'; gl = 'Buying'; }
+  }
+  setSS('ssGrid', gv, gc);
+  document.getElementById('ssGridLbl').textContent = gl;
+}
+let _lastOkTs = 0;
+function setDot(state) { // 'ok' | 'off' | 'stale'
+  const dot = document.getElementById('statusDot');
+  if (dot) dot.className = 'status-dot ' + state;
+}
+function markFresh() {
+  _lastOkTs = Date.now();
+  document.getElementById('livePill').classList.remove('stale');
+  document.getElementById('statStrip').classList.remove('stale');
+}
+function freshnessWatchdog() {
+  if (Date.now() - _lastOkTs > 20000) {
+    document.getElementById('livePill').classList.add('stale');
+    document.getElementById('statStrip').classList.add('stale');
+    setDot('stale');
+  }
+}
+setInterval(freshnessWatchdog, 5000);
+
 // Live power flow
 async function fetchLive() {
   try {
     const res = await fetch('/api/live');
     const d = await res.json();
     if (!d.has_data) {
-      document.getElementById('powerFlowNoData').style.display = 'block';
-      document.getElementById('powerFlowGrid').style.opacity = '0.3';
+      document.getElementById('statStrip').classList.add('stale');
       return;
     }
-    document.getElementById('powerFlowNoData').style.display = 'none';
-    document.getElementById('powerFlowGrid').style.opacity = '1';
-
-    const pw = d.power;
-    document.getElementById('pwSolar').textContent = pw.solar_w + ' W';
-    document.getElementById('pwLoad').textContent = pw.load_w + ' W';
-
-    // Battery: show charge or discharge
-    if (pw.battery_charge_w > 0) {
-      document.getElementById('pwBattery').textContent = '+' + pw.battery_charge_w + ' W';
-      document.getElementById('pwBattery').style.color = 'var(--green)';
-    } else if (pw.battery_discharge_w > 0) {
-      document.getElementById('pwBattery').textContent = '-' + pw.battery_discharge_w + ' W';
-      document.getElementById('pwBattery').style.color = 'var(--red)';
-    } else {
-      document.getElementById('pwBattery').textContent = '0 W';
-      document.getElementById('pwBattery').style.color = 'var(--muted)';
-    }
-
-    // SOC bar
-    const soc = pw.soc;
-    const socFill = document.getElementById('pwSocBar');
-    socFill.style.width = soc + '%';
-    socFill.textContent = soc + '%';
-    socFill.style.background = soc > 60 ? 'var(--green)' : soc > 30 ? 'var(--yellow)' : 'var(--red)';
-    document.getElementById('pwSocBadge').textContent = soc + '%';
-
-    // Grid: export or import
-    if (pw.grid_export_w > 0) {
-      document.getElementById('pwGrid').textContent = pw.grid_export_w + ' W';
-      document.getElementById('pwGrid').style.color = 'var(--green)';
-    } else {
-      document.getElementById('pwGrid').textContent = '0 W';
-      document.getElementById('pwGrid').style.color = 'var(--muted)';
-    }
+    // Live power flow now lives in the always-visible header strip.
+    renderHeaderStrip(d.power);
+    markFresh();
 
     // Energy today
     const en = d.energy_today;
@@ -2638,9 +3400,9 @@ function showTab(name) {
     b.classList.toggle('active', b.dataset.tab === name);
   });
   try { localStorage.setItem('gw_tab', name); } catch (e) {}
-  if (name === 'chart') {
-    // The chart + its SVG overlays size from offsetWidth, which is 0 while the
-    // tab is hidden. Re-render once layout has settled so it isn't blank.
+  if (name === 'chart' || name === 'home') {
+    // Charts + their SVG overlays size from offsetWidth, which is 0 while a tab
+    // is hidden. Re-render once layout has settled so they aren't blank.
     requestAnimationFrame(function() { try { fetchPrices(); } catch (e) {} });
   }
   window.scrollTo(0, 0);
@@ -2658,6 +3420,68 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js').catch(function() {});
   });
 }
+
+// ===== Refresh (button + pull-to-refresh) =====
+let _refreshing = false;
+async function refreshAll() {
+  if (_refreshing) return;
+  _refreshing = true;
+  const btn = document.getElementById('refreshBtn');
+  btn.classList.add('spinning');
+  try {
+    await Promise.all([
+      fetchStatus(), fetchLive(),
+      fetchPrices().catch(function(){}), fetchInsights().catch(function(){}),
+    ]);
+  } finally {
+    setTimeout(function(){ btn.classList.remove('spinning'); }, 500);
+    _refreshing = false;
+  }
+}
+document.getElementById('refreshBtn').addEventListener('click', refreshAll);
+
+// Pull-to-refresh: only when scrolled to the very top. Indicator-only (doesn't
+// fight native scroll); release past the threshold triggers a full refresh.
+(function() {
+  const ptr = document.getElementById('ptr');
+  const label = ptr.querySelector('.ptr-label');
+  const spin = ptr.querySelector('.ptr-spin');
+  const THRESH = 70;
+  let startY = 0, pulling = false, dist = 0;
+  window.addEventListener('touchstart', function(e) {
+    if (window.scrollY <= 0 && !_refreshing) { startY = e.touches[0].clientY; pulling = true; }
+  }, { passive: true });
+  window.addEventListener('touchmove', function(e) {
+    if (!pulling) return;
+    dist = e.touches[0].clientY - startY;
+    if (dist <= 0 || window.scrollY > 0) { reset(); return; }
+    const pull = Math.min(dist * 0.5, 90);
+    ptr.style.height = pull + 'px';
+    ptr.style.opacity = Math.min(pull / THRESH, 1);
+    spin.style.transform = 'rotate(' + (pull * 3) + 'deg)';
+    const ready = pull >= THRESH;
+    ptr.classList.toggle('ready', ready);
+    label.textContent = ready ? 'Release to refresh' : 'Pull to refresh';
+  }, { passive: true });
+  window.addEventListener('touchend', async function() {
+    if (!pulling) return;
+    pulling = false;
+    if (ptr.classList.contains('ready')) {
+      ptr.classList.add('refreshing');
+      ptr.style.height = '48px'; ptr.style.opacity = '1';
+      label.textContent = 'Refreshing…';
+      await refreshAll();
+    }
+    reset();
+  }, { passive: true });
+  function reset() {
+    pulling = false; dist = 0;
+    ptr.classList.remove('ready', 'refreshing');
+    ptr.style.height = ''; ptr.style.opacity = '';
+    spin.style.transform = '';
+    label.textContent = 'Pull to refresh';
+  }
+})();
 
 fetchStatus();
 fetchLive();

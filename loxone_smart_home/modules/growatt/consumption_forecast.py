@@ -284,17 +284,23 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             consumption_by_hour: Dict[str, float] = {}  # "YYYY-MM-DD-HH" -> watts
             for table in consumption_result:
                 for record in table.records:
+                    v = record.get_value()
+                    if not isinstance(v, (int, float)):
+                        continue  # skip None/empty aggregates (would crash watts<=0)
                     t = _to_local(record.get_time())
                     key = t.strftime("%Y-%m-%d-%H")
-                    consumption_by_hour[key] = record.get_value()
+                    consumption_by_hour[key] = float(v)
 
             # Parse temperature data: timestamp -> °C
             temp_by_hour: Dict[str, float] = {}
             for table in temperature_result:
                 for record in table.records:
+                    v = record.get_value()
+                    if not isinstance(v, (int, float)):
+                        continue
                     t = _to_local(record.get_time())
                     key = t.strftime("%Y-%m-%d-%H")
-                    temp_by_hour[key] = record.get_value()
+                    temp_by_hour[key] = float(v)
 
             # Resolve inverter on/off state per hour from sparse change records.
             inverter_on_by_hour = _carry_forward_hourly(

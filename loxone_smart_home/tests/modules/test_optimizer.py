@@ -384,9 +384,17 @@ class TestTwoPassOptimizer:
             max_soc=100.0,
             battery_capacity_kwh=10.0,
         )
-        # The optimizer should still find charge blocks, but they should be
-        # at hours where solar doesn't already fill the battery
-        assert len(charge) > 0
+        # Documented behavior: charging stays in the CHEAP hours (0-1) and is
+        # never placed in the expensive hours (2-3); the solar burst + cheap
+        # charge leave the battery full for the expensive-hour discharge.
+        charge_hours = {ts.hour for ts in charge}
+        assert charge_hours, "expected some charge blocks"
+        assert charge_hours <= {0, 1}, (
+            f"charge must stay in cheap hours 0-1, not expensive 2-3: {sorted(charge_hours)}"
+        )
+        # And the battery reaches (near) full by the time expensive hours start.
+        soc_at_h2 = next(d.soc_after for d in decisions if d.timestamp.hour == 2)
+        assert soc_at_h2 >= 90.0
 
     def test_pass2_preserves_negative_prices(self, optimizer: BatteryOptimizer) -> None:
         """Negative price blocks should never be considered 'wasted'."""
@@ -401,10 +409,12 @@ class TestTwoPassOptimizer:
             min_soc=20.0,
             battery_capacity_kwh=10.0,
         )
-        # Negative price blocks should be in charge set
-        negative_block_hours = {ts.hour for ts in charge if ts.hour in [0, 1]}
-        # At least some negative-price blocks should be selected
-        assert len(charge) > 0
+        # Documented behavior: negative-price blocks (paid to charge) must be
+        # KEPT in the charge set, never dropped as "wasted" by Pass 2.
+        negative_block_hours = {ts.hour for ts in charge if ts.hour in (0, 1)}
+        assert negative_block_hours, (
+            f"negative-price hours 0/1 must be charged: {sorted(ts.hour for ts in charge)}"
+        )
 
     def test_picks_cheapest_negatives_not_chronologically_first(
         self, optimizer: BatteryOptimizer
@@ -1119,3 +1129,130 @@ class TestSellProduction:
         assert tomorrow_10
         assert all(d.solar_kwh == 0.0 for d in today_10)
         assert all(d.solar_kwh == 1.25 for d in tomorrow_10)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive charge power rate (compute_charge_power_rates)
+# ---------------------------------------------------------------------------
+from modules.growatt.optimizer import BlockDecision, compute_charge_power_rates
+
+
+def _charge_dec(ts: datetime, soc_before: float, soc_after: float) -> BlockDecision:
+    return BlockDecision(
+        timestamp=ts, action="charge", price_czk=1.0, distribution_czk=0.0,
+        solar_kwh=0.0, consumption_kwh=0.0,
+        soc_before=soc_before, soc_after=soc_after, net_value=0.0,
+    )
+
+
+def test_adaptive_rate_gentle_long_window_clamps_to_floor():
+    # 4 blocks (1h) adding 8% of a 10 kWh pack = 0.8 kWh over 1h = 0.8 kW avg.
+    # 0.8/9.8 ≈ 8% → below the 25% floor → clamped to 25.
+    base = datetime(2026, 4, 11, 1, 0)
+    decs = [
+        _charge_dec(base + timedelta(minutes=15 * i), 50 + 2 * i, 52 + 2 * i)
+        for i in range(4)
+    ]
+    rates = compute_charge_power_rates(decs, 10.0, 9.8, min_power_rate=25)
+    assert set(rates.values()) == {25}
+    assert len(rates) == 4
+
+
+def test_adaptive_rate_short_window_needs_full_power():
+    # One 15-min block banking 24% of 10 kWh = 2.4 kWh in 0.25h = 9.6 kW avg.
+    # 9.6/9.8 ≈ 98% → near full rate.
+    base = datetime(2026, 4, 11, 13, 0)
+    rates = compute_charge_power_rates([_charge_dec(base, 40, 64)], 10.0, 9.8, efficiency=1.0)
+    assert list(rates.values())[0] == 98
+
+
+def test_adaptive_rate_splits_independent_windows():
+    # Two windows separated by a >15-min gap get independent rates.
+    a = datetime(2026, 4, 11, 1, 0)
+    b = datetime(2026, 4, 11, 5, 0)
+    decs = [
+        _charge_dec(a, 50, 52), _charge_dec(a + timedelta(minutes=15), 52, 54),  # gentle
+        _charge_dec(b, 40, 64),  # full-power single block
+    ]
+    rates = compute_charge_power_rates(decs, 10.0, 9.8, min_power_rate=25, efficiency=1.0)
+    assert rates[a] == 25
+    assert rates[b] == 98
+
+
+def test_adaptive_rate_ignores_non_charge_and_empty():
+    base = datetime(2026, 4, 11, 1, 0)
+    hold = BlockDecision(
+        timestamp=base, action="hold", price_czk=1.0, distribution_czk=0.0,
+        solar_kwh=0.0, consumption_kwh=0.0, soc_before=50, soc_after=50, net_value=0.0,
+    )
+    assert compute_charge_power_rates([hold], 10.0, 9.8) == {}
+    assert compute_charge_power_rates([], 10.0, 9.8) == {}
+
+
+def _disch_dec(ts: datetime, soc_before: float, soc_after: float) -> BlockDecision:
+    return BlockDecision(
+        timestamp=ts, action="discharge", price_czk=4.0, distribution_czk=0.0,
+        solar_kwh=0.0, consumption_kwh=0.0,
+        soc_before=soc_before, soc_after=soc_after, net_value=0.0,
+    )
+
+
+def test_adaptive_discharge_rate_uses_abs_soc_delta():
+    # Symmetric to charging: a short 1-block discharge dumping 24% of a 10 kWh
+    # pack = 2.4 kWh in 0.25h = 9.6 kW → ~98%. A long gentle drain clamps to floor.
+    base = datetime(2026, 4, 11, 21, 0)
+    fast = compute_charge_power_rates(
+        [_disch_dec(base, 64, 40)], 10.0, 9.8, action="discharge", efficiency=1.0
+    )
+    assert list(fast.values())[0] == 98
+    slow = compute_charge_power_rates(
+        [_disch_dec(base + timedelta(minutes=15 * i), 60 - 2 * i, 58 - 2 * i)
+         for i in range(4)],
+        10.0, 9.8, min_power_rate=25, action="discharge", efficiency=1.0,
+    )
+    assert set(slow.values()) == {25}
+
+
+def test_adaptive_discharge_rate_ignores_charge_blocks():
+    # action filter keeps charge and discharge windows independent.
+    base = datetime(2026, 4, 11, 21, 0)
+    mixed = [_charge_dec(base, 40, 64), _disch_dec(base + timedelta(hours=2), 64, 40)]
+    only_disch = compute_charge_power_rates(mixed, 10.0, 9.8, action="discharge")
+    assert len(only_disch) == 1
+    assert base + timedelta(hours=2) in only_disch
+
+
+def test_adaptive_rate_max_power_clamps_ceiling():
+    # A short window that wants full power must be clamped to max_power_rate
+    # (the C-rate ceiling), e.g. 54% for a 5.3 kW cap on a 9.8 kW inverter.
+    base = datetime(2026, 4, 11, 21, 0)
+    rates = compute_charge_power_rates(
+        [_disch_dec(base, 64, 40)], 10.0, 9.8, action="discharge", max_power_rate=54
+    )
+    assert list(rates.values())[0] == 54  # would be 98 un-clamped
+
+
+def test_adaptive_rate_uses_grid_side_power_not_raw_soc():
+    """The rate is sized from GRID-side power (efficiency-corrected), not raw
+    battery ΔSOC. The powerRate caps TOTAL battery throughput, so discharge =
+    ΔSOC·η (house self-consumption counts too — NOT subtracted) and charge =
+    ΔSOC/η."""
+    base = datetime(2026, 4, 11, 21, 0)
+    # Discharge: ΔSOC=20% of 10 kWh = 2.0 kWh drain over 0.25h.
+    # output = 2.0*0.9 = 1.8 kWh / 0.25h = 7.2 kW → 7.2/9.8 ≈ 74%.
+    d_house = BlockDecision(
+        timestamp=base, action="discharge", price_czk=4.0, distribution_czk=0.0,
+        solar_kwh=0.0, consumption_kwh=1.0, soc_before=60.0, soc_after=40.0,
+        net_value=0.0,
+    )
+    d_nohouse = BlockDecision(
+        timestamp=base, action="discharge", price_czk=4.0, distribution_czk=0.0,
+        solar_kwh=0.0, consumption_kwh=0.0, soc_before=60.0, soc_after=40.0,
+        net_value=0.0,
+    )
+    # A co-served house load must NOT change the rate (total-output semantics).
+    assert compute_charge_power_rates([d_house], 10.0, 9.8, action="discharge", efficiency=0.9)[base] == 74
+    assert compute_charge_power_rates([d_nohouse], 10.0, 9.8, action="discharge", efficiency=0.9)[base] == 74
+    # Charge input = ΔSOC/η: 2.0/0.9 = 2.22 kWh / 0.25h = 8.9 kW → 91%.
+    c = _charge_dec(base, 40.0, 60.0)
+    assert compute_charge_power_rates([c], 10.0, 9.8, action="charge", efficiency=0.9)[base] == 91

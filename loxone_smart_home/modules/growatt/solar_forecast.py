@@ -340,9 +340,12 @@ class SolarForecast:
             )
             for a in arrays_data
         ]
-        # Prefer global settings lat/lon (from .env), fall back to config
-        lat = getattr(settings, "latitude", None) or getattr(config, "latitude", 49.0)
-        lon = getattr(settings, "longitude", None) or getattr(config, "longitude", 14.5)
+        # Prefer global settings lat/lon (from .env), fall back to config.
+        # Use explicit None checks so a valid 0.0 coordinate isn't discarded.
+        _s_lat = getattr(settings, "latitude", None)
+        _s_lon = getattr(settings, "longitude", None)
+        lat = _s_lat if _s_lat is not None else getattr(config, "latitude", 49.0)
+        lon = _s_lon if _s_lon is not None else getattr(config, "longitude", 14.5)
         return cls(
             arrays=arrays,
             latitude=lat,
@@ -374,8 +377,11 @@ class SolarForecast:
 
                     async with session.get(url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                         if resp.status == 429:
-                            self.logger.warning("forecast.solar rate limit hit, using cached data")
-                            return self._api_forecast
+                            self.logger.warning(
+                                "forecast.solar rate limit hit — keeping arrays "
+                                "fetched so far this loop"
+                            )
+                            break  # don't discard already-fetched arrays
                         if resp.status != 200:
                             self.logger.warning(
                                 f"forecast.solar returned {resp.status} for {array.name}"
@@ -597,26 +603,36 @@ from(bucket: "{settings.influxdb.bucket_solar}")
                 self.logger.warning("No solar production data found")
                 return False
 
-            # Parse solar data
+            # Parse solar data (skip None/empty aggregates — they'd poison the
+            # numeric model build with TypeErrors downstream).
             solar_by_hour: Dict[str, float] = {}
             for table in solar_result:
                 for record in table.records:
+                    v = record.get_value()
+                    if not isinstance(v, (int, float)):
+                        continue
                     key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
-                    solar_by_hour[key] = record.get_value()
+                    solar_by_hour[key] = float(v)
 
             soc_by_hour: Dict[str, float] = {}
             if soc_result:
                 for table in soc_result:
                     for record in table.records:
+                        v = record.get_value()
+                        if not isinstance(v, (int, float)):
+                            continue
                         key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
-                        soc_by_hour[key] = record.get_value()
+                        soc_by_hour[key] = float(v)
 
             load_by_hour: Dict[str, float] = {}
             if load_result:
                 for table in load_result:
                     for record in table.records:
+                        v = record.get_value()
+                        if not isinstance(v, (int, float)):
+                            continue
                         key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
-                        load_by_hour[key] = record.get_value()
+                        load_by_hour[key] = float(v)
 
             # Carry-forward state intervals: state-change records span until the
             # next change; for each solar-data hour we want the effective state
@@ -1027,13 +1043,15 @@ from(bucket: "{weather_bucket}")
                     all_hours |= set(s.hourly.keys())
 
                 for hour in all_hours:
-                    model_val = model.hourly.get(hour, 0)
-
-                    # Model says 0 (sun below horizon) — trust it,
-                    # other sources don't check sun position
-                    if model_val <= 0:
+                    # Only trust a model 0 when the hour is genuinely PRESENT in
+                    # the model (sun below horizon). A MISSING hour (e.g. a dropped
+                    # weather entry) must NOT be conflated with a real zero — fall
+                    # through to averaging the other sources instead of discarding
+                    # their positive PV.
+                    if hour in model.hourly and model.hourly[hour] <= 0:
                         hourly[hour] = 0
                         continue
+                    model_val = model.hourly.get(hour, 0)
 
                     # Separate model from non-model sources by identity
                     other_vals = [
@@ -1133,6 +1151,8 @@ from(bucket: "{bucket}")
                 for record in table.records:
                     day = record.get_time().strftime("%Y-%m-%d")
                     val = record.get_value()
+                    if not isinstance(val, (int, float)):
+                        continue  # skip None/empty aggregate (would crash max cmp)
                     if day not in actual_by_day or val > actual_by_day[day]:
                         actual_by_day[day] = val
 
@@ -1231,8 +1251,15 @@ from(bucket: "{bucket}")
         if not self._consensus:
             return False
 
+        from datetime import date as _date
+        today = _date.today()
         total_kwp = sum(a.kwp for a in self.arrays)
         for forecast in self._consensus.values():
+            # Skip stale past-dated entries that were never evicted from the
+            # consensus pool — a yesterday forecast must not gate today's
+            # reliability decision.
+            if forecast.date < today:
+                continue
             day_of_year = forecast.date.timetuple().tm_yday
             if 91 <= day_of_year <= 273:  # April-September
                 min_kwh = total_kwp * 0.3

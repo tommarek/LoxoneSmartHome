@@ -36,7 +36,7 @@ from .growatt.decision_engine import (
 from .growatt.inverter_state import InverterState
 from .growatt.solar_forecast import SolarForecast
 from .growatt.consumption_forecast import ConsumptionForecast
-from .growatt.optimizer import BatteryOptimizer
+from .growatt.optimizer import BatteryOptimizer, compute_charge_power_rates, compute_rate_ceiling
 from .growatt.deferrable_loads import DeferrableLoad, DeferrableLoadSchedule
 from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
@@ -142,6 +142,27 @@ class GrowattController(BaseModule):
         )
         self.config = settings.growatt
 
+        # Layer any dashboard-edited overrides on top of the .env defaults. This
+        # mutates self.config in place (before the optimizer/forecasters capture
+        # the reference), so persisted edits take effect on startup. A
+        # missing/invalid file is ignored — the service must always boot.
+        from config.settings_overrides import (
+            DEFAULT_OVERRIDES_PATH,
+            apply_overrides,
+            load_overrides,
+        )
+        self._overrides_path = DEFAULT_OVERRIDES_PATH
+        try:
+            _stored = load_overrides(self._overrides_path)
+            if _stored:
+                applied = apply_overrides(self.config, _stored)
+                self.logger.info(
+                    f"Applied {len(applied)} persisted setting override(s): "
+                    f"{', '.join(sorted(applied))}"
+                )
+        except Exception as e:  # never let a bad overrides file block startup
+            self.logger.warning(f"Ignoring config overrides ({self._overrides_path}): {e}")
+
         # Optional config will be set during validation
 
         # Validate config and set defaults
@@ -207,6 +228,11 @@ class GrowattController(BaseModule):
         self._manual_override_source = ""
 
         self._last_command_results: Dict[str, Dict[str, Any]] = {}
+
+        # Adaptive charge/discharge rate: per-block inverter powerRate% from the
+        # last plan (empty unless the matching feature is enabled). Block ts → %.
+        self._charge_power_rate_by_ts: Dict[datetime, int] = {}
+        self._discharge_power_rate_by_ts: Dict[datetime, int] = {}
 
         # Initialize refactored modules
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
@@ -1316,8 +1342,27 @@ class GrowattController(BaseModule):
                 minutes=total_buffer
             )
 
-            # Keep the original stop time (should be 23:59 for all-day modes)
+            # Keep the original stop time (should be 23:59 for all-day modes).
             adjusted_stop_dt = stop_dt
+            # Near midnight the future-shifted start can reach/pass the stop,
+            # which would emit an invalid start>=stop slot. _fmt emits only HH:MM
+            # (no day), so pushing the stop to the next day would render identical
+            # to the start (degenerate). Clamp the stop to 23:59 of the start's
+            # day, and if the start is itself in the final minute(s), snap it back
+            # to 23:58 so start<stop always holds within HH:MM.
+            if adjusted_start_dt >= adjusted_stop_dt:
+                end_of_day = adjusted_start_dt.replace(
+                    hour=23, minute=59, second=0, microsecond=0
+                )
+                if adjusted_start_dt >= end_of_day:
+                    adjusted_start_dt = adjusted_start_dt.replace(
+                        hour=23, minute=58, second=0, microsecond=0
+                    )
+                adjusted_stop_dt = end_of_day
+                self.logger.warning(
+                    f"Immediate-activation start crossed the stop time; clamped to "
+                    f"{_fmt(adjusted_start_dt)}-{_fmt(adjusted_stop_dt)}"
+                )
 
             direction = 'behind' if self._clock_drift_seconds > 0 else 'ahead'
             skew_desc = (
@@ -1341,6 +1386,14 @@ class GrowattController(BaseModule):
                 adjusted_stop_dt = adjusted_start_dt + duration
             else:
                 adjusted_stop_dt = stop_dt  # keep original stop
+
+            # Prevent a collapsed window: if bumping the start to the future
+            # collided with the stop (same HH:MM, e.g. near a 23:59 boundary),
+            # snap the start back one minute so the window stays non-empty. A
+            # collapsed start==stop would make the mode setters skip actuation
+            # and desync tracked vs hardware.
+            if _fmt(adjusted_start_dt) == _fmt(adjusted_stop_dt):
+                adjusted_start_dt = adjusted_stop_dt - timedelta(minutes=1)
 
             msg = (
                 f"Adjusting start time from {start_str} to {_fmt(adjusted_start_dt)} "
@@ -2560,12 +2613,36 @@ from(bucket: "{bucket}")
                 current_soc=self._battery_soc,
                 min_soc=self.config.min_soc,
                 max_soc=self.config.max_soc,
-                charge_rate_kw=self.config.battery_charge_rate_kw,
-                discharge_rate_kw=self.config.battery_discharge_rate_kw,
+                # Adaptive charging lets the optimizer plan faster-than-gentle
+                # charging (up to the true hardware max) so it can fill a short
+                # cheap/negative window it would otherwise miss at 2.5 kW.
+                charge_rate_kw=(
+                    min(self.config.battery_charge_max_kw,
+                        getattr(self.config, "max_charge_power_kw",
+                                self.config.battery_charge_max_kw))
+                    if getattr(self.config, "adaptive_charge_rate", False)
+                    else self.config.battery_charge_rate_kw
+                ),
+                # Symmetric: let the optimizer plan faster discharge to fully
+                # drain into a short high-price spike it would otherwise miss —
+                # but never above the operational C-rate ceiling.
+                discharge_rate_kw=(
+                    min(self.config.battery_discharge_max_kw,
+                        getattr(self.config, "max_discharge_power_kw",
+                                self.config.battery_discharge_max_kw))
+                    if getattr(self.config, "adaptive_discharge_rate", False)
+                    else self.config.battery_discharge_rate_kw
+                ),
                 discharge_power_pct=self.config.discharge_power_rate,
                 efficiency=self.config.battery_efficiency,
                 sell_fee_czk=self.config.sell_fee_czk,
                 battery_amortisation_czk=self.config.battery_amortisation_czk,
+                # Optional export-only wear penalty (None → shared base cost).
+                # Both engines accept it; raises the arbitrage hurdle without
+                # touching battery→house self-consumption economics.
+                battery_amortisation_export_czk=getattr(
+                    self.config, "battery_amortisation_export_czk", None
+                ),
                 # Strict engine-agnostic rules the plan must respect so it never
                 # promises an export/PV action the hardware gates then block.
                 export_price_min=self.config.export_price_min,
@@ -2579,12 +2656,19 @@ from(bucket: "{bucket}")
                 ),
             )
             # MILP-only knobs (the greedy engine doesn't accept these kwargs).
+            # co_opt_deferrable is the MILP marker (only MILP sets
+            # CO_OPTIMIZES_DEFERRABLE), so gate MILP-only kwargs on it.
             if co_opt_deferrable:
                 opt_kwargs["switch_penalty_czk"] = getattr(
                     self.config, "milp_switch_penalty_czk", 0.0
                 )
                 if deferrable_for_milp:
                     opt_kwargs["deferrable_loads"] = deferrable_for_milp
+            # Keep BOTH engines' sell_production SOC gate in sync with the
+            # controller's actuation remap (greedy + MILP both accept this).
+            opt_kwargs["sell_production_min_soc_margin"] = getattr(
+                self.config, "sell_production_min_soc_margin", 2.0
+            )
             _optimize_call = functools.partial(self._optimizer.optimize, **opt_kwargs)
             charge_times, discharge_times, sell_production_times, decisions = (
                 await asyncio.to_thread(_optimize_call)
@@ -2596,6 +2680,66 @@ from(bucket: "{bucket}")
             hold_idle_times = {
                 d.timestamp for d in decisions if d.action == "hold_idle"
             }
+            # Per-leg SOC-loss factor to convert each engine's ΔSOC to grid-side
+            # energy: the MILP splits round-trip efficiency sqrt-symmetrically
+            # across the two legs, the greedy puts it all on one leg. Use the
+            # engine that ACTUALLY produced the decisions (a MILP solve that fell
+            # back to greedy carries greedy's convention), not just the configured
+            # engine — _last_engine records it.
+            _engine_used = getattr(self._optimizer, "_last_engine", "greedy")
+            _leg_eta = (
+                self.config.battery_efficiency ** 0.5
+                if _engine_used == "milp" else self.config.battery_efficiency
+            )
+            # Adaptive charge rate: per-charge-window inverter powerRate% so the
+            # hardware charges at the gentlest rate that still fills each window.
+            # Empty when the feature is off → falls back to the fixed rate.
+            if getattr(self.config, "adaptive_charge_rate", False):
+                _chg_max_rate = compute_rate_ceiling(
+                    self.config.battery_charge_max_kw,
+                    getattr(self.config, "max_charge_power_kw",
+                            self.config.battery_charge_max_kw),
+                )
+                self._charge_power_rate_by_ts = compute_charge_power_rates(
+                    decisions,
+                    self.config.battery_capacity,
+                    self.config.battery_charge_max_kw,
+                    int(self.config.min_charge_power_rate),
+                    max_power_rate=_chg_max_rate,
+                    efficiency=_leg_eta,
+                )
+                if self._charge_power_rate_by_ts:
+                    _rates = sorted(set(self._charge_power_rate_by_ts.values()))
+                    self.logger.info(
+                        f"⚡ Adaptive charge rates: {len(self._charge_power_rate_by_ts)} "
+                        f"charge block(s), powerRate(s)={_rates}%"
+                    )
+            else:
+                self._charge_power_rate_by_ts = {}
+            # Symmetric adaptive DISCHARGE rate (grid_first powerRate per window).
+            if getattr(self.config, "adaptive_discharge_rate", False):
+                _dis_max_rate = compute_rate_ceiling(
+                    self.config.battery_discharge_max_kw,
+                    getattr(self.config, "max_discharge_power_kw",
+                            self.config.battery_discharge_max_kw),
+                )
+                self._discharge_power_rate_by_ts = compute_charge_power_rates(
+                    decisions,
+                    self.config.battery_capacity,
+                    self.config.battery_discharge_max_kw,
+                    int(self.config.discharge_power_rate),
+                    action="discharge",
+                    max_power_rate=_dis_max_rate,
+                    efficiency=_leg_eta,
+                )
+                if self._discharge_power_rate_by_ts:
+                    _drates = sorted(set(self._discharge_power_rate_by_ts.values()))
+                    self.logger.info(
+                        f"⚡ Adaptive discharge rates: {len(self._discharge_power_rate_by_ts)} "
+                        f"discharge block(s), powerRate(s)={_drates}%"
+                    )
+            else:
+                self._discharge_power_rate_by_ts = {}
             # With MILP co-optimization the deferrable placement is decided by
             # the solver; adopt it (for the dashboard + MQTT actuation).
             if co_opt_deferrable and self._deferrable_loads:
@@ -3455,6 +3599,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     self._last_applied.clear()  # shared dict → also clears mode_manager
                     if self._mode_manager is not None:
                         self._mode_manager._inverter_on = None
+                        # AC-charge / export flags are separate attrs (not in
+                        # _last_applied); null them too — to a sentinel no bool
+                        # target equals — so set_ac_charge/set_export re-issue in
+                        # BOTH directions on a forced drift-recovery re-sync.
+                        self._mode_manager._ac_enabled = None
+                        self._mode_manager._export_enabled = None
                     if self._decision_engine is not None:
                         self._decision_engine._last_mode = None
                     self._current_mode = None
@@ -3468,9 +3618,14 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 # Get decision from engine
                 new_mode = self._decision_engine.decide(context)
 
-                # NEW: Check defer flag - override charging if tomorrow cheaper
+                # Check defer flag - override charging if tomorrow cheaper.
+                # Never override a MANUAL override (Priority 1): a user-requested
+                # charge must win over the auto defer-to-tomorrow heuristic.
+                # (_defer_charging_to_tomorrow is the legacy flag, currently never
+                # set True, but guard the precedence regardless.)
                 if (
-                    self._defer_charging_to_tomorrow
+                    not context.manual_override_active
+                    and self._defer_charging_to_tomorrow
                     and new_mode in ("charge_from_grid", "battery_first_ac_charge")
                 ):
                     # Decision engine wants to charge, but we're deferring
@@ -3481,18 +3636,50 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     )
                     # Switch to regular mode (don't charge from grid)
                     new_mode = "regular"
-
-                # Check if mode changed
-                if self._decision_engine.has_mode_changed(new_mode):
-                    # Get explanation for logging
-                    explanation = self._decision_engine.explain_decision()
-                    # Log mode change with state details (done in _apply_decided_mode)
-
-                    # Apply the new mode (will log consolidated one-liner)
-                    await self._apply_decided_mode(new_mode, reason=reason, explanation=explanation)
-                    self._current_mode = new_mode
-                    await self._write_inverter_state_point(source="mode_change")
+                    # The engine's _last_decision still holds the (overridden)
+                    # charge node, so explain_decision() would log "charging…"
+                    # next to the applied "regular" — contradictory. Use a
+                    # synthetic explanation that matches what we actually did.
+                    _defer_explanation = {
+                        "reason": (
+                            f"Deferring charge to tomorrow "
+                            f"({self._tomorrow_cheaper_by:.1f}% cheaper)"
+                        )
+                    }
                 else:
+                    _defer_explanation = None
+
+                # Re-derive and (re)apply the desired hardware state EVERY
+                # evaluation. The decided mode STRING can be unchanged while the
+                # resolved hardware state still differs — e.g. sell_production
+                # resolves to battery_hold once live SOC crosses the margin, or an
+                # adaptive per-window powerRate changes mid-mode. Gating on the
+                # mode string alone would skip those reactuations until the next
+                # 15-min decide(). has_mode_changed() is kept (it advances the
+                # engine's _last_mode) for the log line; _apply_decided_mode
+                # no-ops internally when nothing actually changed.
+                mode_changed = self._decision_engine.has_mode_changed(new_mode)
+                explanation = _defer_explanation or self._decision_engine.explain_decision()
+                # Carry manual-override custom params (stop_soc/power_rate) into
+                # actuation — the decision path only carries the mode string, so
+                # without this a custom override SOC/rate is silently dropped and
+                # the config default is actuated while the status API reports the
+                # requested value (plan-vs-reality).
+                mode_params = (
+                    self._manual_override_period.params
+                    if self._manual_override_period else None
+                )
+                applied = await self._apply_decided_mode(
+                    new_mode, params=mode_params, reason=reason,
+                    explanation=explanation, context=context,
+                )
+                # Report the EFFECTIVE (actuated) mode, not the pre-remap decision
+                # — e.g. a mid-SOC sell_production actuates as battery_hold, and
+                # operational_mode must match the inverter_mode written alongside.
+                self._current_mode = getattr(self, "_last_built_mode", new_mode)
+                if applied:
+                    await self._write_inverter_state_point(source="mode_change")
+                elif not mode_changed:
                     self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
 
                 # Always re-evaluate export state based on current price,
@@ -3610,6 +3797,23 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         """
         now = self._get_local_now()
 
+        # Enforce manual-override expiry on EVERY evaluation tick. The expiry was
+        # only checked on-demand by the status getter (which doesn't clear it), so
+        # a time-limited override (e.g. 1h discharge) would otherwise keep forcing
+        # the battery indefinitely until a manual reset.
+        if (
+            self._manual_override_period
+            and self._manual_override_end_time
+            and now >= self._manual_override_end_time
+        ):
+            self.logger.info(
+                f"⏱️ Manual override ({self._manual_override_period.kind}) expired "
+                f"at {self._manual_override_end_time:%H:%M} — reverting to auto"
+            )
+            self._manual_override_period = None
+            self._manual_override_end_time = None
+            self._manual_override_source = ""
+
         # Calculate current 15-minute block
         current_minute = now.minute
         block_start_minute = (current_minute // 15) * 15
@@ -3707,7 +3911,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         )
 
     async def _build_desired_state(
-        self, mode: str, params: Optional[Dict[str, Any]] = None
+        self, mode: str, params: Optional[Dict[str, Any]] = None,
+        context: Optional["DecisionContext"] = None,
     ) -> InverterState:
         """Build the complete desired inverter state.
 
@@ -3748,34 +3953,116 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         elif isinstance(stop_soc_raw, (int, float)):
             stop_soc = int(stop_soc_raw)
 
+        # sell_production = grid-first export of SURPLUS SOLAR with the battery
+        # passive. On the SPH, grid-first stop_soc is the level the inverter
+        # maintains: it CHARGES up to it (below) and DISCHARGES down to it (above).
+        # So to keep the battery exactly where it is — neither charging the surplus
+        # in nor discharging it out — pin stop_soc to the LIVE SOC. With export
+        # enabled (price-gated below), the surplus then has only one place to go:
+        # the grid. (stop_soc=max_soc would instead charge the surplus into the
+        # battery at mid-SOC — the bug that prompted this.)
+        if mode == "sell_production":
+            stop_soc = int(round(max(
+                self.config.min_soc, min(self.config.max_soc, self._battery_soc)
+            )))
+
         # Determine power rate
         # AC charge from mode definition
         ac_charge_enabled = bool(mode_def.get("ac_charge", False))
 
-        # If AC charging is enabled, ALWAYS use 100% power rate to charge quickly within the slot
         if ac_charge_enabled:
-            power_rate = 100
-            self.logger.debug("AC charging enabled - setting power_rate to 100%")
+            if params.get("power_rate") is not None:
+                # A manual charge_from_grid override with an explicit rate wins
+                # over both the adaptive map and the config default.
+                power_rate = int(params["power_rate"])
+            elif getattr(self.config, "adaptive_charge_rate", False):
+                # Adaptive: use the per-window rate the optimizer chose for the
+                # CURRENT block (gentle unless the cheap window is short). Falls
+                # back to 100% if this block has no planned rate (e.g. a manual
+                # charge outside the optimizer's plan); force_power_rate writes it.
+                power_rate = 100
+                now = self._get_local_now()
+                cur_ts = now.replace(
+                    minute=(now.minute // 15) * 15, second=0, microsecond=0
+                )
+                rate = self._charge_power_rate_by_ts.get(cur_ts)
+                if rate is not None:
+                    power_rate = int(rate)
+            else:
+                # Non-adaptive: write an EXPLICIT gentle rate matching the
+                # optimizer's battery_charge_rate_kw, so the inverter doesn't
+                # silently inherit a stale powerRate from a prior grid-first
+                # discharge (set_battery_first writes any rate != 100).
+                hw = getattr(self.config, "battery_charge_max_kw", 9.8) or 9.8
+                power_rate = max(10, min(100, round(
+                    self.config.battery_charge_rate_kw / hw * 100
+                )))
+            self.logger.debug(
+                f"AC charging enabled - power_rate={power_rate}%"
+            )
         else:
-            # For other modes, use configured or default rate
-            default_rate = 100
-            if hasattr(self.config, 'discharge_power_rate'):
-                default_rate = self.config.discharge_power_rate
+            # powerRate means DIFFERENT things per inverter mode:
+            #   grid_first  → discharge-to-grid rate  (gentle default)
+            #   battery_first (ac off, e.g. battery_hold) → CHARGE rate
+            # so a battery_hold must NOT inherit discharge_power_rate (that would
+            # throttle surplus-solar banking to ~25%). Bank solar at the charge
+            # ceiling (respecting the C-rate cap); only solar feeds it (ac off).
+            inv_mode = str(mode_def.get("inverter_mode", "load_first"))
+            if inv_mode == "battery_first":
+                hw = getattr(self.config, "battery_charge_max_kw", 9.8) or 9.8
+                cap = getattr(self.config, "max_charge_power_kw", hw)
+                default_rate = max(10, min(100, round(min(hw, cap) / hw * 100)))
+            elif inv_mode == "grid_first":
+                default_rate = getattr(self.config, 'discharge_power_rate', 100)
+            else:
+                # load_first: set_load_first does NOT actuate powerRate, so use a
+                # FIXED sentinel (100) — otherwise a varying value would key
+                # significant_changes() and trigger spurious mode re-applies for a
+                # field the hardware never sees.
+                default_rate = 100
             power_rate = int(params.get("power_rate", default_rate))
+            # Adaptive discharge: for a grid_first discharge block, override the
+            # gentle default with the per-window rate the optimizer chose for the
+            # CURRENT block (faster only when a short high-price spike needs it).
+            # Skip when a manual override supplied an explicit power_rate — that
+            # request must win over the optimizer's planned rate.
+            if (inv_mode == "grid_first"
+                    and "power_rate" not in params
+                    and getattr(self.config, "adaptive_discharge_rate", False)):
+                now = self._get_local_now()
+                cur_ts = now.replace(
+                    minute=(now.minute // 15) * 15, second=0, microsecond=0
+                )
+                drate = self._discharge_power_rate_by_ts.get(cur_ts)
+                if drate is not None:
+                    power_rate = int(drate)
+                    self.logger.debug(
+                        f"Adaptive discharge - power_rate={power_rate}%"
+                    )
 
         # Map mode to inverter mode
         inverter_mode = str(mode_def.get("inverter_mode", "load_first"))
 
-        # Determine export based on price
-        export_enabled = True  # Default
-        context = None
+        # Determine export based on price. Reuse the caller's already-built
+        # context when supplied (the evaluation loop builds one per tick) so we
+        # don't redundantly rebuild it — a rebuild re-runs price/forecast lookups
+        # and has side effects (e.g. the override-expiry check).
+        # Default conservatively when the current block has no price: preserve
+        # the tracked export state if known, else OFF — never force export ON
+        # without a price basis (the steady-state export gate is itself gated on
+        # the same price availability, so it couldn't turn a spurious ON back off).
+        export_enabled = (
+            self._current_inverter_state.export_enabled
+            if self._current_inverter_state is not None else False
+        )
         try:
-            context = await self._build_decision_context()
+            if context is None:
+                context = await self._build_decision_context()
             if context.price_thresholds and context.current_block_key in context.prices_15min:
                 current_price_czk = context.current_price  # Already CZK/kWh
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:
-            self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
+            self.logger.debug(f"Could not determine export state: {e}; preserving prior")
 
         # Preserve the current inverter on/off state — it's owned by the
         # price-threshold gate, NOT mode evaluation. Without this, every
@@ -3795,8 +4082,17 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             try:
                 threshold = self.config.inverter_off_price_threshold_czk
                 hysteresis = self.config.inverter_off_price_hysteresis_czk
-                if (
+                # A SCHEDULED charge block forces the inverter ON even at a
+                # deep-negative price (mirrors the steady-state gate) — otherwise
+                # the seed writes OFF and the same-tick gate immediately flips it
+                # back ON, a spurious OFF→ON Modbus flap during the charge.
+                is_scheduled_charge = (
                     context is not None
+                    and context.current_block_key in self._combined_charging_blocks
+                )
+                if (
+                    not is_scheduled_charge
+                    and context is not None
                     and context.price_thresholds
                     and context.current_block_key in context.prices_15min
                     and context.current_price < threshold - hysteresis
@@ -3804,6 +4100,11 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     current_inverter_on = False
             except Exception as e:
                 self.logger.debug(f"Could not seed inverter_on from price gate: {e}")
+
+        # Stash the EFFECTIVE mode (after any sell_production→battery_hold remap)
+        # so the caller can report the actuated mode as operational_mode, not the
+        # pre-remap decision string (which would contradict inverter_mode).
+        self._last_built_mode = mode
 
         return InverterState(
             inverter_mode=inverter_mode,
@@ -3932,7 +4233,13 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     stop_soc=new_state.stop_soc,
                     power_rate=new_state.power_rate,
                     immediate_activation=immediate_activation,
-                    previous_mode=previous_mode
+                    previous_mode=previous_mode,
+                    # Always write the exact battery-first powerRate (even at
+                    # 100%) so the inverter can't keep a stale 25% from a prior
+                    # grid_first discharge. Both adaptive charging AND battery_hold
+                    # (which banks solar at the charge ceiling, often 100%) need
+                    # this — battery_first is always an explicit-charge state.
+                    force_power_rate=True,
                 )
             elif new_state.inverter_mode == "grid_first":
                 mode_ok = await self._mode_manager.set_grid_first(
@@ -4014,8 +4321,9 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         mode: str,
         params: Optional[Dict[str, Any]] = None,
         reason: Optional[str] = None,
-        explanation: Optional[Dict[str, Any]] = None
-    ) -> None:
+        explanation: Optional[Dict[str, Any]] = None,
+        context: Optional["DecisionContext"] = None,
+    ) -> bool:
         """Apply a mode based on its definition from MODE_DEFINITIONS.
 
         Args:
@@ -4023,9 +4331,13 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             params: Optional parameters for configurable modes
             reason: What triggered the mode change
             explanation: Decision explanation from decision engine
+            context: Already-built decision context to reuse (avoids a rebuild)
+
+        Returns:
+            True if the desired state differed and was applied, False on no-op.
         """
-        # Build desired state from mode and current conditions
-        desired_state = await self._build_desired_state(mode, params)
+        # Build desired state from mode and current conditions (reuse context)
+        desired_state = await self._build_desired_state(mode, params, context=context)
 
         # Check if anything actually changed
         if self._current_inverter_state and desired_state == self._current_inverter_state:
@@ -4034,7 +4346,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 f"State unchanged after evaluation: {desired_state.summary()} "
                 f"(skipped: {self._commands_skipped_count}, sent: {self._commands_sent_count})"
             )
-            return
+            return False
 
         # Log consolidated one-liner with all essential info
         if self._current_inverter_state:
@@ -4057,6 +4369,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
 
         # Track if we're in high load protected mode
         self._high_load_protected_mode_active = (mode == "high_load_protected")
+        return True
 
     # Event-driven evaluation methods
 
@@ -4559,8 +4872,10 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             raise ValueError(f"Invalid duration type: {duration_type}")
 
         # Set default params if not provided based on mode
-        if params is None:
-            params = {}
+        # Own an independent copy so the stored Period.params (read every tick
+        # for actuation) doesn't alias the caller's dict and our setdefault()s
+        # don't mutate it.
+        params = dict(params or {})
 
         # Set sensible defaults for modes that need params
         if mode == "charge_from_grid":
@@ -4646,6 +4961,11 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         """
         sent_before = self._commands_sent_count
         try:
+            # Clear stale per-command results so `failed` reflects ONLY commands
+            # issued during THIS re-apply. The dict persists across evaluations
+            # and is never otherwise cleared, so an old failure for a command
+            # type not re-issued now would mis-report success=false.
+            self._last_command_results.clear()
             await self._evaluate_conditions("manual_reapply", force=True)
 
             results = getattr(self, "_last_command_results", {}) or {}
@@ -4664,6 +4984,90 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         except Exception as e:
             self.logger.error(f"Re-apply current state failed: {e}", exc_info=True)
             return {"success": False, "message": f"Re-apply failed: {e}"}
+
+    def get_settings_schema(self) -> List[Dict[str, Any]]:
+        """Grouped editable-settings schema + current values for the dashboard."""
+        from config.settings_overrides import build_settings_schema
+        return build_settings_schema(self.config)
+
+    async def apply_setting_overrides(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate, persist and (where possible) hot-apply edited settings.
+
+        `updates` maps GrowattConfig field name -> new value (strings from the
+        web form are coerced/validated by Pydantic, including cross-field rules).
+
+        Hot fields (read fresh each evaluation tick) take effect immediately:
+        the live config is mutated and a full schedule recompute + re-evaluation
+        is triggered so the new economics actuate without waiting for the next
+        15-min tick. Fields consumed only at startup (forecaster/optimizer
+        construction, log level) are persisted and reported as needing a restart.
+        """
+        from config.settings_overrides import (
+            EDITABLE_FIELDS,
+            apply_overrides,
+            load_overrides,
+            save_overrides,
+        )
+        try:
+            # Validate + mutate live config in place (raises on any bad value,
+            # leaving the live config untouched on failure).
+            applied = apply_overrides(self.config, updates)
+        except Exception as e:
+            return {"success": False, "message": f"Invalid settings: {e}"}
+
+        if not applied:
+            return {"success": False, "message": "No editable settings in request"}
+
+        # Persist: merge onto whatever is already stored so unrelated prior
+        # overrides survive.
+        try:
+            stored = load_overrides(self._overrides_path)
+            for key in applied:
+                stored[key] = getattr(self.config, key)
+            save_overrides(stored, self._overrides_path)
+            persisted = True
+        except Exception as e:
+            self.logger.error(f"Failed to persist setting overrides: {e}")
+            persisted = False
+
+        restart_required = sorted(
+            k for k in applied if not EDITABLE_FIELDS[k].hot
+        )
+        hot_applied = sorted(k for k in applied if EDITABLE_FIELDS[k].hot)
+
+        # Re-run the optimizer + decision tree so hot economic changes actuate
+        # now. Recompute the schedule first (that's where optimize() reads the
+        # new config), then force a re-evaluation to push any mode change.
+        reevaluated = False
+        if hot_applied:
+            try:
+                await self._calculate_cross_day_optimal_schedule(force_table=True)
+                await self._evaluate_conditions("settings_update", force=True)
+                reevaluated = True
+            except Exception as e:
+                self.logger.error(f"Re-evaluation after settings change failed: {e}")
+
+        msg_parts = [f"Saved {len(applied)} setting(s)"]
+        if hot_applied:
+            msg_parts.append(
+                "applied live" if reevaluated else "applied (re-eval failed)"
+            )
+        if restart_required:
+            msg_parts.append(
+                f"restart required for: {', '.join(restart_required)}"
+            )
+        if not persisted:
+            msg_parts.append("WARNING: not persisted to disk")
+
+        return {
+            "success": True,
+            "applied": sorted(applied),
+            "hot_applied": hot_applied,
+            "restart_required": restart_required,
+            "persisted": persisted,
+            "reevaluated": reevaluated,
+            "message": " — ".join(msg_parts),
+        }
 
     def get_manual_override_status(self) -> Dict[str, Any]:
         """Get current manual override status."""

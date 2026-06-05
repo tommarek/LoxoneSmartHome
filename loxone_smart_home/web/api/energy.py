@@ -705,7 +705,6 @@ def _format_schedule_from_controller(
     # Extract data from controller state
     today_prices = schedule_data.get("today_prices", {})
     tomorrow_prices = schedule_data.get("tomorrow_prices", {})
-    eur_czk_rate = schedule_data.get("eur_czk_rate", 25.0)
 
     # Get schedule blocks (these are sets of (start, end) tuples)
     charge_today = schedule_data.get("charging_blocks_today", set())
@@ -726,7 +725,6 @@ def _format_schedule_from_controller(
             charge_today,
             pre_discharge_today,
             discharge_today,
-            eur_czk_rate,
             now
         )
         days.append(today_schedule)
@@ -740,7 +738,6 @@ def _format_schedule_from_controller(
             charge_tomorrow,
             pre_discharge_tomorrow,
             discharge_tomorrow,
-            eur_czk_rate,
             now
         )
         days.append(tomorrow_schedule)
@@ -780,19 +777,17 @@ def _format_day_schedule_from_controller(
     charge_blocks: set,
     pre_discharge_blocks: set,
     discharge_blocks: set,
-    eur_czk_rate: float,
     now: datetime
 ) -> Dict[str, Any]:
     """Format a single day's schedule from controller data.
 
     Args:
-        prices: Dict of (start, end) -> price_eur
+        prices: Dict of (start, end) -> price_czk (already CZK/kWh)
         date: Date object for this day
         label: Label for the day (e.g., "TODAY", "TOMORROW")
         charge_blocks: Set of (start, end) tuples for charging
         pre_discharge_blocks: Set of (start, end) tuples for pre-discharge charging
         discharge_blocks: Set of (start, end) tuples for discharge
-        eur_czk_rate: EUR to CZK conversion rate
         now: Current datetime
 
     Returns:
@@ -803,7 +798,7 @@ def _format_day_schedule_from_controller(
     # Sort price blocks by time
     sorted_blocks = sorted(prices.items(), key=lambda x: x[0][0])
 
-    for (start_str, end_str), price_eur in sorted_blocks:
+    for (start_str, end_str), price_czk in sorted_blocks:
         # Parse time "HH:MM"
         hour = int(start_str.split(':')[0])
         minute = int(start_str.split(':')[1])
@@ -821,7 +816,7 @@ def _format_day_schedule_from_controller(
             mode, icon = "normal", "-"
 
         # Prices already in CZK/kWh (converted at storage time in controller)
-        price_czk_kwh = price_eur
+        price_czk_kwh = price_czk
 
         # Format time block
         time_block = f"{start_str}-{end_str}"
