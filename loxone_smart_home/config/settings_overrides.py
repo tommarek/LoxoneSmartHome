@@ -162,6 +162,17 @@ EDITABLE_GROUPS: List[FieldGroup] = [
         ],
     ),
     FieldGroup(
+        "High-load protection",
+        "Prevent the battery from discharging while a big load (EV charging or "
+        "heating) runs. Heating is detected from Loxone relays; EV charging from "
+        "InfluxDB (teslamate).",
+        [
+            FieldSpec("high_load_protection_enabled", "Protection enabled", ""),
+            FieldSpec("ev_charging_power_threshold_w", "EV charging threshold", "W"),
+            FieldSpec("ev_high_load_poll_seconds", "EV poll interval", "s", hot=False),
+        ],
+    ),
+    FieldGroup(
         "Optimizer engine",
         "Engine selection takes effect on restart (the optimizer is built once "
         "at startup). The MILP switch penalty applies live.",

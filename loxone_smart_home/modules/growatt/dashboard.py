@@ -955,6 +955,15 @@ async def api_settings_post(request: web.Request) -> web.Response:
     return web.json_response(result, status=status)
 
 
+async def api_restart(request: web.Request) -> web.Response:
+    """Restart the controller process (applies restart-only settings)."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"error": "Controller not ready"}, status=503)
+    result = await ctrl.request_restart("dashboard request")
+    return web.json_response(result)
+
+
 async def settings_page(request: web.Request) -> web.Response:
     """Serve the settings editor page."""
     return web.Response(
@@ -1041,6 +1050,7 @@ def _add_api_routes(app: "web.Application") -> None:
     app.router.add_post("/api/reapply", api_reapply)
     app.router.add_get("/api/settings", api_settings_get)
     app.router.add_post("/api/settings", api_settings_post)
+    app.router.add_post("/api/restart", api_restart)
 
 
 def _add_page_routes(app: "web.Application") -> None:
@@ -1277,6 +1287,19 @@ SETTINGS_HTML = """<!DOCTYPE html>
   .toast.ok{border-color:var(--green)}
   .toast.err{border-color:var(--red)}
   .loading{padding:40px;text-align:center;color:var(--muted)}
+  #restartBtn.pending{border-color:var(--amber);color:var(--amber);
+    animation:pulse 1.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+  .overlay{position:fixed;inset:0;background:rgba(7,9,12,.82);display:none;
+    align-items:center;justify-content:center;z-index:50}
+  .overlay.show{display:flex}
+  .overlay-box{background:var(--card);border:1px solid var(--border);
+    border-radius:14px;padding:28px 32px;text-align:center;max-width:340px}
+  .overlay-sub{font-size:12.5px;color:var(--muted);margin-top:8px}
+  .spinner{width:34px;height:34px;margin:0 auto 14px;border-radius:50%;
+    border:3px solid var(--border);border-top-color:var(--accent);
+    animation:spin .9s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
 </style>
 </head>
 <body>
@@ -1292,16 +1315,25 @@ SETTINGS_HTML = """<!DOCTYPE html>
 <div class="savebar">
   <span class="info" id="saveInfo">No changes</span>
   <div style="display:flex;gap:10px">
+    <button class="btn ghost" id="restartBtn" title="Restart the controller to apply restart-only settings (e.g. forecast engine)">&#8635; Restart</button>
     <button class="btn ghost" id="resetBtn">Reset</button>
     <button class="btn primary" id="saveBtn" disabled>Save changes</button>
   </div>
 </div>
 <div class="toast" id="toast"></div>
+<div class="overlay" id="overlay">
+  <div class="overlay-box">
+    <div class="spinner"></div>
+    <div id="overlayMsg">Restarting controller&hellip;</div>
+    <div class="overlay-sub" id="overlaySub">Applying restart-only settings. This takes ~30&ndash;40s.</div>
+  </div>
+</div>
 
 <script>
 const root = document.getElementById('root');
 const saveBtn = document.getElementById('saveBtn');
 const resetBtn = document.getElementById('resetBtn');
+const restartBtn = document.getElementById('restartBtn');
 const saveInfo = document.getElementById('saveInfo');
 let SCHEMA = [];
 const original = {};   // name -> original value
@@ -1448,11 +1480,56 @@ saveBtn.addEventListener('click', async () => {
     });
     const j = await r.json();
     if (!r.ok || !j.success) throw new Error(j.message || 'Save failed');
-    showToast(j.message || 'Saved', (j.restart_required && j.restart_required.length) ? 'ok' : 'ok');
+    showToast(j.message || 'Saved', 'ok');
+    // A restart-only field changed -> draw attention to the Restart button.
+    if (j.restart_required && j.restart_required.length){
+      restartBtn.classList.add('pending');
+    }
     await load();   // re-pull authoritative values
   }catch(e){
     showToast(e.message, 'err');
     refreshDirty();
+  }
+});
+
+const overlay = document.getElementById('overlay');
+const overlayMsg = document.getElementById('overlayMsg');
+const overlaySub = document.getElementById('overlaySub');
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function pollUntilBack(){
+  // Wait out the shutdown, then poll /api/status until the controller answers.
+  await sleep(6000);
+  for (let i = 0; i < 40; i++){   // ~2 min budget
+    try{
+      const r = await fetch('/api/status', {cache:'no-store'});
+      if (r.ok){ return true; }
+    }catch(_){ /* main still down / proxy 502 */ }
+    overlaySub.textContent = 'Waiting for controller to come back… (' + ((i+1)*3) + 's)';
+    await sleep(3000);
+  }
+  return false;
+}
+
+restartBtn.addEventListener('click', async () => {
+  if (!confirm('Restart the controller now? It will be unavailable for ~30–40s while it reloads (model rebuild + restart-only settings).')) return;
+  overlay.classList.add('show');
+  overlayMsg.textContent = 'Restarting controller…';
+  overlaySub.textContent = 'Applying restart-only settings. This takes ~30–40s.';
+  try{
+    await fetch('/api/restart', {method:'POST'});
+  }catch(_){ /* the process may drop the connection as it exits — expected */ }
+  const back = await pollUntilBack();
+  if (back){
+    overlayMsg.textContent = 'Controller is back ✓';
+    restartBtn.classList.remove('pending');
+    await load();
+    await sleep(600);
+    overlay.classList.remove('show');
+    showToast('Controller restarted — settings applied', 'ok');
+  }else{
+    overlayMsg.textContent = 'Still waiting…';
+    overlaySub.textContent = 'The controller has not answered yet. It may still be rebuilding models — reload the page in a moment.';
   }
 });
 

@@ -540,6 +540,26 @@ class GrowattConfig(BaseSettings):
     # Currency conversion
     eur_czk_rate: float = Field(default=25.0, gt=0)  # EUR to CZK exchange rate
 
+    # High-load protection — prevent battery discharge while a big load (EV
+    # charging or heating) is running, so stored energy isn't drained into it.
+    # Heating is detected from the loxone/status MQTT cache (relay tag1=heating);
+    # EV charging is read from InfluxDB (teslamate `ev` measurement) since it
+    # never reaches that cache.
+    high_load_protection_enabled: bool = Field(
+        default=True,
+        description="Block battery discharge while EV charging or heating is "
+                    "active (decision-engine high_load_protected mode)."
+    )
+    ev_charging_power_threshold_w: int = Field(
+        default=100, ge=0,
+        description="EV is considered 'charging' when ev_charging=1 or "
+                    "ev_charging_power exceeds this many watts."
+    )
+    ev_high_load_poll_seconds: int = Field(
+        default=60, ge=15, le=600,
+        description="How often (seconds) to poll InfluxDB for EV charging state."
+    )
+
     # Simulation mode
     simulation_mode: bool = False
 

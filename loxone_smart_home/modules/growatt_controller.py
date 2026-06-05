@@ -4,6 +4,8 @@ import asyncio
 import functools
 import json
 import math
+import os
+import signal
 import zoneinfo
 from dataclasses import replace
 from datetime import datetime
@@ -380,6 +382,11 @@ class GrowattController(BaseModule):
         self._home_status: Dict[str, Any] = {}
         self._high_loads_active: bool = False
         self._high_load_details: Dict[str, Any] = {}
+        # EV high-load state, refreshed from InfluxDB by _high_load_poll_loop
+        # (EV charging is not in the loxone/status MQTT cache).
+        self._ev_high_load: bool = False
+        self._ev_high_load_power: float = 0.0
+        self._high_load_poll_task: Optional[asyncio.Task[None]] = None
         self._home_status_topic = "loxone/status"
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
@@ -1670,6 +1677,9 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # Start periodic evaluation loop BEFORE model builds
         # Controller is now operational with price data + SOC
         self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
+        # Poll EV charging from InfluxDB (high-load protection — EV isn't in the
+        # MQTT cache). Heating stays event-driven via _on_home_status.
+        self._high_load_poll_task = asyncio.create_task(self._high_load_poll_loop())
         # Supervise it: if it ever dies with an exception (outside its own
         # per-iteration try/except), log loudly and restart — otherwise the
         # controller would silently stop evaluating while the process still
@@ -1820,6 +1830,15 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 pass
             self._periodic_check_task = None
 
+        # Cancel EV high-load poll task
+        if self._high_load_poll_task and not self._high_load_poll_task.done():
+            self._high_load_poll_task.cancel()
+            try:
+                await self._high_load_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._high_load_poll_task = None
+
         # Cancel background model-build task (long InfluxDB queries that, if left
         # running, could re-issue a mode evaluation after safe-shutdown).
         if self._models_task and not self._models_task.done():
@@ -1894,32 +1913,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             self._battery_soc = float(soc_value)
                             break
 
-            # Detect high loads from the raw data
-            high_loads = self._detect_high_loads_from_status(data)
-            was_high_load = self._high_loads_active
-
-            self._high_loads_active = high_loads["active"]
-            self._high_load_details = high_loads
-
-            # Log significant changes
-            if self._high_loads_active != was_high_load:
-                if self._high_loads_active:
-                    details = []
-                    if high_loads.get("ev_charging"):
-                        details.append(f"EV: {high_loads['ev_power']:.0f}W")
-                    if high_loads.get("heating_active"):
-                        details.append(
-                            f"Heating: {len(high_loads.get('heating_relays', []))} relays"
-                        )
-                    self.logger.debug(
-                        f"⚡ High loads detected! {', '.join(details)} - Checking if action needed"
-                    )
-                    # Handle high load start
-                    await self._handle_high_load_start()
-                else:
-                    self.logger.debug("✅ High loads cleared - Restoring scheduled operation")
-                    # Re-evaluate conditions to determine what mode to apply now
-                    await self._evaluate_conditions("high_load_cleared")
+            # Detect HEATING high-load from the MQTT payload (Loxone sends
+            # heating-relay state via UDP → it lands in this cache). EV is NOT
+            # in this payload (it comes from teslamate → InfluxDB), so it is
+            # merged in separately by _recompute_high_load_state.
+            heating = self._detect_high_loads_from_status(data)
+            await self._recompute_high_load_state(heating)
 
         except Exception as e:
             self.logger.error(f"Failed to process home status: {e}", exc_info=True)
@@ -1980,6 +1979,112 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             await self._evaluate_conditions("high_load_detected")
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
+
+    async def _recompute_high_load_state(self, heating: Dict[str, Any]) -> None:
+        """Merge HEATING (from MQTT) with EV (from InfluxDB poll) into the
+        single high-load state the decision engine gates on, and re-evaluate on
+        a transition.
+
+        `heating` is the result of _detect_high_loads_from_status (we use only
+        its heating fields; its MQTT-derived EV fields are always empty here).
+        EV comes from self._ev_high_load, refreshed by _high_load_poll_loop.
+        The whole feature is gated by high_load_protection_enabled: when off,
+        the merged state is forced inactive so nothing is ever gated.
+        """
+        enabled = getattr(self.config, "high_load_protection_enabled", True)
+        heating_active = bool(heating.get("heating_active"))
+        heating_relays = heating.get("heating_relays", []) or []
+        ev_active = bool(self._ev_high_load)
+
+        active = enabled and (heating_active or ev_active)
+        details = {
+            "active": active,
+            "ev_charging": ev_active,
+            "ev_power": self._ev_high_load_power,
+            "heating_active": heating_active,
+            "heating_relays": heating_relays,
+        }
+        was_active = self._high_loads_active
+        self._high_loads_active = active
+        self._high_load_details = details
+
+        if active == was_active:
+            return
+        if active:
+            parts = []
+            if ev_active:
+                parts.append(f"EV: {self._ev_high_load_power:.0f}W")
+            if heating_active:
+                parts.append(f"Heating: {len(heating_relays)} relay(s)")
+            self.logger.info(f"⚡ High loads ACTIVE ({', '.join(parts)}) — protecting battery")
+            await self._handle_high_load_start()
+        else:
+            self.logger.info("✅ High loads cleared — restoring scheduled operation")
+            await self._evaluate_conditions("high_load_cleared")
+
+    async def _query_ev_charging_from_influx(self) -> Tuple[bool, float]:
+        """Return (ev_charging_active, power_w) from InfluxDB.
+
+        EV charging is published by teslamate into the `ev` measurement of the
+        loxone bucket (fields ev_charging 0/1, ev_charging_power W). It never
+        reaches the loxone/status MQTT cache, so it must be read from InfluxDB.
+        A recent window + last() means a quiet/idle car (no rows) reads as
+        not-charging. Any error → (False, 0) so a transient query failure can
+        never wedge the battery into protection.
+        """
+        if not self.influxdb_client:
+            return (False, 0.0)
+        threshold = getattr(self.config, "ev_charging_power_threshold_w", 100)
+        bucket = self.settings.influxdb.bucket_loxone
+        query = f'''
+            from(bucket: "{bucket}")
+              |> range(start: -30m)
+              |> filter(fn: (r) => r._measurement == "ev")
+              |> filter(fn: (r) => r._field == "ev_charging" or r._field == "ev_charging_power")
+              |> last()
+        '''
+        try:
+            result = await self.influxdb_client.query(query)
+            charging_flag = False
+            power = 0.0
+            for table in result:
+                for record in table.records:
+                    field = record.get_field()
+                    value = record.get_value()
+                    if value is None:
+                        continue
+                    if field == "ev_charging" and float(value) >= 1:
+                        charging_flag = True
+                    elif field == "ev_charging_power":
+                        power = float(value)
+            active = charging_flag or power > threshold
+            return (active, power if active else 0.0)
+        except Exception as e:
+            self.logger.warning(f"EV charging InfluxDB query failed: {e}")
+            return (False, 0.0)
+
+    async def _high_load_poll_loop(self) -> None:
+        """Periodically refresh EV high-load state from InfluxDB and re-merge.
+
+        Heating is event-driven (MQTT) but EV must be polled because teslamate
+        data only lands in InfluxDB. On each tick we re-derive the heating part
+        from the last cached home status so the merged state stays consistent.
+        """
+        interval = max(15, getattr(self.config, "ev_high_load_poll_seconds", 60))
+        while self._running:
+            try:
+                if getattr(self.config, "high_load_protection_enabled", True):
+                    ev_active, power = await self._query_ev_charging_from_influx()
+                    self._ev_high_load = ev_active
+                    self._ev_high_load_power = power
+                # Re-merge with the latest heating state (from the cached status).
+                heating = self._detect_high_loads_from_status(self._home_status or {})
+                await self._recompute_high_load_state(heating)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error(f"High-load poll loop error: {e}", exc_info=True)
+            await asyncio.sleep(interval)
 
     async def _update_solar_forecast(self) -> None:
         """Fetch and update solar production forecast from all sources."""
@@ -5067,6 +5172,25 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             "persisted": persisted,
             "reevaluated": reevaluated,
             "message": " — ".join(msg_parts),
+        }
+
+    async def request_restart(self, reason: str = "settings change") -> Dict[str, Any]:
+        """Restart the controller process so startup-only settings take effect.
+
+        There is no docker socket, so we can't recreate our own container
+        directly. Instead we send ourselves SIGTERM, which main.py's signal
+        handler turns into a graceful shutdown; the process then exits and
+        Docker's ``restart: unless-stopped`` policy recreates the container,
+        re-reading config_overrides.json (incl. the ml consumption engine) on
+        boot. SIGTERM is scheduled ~1s in the future so this HTTP response is
+        delivered before the process dies.
+        """
+        self.logger.warning(f"🔄 Restart requested ({reason}) — sending SIGTERM in 1s")
+        loop = asyncio.get_event_loop()
+        loop.call_later(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        return {
+            "success": True,
+            "message": "Restarting controller — it will be back in ~30–40s.",
         }
 
     def get_manual_override_status(self) -> Dict[str, Any]:
