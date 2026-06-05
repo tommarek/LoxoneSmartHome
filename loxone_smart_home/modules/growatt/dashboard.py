@@ -174,6 +174,24 @@ async def api_status(request: web.Request) -> web.Response:
         current_block = (start_str, end_str)
         current_price_czk = ctrl._current_prices.get(current_block, 0.0)
 
+    # Distribution tariff (import surcharge) for the current block, so the UI can
+    # show the REAL all-in price you pay to buy = spot + distribution.
+    current_distribution_czk = 0.0
+    if current_block:
+        from .decision_engine import GrowattDecisionEngine, PriceThresholds
+        _th = PriceThresholds(
+            charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
+            discharge_profit_margin=4.0, battery_efficiency=0.85,
+            distribution_tariff_high=ctrl.config.distribution_tariff_high,
+            distribution_tariff_low=ctrl.config.distribution_tariff_low,
+            low_tariff_hours=getattr(
+                ctrl.config, "low_tariff_hours", "0-10,11-12,13-14,15-17,18-24"
+            ),
+        )
+        current_distribution_czk = GrowattDecisionEngine._get_distribution_tariff(
+            int(current_block[0].split(":")[0]), _th
+        )
+
     # Inverter state
     inv = ctrl._current_inverter_state
     inverter_state = None
@@ -329,6 +347,8 @@ async def api_status(request: web.Request) -> web.Response:
         ),
         "current_price": {
             "czk_kwh": round(current_price_czk, 2),
+            "distribution_czk": round(current_distribution_czk, 2),
+            "buy_czk": round(current_price_czk + current_distribution_czk, 2),
             "block": current_block,
         },
         "high_loads_active": ctrl._high_loads_active,
@@ -413,6 +433,7 @@ def _build_price_rows(
             "end": end,
             "day": day,
             "czk_kwh": czk,
+            "buy_czk": round(czk + dist, 2),  # real all-in import price
             "net_sell_czk": net_sell,
             "distribution_czk": round(dist, 2),
             "is_charging": is_charging,
@@ -2175,7 +2196,13 @@ html { scroll-behavior: smooth; }
       <h2>Current Price</h2>
       <div class="stat">
         <div class="stat-value" id="priceCzk">--</div>
-        <div class="stat-label">CZK/kWh</div>
+        <div class="stat-label">CZK/kWh <span style="color:var(--muted)">spot</span></div>
+      </div>
+      <div class="stat" style="margin-top:6px">
+        <div class="stat-label" id="priceBuy" style="font-size:13px">
+          + <span id="priceDist">--</span> tariff =
+          <b style="color:var(--text)" id="priceAllIn">--</b> CZK/kWh to buy
+        </div>
       </div>
       <div class="stat" style="margin-top:8px">
         <div class="stat-label">Block: <span id="priceBlock">--</span></div>
@@ -2443,6 +2470,11 @@ function updateUI(d) {
   document.getElementById('priceBlock').textContent = p.block ? p.block[0] + ' - ' + p.block[1] : '--';
   const priceEl = document.getElementById('priceCzk');
   priceEl.style.color = (p.czk_kwh || 0) < 0 ? 'var(--green)' : (p.czk_kwh || 0) > 3 ? 'var(--red)' : 'var(--text)';
+  // Real all-in import price = spot + distribution tariff (what you actually pay).
+  const dist = (p.distribution_czk != null) ? p.distribution_czk : 0;
+  const buy = (p.buy_czk != null) ? p.buy_czk : (p.czk_kwh || 0) + dist;
+  document.getElementById('priceDist').textContent = dist.toFixed(2);
+  document.getElementById('priceAllIn').textContent = buy.toFixed(2);
 
   // Solar
   if (d.solar_forecast) {
@@ -3278,9 +3310,10 @@ function showTooltip(e, bar, tooltip) {
 
   tooltip.innerHTML =
     '<div class="tt-time">' + p.start + ' - ' + p.end + dayLabel + '</div>' +
-    '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh</div>' +
+    '<div class="tt-price ' + priceClass + '">' + v.toFixed(2) + ' CZK/kWh <span style="font-size:10px;color:var(--muted)">spot</span></div>' +
+    '<div class="tt-row"><span class="tt-label">Buy (incl. tariff)</span><span style="color:var(--text)"><b>' + (p.buy_czk != null ? p.buy_czk : v + (p.distribution_czk||0)).toFixed(2) + '</b> CZK/kWh</span></div>' +
+    '<div class="tt-row"><span class="tt-label" style="font-size:10px">spot ' + v.toFixed(2) + ' + dist ' + (p.distribution_czk||0).toFixed(2) + ' (' + ((p.distribution_czk||0) > 0.5 ? 'VT high' : 'NT low') + ')</span></div>' +
     '<div class="tt-row"><span class="tt-label">Net sell</span><span style="color:' + sellColor + '">' + netSell.toFixed(2) + ' CZK/kWh</span></div>' +
-    '<div class="tt-row"><span class="tt-label" style="font-size:10px">spot ' + v.toFixed(2) + ' - dist ' + (p.distribution_czk||0).toFixed(2) + ' - fee 0.50 - amort 2.00</span></div>' +
     '<div class="tt-row"><span class="tt-label">Rank</span><span>#' + priceRank + '/' + sameDayPrices.length + ' (' + rankLabel + ')</span></div>' +
     projHtml +
     (statusHtml ? '<div style="margin-top:4px">' + statusHtml + '</div>' : '');
