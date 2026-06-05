@@ -2054,14 +2054,15 @@ html { scroll-behavior: smooth; }
 .home-chart { position: relative; height: 134px; margin-top: 10px; }
 .home-chart .price-chart { height: 134px; margin-top: 0; gap: 0; }
 .home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; border-radius: 1px 1px 0 0; }
-/* Distribution-tariff segment stacked on top of the spot-price portion of a
-   bar. A translucent light wash pales whatever colour the bar is, so the bar
-   shows the REAL all-in price (spot + tariff) with the tariff part distinct. */
+/* Distribution-tariff segment at the BASE of each bar (the fixed cost you always
+   pay), with the spot price riding on top. A translucent light wash pales
+   whatever colour the bar is, so the bar shows the REAL all-in price (spot +
+   tariff) with the tariff part distinct. */
 .price-bar .bar-tariff {
   position: absolute;
-  top: 0; left: 0; right: 0;
+  bottom: 0; left: 0; right: 0;
   background: rgba(255, 255, 255, 0.40);
-  border-radius: inherit;
+  border-radius: 0;
   pointer-events: none;
 }
 .home-chart-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
