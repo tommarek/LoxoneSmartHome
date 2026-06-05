@@ -4058,15 +4058,24 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         elif isinstance(stop_soc_raw, (int, float)):
             stop_soc = int(stop_soc_raw)
 
-        # sell_production = grid-first export of SURPLUS SOLAR with the battery
-        # passive. On the SPH, grid-first stop_soc is the level the inverter
-        # maintains: it CHARGES up to it (below) and DISCHARGES down to it (above).
-        # So to keep the battery exactly where it is — neither charging the surplus
-        # in nor discharging it out — pin stop_soc to the LIVE SOC. With export
-        # enabled (price-gated below), the surplus then has only one place to go:
-        # the grid. (stop_soc=max_soc would instead charge the surplus into the
-        # battery at mid-SOC — the bug that prompted this.)
-        if mode == "sell_production":
+        # Pin stop_soc to the LIVE SOC for the two "battery passive" modes, so the
+        # inverter neither charges the battery in nor discharges it out:
+        #
+        #   sell_production (grid_first): export surplus solar, battery passive.
+        #   battery_hold    (battery_first): the optimizer's "hold" — preserve the
+        #     battery, serve the house from grid, no discharge.
+        #
+        # On the SPH, stop_soc is the level the inverter MAINTAINS in BOTH modes:
+        # it charges UP to stop_soc (from GRID too, even with ac_charge off — the
+        # ac_charge flag does NOT prevent battery_first grid-charging) and
+        # discharges DOWN to it. So stop_soc=max_soc made battery_hold grid-charge
+        # the battery toward 100% at the spot price (confirmed from telemetry:
+        # ChargePower>0 while importing from grid during a hold). Pinning to the
+        # live SOC removes the charge headroom → no grid charge; any surplus solar
+        # exports instead of being banked (export is price-gated below). Banking
+        # surplus solar during a hold is NOT achievable on this inverter without
+        # also grid-charging, so we prefer "export surplus, never grid-charge".
+        if mode in ("sell_production", "battery_hold"):
             stop_soc = int(round(max(
                 self.config.min_soc, min(self.config.max_soc, self._battery_soc)
             )))

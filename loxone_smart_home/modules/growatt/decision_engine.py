@@ -231,15 +231,19 @@ MODE_DEFINITIONS = {
         "ac_charge": False
     },
     "battery_hold": {
-        "description": "Preserve battery — no discharge, but allow solar charging",
+        "description": "Preserve battery — no discharge, no grid charge",
         # battery_first prevents the battery from DISCHARGING for the house (the
-        # house is served from grid) — the "hold". With ac_charge OFF it does NOT
-        # grid-charge, but it STILL charges from surplus SOLAR up to stop_soc, so
-        # excess daytime PV is captured instead of being capped/exported. (The
-        # earlier load_first + current_soc approach blocked solar charging,
-        # because in load_first stop_soc is also the charge ceiling.)
+        # house is served from grid) — the "hold". stop_soc is pinned to the LIVE
+        # SOC in the controller (_build_desired_state), NOT max_soc: on the SPH,
+        # battery_first charges UP to stop_soc from the GRID even with ac_charge
+        # off (the flag does not gate grid-charging), so max_soc made the hold
+        # silently grid-charge to 100% at the spot price. With stop_soc=live SOC
+        # there's no charge headroom → no grid charge, no discharge; surplus solar
+        # exports rather than being banked (banking can't be done here without
+        # also grid-charging). max_soc below is just the resolver default — the
+        # live-SOC pin overrides it.
         "inverter_mode": "battery_first",
-        "stop_soc": "max_soc",  # solar may fill to full; ac_charge off = no grid charge
+        "stop_soc": "max_soc",
         "ac_charge": False
     }
 }
