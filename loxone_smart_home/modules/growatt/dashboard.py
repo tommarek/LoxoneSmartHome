@@ -1825,33 +1825,49 @@ body {
   display: flex;
   justify-content: space-between;
 }
+/* Each bar is a FULL-HEIGHT transparent column anchored on a 0 line at the
+   bottom. Inside it: a distribution-fee segment sitting on 0, the spot price
+   stacked on top of the fee (positive prices), and — for NEGATIVE spot — a
+   segment hung from the TOP of the chart pointing down. The per-bar colour is
+   carried in --bar-color so the segments can read it. */
 .price-bar {
   flex: 0 0 var(--bar-w, 2px);
   width: var(--bar-w, 2px);
-  border-radius: 2px 2px 0 0;
   position: relative;
+  height: 100%;
+  background: transparent;
   transition: opacity 0.2s;
 }
 .price-bar:hover { opacity: 0.8; cursor: pointer; }
-.price-bar.charging { background: var(--green) !important; }
-.price-bar.pre-discharge { background: #c084fc !important; }
-.price-bar.discharge { background: var(--red) !important; }
-.price-bar.sell-production { background: #f97316 !important; }
-.price-bar.battery-hold { background: #0ea5e9 !important; }
-.price-bar.inverter-off {
-  background: repeating-linear-gradient(
-    45deg,
-    #555 0,
-    #555 4px,
-    #2a2a2a 4px,
-    #2a2a2a 8px
-  ) !important;
+.price-bar .seg-spot, .price-bar .seg-neg, .price-bar .seg-fee {
+  position: absolute; left: 0; right: 0; pointer-events: none;
 }
-.price-bar.current { outline: 2px solid var(--accent); outline-offset: -1px; }
-.price-bar.negative { background: #22c55e44; }
-.price-bar.cheap { background: #4f8cff44; }
-.price-bar.mid { background: #eab30844; }
-.price-bar.expensive { background: #ef444444; }
+.price-bar .seg-fee {                /* distribution fee, on the 0 line */
+  bottom: 0;
+  background: rgba(148, 163, 184, 0.45);
+}
+.price-bar .seg-spot {               /* spot price, stacked above the fee */
+  background: var(--bar-color, #4f8cff44);
+  border-radius: 2px 2px 0 0;
+}
+.price-bar .seg-neg {                /* negative spot, hung from the top */
+  top: 0;
+  background: var(--bar-color, #22c55e);
+  border-radius: 0 0 2px 2px;
+}
+.price-bar.charging      { --bar-color: var(--green); }
+.price-bar.pre-discharge { --bar-color: #c084fc; }
+.price-bar.discharge     { --bar-color: var(--red); }
+.price-bar.sell-production { --bar-color: #f97316; }
+.price-bar.battery-hold  { --bar-color: #0ea5e9; }
+.price-bar.negative      { --bar-color: #22c55e; }
+.price-bar.cheap         { --bar-color: #4f8cff88; }
+.price-bar.mid           { --bar-color: #eab308aa; }
+.price-bar.expensive     { --bar-color: #ef4444aa; }
+.price-bar.inverter-off .seg-spot, .price-bar.inverter-off .seg-neg {
+  background: repeating-linear-gradient(45deg, #555 0, #555 4px, #2a2a2a 4px, #2a2a2a 8px);
+}
+.price-bar.current { outline: 2px solid var(--accent); outline-offset: -1px; border-radius: 2px; }
 
 .chart-tooltip {
   display: none;
@@ -2053,18 +2069,7 @@ html { scroll-behavior: smooth; }
 /* Compact Home "Today" chart: 96 bars fit the width (flex), no scroll. */
 .home-chart { position: relative; height: 134px; margin-top: 10px; }
 .home-chart .price-chart { height: 134px; margin-top: 0; gap: 0; }
-.home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; border-radius: 1px 1px 0 0; }
-/* Distribution-tariff segment at the BASE of each bar (the fixed cost you always
-   pay), with the spot price riding on top. A translucent light wash pales
-   whatever colour the bar is, so the bar shows the REAL all-in price (spot +
-   tariff) with the tariff part distinct. */
-.price-bar .bar-tariff {
-  position: absolute;
-  bottom: 0; left: 0; right: 0;
-  background: rgba(255, 255, 255, 0.40);
-  border-radius: 0;
-  pointer-events: none;
-}
+.home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; }
 .home-chart-svg { position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none; overflow: visible; }
 .home-now-line { position: absolute; top: 0; bottom: 0; width: 0; border-left: 2px dashed var(--accent); opacity: .6; pointer-events: none; }
 .home-legend { display: flex; flex-wrap: wrap; gap: 3px 11px; margin-top: 9px; font-size: 10.5px; color: var(--muted); }
@@ -2618,13 +2623,37 @@ function homeBarClass(p) {
   else if (p.is_inverter_off) cls = 'inverter-off';
   return cls;
 }
-// Paler "tariff" segment stacked on top of a bar's spot portion. tFrac = the
-// tariff's share of the all-in bar height. Empty for negative/zero-tariff bars.
-function tariffSeg(p, buy) {
-  const dist = p.distribution_czk || 0;
-  if (!(buy > 0) || dist <= 0) return '';
-  const tFrac = Math.min(100, dist / buy * 100);
-  return '<div class="bar-tariff" style="height:' + tFrac.toFixed(1) + '%"></div>';
+// Single vertical scale for a price chart: the tallest of any block's all-in
+// (spot+fee), any negative spot magnitude, or any fee. So positive bars (fee+
+// spot, growing up from 0) and negative-from-top bars share one scale.
+function priceScale(prices) {
+  let s = 1;
+  prices.forEach(p => {
+    const spot = p.czk_kwh, fee = p.distribution_czk || 0;
+    const top = spot >= 0 ? (p.buy_czk != null ? p.buy_czk : spot + fee) : Math.abs(spot);
+    if (top > s) s = top;
+    if (fee > s) s = fee;
+  });
+  return s;
+}
+
+// Inner segments of one full-height bar:
+//   - fee  : distribution tariff, sitting on the 0 line (bottom)
+//   - spot : positive spot price, stacked on top of the fee
+//   - neg  : negative spot, hung from the TOP of the chart pointing down
+function barInner(p, scale) {
+  const spot = p.czk_kwh, fee = p.distribution_czk || 0;
+  let s = '';
+  const feeH = Math.min(100, fee / scale * 100);
+  if (feeH > 0.2) s += '<div class="seg-fee" style="height:' + feeH.toFixed(1) + '%"></div>';
+  if (spot >= 0) {
+    const spotH = Math.max(0, Math.min(100 - feeH, spot / scale * 100));
+    if (spotH > 0.2) s += '<div class="seg-spot" style="bottom:' + feeH.toFixed(1) + '%;height:' + spotH.toFixed(1) + '%"></div>';
+  } else {
+    const negH = Math.min(100, Math.abs(spot) / scale * 100);
+    s += '<div class="seg-neg" style="height:' + Math.max(negH, 0.6).toFixed(1) + '%"></div>';
+  }
+  return s;
 }
 function renderHomeChart(prices, timeline) {
   const bars = document.getElementById('homeChartBars');
@@ -2633,17 +2662,12 @@ function renderHomeChart(prices, timeline) {
   if (!bars) return;
   if (!prices.length) { if (nodata) nodata.style.display = 'block'; if (wrap) wrap.style.display = 'none'; return; }
   if (nodata) nodata.style.display = 'none'; if (wrap) wrap.style.display = '';
-  // Scale to the all-in price (spot + distribution tariff) so the bar height is
-  // the REAL cost and the tariff segment never overflows the chart.
-  const allIn = p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh;
-  const vals = prices.map(allIn);
-  const maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
+  // Full-height bars: fee on the 0 line, spot above, negative hung from top.
+  const scale = priceScale(prices);
   let html = '';
   prices.forEach(p => {
-    const v = p.czk_kwh, buy = allIn(p), h = Math.abs(buy) / maxAbs * 100;
     let cls = homeBarClass(p); if (p.is_current) cls += ' current';
-    if (v < 0) html += '<div class="price-bar ' + cls + '" style="height:' + h + '%;align-self:flex-start;opacity:.55"></div>';
-    else html += '<div class="price-bar ' + cls + '" style="height:' + Math.max(h, 3) + '%">' + tariffSeg(p, buy) + '</div>';
+    html += '<div class="price-bar ' + cls + '">' + barInner(p, scale) + '</div>';
   });
   bars.innerHTML = html;
 
@@ -2743,12 +2767,9 @@ async function fetchPrices() {
     document.getElementById('priceChartTitle').textContent =
       data.has_tomorrow ? 'Today + Tomorrow Prices & Battery SOC' : "Today's Prices & Battery SOC";
 
-    // Shared vertical scale so both charts are visually comparable. Use the
-    // all-in price (spot + tariff) so the stacked tariff segments never overflow.
-    const allVals = allPrices.map(p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh);
-    const maxAbs = allVals.length
-      ? Math.max(Math.abs(Math.min(...allVals)), Math.abs(Math.max(...allVals)), 1)
-      : 1;
+    // Shared vertical scale so today + tomorrow charts are comparable: tallest
+    // all-in (fee+spot) or negative-spot magnitude across both days.
+    const maxAbs = allPrices.length ? priceScale(allPrices) : 1;
 
     const timeline = projData.timeline || [];
     renderHomeChart(todayPrices, timeline);  // compact Home overview
@@ -3172,20 +3193,12 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   if (!chart) return;
   if (!prices.length) { chart.innerHTML = '<div style="color:var(--muted)">No price data</div>'; return; }
 
-  // Scale to all-in (spot + distribution tariff) so the tariff segment fits.
-  const allIn = p => (p.buy_czk != null && p.czk_kwh >= 0) ? p.buy_czk : p.czk_kwh;
-  // Fall back to per-chart scale if caller didn't pass one
-  if (!maxAbs) {
-    const vals = prices.map(allIn);
-    maxAbs = Math.max(Math.abs(Math.min(...vals)), Math.abs(Math.max(...vals)), 1);
-  }
+  // Single scale across both day-charts (fee+spot up from 0, neg from top).
+  if (!maxAbs) maxAbs = priceScale(prices);
 
   let html = '';
   prices.forEach((p, i) => {
     const v = p.czk_kwh;
-    const buy = allIn(p);
-    const h = Math.abs(buy) / maxAbs * 100;
-    const isNeg = v < 0;
     let cls = v < 0 ? 'negative' : v < 1.5 ? 'cheap' : v < 3 ? 'mid' : 'expensive';
     if (p.status === 'pre_discharge_charge') cls = 'pre-discharge';
     else if (p.is_charging) cls = 'charging';
@@ -3197,11 +3210,7 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
 
     const globalIdx = i + (idxOffset || 0);
     const tmrwOpacity = p.day === 'tomorrow' ? 'opacity:0.6;' : '';
-    if (isNeg) {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + h + '%;align-self:flex-start;opacity:0.5;' + tmrwOpacity + '"></div>';
-    } else {
-      html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="height:' + Math.max(h, 3) + '%;' + tmrwOpacity + '">' + tariffSeg(p, buy) + '</div>';
-    }
+    html += '<div class="price-bar ' + cls + '" data-idx="' + globalIdx + '" style="' + tmrwOpacity + '">' + barInner(p, maxAbs) + '</div>';
   });
   chart.innerHTML = html;
 
