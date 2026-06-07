@@ -720,6 +720,87 @@ def _avg_block_price(ctrl, blocks) -> Optional[float]:
     return sum(vals) / len(vals) if vals else None
 
 
+async def _today_grid_economics(ctrl):
+    """Exact today's grid import COST and export REVENUE.
+
+    Integrates the inverter's cumulative energy meters (EnergyToUserToday /
+    EnergyToGridToday) differenced per 15-min block against THAT block's real
+    price — import pays spot+distribution, export earns spot-sell_fee (no
+    distribution). This is the meter-accurate cost; the daily-average estimate it
+    replaces multiplied total kWh by the day's average spot, which badly mis-
+    prices energy bought/sold in cheap or negative windows (could even flip the
+    sign). Returns (import_cost_czk, export_revenue_czk) or None on any failure
+    (caller falls back to the rough estimate). import_cost can be NEGATIVE when
+    you were net paid to import (negative spot beating distribution).
+    """
+    if not getattr(ctrl, "influxdb_client", None) or not ctrl._current_prices:
+        return None
+    from .decision_engine import GrowattDecisionEngine, PriceThresholds
+    import zoneinfo
+    from datetime import timedelta
+    bucket = ctrl.settings.influxdb.bucket_solar
+    flux = (
+        f'from(bucket: "{bucket}")\n'
+        '  |> range(start: -18h)\n'
+        '  |> filter(fn: (r) => r._measurement == "solar" and '
+        '(r._field == "EnergyToUserToday" or r._field == "EnergyToGridToday"))\n'
+        '  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)\n'
+    )
+    try:
+        result = await ctrl.influxdb_client.query(flux)
+    except Exception:
+        return None
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Prague")
+    except Exception:
+        tz = None
+    now = datetime.now(tz) if tz else datetime.now()
+    today = now.date()
+    series = {"EnergyToUserToday": [], "EnergyToGridToday": []}
+    for table in result:
+        for rec in table.records:
+            t = rec.get_time()
+            if tz is not None and getattr(t, "tzinfo", None) is not None:
+                t = t.astimezone(tz)
+            f = rec.get_field(); v = rec.get_value()
+            if v is None or f not in series:
+                continue
+            series[f].append((t, float(v)))
+
+    th = PriceThresholds(
+        charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
+        discharge_profit_margin=4.0, battery_efficiency=0.85,
+        distribution_tariff_high=ctrl.config.distribution_tariff_high,
+        distribution_tariff_low=ctrl.config.distribution_tariff_low,
+        low_tariff_hours=getattr(ctrl.config, "low_tariff_hours",
+                                 "0-10,11-12,13-14,15-17,18-24"),
+    )
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    spot_by_start = {s: p for (s, e), p in ctrl._current_prices.items()}
+
+    def integrate(points, is_import):
+        cost = 0.0
+        for i in range(1, len(points)):
+            (t0, v0), (t1, v1) = points[i - 1], points[i]
+            de = v1 - v0
+            if de <= 0 or t1.date() != today:   # skip midnight reset / other days
+                continue
+            block_start = (t1 - timedelta(minutes=15)).strftime("%H:%M")
+            spot = spot_by_start.get(block_start)
+            if spot is None:
+                continue
+            if is_import:
+                dist = GrowattDecisionEngine._get_distribution_tariff(
+                    (t1 - timedelta(minutes=15)).hour, th)
+                cost += de * (spot + dist)
+            else:
+                cost += de * max(0.0, spot - sell_fee)
+        return round(cost, 1)
+
+    return (integrate(sorted(series["EnergyToUserToday"]), True),
+            integrate(sorted(series["EnergyToGridToday"]), False))
+
+
 async def api_insights(request: web.Request) -> web.Response:
     """Aggregated 'more info' panel: economics, forecast accuracy, active
     engines, command health, deferrable loads, and data freshness. Everything
@@ -839,7 +920,14 @@ async def api_insights(request: web.Request) -> web.Response:
     dist_hi = getattr(ctrl.config, "distribution_tariff_high", 1.5)
     avg_charge_price = _avg_block_price(ctrl, getattr(ctrl, "_combined_charging_blocks", set()))
     avg_disch_price = _avg_block_price(ctrl, getattr(ctrl, "_discharge_periods_today", set()))
-    if avg_price is not None:
+    # Meter-accurate import cost / export revenue (per-block energy × that
+    # block's real price). Falls back to the rough daily-average estimate only
+    # if the integration fails.
+    grid = await _today_grid_economics(ctrl)
+    if grid is not None:
+        econ["import_cost_czk"], econ["export_revenue_czk"] = grid
+        econ["grid_actual"] = True
+    elif avg_price is not None:
         econ["export_revenue_czk"] = round(export_kwh * max(0.0, avg_price - sell_fee), 1)
         econ["import_cost_czk"] = round(import_kwh * (avg_price + dist_hi), 1)
     if avg_charge_price is not None and avg_disch_price is not None:
@@ -2787,7 +2875,8 @@ function renderHomeMoney(ec) {
   }
   const set = (id, txt) => { const e = document.getElementById(id); if (e) e.textContent = txt; };
   set('moneyEarned', earned == null ? '--' : '+' + earned.toFixed(1));
-  set('moneySpent', spent == null ? '--' : '-' + spent.toFixed(1));
+  // import cost can be negative (net paid to import at negative prices) → show +
+  set('moneySpent', spent == null ? '--' : (spent >= 0 ? '-' + spent.toFixed(1) : '+' + (-spent).toFixed(1)));
   const arb = ec.arbitrage_czk;
   set('moneyArb', arb == null ? '--' : (arb >= 0 ? '+' : '') + arb.toFixed(1));
   const plan = ec.plan_value_czk, planEl = document.getElementById('moneyPlan');
@@ -3136,7 +3225,8 @@ async function fetchInsights() {
     planEl.style.color = (ec.plan_value_czk || 0) >= 0 ? 'var(--green)' : 'var(--red)';
   }
   setText('econExport', fmtCzk(ec.export_revenue_czk));
-  setText('econImport', ec.import_cost_czk == null ? '--' : '-' + ec.import_cost_czk.toFixed(1) + ' CZK');
+  setText('econImport', ec.import_cost_czk == null ? '--' :
+    (ec.import_cost_czk >= 0 ? '-' + ec.import_cost_czk.toFixed(1) : '+' + (-ec.import_cost_czk).toFixed(1)) + ' CZK');
   setText('econArbitrage', fmtCzk(ec.arbitrage_czk));
 
   // --- Forecast accuracy ---
