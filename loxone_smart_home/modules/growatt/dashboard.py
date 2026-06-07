@@ -1771,6 +1771,17 @@ body {
   align-items: flex-end;
   gap: 1px;
   margin-top: 8px;
+  position: relative;
+}
+/* 0 CZK/kWh reference line; bars below it are negative (you're paid). */
+.zero-line {
+  position: absolute;
+  left: 0; right: 0;
+  height: 0;
+  border-top: 1px dashed var(--muted);
+  opacity: 0.55;
+  pointer-events: none;
+  z-index: 1;
 }
 /* "Now" divider drawn in the chart between elapsed and upcoming blocks. */
 .now-divider {
@@ -2622,44 +2633,49 @@ function homeBarClass(p) {
   else if (p.is_inverter_off) cls = 'inverter-off';
   return cls;
 }
-// Single vertical scale for a price chart: the tallest of any block's all-in
-// (spot+fee), any negative spot magnitude, or any fee. So positive bars (fee+
-// spot, growing up from 0) and negative-from-top bars share one scale.
+// Vertical scale for a price chart on a ZERO line: how far the all-in price
+// reaches ABOVE 0 (cost, incl. the fee floor) and BELOW 0 (net paid). The 0
+// line is then placed maxNeg/range up from the bottom so negatives drop below.
 function priceScale(prices) {
-  let s = 1;
+  let maxPos = 0.001, maxNeg = 0;
   prices.forEach(p => {
     const spot = p.czk_kwh, fee = p.distribution_czk || 0;
-    const top = spot >= 0 ? (p.buy_czk != null ? p.buy_czk : spot + fee) : Math.abs(spot);
-    if (top > s) s = top;
-    if (fee > s) s = fee;
+    const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
+    maxPos = Math.max(maxPos, fee, allin > 0 ? allin : 0);  // fee floor always shown
+    if (allin < 0) maxNeg = Math.max(maxNeg, -allin);
   });
+  const range = maxPos + maxNeg;
+  return { maxPos, maxNeg, range, zero: maxNeg / range * 100 };
+}
+
+// Inner segments of one full-height bar on the zero line at `sc.zero`% up:
+//   - fee  : distribution fee, ALWAYS from the 0 line up to +fee (the floor you
+//            pay, same level as positive bars)
+//   - spot : positive net stacks above the fee -> top = all-in (cost)
+//   - neg  : negative all-in drops BELOW the 0 line -> bottom = all-in (the real
+//            value you're paid). fee stays above 0, net drops below: the total
+//            span (fee top -> net bottom) == the gross negative spot.
+function barInner(p, sc) {
+  const spot = p.czk_kwh, fee = p.distribution_czk || 0;
+  const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
+  const range = sc.range, zero = sc.zero;
+  let s = '';
+  if (allin >= 0) {
+    const feeH = Math.min(fee, allin) / range * 100;       // fee floor (capped at all-in)
+    if (feeH > 0.2) s += '<div class="seg-fee" style="bottom:' + zero.toFixed(1) + '%;height:' + feeH.toFixed(1) + '%"></div>';
+    const spotH = Math.max(0, allin - fee) / range * 100;  // net above the fee
+    if (spotH > 0.2) s += '<div class="seg-spot" style="bottom:' + (zero + feeH).toFixed(1) + '%;height:' + spotH.toFixed(1) + '%"></div>';
+  } else {
+    const feeH = fee / range * 100;                        // full fee floor above 0
+    if (feeH > 0.2) s += '<div class="seg-fee" style="bottom:' + zero.toFixed(1) + '%;height:' + feeH.toFixed(1) + '%"></div>';
+    const negH = Math.min(zero, (-allin) / range * 100);   // net paid, below 0
+    s += '<div class="seg-neg" style="bottom:' + (zero - negH).toFixed(1) + '%;height:' + Math.max(negH, 0.6).toFixed(1) + '%"></div>';
+  }
   return s;
 }
 
-// Inner segments of one full-height bar, driven by the ALL-IN price (spot+fee)
-// so the distribution fee actually nets against a negative spot:
-//   net cost (all-in >= 0): fee sits on the 0 line, spot stacks on top -> the
-//       bar grows up to the all-in cost.
-//   net paid (all-in < 0):  the bar hangs from the TOP pointing down by the NET
-//       |all-in|; the fee is drawn as the slice just below it, so you can see
-//       the fee eating into the gross negative (net + fee == |spot|).
-function barInner(p, scale) {
-  const spot = p.czk_kwh, fee = p.distribution_czk || 0;
-  const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
-  let s = '';
-  if (allin >= 0) {
-    const allH = Math.min(100, allin / scale * 100);
-    const feeH = Math.min(allH, fee / scale * 100);   // fee can't exceed all-in
-    if (feeH > 0.2) s += '<div class="seg-fee" style="bottom:0;height:' + feeH.toFixed(1) + '%"></div>';
-    const spotH = Math.max(0, allH - feeH);
-    if (spotH > 0.2) s += '<div class="seg-spot" style="bottom:' + feeH.toFixed(1) + '%;height:' + spotH.toFixed(1) + '%"></div>';
-  } else {
-    const netH = Math.min(100, Math.abs(allin) / scale * 100);  // net you're paid
-    s += '<div class="seg-neg" style="top:0;height:' + Math.max(netH, 0.6).toFixed(1) + '%"></div>';
-    const feeH = Math.min(100 - netH, fee / scale * 100);       // fee offsetting it
-    if (feeH > 0.2) s += '<div class="seg-fee" style="top:' + netH.toFixed(1) + '%;height:' + feeH.toFixed(1) + '%"></div>';
-  }
-  return s;
+function zeroLineHtml(sc) {
+  return sc.maxNeg > 0 ? '<div class="zero-line" style="bottom:' + sc.zero.toFixed(1) + '%"></div>' : '';
 }
 function renderHomeChart(prices, timeline) {
   const bars = document.getElementById('homeChartBars');
@@ -2668,12 +2684,12 @@ function renderHomeChart(prices, timeline) {
   if (!bars) return;
   if (!prices.length) { if (nodata) nodata.style.display = 'block'; if (wrap) wrap.style.display = 'none'; return; }
   if (nodata) nodata.style.display = 'none'; if (wrap) wrap.style.display = '';
-  // Full-height bars: fee on the 0 line, spot above, negative hung from top.
-  const scale = priceScale(prices);
-  let html = '';
+  // Full-height bars on a 0 line: fee floor, positive net above, negative below.
+  const sc = priceScale(prices);
+  let html = zeroLineHtml(sc);
   prices.forEach(p => {
     let cls = homeBarClass(p); if (p.is_current) cls += ' current';
-    html += '<div class="price-bar ' + cls + '">' + barInner(p, scale) + '</div>';
+    html += '<div class="price-bar ' + cls + '">' + barInner(p, sc) + '</div>';
   });
   bars.innerHTML = html;
 
@@ -2773,9 +2789,9 @@ async function fetchPrices() {
     document.getElementById('priceChartTitle').textContent =
       data.has_tomorrow ? 'Today + Tomorrow Prices & Battery SOC' : "Today's Prices & Battery SOC";
 
-    // Shared vertical scale so today + tomorrow charts are comparable: tallest
-    // all-in (fee+spot) or negative-spot magnitude across both days.
-    const maxAbs = allPrices.length ? priceScale(allPrices) : 1;
+    // Shared zero-line scale so today + tomorrow charts are comparable
+    // (same 0-line position and units across both days).
+    const maxAbs = priceScale(allPrices);
 
     const timeline = projData.timeline || [];
     renderHomeChart(todayPrices, timeline);  // compact Home overview
@@ -3199,10 +3215,10 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
   if (!chart) return;
   if (!prices.length) { chart.innerHTML = '<div style="color:var(--muted)">No price data</div>'; return; }
 
-  // Single scale across both day-charts (fee+spot up from 0, neg from top).
+  // Single scale across both day-charts (zero line, neg below it).
   if (!maxAbs) maxAbs = priceScale(prices);
 
-  let html = '';
+  let html = zeroLineHtml(maxAbs);
   prices.forEach((p, i) => {
     const v = p.czk_kwh;
     let cls = v < 0 ? 'negative' : v < 1.5 ? 'cheap' : v < 3 ? 'mid' : 'expensive';
