@@ -119,10 +119,12 @@ def test_high_load_protection_triggers(
     assert explanation["priority"]["level"] == Priority.HIGH_LOAD_PROTECTION
     assert "high loads" in explanation["reason"].lower()
 
-    # Verify mode definition
+    # Verify mode definition: battery_first (not load_first) so the battery is
+    # passive and does NOT discharge to cover a load deficit (e.g. EV charging);
+    # stop_soc is pinned to the live SOC in the controller to avoid grid-charge.
     mode_def = MODE_DEFINITIONS["high_load_protected"]
-    assert mode_def["stop_soc"] == "max_soc"  # Should prevent discharge
-    assert mode_def["inverter_mode"] == "load_first"
+    assert mode_def["inverter_mode"] == "battery_first"
+    assert mode_def["ac_charge"] is False
 
 
 def test_default_mode_fallback(

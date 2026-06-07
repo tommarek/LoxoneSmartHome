@@ -63,21 +63,33 @@ def _bind(stub, name):
 # --- _query_ev_charging_from_influx ---------------------------------------
 
 async def test_ev_query_detects_charging_flag():
-    stub = _stub()
+    stub = _stub()  # power in kW
     stub.influxdb_client.query = AsyncMock(
-        return_value=_influx_result([("ev_charging", 1), ("ev_charging_power", 7200)])
+        return_value=_influx_result([("ev_charging", 1), ("ev_charging_power", 9.7)])
     )
     active, power = await _bind(stub, "_query_ev_charging_from_influx")()
-    assert active is True and power == 7200
+    assert active is True and power == 9.7
 
 
-async def test_ev_query_power_over_threshold_without_flag():
+async def test_ev_query_power_kw_over_threshold_without_flag():
+    # The flag ages out mid-charge; the kW power must still trigger. 9.7 kW =
+    # 9700 W > 100 W threshold. Guards the kW->W conversion (the discharge bug).
     stub = _stub()
     stub.influxdb_client.query = AsyncMock(
-        return_value=_influx_result([("ev_charging", 0), ("ev_charging_power", 3500)])
+        return_value=_influx_result([("ev_charging", 0), ("ev_charging_power", 9.7)])
     )
     active, power = await _bind(stub, "_query_ev_charging_from_influx")()
-    assert active is True and power == 3500
+    assert active is True and power == 9.7
+
+
+async def test_ev_query_trickle_kw_below_threshold_inactive():
+    # 0.05 kW = 50 W < 100 W threshold -> not a real charge.
+    stub = _stub()
+    stub.influxdb_client.query = AsyncMock(
+        return_value=_influx_result([("ev_charging", 0), ("ev_charging_power", 0.05)])
+    )
+    active, power = await _bind(stub, "_query_ev_charging_from_influx")()
+    assert active is False and power == 0.0
 
 
 async def test_ev_query_idle_returns_inactive():

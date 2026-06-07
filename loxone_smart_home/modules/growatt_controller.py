@@ -2026,11 +2026,18 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         """Return (ev_charging_active, power_w) from InfluxDB.
 
         EV charging is published by teslamate into the `ev` measurement of the
-        loxone bucket (fields ev_charging 0/1, ev_charging_power W). It never
-        reaches the loxone/status MQTT cache, so it must be read from InfluxDB.
-        A recent window + last() means a quiet/idle car (no rows) reads as
-        not-charging. Any error → (False, 0) so a transient query failure can
+        loxone bucket (fields ev_charging 0/1, ev_charging_power in **kW**). It
+        never reaches the loxone/status MQTT cache, so it must be read from
+        InfluxDB. A recent window + last() means a quiet/idle car (no rows) reads
+        as not-charging. Any error → (False, 0) so a transient query failure can
         never wedge the battery into protection.
+
+        IMPORTANT: ev_charging is written ON CHANGE (e.g. once when charging
+        starts), so it ages out of the 30-min window during a long charge — the
+        continuously-updated ev_charging_power is the reliable signal. It is in
+        kW, so it must be converted to W before comparing to the W threshold
+        (the bug that let the battery discharge into the car mid-charge).
+        Returns power in kW.
         """
         if not self.influxdb_client:
             return (False, 0.0)
@@ -2056,8 +2063,9 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     if field == "ev_charging" and float(value) >= 1:
                         charging_flag = True
                     elif field == "ev_charging_power":
-                        power = float(value)
-            active = charging_flag or power > threshold
+                        power = float(value)  # kW
+            # power is kW; threshold is W → convert before comparing.
+            active = charging_flag or (power * 1000.0) > threshold
             return (active, power if active else 0.0)
         except Exception as e:
             self.logger.warning(f"EV charging InfluxDB query failed: {e}")
@@ -4075,7 +4083,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # exports instead of being banked (export is price-gated below). Banking
         # surplus solar during a hold is NOT achievable on this inverter without
         # also grid-charging, so we prefer "export surplus, never grid-charge".
-        if mode in ("sell_production", "battery_hold"):
+        if mode in ("sell_production", "battery_hold", "high_load_protected"):
             stop_soc = int(round(max(
                 self.config.min_soc, min(self.config.max_soc, self._battery_soc)
             )))

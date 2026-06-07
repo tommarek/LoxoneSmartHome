@@ -201,8 +201,14 @@ MODE_DEFINITIONS = {
     },
     "high_load_protected": {
         "description": "High load protection - prevent battery discharge",
-        "inverter_mode": "load_first",
-        "stop_soc": "max_soc",  # Prevent any discharge
+        # load_first DISCHARGES the battery to cover a load deficit (it ignores
+        # stop_soc as a discharge floor on the SPH), so it does NOT protect the
+        # battery when a big load like an EV pulls more than solar — the battery
+        # drained into the car. Use battery_first like battery_hold: the battery
+        # is passive (grid+solar serve the load, no discharge). stop_soc is
+        # pinned to the LIVE SOC in the controller so it also won't grid-charge.
+        "inverter_mode": "battery_first",
+        "stop_soc": "max_soc",  # overridden to live SOC in _build_desired_state
         "ac_charge": False
     },
     "charge_from_grid": {
