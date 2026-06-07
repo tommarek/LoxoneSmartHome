@@ -1765,6 +1765,19 @@ body {
 .chart-scroll::-webkit-scrollbar-track { background: var(--bg); border-radius: 4px; }
 .chart-scroll::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 4px; opacity: 0.7; }
 .chart-content { position: relative; }
+/* High-load protection banner (home tab) */
+.hl-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin-bottom: 12px; padding: 11px 14px;
+  border-radius: 10px;
+  background: rgba(245, 185, 66, 0.14);
+  border: 1px solid var(--amber);
+  color: var(--text);
+  font-size: 14px;
+}
+.hl-banner .hl-ico { font-size: 20px; line-height: 1; }
+.hl-banner b { color: var(--amber); }
+.hl-banner .hl-sub { color: var(--muted); font-size: 12.5px; }
 .price-chart {
   height: 180px;
   display: flex;
@@ -2141,6 +2154,9 @@ html { scroll-behavior: smooth; }
 
 <div class="container">
   <section class="tab-page active" id="tab-home">
+  <!-- High-load protection banner: shown only while a big load (EV/heating) is
+       active and the battery is being held off discharge. -->
+  <div id="highLoadBanner" class="hl-banner" style="display:none"></div>
   <!-- Today overview: compact full-day price + SOC, no horizontal scroll -->
   <div class="card" style="margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
@@ -2474,13 +2490,33 @@ function updateUI(d) {
   fill.textContent = soc.toFixed(0) + '%';
   fill.style.background = soc > 60 ? 'var(--green)' : soc > 30 ? 'var(--yellow)' : 'var(--red)';
 
+  // High-load protection banner (prominent, top of home tab) + tag.
+  // ev_power from the controller is already in kW.
+  const hlBanner = document.getElementById('highLoadBanner');
+  let hlParts = [];
+  if (d.high_loads_active) {
+    if (d.high_loads?.ev_charging) hlParts.push('🚗 EV charging ' + (d.high_loads.ev_power || 0).toFixed(1) + ' kW');
+    if (d.high_loads?.heating_relays?.length) hlParts.push('🔥 heating (' + d.high_loads.heating_relays.join(', ') + ')');
+  }
+  if (hlBanner) {
+    if (d.high_loads_active) {
+      const protectedNow = d.mode === 'high_load_protected';
+      hlBanner.innerHTML =
+        '<span class="hl-ico">⚡</span>' +
+        '<div><b>High load — ' + (hlParts.join(' · ') || 'active') + '</b>' +
+        '<div class="hl-sub">' + (protectedNow
+          ? 'Battery protected — no discharge while this load runs'
+          : 'High load detected') + '</div></div>';
+      hlBanner.style.display = 'flex';
+    } else {
+      hlBanner.style.display = 'none';
+    }
+  }
+
   // Tags
   const tags = [];
   if (d.simulation_mode) tags.push('<span class="tag tag-warn">SIM</span>');
   if (d.high_loads_active) {
-    let hlParts = [];
-    if (d.high_loads?.heating_relays?.length) hlParts.push('🔥 ' + d.high_loads.heating_relays.join(', '));
-    if (d.high_loads?.ev_charging) hlParts.push('🚗 EV ' + (d.high_loads.ev_power/1000).toFixed(1) + ' kW');
     tags.push('<span class="tag tag-warn">' + (hlParts.length ? hlParts.join(' · ') : 'HIGH LOAD') + '</span>');
   }
   if (d.inverter) {
