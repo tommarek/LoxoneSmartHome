@@ -1842,8 +1842,7 @@ body {
 .price-bar .seg-spot, .price-bar .seg-neg, .price-bar .seg-fee {
   position: absolute; left: 0; right: 0; pointer-events: none;
 }
-.price-bar .seg-fee {                /* distribution fee, on the 0 line */
-  bottom: 0;
+.price-bar .seg-fee {                /* distribution fee (bottom/top set inline) */
   background: rgba(148, 163, 184, 0.45);
 }
 .price-bar .seg-spot {               /* spot price, stacked above the fee */
@@ -2637,21 +2636,28 @@ function priceScale(prices) {
   return s;
 }
 
-// Inner segments of one full-height bar:
-//   - fee  : distribution tariff, sitting on the 0 line (bottom)
-//   - spot : positive spot price, stacked on top of the fee
-//   - neg  : negative spot, hung from the TOP of the chart pointing down
+// Inner segments of one full-height bar, driven by the ALL-IN price (spot+fee)
+// so the distribution fee actually nets against a negative spot:
+//   net cost (all-in >= 0): fee sits on the 0 line, spot stacks on top -> the
+//       bar grows up to the all-in cost.
+//   net paid (all-in < 0):  the bar hangs from the TOP pointing down by the NET
+//       |all-in|; the fee is drawn as the slice just below it, so you can see
+//       the fee eating into the gross negative (net + fee == |spot|).
 function barInner(p, scale) {
   const spot = p.czk_kwh, fee = p.distribution_czk || 0;
+  const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
   let s = '';
-  const feeH = Math.min(100, fee / scale * 100);
-  if (feeH > 0.2) s += '<div class="seg-fee" style="height:' + feeH.toFixed(1) + '%"></div>';
-  if (spot >= 0) {
-    const spotH = Math.max(0, Math.min(100 - feeH, spot / scale * 100));
+  if (allin >= 0) {
+    const allH = Math.min(100, allin / scale * 100);
+    const feeH = Math.min(allH, fee / scale * 100);   // fee can't exceed all-in
+    if (feeH > 0.2) s += '<div class="seg-fee" style="bottom:0;height:' + feeH.toFixed(1) + '%"></div>';
+    const spotH = Math.max(0, allH - feeH);
     if (spotH > 0.2) s += '<div class="seg-spot" style="bottom:' + feeH.toFixed(1) + '%;height:' + spotH.toFixed(1) + '%"></div>';
   } else {
-    const negH = Math.min(100, Math.abs(spot) / scale * 100);
-    s += '<div class="seg-neg" style="height:' + Math.max(negH, 0.6).toFixed(1) + '%"></div>';
+    const netH = Math.min(100, Math.abs(allin) / scale * 100);  // net you're paid
+    s += '<div class="seg-neg" style="top:0;height:' + Math.max(netH, 0.6).toFixed(1) + '%"></div>';
+    const feeH = Math.min(100 - netH, fee / scale * 100);       // fee offsetting it
+    if (feeH > 0.2) s += '<div class="seg-fee" style="top:' + netH.toFixed(1) + '%;height:' + feeH.toFixed(1) + '%"></div>';
   }
   return s;
 }
