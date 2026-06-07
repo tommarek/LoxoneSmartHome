@@ -2685,13 +2685,16 @@ function renderHomeChart(prices, timeline) {
   if (!prices.length) { if (nodata) nodata.style.display = 'block'; if (wrap) wrap.style.display = 'none'; return; }
   if (nodata) nodata.style.display = 'none'; if (wrap) wrap.style.display = '';
   // Full-height bars on a 0 line: fee floor, positive net above, negative below.
+  // data-idx maps to priceData (today is first there) so the home bars reuse the
+  // same hover tooltip as the Prices tab; hover hits the whole column.
   const sc = priceScale(prices);
   let html = zeroLineHtml(sc);
-  prices.forEach(p => {
+  prices.forEach((p, i) => {
     let cls = homeBarClass(p); if (p.is_current) cls += ' current';
-    html += '<div class="price-bar ' + cls + '">' + barInner(p, sc) + '</div>';
+    html += '<div class="price-bar ' + cls + '" data-idx="' + i + '">' + barInner(p, sc) + '</div>';
   });
   bars.innerHTML = html;
+  wireBarTooltips(bars);
 
   // Overlay lines, reusing the big chart's renderers so the Home chart shows the
   // SAME solar + draw (consumption) + SOC, each as actual (solid, elapsed) +
@@ -3272,11 +3275,18 @@ function renderPriceChart(prices, mountId, idxOffset, maxAbs) {
     }
   }
 
-  // Attach tooltip events for THIS chart's bars. On touch we DON'T preventDefault
-  // (so dragging still scrolls the chart): a near-stationary touch is a tap →
-  // show the tooltip; a drag scrolls and hides any open tooltip.
+  wireBarTooltips(chart);
+}
+
+// Attach tooltip events to every .price-bar in a container. Each bar is a
+// FULL-HEIGHT column (transparent, segments have pointer-events:none), so the
+// hover/tap target is the whole column, not just the coloured part. On touch we
+// DON'T preventDefault (so dragging still scrolls): a near-stationary touch is a
+// tap → show the tooltip; a drag scrolls and hides any open tooltip.
+function wireBarTooltips(container) {
   const tooltip = document.getElementById('chartTooltip');
-  chart.querySelectorAll('.price-bar').forEach(bar => {
+  if (!container || !tooltip) return;
+  container.querySelectorAll('.price-bar').forEach(bar => {
     bar.addEventListener('mouseenter', (e) => showTooltip(e, bar, tooltip));
     bar.addEventListener('mousemove', (e) => moveTooltip(e, tooltip));
     bar.addEventListener('mouseleave', () => tooltip.style.display = 'none');
