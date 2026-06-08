@@ -14,9 +14,10 @@ This is a consolidated Python service that combines multiple smart home automati
 |---|---|
 | **Server** | `ssh -p 2222 tom@192.168.0.201` (SSH key passphrase required) |
 | **Repo on server** | `/volume1/homes/tom/git/loxone-db-grafana/` |
-| **Container** | `loxone_smart_home` (built from `./loxone_smart_home/` via docker-compose) |
+| **Containers** | **TWO**, both built from `./loxone_smart_home/` (same Dockerfile, **separate image tags**): `loxone_smart_home` (the controller + async modules + the API on internal port 5556) and `loxone_web` (the public dashboard pages on 5555, proxies `/api/*` to `loxone_smart_home:5556`). See "Web/controller split" below. |
 | **Network** | `caddy_net` (external) — shares `influxdb`, `mosquitto`, Grafana with the `selfhosted` stack. The compose `environment:` block overrides `INFLUXDB_HOST=http://influxdb:8086` and `MQTT_BROKER=mosquitto` to reach them by container name. |
 | **Local repo** | `/Users/tom/git/LoxoneSmartHome` |
+| **selfhosted repo** | `/Users/tom/git/selfhosted` (local) / `/volume1/homes/tom/git/selfhosted` (server) — holds the Caddy config; the energy upstream points at `loxone_web:5555`. |
 
 **Two SSH rules** (both mandatory or commands fail):
 - Always use a **login shell** — `ssh -p 2222 tom@192.168.0.201 bash -l -c '<cmd>'` or a `bash -l` heredoc. Docker is not on `PATH` otherwise.
@@ -35,35 +36,50 @@ tar cf - \
 | ssh -p 2222 tom@192.168.0.201 \
   "cd /volume1/homes/tom/git/loxone-db-grafana/loxone_smart_home && tar xf - -v"
 
-# 2. Rebuild + restart (heredoc, from the REPO ROOT on the server)
+# 2. Rebuild + restart. BOTH containers build from the same context but have
+#    SEPARATE image tags, so rebuild whichever the change affects (see the
+#    "which container" rule below). When in doubt, build both.
 ssh -p 2222 tom@192.168.0.201 bash -l << 'ENDSSH'
 cd /volume1/homes/tom/git/loxone-db-grafana
-docker-compose build loxone_smart_home
-docker-compose up -d loxone_smart_home
+docker-compose build loxone_smart_home loxone_web
+docker-compose up -d loxone_smart_home loxone_web
 ENDSSH
 
-# 3. Verify — tail logs and check health
+# 3. Verify — tail logs (there is no healthcheck, so inspect Status, not Health)
 ssh -p 2222 tom@192.168.0.201 bash -l << 'ENDSSH'
+docker ps --format '{{.Names}}: {{.Status}}' | grep loxone
 docker logs loxone_smart_home --tail 50 2>&1 | sed 's/\x1b\[[0-9;]*m//g'
-docker inspect loxone_smart_home --format='{{.State.Health.Status}}'
 ENDSSH
 ```
 
-- If you only changed Python (no new deps), `docker-compose up -d` alone re-runs from the rebuilt layer — but always `build` when in doubt. New deps in `requirements.txt` **require** a rebuild.
+**Which container to rebuild** (the file decides):
+- Controller / async modules / the `/api/*` JSON+control handlers (`modules/growatt_controller.py`, `modules/growatt/*.py`, `config/*`, `main.py`, the `api_*` functions in `dashboard.py`) → **`loxone_smart_home`**. Recreating it restarts the controller (~30–40s: model rebuild, inverter re-actuation).
+- The dashboard **pages/HTML/JS** (`DASHBOARD_HTML`/`SETTINGS_HTML` and page handlers in `dashboard.py`, `run_web_apps.py`) → **`loxone_web`** only (restart is cheap; controller untouched). This is the whole point of the split — iterate on UI without bouncing the controller.
+- `modules/growatt/dashboard.py` contains BOTH the API handlers (main) and the page strings (web), so a change there usually means **rebuild both**.
+
+Notes:
+- After recreating `loxone_smart_home`, the new container gets a fresh IP; the proxy in `loxone_web` resolves it by service name each request, so no action needed there. But `caddy` caches DNS — if you change the Caddy upstream, **restart the `caddy` container** (`sed -i` on a bind-mounted file changes the inode and the container keeps the old one — see git history / memory).
 - Strip ANSI colors from logs with `sed 's/\x1b\[[0-9;]*m//g'`.
 - The `.profile` warning (`/opt/etc/profile: No such file or directory`) is harmless — ignore it.
+- **InfluxDB queries from the server**: the auto-mode classifier blocks inlining the token literal. Run a `python3 -c`/heredoc **inside a container** and read `os.environ["INFLUXDB_TOKEN"]` (org `loxone`); the container has no `curl`. Flux quoting in a single-quoted `-c '...'` is fiddly — use `q("""from(bucket:\"solar\") ...""")` triple-quoted form (proven to work).
 
-### Entry points & ports
+### Web/controller split, entry points & ports
 
-The Docker image runs `run_integrated.py`, which launches **both** the async main app and the FastAPI web service in one container.
+The monitoring dashboard (`modules/growatt/dashboard.py`) is split across the two containers so the **UI can be iterated without restarting the controller** (which would retrain models + re-actuate the inverter):
 
-| Script | What it runs | Use for |
-|---|---|---|
-| `run_integrated.py` | main app **+** web service (the container default) | production |
-| `main.py` | async modules only (UDP, MQTT, weather, Growatt) | headless debugging |
-| `run_web_service.py` | FastAPI web/dashboard only (needs `WEB_SERVICE_ENABLED=true`) | dashboard/API work |
+- **`loxone_smart_home`** (image default CMD `run_integrated.py` → `main.py`): the controller + async modules, and the **controller-backed API app on internal port 5556** (`create_api_app` / `start_api_dashboard`). 5556 is `expose`d, NOT published. (`run_integrated.py` also *can* launch the `web/` FastAPI on 8080 when `WEB_SERVICE_ENABLED=true`, but it's **off in prod**.)
+- **`loxone_web`** (compose `command: ["python","run_web_apps.py"]`): serves the dashboard **pages** on **5555** (`create_pages_app`) and **reverse-proxies `/api/*`** (incl. the SSE log stream, via the streaming `_proxy_to_api`) to `DASHBOARD_API_UPSTREAM` (default `http://loxone_smart_home:5556`). Stateless — settings POSTs proxy to main, which persists.
 
-Ports: `2000/udp` (Loxone UDP listener), `8080` (FastAPI web service from `run_web_service.py` — the `web/` app), and `5555` (the Growatt **monitoring dashboard** in `modules/growatt/dashboard.py` + its JSON API: `/api/status`, `/api/live`, `/api/insights`, `/api/prices`, `/api/projection`, `/api/solar_actuals`, `/api/soc_actuals`, `/api/consumption_actuals`, …). The `selfhosted` Caddy reverse-proxies **`5555`** to `energy.markovi.online` (see `selfhosted/caddy/Caddyfile`, `{$DOMAIN_ENERGY}` block) — so the **monitoring dashboard is the public page**; `8080` is a separate app and is **not** publicly exposed. Both 8080 and 5555 are launched by `run_integrated.py`.
+Single-process dev: `create_dashboard_app` / `start_dashboard` still serve pages + API in one process. `_add_api_routes` / `_add_page_routes` are the shared route groups.
+
+Ports: `2000/udp` (Loxone UDP listener), **`5555`** (public dashboard pages, served by `loxone_web`), `5556` (internal API on `loxone_smart_home`). API routes include `/api/status /api/live /api/insights /api/prices /api/projection /api/settings(GET/POST) /api/restart /api/override /api/reapply /api/logs/stream …`. The `selfhosted` Caddy reverse-proxies `energy.markovi.online` → **`loxone_web:5555`** (`{$DOMAIN_ENERGY}` block), behind Caddy forward-auth + **Pocket ID (OIDC SSO)** — so the public page is already authenticated; there is no app-level auth.
+
+### Settings editor, restart-from-UI, runtime config overrides
+
+- **`/settings`** page (gear icon in the appbar) edits a curated subset of `GrowattConfig` live. Backed by `config/settings_overrides.py` (`EDITABLE_GROUPS` registry → group/label/unit + `hot` vs restart flag; validates via Pydantic incl. cross-field rules; persists to `config_overrides.json`).
+- Layering: `.env` defaults → `config_overrides.json` → live `GrowattConfig` (mutated in place at controller `__init__`, and on each POST). **hot** fields apply on the next eval tick + a forced re-eval; **restart** fields (engine/forecaster toggles, log level) need a restart.
+- Persistence path: `/app/config_state/config_overrides.json`, backed by the **named docker volume `loxone_config_state`** on `loxone_smart_home` (overridable via `CONFIG_OVERRIDES_PATH` env, used in tests).
+- **Restart-from-UI**: `POST /api/restart` → `controller.request_restart()` sends the process `SIGTERM` → graceful shutdown → Docker `restart: unless-stopped` recreates the container, re-reading the overrides. The settings page shows a "Restart" button that polls `/api/status` until it's back.
 
 ## Testing
 
@@ -179,6 +195,26 @@ Notes:
 - **MILP** is a drop-in for the greedy engine (identical signature, same 4-tuple output) using an explicit per-block solar/grid/battery/load energy-flow model; runs off the event loop via `asyncio.to_thread`. Reuses the greedy helper's reserve-SOC computation so both engines protect the same overnight energy.
 - **Deferrable loads** are added to the optimizer's `consumption_hourly` as an overlay so the battery plans around them. **Only list loads NOT already present in the consumption history** (`INVPowerToLocalLoad`) — otherwise the forecast already learned them and you double-count, over-charging from grid.
 - **Solcast** free tier is 10 req/day per rooftop; the client throttles to ≤9/day with a UTC-monotonic interval guard and counts every attempt (success or failure).
+- **Optimizer economics are per-block** (not daily-average): both engines build `import_cost[i] = prices[i] + distribution(hour)` and `export = prices[i] - sell_fee` per 15-min block, so negative prices and VT/NT tariff bands are priced correctly. (The dashboard's "Economics (today)" card is a *separate* reporting estimate — it was meter-accurate-ified in `_today_grid_economics`, but never fed dispatch.)
+
+### High-load protection (EV / heating) — `growatt_controller.py` + `decision_engine.py`
+
+Stops the battery DISCHARGING while a big load runs, so stored energy isn't drained into it. Gate: Priority-3 `high_load_protected` decision node + `and not ctx.high_loads_active` guards on every discharge/sell/hold node. Driven by `self._high_loads_active`. Config group "High-load protection" (`high_load_protection_enabled`, `ev_charging_power_threshold_w`, `ev_high_load_poll_seconds`).
+
+Two detection sources (different, both fixed this branch):
+- **Heating**: Loxone relays via the `loxone/status` MQTT cache (`_detect_high_loads_from_status`, `tag1=heating`). Event-driven.
+- **EV**: teslamate → InfluxDB only (`ev` measurement: `ev_charging` 0/1, `ev_charging_power` in **kW**, `ev_connected`). Polled by `_high_load_poll_loop` (`_query_ev_charging_from_influx`), merged with heating by `_recompute_high_load_state`. **GOTCHA**: `ev_charging` is written ON CHANGE so it ages out of the 30-min window mid-charge; `ev_charging_power` is **kW** but the threshold is **W**, so detection must use `(power_kw*1000) > threshold_w`. Dashboard `ev_power` is kW (don't /1000).
+
+### SPH inverter mode quirk (critical — `decision_engine.py` MODE_DEFINITIONS + `_build_desired_state`)
+
+On this Growatt SPH, confirmed from telemetry:
+- `battery_first` CHARGES the battery up to `stop_soc` **from the grid**, even with `ac_charge=False` (the flag does NOT gate grid-charge).
+- `load_first` DISCHARGES the battery to cover any load deficit — `stop_soc` is NOT a discharge floor there.
+- `grid_first` maintains `stop_soc` (charges up to it, discharges down to it).
+
+So the "battery passive, no discharge AND no grid-charge" modes — **`sell_production`, `battery_hold`, `high_load_protected`** — must use **`battery_first` with `stop_soc` pinned to the LIVE SOC** (the pin list in `_build_desired_state`). `load_first`/`max_soc` do NOT hold the battery. You cannot bank surplus solar during a hold without also grid-charging, so a hold exports surplus instead. Don't "fix" these back to load_first or stop_soc=max_soc.
+
+Also added: `battery_amortisation_export_czk` (optional, default None=use shared wear cost) — applies an export-only wear penalty to the grid-export term in both engines, leaving self-consumption at the base cost.
 
 ### Async Resource Management
 - **AsyncMQTTClient**: Thread-safe MQTT operations with automatic reconnection
@@ -209,6 +245,7 @@ Notes:
 
 ## InfluxDB Buckets
 
-- **solar**: Inverter telemetry (`solar` measurement), forecast cache (`solar_forecast_cache`), consensus history (`solar_forecast_history`)
+- **solar**: Inverter telemetry (`solar` measurement: `SOC`, `ChargePower`, `DischargePower`, `ACPowerToUser` [grid import W], `ACPowerToGrid` [export W], `INVPowerToLocalLoad`, `PV1/2InputPower`, cumulative `EnergyToUserToday`/`EnergyToGridToday`/`Charge`/`Discharge`…), forecast cache (`solar_forecast_cache`), consensus history (`solar_forecast_history`)
 - **weather_forecast**: Weather data from OpenMeteo/Aladin/OWM (`weather_forecast` measurement, `type` tag: `hour`/`day`)
-- **loxone**: Loxone Miniserver data (relays, temperatures, humidity, etc.)
+- **loxone**: Loxone Miniserver data: `relay` (`tag1=heating`/`shading`), `ev` (`ev_charging`, `ev_charging_power` kW, `ev_connected` — from teslamate), `temperature`, `target_temp`, humidity, etc.
+- **ote_prices**: OTE day-ahead spot prices (`electricity_prices` measurement, fields `price` [EUR/MWh], `price_czk_kwh`), written with future timestamps for the next day. Written by `ote_price_collector`; the controller fetches DAM separately via `price_analyzer.fetch_dam_energy_prices` (negative prices are kept, never clamped).
