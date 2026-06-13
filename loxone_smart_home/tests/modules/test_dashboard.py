@@ -302,3 +302,191 @@ async def test_pages_app_proxies_api_to_upstream():
             j2 = await r2.json()
             assert j2["method"] == "POST" and j2["path"] == "/api/settings"
             assert '"x": 1' in j2["body"]
+
+
+# ---------------------------------------------------------------------------
+# Economics: meter-accurate grid cost, real battery arbitrage, plan savings
+# ---------------------------------------------------------------------------
+from datetime import timedelta
+
+
+class _FieldRecord:
+    """Influx record carrying a field name (the economics queries select many)."""
+    def __init__(self, t, field, v):
+        self._t, self._f, self._v = t, field, v
+
+    def get_time(self):
+        return self._t
+
+    def get_field(self):
+        return self._f
+
+    def get_value(self):
+        return self._v
+
+
+def _econ_config():
+    return SimpleNamespace(
+        distribution_tariff_high=0.919, distribution_tariff_low=0.281,
+        low_tariff_hours="0-10,11-12,13-14,15-17,18-24",
+        charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
+        discharge_profit_margin=4.0, battery_efficiency=0.85,
+        summer_charge_price_max=0.0, sell_fee_czk=0.5,
+    )
+
+
+def _econ_ctrl(records, prices=None):
+    return SimpleNamespace(
+        influxdb_client=_FakeInflux(records),
+        settings=SimpleNamespace(influxdb=SimpleNamespace(bucket_solar="solar")),
+        config=_econ_config(),
+        _current_prices=prices or {},
+        _optimizer=None,
+    )
+
+
+def _today_at(hh, mm=0):
+    d = datetime.now().date()
+    return datetime(d.year, d.month, d.day, hh, mm)
+
+
+def test_make_price_thresholds_uses_live_config():
+    th = dashboard._make_price_thresholds(_econ_ctrl([]))
+    # Pulled straight from config, NOT a hardcoded fallback.
+    assert th.distribution_tariff_high == 0.919
+    assert th.distribution_tariff_low == 0.281
+    assert th.low_tariff_hours == "0-10,11-12,13-14,15-17,18-24"
+
+
+def test_nearest_spot_picks_closest_block():
+    spot = {"09:00": 3.0, "12:00": 5.0}
+    # 09:30 is closer to 09:00 than 12:00.
+    assert dashboard._nearest_spot(spot, "09:30") == 3.0
+    # 11:30 is closer to 12:00.
+    assert dashboard._nearest_spot(spot, "11:30") == 5.0
+    assert dashboard._nearest_spot({}, "09:00") is None
+
+
+@pytest.mark.asyncio
+async def test_grid_economics_counts_dropped_not_silent():
+    # Two import blocks: 09:00 (priced) and 10:00 (NO matching price → must be
+    # priced via nearest fallback and FLAGGED, not silently dropped — the bug).
+    recs = [
+        _FieldRecord(_today_at(9, 0), "EnergyToUserToday", 0.0),
+        _FieldRecord(_today_at(9, 15), "EnergyToUserToday", 2.0),   # block 09:00, +2
+        _FieldRecord(_today_at(10, 15), "EnergyToUserToday", 5.0),  # block 10:00, +3
+    ]
+    ctrl = _econ_ctrl(recs, prices={("09:00", "09:15"): 3.0})
+    res = await dashboard._today_grid_economics(ctrl)
+    assert res is not None
+    # All 5 kWh accounted for (2 + 3), nothing silently dropped.
+    assert res.import_kwh == 5.0
+    assert res.dropped_blocks == 1
+    assert res.dropped_kwh == 3.0
+    # Import cost > 0 with positive prices (the reported bug made it too low).
+    assert res.import_cost_czk > 0
+    assert res.import_avg_czk_per_kwh is not None
+
+
+@pytest.mark.asyncio
+async def test_grid_economics_skips_midnight_reset():
+    # A negative delta (cumulative meter reset at midnight) is skipped and is
+    # NOT counted as a fallback-priced "dropped" block.
+    recs = [
+        _FieldRecord(_today_at(0, 0), "EnergyToUserToday", 8.0),
+        _FieldRecord(_today_at(0, 15), "EnergyToUserToday", 0.5),  # reset → de<0
+        _FieldRecord(_today_at(0, 30), "EnergyToUserToday", 1.0),  # +0.5
+    ]
+    ctrl = _econ_ctrl(recs, prices={("00:15", "00:30"): 2.0})
+    res = await dashboard._today_grid_economics(ctrl)
+    assert res is not None
+    assert res.import_kwh == 0.5          # only the +0.5 block counted
+    assert res.dropped_blocks == 0        # reset is not a "dropped" block
+
+
+@pytest.mark.asyncio
+async def test_grid_economics_distribution_vt_vs_nt():
+    # Hour 9 is NT (low tariff), hour 10 is VT (high) under D57d half-open ranges.
+    recs = [
+        _FieldRecord(_today_at(9, 0), "EnergyToUserToday", 0.0),
+        _FieldRecord(_today_at(9, 15), "EnergyToUserToday", 1.0),   # block 09:00 NT
+        _FieldRecord(_today_at(10, 0), "EnergyToUserToday", 1.0),   # de=0 skipped
+        _FieldRecord(_today_at(10, 15), "EnergyToUserToday", 2.0),  # block 10:00 VT
+    ]
+    prices = {("09:00", "09:15"): 3.0, ("10:00", "10:15"): 3.0}
+    ctrl = _econ_ctrl(recs, prices=prices)
+    res = await dashboard._today_grid_economics(ctrl)
+    # NT block: 1*(3+0.281)=3.281 ; VT block: 1*(3+0.919)=3.919 → 7.2
+    assert res.import_cost_czk == pytest.approx(7.2, abs=0.05)
+
+
+def test_battery_arbitrage_solar_only_charge_is_free():
+    ctrl = _econ_ctrl([], prices={("09:00", "09:15"): 3.0})
+    # kWh per block (already W→kWh, as _aligned_blocks produces).
+    blocks = {"09:00": {
+        "ChargePower": 0.5, "PV1InputPower": 0.75, "PV2InputPower": 0.0,
+        "INVPowerToLocalLoad": 0.125,  # pv_surplus 0.625 >= charge 0.5
+    }}
+    res = dashboard._battery_arbitrage_from_flows(ctrl, blocks)
+    assert res.source == "influx_power"
+    assert res.solar_charge_kwh == 0.5
+    assert res.grid_charge_kwh == 0.0
+    assert res.grid_charge_cost_czk == 0.0  # solar is free
+
+
+def test_battery_arbitrage_grid_charge_priced_at_buy():
+    ctrl = _econ_ctrl([], prices={("02:00", "02:15"): 1.0})
+    blocks = {"02:00": {
+        "ChargePower": 0.5, "PV1InputPower": 0.0, "PV2InputPower": 0.0,
+        "INVPowerToLocalLoad": 0.0,  # no PV → all charge from grid
+    }}
+    res = dashboard._battery_arbitrage_from_flows(ctrl, blocks)
+    assert res.grid_charge_kwh == 0.5
+    assert res.solar_charge_kwh == 0.0
+    # buy = spot 1.0 + NT dist 0.281 = 1.281 ; 0.5 kWh → 0.64, rounded(1)=0.6
+    assert res.grid_charge_cost_czk == pytest.approx(0.6, abs=0.02)
+
+
+def test_plan_savings_positive_for_self_consumption():
+    ctrl = _econ_ctrl([], prices={("19:00", "19:15"): 4.0})
+    # Battery serves a 0.25 kWh load deficit that the baseline would import.
+    blocks = {"19:00": {
+        "DischargePower": 0.25, "PV1InputPower": 0.0, "PV2InputPower": 0.0,
+        "INVPowerToLocalLoad": 0.25, "ACPowerToUser": 0.0, "ACPowerToGrid": 0.0,
+    }}
+    savings, n = dashboard._plan_savings_from_flows(ctrl, blocks)
+    assert n == 1
+    # baseline imports 0.25 kWh at buy (4+0.281≈4.28); actual cost ~0 → savings>0.
+    assert savings is not None and savings > 0
+
+
+def test_plan_savings_zero_when_actual_matches_baseline():
+    ctrl = _econ_ctrl([], prices={("19:00", "19:15"): 4.0})
+    # No battery activity: actual import == baseline deficit → ~zero savings.
+    blocks = {"19:00": {
+        "PV1InputPower": 0.0, "PV2InputPower": 0.0,
+        "INVPowerToLocalLoad": 0.25, "ACPowerToUser": 0.25, "ACPowerToGrid": 0.0,
+    }}
+    savings, n = dashboard._plan_savings_from_flows(ctrl, blocks)
+    assert n == 1
+    assert savings == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_api_economics_schema_complete():
+    recs = [
+        _FieldRecord(_today_at(9, 0), "EnergyToUserToday", 0.0),
+        _FieldRecord(_today_at(9, 15), "EnergyToUserToday", 1.0),
+    ]
+    ctrl = _econ_ctrl(recs, prices={("09:00", "09:15"): 3.0})
+    app = dashboard.create_api_app(ctrl)
+    async with TestClient(TestServer(app)) as client:
+        resp = await client.get("/api/economics")
+        assert resp.status == 200
+        body = await resp.json()
+        ec = body["economics"]
+        for key in ("import_cost_czk", "export_revenue_czk", "net_cost_czk",
+                    "saved_today_czk", "batt_net_arbitrage_czk", "_accuracy"):
+            assert key in ec
+        # Deprecated field kept null for the legacy frontend.
+        assert ec["plan_value_czk"] is None

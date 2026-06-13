@@ -12,8 +12,9 @@ import json
 import logging
 import collections
 import pathlib
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from aiohttp import web
 
@@ -486,9 +487,10 @@ async def api_prices(request: web.Request) -> web.Response:
         from modules.growatt.optimizer import compute_rate_ceiling
         _chg_cap = compute_rate_ceiling(_cmax, getattr(ctrl.config, 'max_charge_power_kw', _cmax))
         _dis_cap = compute_rate_ceiling(_dmax, getattr(ctrl.config, 'max_discharge_power_kw', _dmax))
-        _engine_used = getattr(getattr(ctrl, '_optimizer', None), '_last_engine', 'greedy')
         _eff = getattr(ctrl.config, 'battery_efficiency', 0.85)
-        _leg_eta = _eff ** 0.5 if _engine_used == 'milp' else _eff
+        # Both engines use the per-leg sqrt convention (round-trip efficiency
+        # split across the charge/discharge legs).
+        _leg_eta = _eff ** 0.5
         charge_rates = compute_charge_power_rates(
             decisions, batt_cap, _cmax,
             int(getattr(ctrl.config, 'min_charge_power_rate', 25)),
@@ -577,9 +579,10 @@ async def api_projection(request: web.Request) -> web.Response:
     from modules.growatt.optimizer import compute_rate_ceiling
     _chg_cap = compute_rate_ceiling(_cmax, getattr(ctrl.config, 'max_charge_power_kw', _cmax))
     _dis_cap = compute_rate_ceiling(_dmax, getattr(ctrl.config, 'max_discharge_power_kw', _dmax))
-    _engine_used = getattr(getattr(ctrl, '_optimizer', None), '_last_engine', 'greedy')
     _eff = getattr(ctrl.config, 'battery_efficiency', 0.85)
-    _leg_eta = _eff ** 0.5 if _engine_used == 'milp' else _eff
+    # Both engines use the per-leg sqrt convention (round-trip efficiency
+    # split across the charge/discharge legs).
+    _leg_eta = _eff ** 0.5
     charge_rates = compute_charge_power_rates(
         decisions, battery_capacity, _cmax,
         int(getattr(ctrl.config, 'min_charge_power_rate', 25)),
@@ -720,7 +723,73 @@ def _avg_block_price(ctrl, blocks) -> Optional[float]:
     return sum(vals) / len(vals) if vals else None
 
 
-async def _today_grid_economics(ctrl):
+def _make_price_thresholds(ctrl) -> "Any":
+    """Build a PriceThresholds straight from the live controller config.
+
+    Single factory so the dashboard's economics math always prices the SAME
+    distribution tariff / VT-NT schedule the controller dispatches on. The old
+    inline construct hard-coded charge/discharge thresholds and risked an
+    out-of-date `low_tariff_hours` fallback; this reads every field from
+    `ctrl.config` (which mirrors GrowattConfig defaults).
+    """
+    from .decision_engine import PriceThresholds
+    cfg = ctrl.config
+    return PriceThresholds(
+        charge_price_max=getattr(cfg, "charge_price_max", 1.5),
+        export_price_min=getattr(cfg, "export_price_min", 1.0),
+        discharge_price_min=getattr(cfg, "discharge_price_min", 5.0),
+        discharge_profit_margin=getattr(cfg, "discharge_profit_margin", 4.0),
+        battery_efficiency=getattr(cfg, "battery_efficiency", 0.85),
+        summer_charge_price_max=getattr(cfg, "summer_charge_price_max", 0.0),
+        distribution_tariff_high=cfg.distribution_tariff_high,
+        distribution_tariff_low=cfg.distribution_tariff_low,
+        low_tariff_hours=getattr(
+            cfg, "low_tariff_hours", "0-10,11-12,13-14,15-17,18-24"),
+    )
+
+
+def _hhmm_to_minutes(hhmm: str) -> Optional[int]:
+    """'HH:MM' → minutes since midnight, or None if unparseable."""
+    try:
+        h, m = hhmm.split(":")
+        return int(h) * 60 + int(m)
+    except (ValueError, AttributeError):
+        return None
+
+
+def _nearest_spot(spot_by_start: Dict[str, float], block_start: str) -> Optional[float]:
+    """Closest available block's spot price to `block_start` by clock distance.
+
+    Used as a fallback when a block has no exactly-matching price key (e.g. a
+    momentary gap in the published 96-block grid) so the energy is still PRICED
+    rather than silently dropped from the cost total. Returns None only when no
+    prices exist at all.
+    """
+    target = _hhmm_to_minutes(block_start)
+    if target is None or not spot_by_start:
+        return None
+    best_key = min(
+        spot_by_start,
+        key=lambda k: abs((_hhmm_to_minutes(k) or 0) - target),
+    )
+    return spot_by_start[best_key]
+
+
+@dataclass
+class GridEconomicsResult:
+    """Meter-accurate today grid economics (per-block energy × that block's price)."""
+    import_cost_czk: float
+    export_revenue_czk: float
+    import_kwh: float
+    export_kwh: float
+    import_avg_czk_per_kwh: Optional[float]
+    export_avg_czk_per_kwh: Optional[float]
+    dropped_blocks: int          # blocks priced via nearest/day-avg fallback
+    dropped_kwh: float           # energy in those fallback-priced blocks
+    source: str                  # "influx_meter"
+
+
+async def _today_grid_economics(ctrl) -> Optional[GridEconomicsResult]:
     """Exact today's grid import COST and export REVENUE.
 
     Integrates the inverter's cumulative energy meters (EnergyToUserToday /
@@ -729,13 +798,17 @@ async def _today_grid_economics(ctrl):
     distribution). This is the meter-accurate cost; the daily-average estimate it
     replaces multiplied total kWh by the day's average spot, which badly mis-
     prices energy bought/sold in cheap or negative windows (could even flip the
-    sign). Returns (import_cost_czk, export_revenue_czk) or None on any failure
-    (caller falls back to the rough estimate). import_cost can be NEGATIVE when
-    you were net paid to import (negative spot beating distribution).
+    sign). Returns a GridEconomicsResult or None on any failure (caller falls
+    back to the rough estimate). import_cost can be NEGATIVE when you were net
+    paid to import (negative spot beating distribution).
+
+    Blocks whose price key doesn't match exactly are priced via the nearest
+    available block (then day-average) and COUNTED in dropped_blocks/dropped_kwh
+    — never silently dropped, which previously made import cost read too low.
     """
     if not getattr(ctrl, "influxdb_client", None) or not ctrl._current_prices:
         return None
-    from .decision_engine import GrowattDecisionEngine, PriceThresholds
+    from .decision_engine import GrowattDecisionEngine
     import zoneinfo
     from datetime import timedelta
     bucket = ctrl.settings.influxdb.bucket_solar
@@ -744,6 +817,10 @@ async def _today_grid_economics(ctrl):
         '  |> range(start: -18h)\n'
         '  |> filter(fn: (r) => r._measurement == "solar" and '
         '(r._field == "EnergyToUserToday" or r._field == "EnergyToGridToday"))\n'
+        # fn:last STOP-labels each window: t1 is the EXCLUSIVE window end (=start
+        # of the next block), so the block this delta belongs to starts at
+        # t1-15min. This is the deliberate stop-label convention for the DISPLAY
+        # path (model pipelines use timeSrc:"_start"; do not "fix" this to match).
         '  |> aggregateWindow(every: 15m, fn: last, createEmpty: false)\n'
     )
     try:
@@ -756,7 +833,7 @@ async def _today_grid_economics(ctrl):
         tz = None
     now = datetime.now(tz) if tz else datetime.now()
     today = now.date()
-    series = {"EnergyToUserToday": [], "EnergyToGridToday": []}
+    series: Dict[str, list] = {"EnergyToUserToday": [], "EnergyToGridToday": []}
     for table in result:
         for rec in table.records:
             t = rec.get_time()
@@ -767,38 +844,386 @@ async def _today_grid_economics(ctrl):
                 continue
             series[f].append((t, float(v)))
 
-    th = PriceThresholds(
-        charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
-        discharge_profit_margin=4.0, battery_efficiency=0.85,
-        distribution_tariff_high=ctrl.config.distribution_tariff_high,
-        distribution_tariff_low=ctrl.config.distribution_tariff_low,
-        low_tariff_hours=getattr(ctrl.config, "low_tariff_hours",
-                                 "0-10,11-12,13-14,15-17,18-24"),
-    )
+    th = _make_price_thresholds(ctrl)
     sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
     spot_by_start = {s: p for (s, e), p in ctrl._current_prices.items()}
+    day_avg_spot = (
+        sum(spot_by_start.values()) / len(spot_by_start) if spot_by_start else None
+    )
 
     def integrate(points, is_import):
         cost = 0.0
+        energy = 0.0
+        dropped_blocks = 0
+        dropped_kwh = 0.0
         for i in range(1, len(points)):
             (t0, v0), (t1, v1) = points[i - 1], points[i]
             de = v1 - v0
             if de <= 0 or t1.date() != today:   # skip midnight reset / other days
                 continue
-            block_start = (t1 - timedelta(minutes=15)).strftime("%H:%M")
+            block_dt = t1 - timedelta(minutes=15)
+            block_start = block_dt.strftime("%H:%M")
             spot = spot_by_start.get(block_start)
             if spot is None:
-                continue
+                # Price the block via nearest available block (then day-avg)
+                # and FLAG it, instead of dropping its energy from the total.
+                spot = _nearest_spot(spot_by_start, block_start)
+                if spot is None:
+                    spot = day_avg_spot
+                if spot is None:
+                    continue  # no price data at all — unpriceable
+                dropped_blocks += 1
+                dropped_kwh += de
+            energy += de
             if is_import:
-                dist = GrowattDecisionEngine._get_distribution_tariff(
-                    (t1 - timedelta(minutes=15)).hour, th)
+                dist = GrowattDecisionEngine._get_distribution_tariff(block_dt.hour, th)
                 cost += de * (spot + dist)
             else:
                 cost += de * max(0.0, spot - sell_fee)
-        return round(cost, 1)
+        return round(cost, 1), round(energy, 3), dropped_blocks, round(dropped_kwh, 3)
 
-    return (integrate(sorted(series["EnergyToUserToday"]), True),
-            integrate(sorted(series["EnergyToGridToday"]), False))
+    imp_cost, imp_kwh, imp_drop_b, imp_drop_k = integrate(
+        sorted(series["EnergyToUserToday"]), True)
+    exp_rev, exp_kwh, exp_drop_b, exp_drop_k = integrate(
+        sorted(series["EnergyToGridToday"]), False)
+
+    return GridEconomicsResult(
+        import_cost_czk=imp_cost,
+        export_revenue_czk=exp_rev,
+        import_kwh=imp_kwh,
+        export_kwh=exp_kwh,
+        import_avg_czk_per_kwh=round(imp_cost / imp_kwh, 2) if imp_kwh > 0 else None,
+        export_avg_czk_per_kwh=round(exp_rev / exp_kwh, 2) if exp_kwh > 0 else None,
+        dropped_blocks=imp_drop_b + exp_drop_b,
+        dropped_kwh=round(imp_drop_k + exp_drop_k, 3),
+        source="influx_meter",
+    )
+
+
+async def _query_today_power_flows(ctrl) -> Optional[Dict[str, list]]:
+    """Per-15-min mean power (W) for the battery/PV/grid/load fields today.
+
+    One InfluxDB query feeding BOTH the battery-arbitrage and plan-savings
+    calculations, cached ~90 s on the controller so a single /api/economics
+    request hits InfluxDB once. Returns {field: [(local_dt, mean_W), …]} sorted
+    by time and filtered to today, or None on failure.
+    """
+    if not getattr(ctrl, "influxdb_client", None):
+        return None
+    cache = getattr(ctrl, "_econ_power_cache", None)
+    if cache:
+        ts, payload = cache
+        if (datetime.now() - ts).total_seconds() < 90:
+            return payload
+    import zoneinfo
+    fields = (
+        "ChargePower", "DischargePower", "ACPowerToUser", "ACPowerToGrid",
+        "PV1InputPower", "PV2InputPower", "INVPowerToLocalLoad",
+    )
+    field_filter = " or ".join(f'r._field == "{f}"' for f in fields)
+    bucket = ctrl.settings.influxdb.bucket_solar
+    flux = (
+        f'from(bucket: "{bucket}")\n'
+        '  |> range(start: -18h)\n'
+        f'  |> filter(fn: (r) => r._measurement == "solar" and ({field_filter}))\n'
+        # Stop-labeled like _today_grid_economics: each window's mean power maps
+        # to the block STARTING at t-15min (see that function's comment).
+        '  |> aggregateWindow(every: 15m, fn: mean, createEmpty: false)\n'
+    )
+    try:
+        result = await ctrl.influxdb_client.query(flux)
+    except Exception:
+        return None
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Prague")
+    except Exception:
+        tz = None
+    now = datetime.now(tz) if tz else datetime.now()
+    today = now.date()
+    series: Dict[str, list] = {f: [] for f in fields}
+    for table in result:
+        for rec in table.records:
+            t = rec.get_time()
+            if tz is not None and getattr(t, "tzinfo", None) is not None:
+                t = t.astimezone(tz)
+            f = rec.get_field(); v = rec.get_value()
+            if v is None or f not in series or t.date() != today:
+                continue
+            series[f].append((t, float(v)))
+    for f in series:
+        series[f].sort()
+    setattr(ctrl, "_econ_power_cache", (datetime.now(), series))
+    return series
+
+
+def _aligned_blocks(series: Dict[str, list]) -> Dict[str, Dict[str, float]]:
+    """Reindex {field: [(dt, W)]} into {block_start_HHMM: {field: kWh}}.
+
+    Each window is stop-labeled, so its block starts 15 min before the record
+    time; mean W over a 15-min window → kWh = W/1000 * 0.25.
+    """
+    from datetime import timedelta
+    blocks: Dict[str, Dict[str, float]] = {}
+    for field, points in series.items():
+        for (t, w) in points:
+            block_start = (t - timedelta(minutes=15)).strftime("%H:%M")
+            blocks.setdefault(block_start, {})[field] = (w / 1000.0) * 0.25
+    return blocks
+
+
+@dataclass
+class BatteryArbitrageResult:
+    grid_charge_kwh: float
+    solar_charge_kwh: float
+    grid_charge_cost_czk: float
+    discharge_self_kwh: float
+    discharge_export_kwh: float
+    self_consumption_value_czk: float
+    export_value_czk: float
+    net_arbitrage_czk: float
+    source: str                  # "influx_power" | "unavailable"
+    blocks_counted: int
+
+
+def _battery_arbitrage_from_flows(ctrl, blocks: Dict[str, Dict[str, float]]
+                                  ) -> BatteryArbitrageResult:
+    """Battery arbitrage from per-block actuals, splitting charge by source.
+
+    Charge attribution per block (SPH PV-first hierarchy): PV serves load first;
+    the surplus charges the battery; grid supplements only the remainder.
+      solar_to_batt = min(charge, max(0, pv - load))
+      grid_to_batt  = charge - solar_to_batt
+    Grid-sourced charge is PRICED at that block's buy price (spot+dist); solar
+    charge is free (already-earned energy). Discharge is valued by what it
+    DISPLACED: the self-consumption share at the buy price (avoided import), the
+    export share at the sell price; the split follows the block's export/discharge
+    power ratio. net_arbitrage = self+export value − grid charge cost.
+    """
+    from .decision_engine import GrowattDecisionEngine
+    th = _make_price_thresholds(ctrl)
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    spot_by_start = {s: p for (s, e), p in (ctrl._current_prices or {}).items()}
+
+    g_chg = s_chg = g_chg_cost = 0.0
+    dis_self = dis_exp = sc_val = exp_val = 0.0
+    counted = 0
+    for block_start, fl in blocks.items():
+        spot = spot_by_start.get(block_start)
+        if spot is None:
+            spot = _nearest_spot(spot_by_start, block_start)
+        if spot is None:
+            continue
+        hour = _hhmm_to_minutes(block_start)
+        hour = (hour // 60) if hour is not None else 0
+        dist = GrowattDecisionEngine._get_distribution_tariff(hour, th)
+        buy = spot + dist
+        sell = max(0.0, spot - sell_fee)
+
+        charge = max(0.0, fl.get("ChargePower", 0.0))
+        discharge = max(0.0, fl.get("DischargePower", 0.0))
+        pv = max(0.0, fl.get("PV1InputPower", 0.0) + fl.get("PV2InputPower", 0.0))
+        load = max(0.0, fl.get("INVPowerToLocalLoad", 0.0))
+        grid_export = max(0.0, fl.get("ACPowerToGrid", 0.0))
+        if charge <= 0 and discharge <= 0:
+            continue
+        counted += 1
+
+        # Charge source split.
+        pv_surplus = max(0.0, pv - load)
+        solar_to_batt = min(charge, pv_surplus)
+        grid_to_batt = max(0.0, charge - solar_to_batt)
+        s_chg += solar_to_batt
+        g_chg += grid_to_batt
+        g_chg_cost += grid_to_batt * buy
+
+        # Discharge valuation: split by export vs self-consumption.
+        if discharge > 0:
+            export_frac = min(1.0, grid_export / discharge) if grid_export > 0 else 0.0
+            d_exp = discharge * export_frac
+            d_self = discharge - d_exp
+            dis_export = d_exp
+            dis_self_b = d_self
+            dis_exp += dis_export
+            dis_self += dis_self_b
+            exp_val += dis_export * sell
+            sc_val += dis_self_b * buy
+
+    if counted == 0:
+        return BatteryArbitrageResult(
+            0, 0, 0, 0, 0, 0, 0, 0, "unavailable", 0)
+    net = sc_val + exp_val - g_chg_cost
+    return BatteryArbitrageResult(
+        grid_charge_kwh=round(g_chg, 3),
+        solar_charge_kwh=round(s_chg, 3),
+        grid_charge_cost_czk=round(g_chg_cost, 1),
+        discharge_self_kwh=round(dis_self, 3),
+        discharge_export_kwh=round(dis_exp, 3),
+        self_consumption_value_czk=round(sc_val, 1),
+        export_value_czk=round(exp_val, 1),
+        net_arbitrage_czk=round(net, 1),
+        source="influx_power",
+        blocks_counted=counted,
+    )
+
+
+def _plan_savings_from_flows(ctrl, blocks: Dict[str, Dict[str, float]]
+                             ) -> Tuple[Optional[float], int]:
+    """Savings today vs a NO-BATTERY baseline, from actuals.
+
+    Per elapsed block, compare:
+      baseline (no battery): net_solar = pv - load; surplus exported at sell,
+                             deficit imported at buy.
+      actual:  recorded grid import at buy − recorded grid export at sell.
+      savings = baseline_cost − actual_cost  (positive when the battery helped).
+    Mirrors simulate_battery's accounting but on measured flows; never sums
+    optimizer net_value scores. Returns (savings_czk, blocks_counted).
+    """
+    from .decision_engine import GrowattDecisionEngine
+    th = _make_price_thresholds(ctrl)
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    spot_by_start = {s: p for (s, e), p in (ctrl._current_prices or {}).items()}
+
+    savings = 0.0
+    counted = 0
+    for block_start, fl in blocks.items():
+        spot = spot_by_start.get(block_start)
+        if spot is None:
+            spot = _nearest_spot(spot_by_start, block_start)
+        if spot is None:
+            continue
+        hour = _hhmm_to_minutes(block_start)
+        hour = (hour // 60) if hour is not None else 0
+        dist = GrowattDecisionEngine._get_distribution_tariff(hour, th)
+        buy = spot + dist
+        sell = max(0.0, spot - sell_fee)
+
+        pv = max(0.0, fl.get("PV1InputPower", 0.0) + fl.get("PV2InputPower", 0.0))
+        load = max(0.0, fl.get("INVPowerToLocalLoad", 0.0))
+        actual_import = max(0.0, fl.get("ACPowerToUser", 0.0))
+        actual_export = max(0.0, fl.get("ACPowerToGrid", 0.0))
+        # No telemetry for this block at all → skip.
+        if not any(k in fl for k in ("PV1InputPower", "INVPowerToLocalLoad",
+                                     "ACPowerToUser")):
+            continue
+        counted += 1
+
+        net_solar = pv - load
+        if net_solar >= 0:
+            baseline_cost = -net_solar * sell      # would have exported surplus
+        else:
+            baseline_cost = (-net_solar) * buy     # would have imported deficit
+        actual_cost = actual_import * buy - actual_export * sell
+        savings += baseline_cost - actual_cost
+
+    if counted == 0:
+        return None, 0
+    return round(savings, 1), counted
+
+
+async def _build_economics(ctrl, opt) -> Dict[str, Any]:
+    """Consolidated today-economics dict shared by /api/economics and /api/insights.
+
+    All four numbers computed from meters/actuals (never net_value scores), each
+    tagged with a source/accuracy flag. The legacy keys plan_value_czk and
+    arbitrage_czk are retained as None for the old frontend during migration.
+    """
+    econ: Dict[str, Any] = {}
+    acc: Dict[str, str] = {}
+
+    grid = await _today_grid_economics(ctrl)
+    flows = await _query_today_power_flows(ctrl)
+    blocks = _aligned_blocks(flows) if flows else {}
+
+    # --- Grid import/export (meter-accurate) ---
+    if grid is not None:
+        econ["import_cost_czk"] = grid.import_cost_czk
+        econ["export_revenue_czk"] = grid.export_revenue_czk
+        econ["import_kwh"] = grid.import_kwh
+        econ["export_kwh"] = grid.export_kwh
+        econ["import_avg_czk_per_kwh"] = grid.import_avg_czk_per_kwh
+        econ["export_avg_czk_per_kwh"] = grid.export_avg_czk_per_kwh
+        econ["grid_dropped_blocks"] = grid.dropped_blocks
+        econ["grid_dropped_kwh"] = grid.dropped_kwh
+        econ["grid_source"] = grid.source
+        acc["import_cost"] = acc["export_revenue"] = "meter_integrated"
+        econ["net_cost_czk"] = round(grid.import_cost_czk - grid.export_revenue_czk, 1)
+        acc["net_cost"] = "meter_integrated"
+        econ["estimated"] = False
+    else:
+        # Rough daily-average fallback (legacy behaviour) when integration fails.
+        tel = _get_live_telemetry()
+        export_kwh = tel.get("EnergyToGridToday", 0) or 0
+        import_kwh = tel.get("EnergyToUserToday", 0) or 0
+        prices = list(ctrl._current_prices.values()) if ctrl._current_prices else []
+        avg_price = sum(prices) / len(prices) if prices else None
+        sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+        dist_hi = getattr(ctrl.config, "distribution_tariff_high", 1.5)
+        if avg_price is not None:
+            econ["export_revenue_czk"] = round(export_kwh * max(0.0, avg_price - sell_fee), 1)
+            econ["import_cost_czk"] = round(import_kwh * (avg_price + dist_hi), 1)
+            econ["net_cost_czk"] = round(
+                econ["import_cost_czk"] - econ["export_revenue_czk"], 1)
+        econ["import_kwh"] = round(import_kwh, 1)
+        econ["export_kwh"] = round(export_kwh, 1)
+        econ["grid_source"] = "fallback_daily_avg"
+        acc["import_cost"] = acc["export_revenue"] = acc["net_cost"] = "daily_avg_estimate"
+        econ["estimated"] = True
+
+    # --- Battery arbitrage (from actuals, grid-vs-solar split) ---
+    arb = _battery_arbitrage_from_flows(ctrl, blocks) if blocks else None
+    if arb is not None and arb.source == "influx_power":
+        econ["batt_grid_charge_kwh"] = arb.grid_charge_kwh
+        econ["batt_solar_charge_kwh"] = arb.solar_charge_kwh
+        econ["batt_grid_charge_cost_czk"] = arb.grid_charge_cost_czk
+        econ["batt_discharge_self_kwh"] = arb.discharge_self_kwh
+        econ["batt_discharge_export_kwh"] = arb.discharge_export_kwh
+        econ["batt_self_consumption_value_czk"] = arb.self_consumption_value_czk
+        econ["batt_export_value_czk"] = arb.export_value_czk
+        econ["batt_net_arbitrage_czk"] = arb.net_arbitrage_czk
+        econ["batt_source"] = arb.source
+        acc["batt_arbitrage"] = "power_attributed"
+    else:
+        econ["batt_net_arbitrage_czk"] = None
+        econ["batt_source"] = "unavailable"
+
+    # --- Plan savings vs no-battery baseline (from actuals) ---
+    if blocks:
+        savings, n = _plan_savings_from_flows(ctrl, blocks)
+        econ["plan_savings_czk"] = savings
+        econ["saved_today_czk"] = savings
+        econ["plan_savings_blocks_counted"] = n
+        econ["plan_savings_source"] = "influx_actuals" if savings is not None else "unavailable"
+        acc["plan_savings"] = "actuals_integrated"
+    else:
+        econ["plan_savings_czk"] = None
+        econ["saved_today_czk"] = None
+        econ["plan_savings_source"] = "unavailable"
+
+    # --- Deprecated legacy fields (kept null for the old frontend) ---
+    # plan_value_czk summed net_value, which mixes CZK (MILP) and CZK/kWh
+    # (greedy) — dimensionally wrong; arbitrage_czk priced free solar as if
+    # grid-bought. Both replaced by saved_today_czk / batt_net_arbitrage_czk.
+    econ["plan_value_czk"] = None
+    econ["arbitrage_czk"] = econ.get("batt_net_arbitrage_czk")
+
+    econ["_accuracy"] = acc
+    return econ
+
+
+async def api_economics(request: web.Request) -> web.Response:
+    """Authoritative today-economics endpoint (consolidated, source-flagged)."""
+    ctrl = _get_controller(request)
+    if not ctrl:
+        return web.json_response({"economics": {}, "error": "no controller"})
+    opt = getattr(ctrl, "_optimizer", None)
+    try:
+        econ = await _build_economics(ctrl, opt)
+    except Exception as e:
+        return web.json_response({"economics": {}, "error": str(e)})
+    return web.json_response({
+        "timestamp": datetime.now().isoformat(),
+        "economics": econ,
+    })
 
 
 async def api_insights(request: web.Request) -> web.Response:
@@ -901,42 +1326,11 @@ async def api_insights(request: web.Request) -> web.Response:
         for l in defs
     ]
 
-    # ---- Economics (today). plan_value is exact; the rest are estimates from
-    #      daily energy totals × representative prices and are flagged as such. ----
-    econ: Dict[str, Any] = {"estimated": True}
-    decisions = getattr(opt, "_last_decisions", []) if opt else []
-    if decisions:
-        econ["plan_value_czk"] = round(
-            sum((getattr(d, "net_value", 0) or 0) for d in decisions), 1
-        )
-    tel = _get_live_telemetry()
-    export_kwh = tel.get("EnergyToGridToday", 0) or 0
-    import_kwh = tel.get("EnergyToUserToday", 0) or 0
-    charge_kwh = tel.get("ChargeEnergyToday", 0) or 0
-    discharge_kwh = tel.get("DischargeEnergyToday", 0) or 0
-    prices = list(ctrl._current_prices.values()) if ctrl._current_prices else []
-    avg_price = sum(prices) / len(prices) if prices else None
-    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
-    dist_hi = getattr(ctrl.config, "distribution_tariff_high", 1.5)
-    avg_charge_price = _avg_block_price(ctrl, getattr(ctrl, "_combined_charging_blocks", set()))
-    avg_disch_price = _avg_block_price(ctrl, getattr(ctrl, "_discharge_periods_today", set()))
-    # Meter-accurate import cost / export revenue (per-block energy × that
-    # block's real price). Falls back to the rough daily-average estimate only
-    # if the integration fails.
-    grid = await _today_grid_economics(ctrl)
-    if grid is not None:
-        econ["import_cost_czk"], econ["export_revenue_czk"] = grid
-        econ["grid_actual"] = True
-    elif avg_price is not None:
-        econ["export_revenue_czk"] = round(export_kwh * max(0.0, avg_price - sell_fee), 1)
-        econ["import_cost_czk"] = round(import_kwh * (avg_price + dist_hi), 1)
-    if avg_charge_price is not None and avg_disch_price is not None:
-        econ["arbitrage_czk"] = round(
-            discharge_kwh * avg_disch_price - charge_kwh * avg_charge_price, 1
-        )
-    econ["export_kwh"] = round(export_kwh, 1)
-    econ["import_kwh"] = round(import_kwh, 1)
-    out["economics"] = econ
+    # ---- Economics (today) — consolidated, meter/actuals-based, source-flagged.
+    #      Shared with /api/economics via _build_economics so the two never
+    #      diverge. Old keys (plan_value_czk/arbitrage_czk) kept null for the
+    #      legacy frontend during migration. ----
+    out["economics"] = await _build_economics(ctrl, opt)
 
     # ---- Data freshness ----
     def _age(ts):
@@ -1152,6 +1546,7 @@ def _add_api_routes(app: "web.Application") -> None:
     app.router.add_get("/api/soc_actuals", api_soc_actuals)
     app.router.add_get("/api/consumption_actuals", api_consumption_actuals)
     app.router.add_get("/api/insights", api_insights)
+    app.router.add_get("/api/economics", api_economics)
     app.router.add_get("/api/logs", api_logs)
     app.router.add_get("/api/logs/stream", api_logs_stream)
     app.router.add_post("/api/override", api_override_set)
@@ -2271,8 +2666,8 @@ html { scroll-behavior: smooth; }
     <div class="money-grid">
       <div class="money-item"><div class="money-val" id="moneyEarned" style="color:var(--green)">--</div><div class="money-lbl">Earned · export</div></div>
       <div class="money-item"><div class="money-val" id="moneySpent" style="color:var(--red)">--</div><div class="money-lbl">Spent · import</div></div>
-      <div class="money-item"><div class="money-val" id="moneyArb" style="color:var(--accent)">--</div><div class="money-lbl">Arbitrage</div></div>
-      <div class="money-item"><div class="money-val" id="moneyPlan">--</div><div class="money-lbl">Optimizer value</div></div>
+      <div class="money-item"><div class="money-val" id="moneyArb" style="color:var(--accent)">--</div><div class="money-lbl">Battery · net</div></div>
+      <div class="money-item"><div class="money-val" id="moneyPlan">--</div><div class="money-lbl">Saved today</div></div>
     </div>
     <div class="stat-label" style="margin-top:8px;font-size:11px;opacity:.65" id="moneyNote">Net = earned − spent · estimated from today&#39;s totals × prices</div>
   </div>
@@ -2406,11 +2801,11 @@ html { scroll-behavior: smooth; }
     <div class="card">
       <h2>💰 Economics (today)</h2>
       <div style="font-size:13px;line-height:1.9">
-        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Optimizer plan value</span><span id="econPlan" style="font-weight:700">--</span></div>
-        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Export revenue (est.)</span><span id="econExport">--</span></div>
-        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Import cost (est.)</span><span id="econImport">--</span></div>
-        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Battery arbitrage (est.)</span><span id="econArbitrage">--</span></div>
-        <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="econNote">estimates from daily totals × prices</div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Saved today (vs no battery)</span><span id="econPlan" style="font-weight:700">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Import cost</span><span id="econImport">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Export revenue</span><span id="econExport">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Battery arbitrage (net)</span><span id="econArbitrage">--</span></div>
+        <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="econNote">meter/actuals-based</div>
       </div>
     </div>
     <div class="card">
@@ -2877,12 +3272,16 @@ function renderHomeMoney(ec) {
   set('moneyEarned', earned == null ? '--' : '+' + earned.toFixed(1));
   // import cost can be negative (net paid to import at negative prices) → show +
   set('moneySpent', spent == null ? '--' : (spent >= 0 ? '-' + spent.toFixed(1) : '+' + (-spent).toFixed(1)));
-  const arb = ec.arbitrage_czk;
+  // Battery net arbitrage (grid-charge cost vs discharge value, solar free).
+  const arb = (ec.batt_net_arbitrage_czk != null) ? ec.batt_net_arbitrage_czk : ec.arbitrage_czk;
   set('moneyArb', arb == null ? '--' : (arb >= 0 ? '+' : '') + arb.toFixed(1));
-  const plan = ec.plan_value_czk, planEl = document.getElementById('moneyPlan');
+  // Saved today = actual vs no-battery baseline (replaces the old, dimensionally
+  // wrong sum-of-net_value "optimizer value").
+  const saved = (ec.saved_today_czk != null) ? ec.saved_today_czk : ec.plan_value_czk;
+  const planEl = document.getElementById('moneyPlan');
   if (planEl) {
-    planEl.textContent = plan == null ? '--' : (plan >= 0 ? '+' : '') + plan.toFixed(1);
-    planEl.style.color = (plan || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+    planEl.textContent = saved == null ? '--' : (saved >= 0 ? '+' : '') + saved.toFixed(1);
+    planEl.style.color = (saved || 0) >= 0 ? 'var(--green)' : 'var(--red)';
   }
 }
 
@@ -3219,15 +3618,17 @@ async function fetchInsights() {
   // --- Economics ---
   const ec = d.economics || {};
   renderHomeMoney(ec);  // compact Home money summary
+  const saved = (ec.saved_today_czk != null) ? ec.saved_today_czk : ec.plan_value_czk;
   const planEl = document.getElementById('econPlan');
   if (planEl) {
-    planEl.textContent = fmtCzk(ec.plan_value_czk);
-    planEl.style.color = (ec.plan_value_czk || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+    planEl.textContent = fmtCzk(saved);
+    planEl.style.color = (saved || 0) >= 0 ? 'var(--green)' : 'var(--red)';
   }
   setText('econExport', fmtCzk(ec.export_revenue_czk));
   setText('econImport', ec.import_cost_czk == null ? '--' :
     (ec.import_cost_czk >= 0 ? '-' + ec.import_cost_czk.toFixed(1) : '+' + (-ec.import_cost_czk).toFixed(1)) + ' CZK');
-  setText('econArbitrage', fmtCzk(ec.arbitrage_czk));
+  const arbNet = (ec.batt_net_arbitrage_czk != null) ? ec.batt_net_arbitrage_czk : ec.arbitrage_czk;
+  setText('econArbitrage', fmtCzk(arbNet));
 
   // --- Forecast accuracy ---
   const ac = d.accuracy || {};
