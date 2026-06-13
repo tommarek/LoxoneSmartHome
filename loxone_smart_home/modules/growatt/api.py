@@ -404,51 +404,51 @@ async def get_prices(request: web.Request) -> web.Response:
         )
 
     try:
-        # Get current time and price for current hour
+        # Current price for the current 15-MIN block. _current_prices is keyed by
+        # 15-min blocks ('HH:00'/'HH:15'/'HH:30'/'HH:45'); matching '%H:00' would
+        # return the hour's first-quarter price for any wall-clock minute >= 15.
+        # Floor the minute to the nearest 15 to look up the actual current block.
         now = controller._get_local_now()
-        current_hour = now.strftime("%H:00")
+        block_min = (now.minute // 15) * 15
+        current_block_start = f"{now.hour:02d}:{block_min:02d}"
 
-        # Convert EUR/MWh prices to CZK/kWh for display
+        # Prices in _current_prices are already CZK/kWh (converted at storage time)
         eur_czk_rate = controller._eur_czk_rate or 25.0
 
         # Find current price
-        current_price_eur = None
+        current_price_czk = None
         for (start, _), price in controller._current_prices.items():
-            if start == current_hour:
-                current_price_eur = price
+            if start == current_block_start:
+                current_price_czk = price
                 break
 
-        # Calculate statistics
+        # Calculate statistics (already CZK/kWh)
         prices_list = list(controller._current_prices.values())
-        avg_price_eur: Optional[float] = None
-        min_price_eur: Optional[float] = None
-        max_price_eur: Optional[float] = None
+        avg_price_czk: Optional[float] = None
+        min_price_czk: Optional[float] = None
+        max_price_czk: Optional[float] = None
         if prices_list:
-            avg_price_eur = sum(prices_list) / len(prices_list)
-            min_price_eur = min(prices_list)
-            max_price_eur = max(prices_list)
+            avg_price_czk = sum(prices_list) / len(prices_list)
+            min_price_czk = min(prices_list)
+            max_price_czk = max(prices_list)
 
-        # Convert to CZK/kWh (EUR/MWh * rate / 1000)
-        def to_czk_kwh(eur_mwh: Optional[float]) -> Optional[float]:
-            if eur_mwh is None:
-                return None
-            return round(eur_mwh * eur_czk_rate / 1000, 2)
+        def _round(v: Optional[float]) -> Optional[float]:
+            return round(v, 2) if v is not None else None
 
         # Build hourly prices list for chart
         hourly_data = []
-        for (start, end), price_eur in sorted(controller._current_prices.items()):
+        for (start, end), price_czk in sorted(controller._current_prices.items()):
             hourly_data.append({
                 "hour": start,
                 "end": end,
-                "price_eur_mwh": price_eur,
-                "price_czk_kwh": to_czk_kwh(price_eur)
+                "price_czk_kwh": _round(price_czk)
             })
 
         return web.json_response({
-            "current_price_czk_kwh": to_czk_kwh(current_price_eur),
-            "average_today_czk_kwh": to_czk_kwh(avg_price_eur),
-            "min_price_czk_kwh": to_czk_kwh(min_price_eur),
-            "max_price_czk_kwh": to_czk_kwh(max_price_eur),
+            "current_price_czk_kwh": _round(current_price_czk),
+            "average_today_czk_kwh": _round(avg_price_czk),
+            "min_price_czk_kwh": _round(min_price_czk),
+            "max_price_czk_kwh": _round(max_price_czk),
             "export_threshold_czk_kwh": controller.config.export_price_min,
             "eur_czk_rate": eur_czk_rate,
             "eur_czk_rate_updated": (

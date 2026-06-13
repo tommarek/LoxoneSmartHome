@@ -1,12 +1,14 @@
 """Tests for the Growatt controller module."""
 
 import json
+from datetime import datetime, time, timedelta
 from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
 from config.settings import GrowattConfig, Settings
+from modules.growatt.deferrable_loads import DeferrableLoad, DeferrableLoadSchedule
 from modules.growatt_controller import GrowattController
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
@@ -71,6 +73,113 @@ async def test_controller_initialization(growatt_controller: GrowattController) 
     assert growatt_controller.name == "GrowattController"
     assert growatt_controller.config is not None
     assert growatt_controller._periodic_check_task is None
+
+
+@pytest.mark.asyncio
+async def test_deferrable_load_actuation_serializes_payload_and_tracks_block(
+    growatt_controller: GrowattController,
+    mock_mqtt_client: AsyncMock,
+) -> None:
+    """Deferrable actuation publishes JSON payloads and counts delivered blocks once."""
+    block = datetime(2026, 5, 30, 10, 0)
+    growatt_controller._deferrable_loads = [
+        DeferrableLoad(
+            name="ev",
+            energy_required_kwh=1.0,
+            power_kw=2.0,
+            earliest_start=time(0, 0),
+            latest_end=time(23, 59),
+            mqtt_topic_on="ev/on",
+            mqtt_topic_off="ev/off",
+            payload_on={"enabled": True},
+            payload_off={"enabled": False},
+        )
+    ]
+    growatt_controller._deferrable_schedules = [
+        DeferrableLoadSchedule(load_name="ev", block_datetimes=[block])
+    ]
+
+    await growatt_controller._apply_deferrable_load_schedule(block)
+    await growatt_controller._apply_deferrable_load_schedule(block.replace(minute=1))
+
+    # First tick turns the load ON; the second tick (same block, load already
+    # active) RE-ISSUES the ON command idempotently so a dropped publish self-
+    # heals — every publish targets the ON topic with the ON payload.
+    on_call = call("ev/on", json.dumps({"enabled": True}))
+    assert mock_mqtt_client.publish.await_count == 2
+    mock_mqtt_client.publish.assert_has_awaits([on_call, on_call])
+    assert growatt_controller._deferrable_active == {"ev"}
+    # The block is still credited exactly ONCE despite the re-issue.
+    assert growatt_controller._deferrable_completed_blocks == {("ev", block)}
+
+
+@pytest.mark.asyncio
+async def test_deferrable_load_actuation_turns_off_when_schedule_empty(
+    growatt_controller: GrowattController,
+    mock_mqtt_client: AsyncMock,
+) -> None:
+    """Clearing schedules should force active loads off instead of returning early."""
+    growatt_controller._deferrable_loads = [
+        DeferrableLoad(
+            name="ev",
+            energy_required_kwh=1.0,
+            power_kw=2.0,
+            earliest_start=time(0, 0),
+            latest_end=time(23, 59),
+            mqtt_topic_on="ev/on",
+            mqtt_topic_off="ev/off",
+        )
+    ]
+    growatt_controller._deferrable_schedules = []
+    growatt_controller._deferrable_active = {"ev"}
+
+    await growatt_controller._apply_deferrable_load_schedule(
+        datetime(2026, 5, 30, 10, 0)
+    )
+
+    mock_mqtt_client.publish.assert_awaited_once_with(
+        "ev/off", json.dumps({"value": 0})
+    )
+    assert growatt_controller._deferrable_active == set()
+
+
+@pytest.mark.asyncio
+async def test_deferrable_load_empty_config_forgets_state_without_crash(
+    growatt_controller: GrowattController,
+    mock_mqtt_client: AsyncMock,
+) -> None:
+    """If config disappears, controller should not retain stale active state."""
+    growatt_controller._deferrable_loads = []
+    growatt_controller._deferrable_schedules = []
+    growatt_controller._deferrable_active = {"removed_load"}
+
+    await growatt_controller._apply_deferrable_load_schedule(
+        datetime(2026, 5, 30, 10, 0)
+    )
+
+    mock_mqtt_client.publish.assert_not_awaited()
+    assert growatt_controller._deferrable_active == set()
+
+
+def test_deferrable_completed_blocks_are_pruned_to_recent_window(
+    growatt_controller: GrowattController,
+) -> None:
+    """Completed blocks older than the current 24h planning window are ignored."""
+    now = datetime(2026, 5, 30, 10, 0)
+    growatt_controller._deferrable_completed_blocks = {
+        ("ev", now - timedelta(hours=25)),
+        ("ev", now - timedelta(hours=1)),
+    }
+
+    active_window_start = now - timedelta(hours=24)
+    growatt_controller._deferrable_completed_blocks = {
+        (name, ts) for name, ts in growatt_controller._deferrable_completed_blocks
+        if ts >= active_window_start
+    }
+
+    assert growatt_controller._deferrable_completed_blocks == {
+        ("ev", now - timedelta(hours=1))
+    }
 
 
 async def test_fetch_dam_energy_prices_success(

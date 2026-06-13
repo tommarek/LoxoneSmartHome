@@ -65,7 +65,7 @@ def base_context() -> DecisionContext:
 def test_decision_engine_initialization(decision_engine: GrowattDecisionEngine) -> None:
     """Test that decision engine initializes correctly."""
     assert decision_engine is not None
-    assert len(decision_engine.decision_tree) == 6  # 6 decision nodes (consolidated export control)
+    assert len(decision_engine.decision_tree) == 9  # 9 decision nodes
     assert decision_engine._last_decision is None
 
 
@@ -119,10 +119,12 @@ def test_high_load_protection_triggers(
     assert explanation["priority"]["level"] == Priority.HIGH_LOAD_PROTECTION
     assert "high loads" in explanation["reason"].lower()
 
-    # Verify mode definition
+    # Verify mode definition: battery_first (not load_first) so the battery is
+    # passive and does NOT discharge to cover a load deficit (e.g. EV charging);
+    # stop_soc is pinned to the live SOC in the controller to avoid grid-charge.
     mode_def = MODE_DEFINITIONS["high_load_protected"]
-    assert mode_def["stop_soc"] == 100  # Should prevent discharge
-    assert mode_def["inverter_mode"] == "load_first"
+    assert mode_def["inverter_mode"] == "battery_first"
+    assert mode_def["ac_charge"] is False
 
 
 def test_default_mode_fallback(
@@ -242,7 +244,7 @@ def test_explanation_with_context(
 
     assert explanation["decision"] == "high_load_protected"
     assert explanation["context"]["high_loads"] is True
-    assert explanation["mode_details"]["stop_soc"] == 100
+    assert explanation["mode_details"]["stop_soc"] == "max_soc"
 
 
 def test_charge_from_grid_detection(
@@ -266,6 +268,206 @@ def test_charge_from_grid_detection(
 
     decision = decision_engine.decide(context)
     assert decision == "charge_from_grid"
+
+
+def test_optimizer_owns_charging_no_seasonal_gate(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """When the optimizer is active it owns charge economics: the rule-based
+    summer/price gate does NOT apply, so a block the optimizer scheduled is
+    charged regardless of season/price. Correctness against bad-price charging
+    lives in the MILP (objective-driven reserve, no peak grid-charge), not in a
+    seasonal heuristic — so the decision engine simply actuates the model's set."""
+    block = ("13:00", "13:15")
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 6, 1, 13, 0),
+        current_mode="regular",
+        current_price=1.2,  # positive; summer gate would block, optimizer won't
+        current_block_key=block,
+        cheapest_blocks={block},  # optimizer's chosen charge block
+        is_summer_mode=True,
+        optimizer_active=True,
+        price_thresholds=PriceThresholds(
+            charge_price_max=2.0, export_price_min=0.8, discharge_price_min=6.0,
+            discharge_profit_margin=1.5, battery_efficiency=0.87,
+            summer_charge_price_max=0.0,
+        ),
+    )
+    assert context.is_battery_charging_scheduled is True
+    assert decision_engine.decide(context) == "charge_from_grid"
+
+
+def test_summer_gate_still_blocks_rulebased_charge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """Without the optimizer, the rule-based summer policy still applies: a
+    positive-price block is NOT charged from grid in summer (only <= 0 CZK)."""
+    block = ("18:30", "18:45")
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 6, 1, 18, 30),
+        current_mode="regular",
+        current_price=3.53,
+        current_block_key=block,
+        cheapest_blocks={block},
+        is_summer_mode=True,
+        optimizer_active=False,
+        price_thresholds=PriceThresholds(
+            charge_price_max=2.0, export_price_min=3.0, discharge_price_min=6.0,
+            discharge_profit_margin=1.5, battery_efficiency=0.87,
+            summer_charge_price_max=0.0,
+        ),
+    )
+    assert context.is_battery_charging_scheduled is False
+    assert decision_engine.decide(context) != "charge_from_grid"
+
+
+def test_optimizer_charge_skipped_when_block_not_scheduled(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """With the optimizer active, a block NOT in its charge set is not charged,
+    even in winter (no rule-based fallback sneaks in)."""
+    context = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=50.0,
+        current_time=datetime(2024, 1, 1, 10, 0),
+        current_mode="regular",
+        current_price=1.0,
+        current_block_key=("10:00", "10:15"),
+        cheapest_blocks={("03:00", "03:15")},  # different block scheduled
+        is_summer_mode=False,
+        optimizer_active=True,
+    )
+    assert context.is_battery_charging_scheduled is False
+
+
+def test_optimizer_active_suppresses_price_based_discharge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """When the optimizer drives, the rule-based price-based discharge (4B) must
+    NOT fire for a block the optimizer left as hold — otherwise the inverter
+    exports to grid while the chart (optimizer schedule) shows it idle.
+    Regression for 'graph shows discharge disabled but battery still discharging'."""
+    block = ("20:30", "20:45")
+    thresholds = PriceThresholds(
+        charge_price_max=2.0, export_price_min=1.0, discharge_price_min=5.0,
+        discharge_profit_margin=1.5, battery_efficiency=0.87,
+    )
+    ctx = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=61.0,
+        current_time=datetime(2024, 6, 1, 20, 30),
+        current_mode="regular",
+        current_price=8.65,  # well above discharge threshold → 4B would fire
+        current_block_key=block,
+        prices_15min={block: 8.65, ("03:00", "03:15"): 1.0},
+        price_thresholds=thresholds,
+        min_soc=20.0,
+        optimizer_active=True,
+        optimizer_discharge_blocks=set(),  # optimizer did NOT schedule this block
+    )
+    assert decision_engine.decide(ctx) != "discharge_to_grid"
+
+
+def test_optimizer_scheduled_discharge_still_fires(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """A block the optimizer DID schedule for discharge still discharges (4A)."""
+    block = ("21:00", "21:15")
+    ctx = DecisionContext(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=61.0,
+        current_time=datetime(2024, 6, 1, 21, 0),
+        current_mode="regular",
+        current_price=9.0,
+        current_block_key=block,
+        min_soc=20.0,
+        optimizer_active=True,
+        optimizer_discharge_blocks={block},
+    )
+    assert decision_engine.decide(ctx) == "discharge_to_grid"
+
+
+def _hold_ctx(block, **overrides) -> DecisionContext:
+    base = dict(
+        manual_override_active=False,
+        high_loads_active=False,
+        battery_soc=44.0,
+        current_time=datetime(2024, 6, 1, 2, 0),
+        current_mode="regular",
+        current_price=3.5,
+        current_block_key=block,
+        min_soc=20.0,
+        max_soc=90.0,
+        optimizer_active=True,
+        optimizer_hold_blocks={block},
+    )
+    base.update(overrides)
+    return DecisionContext(**base)
+
+
+def test_battery_hold_node_selected(decision_engine: GrowattDecisionEngine) -> None:
+    """A block the optimizer scheduled to hold actuates the battery_hold mode
+    (preserve battery, serve house from grid) instead of regular/load_first."""
+    block = ("02:00", "02:15")
+    assert decision_engine.decide(_hold_ctx(block)) == "battery_hold"
+
+
+def test_battery_hold_allows_solar_charge_no_discharge() -> None:
+    """battery_hold uses battery_first + AC-charge OFF: the battery doesn't
+    discharge for the house (hold) and doesn't grid-charge, but solar may still
+    charge it up to max_soc (so daytime PV isn't capped/exported)."""
+    bh = MODE_DEFINITIONS["battery_hold"]
+    assert bh["inverter_mode"] == "battery_first"  # prevents discharge, allows solar charge
+    assert bh["stop_soc"] == "max_soc"
+    assert bh["ac_charge"] is False  # no grid charge
+
+
+def test_battery_hold_yields_to_manual_override(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    block = ("02:00", "02:15")
+    ctx = _hold_ctx(block, manual_override_active=True, manual_override_mode="regular")
+    assert decision_engine.decide(ctx) == "regular"
+
+
+def test_battery_hold_yields_to_high_load_protection(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """During high loads, high_load_protected (priority 3) fires first — it holds
+    the battery identically, so the hold block is still protected."""
+    block = ("02:00", "02:15")
+    ctx = _hold_ctx(block, high_loads_active=True)
+    assert decision_engine.decide(ctx) == "high_load_protected"
+
+
+def test_battery_hold_yields_to_discharge(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """If a block is (defensively) flagged for both discharge and hold, the
+    higher-priority discharge node wins."""
+    block = ("21:00", "21:15")
+    ctx = _hold_ctx(
+        block, current_time=datetime(2024, 6, 1, 21, 0), current_price=9.0,
+        battery_soc=61.0, optimizer_discharge_blocks={block},
+    )
+    assert decision_engine.decide(ctx) == "discharge_to_grid"
+
+
+def test_no_battery_hold_when_block_not_scheduled(
+    decision_engine: GrowattDecisionEngine
+) -> None:
+    """A block NOT in the hold set falls through to regular (load_first)."""
+    ctx = _hold_ctx(("02:00", "02:15"), current_block_key=("03:00", "03:15"))
+    assert decision_engine.decide(ctx) == "regular"
 
 
 def test_priority_ordering() -> None:
@@ -307,7 +509,7 @@ def test_price_based_charging_decision(
         end_min = start_min + 15
         start_str = f"03:{start_min:02d}"
         end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
-        prices_15min[(start_str, end_str)] = 60.0  # Cheap price
+        prices_15min[(start_str, end_str)] = 1.5  # Cheap price (CZK/kWh)
 
     # Mark current block as one of the cheapest
     current_block = ("03:00", "03:15")
@@ -320,13 +522,13 @@ def test_price_based_charging_decision(
         current_time=datetime(2024, 1, 1, 3, 0),  # 3 AM
         manual_override_mode=None,
         current_mode="regular",
-        current_price=60.0,  # Cheap price
+        current_price=1.5,  # Cheap price (CZK/kWh)
         current_block_key=current_block,
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=3.0,  # 120.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=3.0,  # CZK/kWh
             discharge_price_min=6.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.87
@@ -352,7 +554,7 @@ def test_price_based_discharge_decision(
         end_min = start_min + 15
         start_str = f"03:{start_min:02d}"
         end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
-        prices_15min[(start_str, end_str)] = 30.0  # Cheap price
+        prices_15min[(start_str, end_str)] = 0.75  # Cheap price (CZK/kWh)
 
     # Add expensive blocks (18:00-19:00)
     for i in range(4):
@@ -360,7 +562,7 @@ def test_price_based_discharge_decision(
         end_min = start_min + 15
         start_str = f"18:{start_min:02d}"
         end_str = f"18:{end_min:02d}" if end_min < 60 else "19:00"
-        prices_15min[(start_str, end_str)] = 150.0  # High price
+        prices_15min[(start_str, end_str)] = 3.75  # High price (CZK/kWh)
 
     current_block = ("18:00", "18:15")
 
@@ -371,13 +573,13 @@ def test_price_based_discharge_decision(
         battery_soc=80.0,  # Good SOC for discharge
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 18, 0),  # 6 PM peak
-        current_price=150.0,  # 3.75 CZK/kWh
+        current_price=3.75,  # CZK/kWh
         current_block_key=current_block,
         prices_15min=prices_15min,
         cheapest_blocks=set(),  # Not a charging block
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.2,
             battery_efficiency=0.87
@@ -388,11 +590,11 @@ def test_price_based_discharge_decision(
             percentile=100.0,
             blocks_cheaper_count=1,
             blocks_more_expensive_count=0,
-            daily_min=30.0,  # 0.75 CZK/kWh
-            daily_max=150.0,
-            daily_avg=90.0,
-            daily_median=90.0,
-            daily_spread=120.0,
+            daily_min=0.75,  # CZK/kWh
+            daily_max=3.75,
+            daily_avg=2.25,
+            daily_median=2.25,
+            daily_spread=3.0,
             price_quadrant="Most Expensive",
             is_relatively_cheap=False,
             is_relatively_expensive=True
@@ -403,7 +605,7 @@ def test_price_based_discharge_decision(
     decision = decision_engine.decide(context)
     explanation = decision_engine.explain_decision()
 
-    # 3.75 CZK/kWh > max(2.0 min, 0.75*1.2 margin) = max(2.0, 0.9) = 2.0, so should discharge
+    # 3.75 CZK/kWh > max(2.0 min, 0.75 * 1.2 margin) = max(2.0, 0.9) = 2.0, so should discharge
     assert decision == "discharge_to_grid"
     assert "25% power" in explanation["reason"].lower()
 
@@ -418,7 +620,7 @@ def test_low_battery_prevents_discharge(
         end_min = start_min + 15
         start_str = f"18:{start_min:02d}"
         end_str = f"18:{end_min:02d}" if end_min < 60 else "19:00"
-        prices_15min[(start_str, end_str)] = 150.0  # High price
+        prices_15min[(start_str, end_str)] = 3.75  # High price (CZK/kWh)
 
     context = DecisionContext(
         manual_override_active=False,
@@ -427,13 +629,13 @@ def test_low_battery_prevents_discharge(
         battery_soc=15.0,  # Too low for discharge (below 20% threshold)
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 18, 0),
-        current_price=150.0,  # High price
+        current_price=3.75,  # High price (CZK/kWh)
         current_block_key=("18:00", "18:15"),
         prices_15min=prices_15min,
         cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -455,7 +657,7 @@ def test_full_battery_prevents_charging(
         end_min = start_min + 15
         start_str = f"03:{start_min:02d}"
         end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
-        prices_15min[(start_str, end_str)] = 50.0  # Very cheap
+        prices_15min[(start_str, end_str)] = 1.25  # Very cheap (CZK/kWh)
 
     current_block = ("03:00", "03:15")
     cheapest_blocks = {current_block}  # Mark as cheapest block
@@ -467,13 +669,13 @@ def test_full_battery_prevents_charging(
         battery_soc=100.0,  # Completely full
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 3, 0),
-        current_price=50.0,  # Very cheap
+        current_price=1.25,  # Very cheap (CZK/kWh)
         current_block_key=current_block,
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=3.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -502,10 +704,10 @@ def test_export_enabled_above_threshold(
         sunrise=time(5, 30),
         sunset=time(21, 0),
         is_summer_mode=True,
-        current_price=50.0,  # Above export threshold but below cheap threshold
+        current_price=1.25,  # Above export threshold but below cheap threshold (CZK/kWh)
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=3.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -531,10 +733,10 @@ def test_low_price_export_disabled(
         battery_soc=100.0,  # Full battery to avoid charging
         current_mode="regular",
         current_time=datetime(2024, 1, 1, 12, 0),
-        current_price=30.0,  # Below export threshold
+        current_price=0.75,  # Below export threshold (CZK/kWh)
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=1.0,  # 40 EUR/MWh = 1 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=3.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -559,20 +761,20 @@ def test_price_validation_invalid_data(
         end_min = start_min + 15
         start_str = f"03:{start_min:02d}"
         end_str = f"03:{end_min:02d}" if end_min < 60 else "04:00"
-        prices_15min[(start_str, end_str)] = -50.0  # Invalid negative price
+        prices_15min[(start_str, end_str)] = -1.25  # Invalid negative price (CZK/kWh)
 
     context = DecisionContext(
         manual_override_active=False,
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 0),
-        current_price=-50.0,  # Invalid negative price
+        current_price=-1.25,  # Invalid negative price (CZK/kWh)
         current_block_key=("03:00", "03:15"),
         prices_15min=prices_15min,
         cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=3.0,  # CZK/kWh
             discharge_price_min=3.5,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -603,7 +805,7 @@ def test_time_range_overnight(
                     end_str = f"{hour:02d}:{end_min:02d}"
                 else:
                     end_str = f"{(hour + 1) % 24:02d}:00"
-            prices_15min[(start_str, end_str)] = 60.0
+            prices_15min[(start_str, end_str)] = 1.5  # CZK/kWh
 
     current_block = ("02:00", "02:15")
     # Mark this as a cheapest block for charging
@@ -614,13 +816,13 @@ def test_time_range_overnight(
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 0),  # 2 AM
-        current_price=60.0,
+        current_price=1.5,  # CZK/kWh
         current_block_key=current_block,
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=3.0,  # CZK/kWh
             discharge_price_min=3.5,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -637,8 +839,8 @@ def test_profit_margin_calculation(
 ) -> None:
     """Test profit margin prevents unprofitable discharge."""
     prices_15min = create_15min_prices({
-        3: 100.0,  # Charge price too high
-        18: 125.0,  # Current price
+        3: 2.5,  # Charge price too high (CZK/kWh)
+        18: 3.125,  # Current price (CZK/kWh)
     })
 
     context = DecisionContext(
@@ -646,13 +848,13 @@ def test_profit_margin_calculation(
         high_loads_active=False,
         battery_soc=80.0,
         current_time=datetime(2024, 1, 1, 18, 0),
-        current_price=125.0,  # Above export threshold but not profitable enough
+        current_price=3.125,  # Above export threshold but not profitable enough (CZK/kWh)
         current_block_key=("18:00", "18:15"),
         prices_15min=prices_15min,
         cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=3.0,  # CZK/kWh
             discharge_price_min=3.5,
             discharge_profit_margin=1.5,  # High margin requirement
             battery_efficiency=0.87
@@ -683,13 +885,13 @@ def test_consecutive_cheap_hours_grouping(
 ) -> None:
     """Test that charging blocks are selected based on cheapest prices (non-consecutive OK)."""
     prices_15min = create_15min_prices({
-        2: 60.0,   # Cheap
-        3: 65.0,   # Cheap
-        4: 70.0,   # Cheap
-        5: 85.0,   # Expensive
-        6: 60.0,   # Cheap again (non-consecutive)
-        7: 90.0,   # Expensive
-        8: 55.0,   # Cheapest
+        2: 1.5,    # Cheap (CZK/kWh)
+        3: 1.625,  # Cheap (CZK/kWh)
+        4: 1.75,   # Cheap (CZK/kWh)
+        5: 2.125,  # Expensive (CZK/kWh)
+        6: 1.5,    # Cheap again (non-consecutive) (CZK/kWh)
+        7: 2.25,   # Expensive (CZK/kWh)
+        8: 1.375,  # Cheapest (CZK/kWh)
     })
 
     # The 8 cheapest blocks should be from hours 8, 2, 6, 3 (in price order)
@@ -698,10 +900,10 @@ def test_consecutive_cheap_hours_grouping(
     for i in range(4):
         start_min = i * 15
         end_min = start_min + 15
-        # Hour 8 blocks (cheapest at 55.0)
+        # Hour 8 blocks (cheapest at 1.375 CZK/kWh)
         h8_end = f"08:{end_min:02d}" if end_min < 60 else "09:00"
         cheapest_blocks.add((f"08:{start_min:02d}", h8_end))
-        # Hour 2 blocks (second cheapest at 60.0)
+        # Hour 2 blocks (second cheapest at 1.5 CZK/kWh)
         h2_end = f"02:{end_min:02d}" if end_min < 60 else "03:00"
         cheapest_blocks.add((f"02:{start_min:02d}", h2_end))
 
@@ -710,13 +912,13 @@ def test_consecutive_cheap_hours_grouping(
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 8, 0),
-        current_price=55.0,
+        current_price=1.375,  # CZK/kWh
         current_block_key=("08:00", "08:15"),
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80 EUR/MWh = 2 CZK/kWh
-            export_price_min=3.0,  # 120 EUR/MWh = 3 CZK/kWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=3.0,  # CZK/kWh
             discharge_price_min=3.5,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -726,21 +928,6 @@ def test_consecutive_cheap_hours_grouping(
     # Should charge when in a cheapest block
     decision = decision_engine.decide(context)
     assert decision == "charge_from_grid"
-
-
-def test_invalid_time_format_handling(
-    decision_engine: GrowattDecisionEngine
-) -> None:
-    """Test that invalid time formats are handled gracefully."""
-    # Test the _is_hour_in_range method with invalid formats
-    result = decision_engine._is_hour_in_range("invalid", "02:00", "04:00")
-    assert result is False
-
-    result = decision_engine._is_hour_in_range("03:00", "invalid", "04:00")
-    assert result is False
-
-    result = decision_engine._is_hour_in_range("03:00", "02:00", "invalid")
-    assert result is False
 
 
 def test_mode_change_tracking(
@@ -795,12 +982,12 @@ def test_calculate_price_ranking(decision_engine: GrowattDecisionEngine) -> None
     """Test price ranking calculation."""
     # Create 15-minute prices - we need at least a few different price levels
     prices_15min = {}
-    prices_15min.update(create_15min_prices({0: 50.0}))  # 4 blocks
-    prices_15min.update(create_15min_prices({1: 40.0}))  # 4 blocks - Cheapest
-    prices_15min.update(create_15min_prices({2: 60.0}))  # 4 blocks
-    prices_15min.update(create_15min_prices({3: 80.0}))  # 4 blocks
-    prices_15min.update(create_15min_prices({4: 100.0}))  # 4 blocks - Most expensive
-    prices_15min.update(create_15min_prices({5: 70.0}))  # 4 blocks
+    prices_15min.update(create_15min_prices({0: 1.25}))  # 4 blocks (CZK/kWh)
+    prices_15min.update(create_15min_prices({1: 1.0}))   # 4 blocks - Cheapest (CZK/kWh)
+    prices_15min.update(create_15min_prices({2: 1.5}))   # 4 blocks (CZK/kWh)
+    prices_15min.update(create_15min_prices({3: 2.0}))   # 4 blocks (CZK/kWh)
+    prices_15min.update(create_15min_prices({4: 2.5}))   # 4 blocks - Most expensive (CZK/kWh)
+    prices_15min.update(create_15min_prices({5: 1.75}))  # 4 blocks (CZK/kWh)
     # Total: 24 blocks
 
     # Test cheapest block (from hour 1)
@@ -836,10 +1023,10 @@ def test_calculate_price_ranking(decision_engine: GrowattDecisionEngine) -> None
 def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngine) -> None:
     """Test that charging decisions use percentile ranking when available."""
     prices_15min = create_15min_prices({
-        0: 80.0,
-        1: 40.0,  # Cheapest - should charge
-        2: 90.0,
-        3: 100.0,
+        0: 2.0,   # CZK/kWh
+        1: 1.0,   # Cheapest - should charge (CZK/kWh)
+        2: 2.25,  # CZK/kWh
+        3: 2.5,   # CZK/kWh
     })
 
     # Mark hour 1 blocks as cheapest
@@ -855,11 +1042,11 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
         percentile=0.0,
         blocks_cheaper_count=0,
         blocks_more_expensive_count=15,
-        daily_min=40.0,
-        daily_max=100.0,
-        daily_avg=77.5,
-        daily_median=85.0,
-        daily_spread=60.0,
+        daily_min=1.0,
+        daily_max=2.5,
+        daily_avg=1.9375,
+        daily_median=2.125,
+        daily_spread=1.5,
         price_quadrant="Cheapest",
         is_relatively_cheap=True,
         is_relatively_expensive=False
@@ -870,13 +1057,13 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 1, 30),
-        current_price=40.0,
+        current_price=1.0,  # CZK/kWh
         current_block_key=("01:30", "01:45"),
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=1.2,  # 50.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=1.2,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -892,10 +1079,10 @@ def test_percentile_based_charging_decision(decision_engine: GrowattDecisionEngi
 def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine) -> None:
     """Test that export decisions use absolute threshold only (percentile info is for context)."""
     prices_15min = create_15min_prices({
-        0: 30.0,  # Below threshold
-        1: 40.0,  # At threshold
-        2: 60.0,  # Above threshold
-        3: 80.0,  # Well above threshold
+        0: 0.75,  # Below threshold (CZK/kWh)
+        1: 1.0,   # At threshold (CZK/kWh)
+        2: 1.5,   # Above threshold (CZK/kWh)
+        3: 2.0,   # Well above threshold (CZK/kWh)
     })
 
     # Test 1: Price below absolute threshold - should NOT export
@@ -905,11 +1092,11 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
         percentile=0.0,  # Cheapest hour
         blocks_cheaper_count=3,
         blocks_more_expensive_count=0,
-        daily_min=30.0,
-        daily_max=80.0,
-        daily_avg=52.5,
-        daily_median=50.0,
-        daily_spread=50.0,
+        daily_min=0.75,
+        daily_max=2.0,
+        daily_avg=1.3125,
+        daily_median=1.25,
+        daily_spread=1.25,
         price_quadrant="Cheap",
         is_relatively_cheap=True,
         is_relatively_expensive=False
@@ -920,13 +1107,13 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
         high_loads_active=False,
         battery_soc=100.0,  # Full battery to prevent charging decision
         current_time=datetime(2024, 1, 1, 0, 30),
-        current_price=30.0,  # Below threshold
+        current_price=0.75,  # Below threshold (CZK/kWh)
         current_block_key=("00:30", "00:45"),
         prices_15min=prices_15min,
         cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
-            charge_price_max=0.5,  # 20.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=0.5,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -942,7 +1129,7 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
     # Export control is handled separately, not in mode decision
 
     # Test 2: Price above absolute threshold - should export
-    context.current_price = 60.0
+    context.current_price = 1.5  # CZK/kWh
     context.current_time = datetime(2024, 1, 1, 2, 30)
 
     decision = decision_engine.decide(context)
@@ -956,11 +1143,11 @@ def test_percentile_based_export_decision(decision_engine: GrowattDecisionEngine
 def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
     """Test that winter mode only charges during 2 cheapest hours."""
     prices_15min = create_15min_prices({
-        0: 20.0,  # Cheapest hour
-        1: 25.0,  # Second cheapest
-        2: 35.0,  # Third
-        3: 40.0,  # Fourth
-        4: 50.0,  # Most expensive
+        0: 0.5,    # Cheapest hour (CZK/kWh)
+        1: 0.625,  # Second cheapest (CZK/kWh)
+        2: 0.875,  # Third (CZK/kWh)
+        3: 1.0,    # Fourth (CZK/kWh)
+        4: 1.25,   # Most expensive (CZK/kWh)
     })
 
     # Mark hours 0 and 1 blocks as cheapest (8 blocks total = 2 hours)
@@ -982,11 +1169,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         percentile=0.0,
         blocks_cheaper_count=0,
         blocks_more_expensive_count=4,
-        daily_min=20.0,
-        daily_max=50.0,
-        daily_avg=34.0,
-        daily_median=35.0,
-        daily_spread=30.0,
+        daily_min=0.5,
+        daily_max=1.25,
+        daily_avg=0.85,
+        daily_median=0.875,
+        daily_spread=0.75,
         price_quadrant="Cheapest",
         is_relatively_cheap=True,
         is_relatively_expensive=False
@@ -997,13 +1184,13 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         high_loads_active=False,
         battery_soc=50.0,  # Not full
         current_time=datetime(2024, 1, 1, 0, 30),
-        current_price=20.0,
+        current_price=0.5,  # CZK/kWh
         current_block_key=("00:30", "00:45"),
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=0.8,  # 30.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=0.8,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -1023,12 +1210,12 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 30),
-        current_price=35.0,
+        current_price=0.875,  # CZK/kWh
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=0.8,  # 30.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=0.8,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -1039,11 +1226,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
             percentile=50.0,
             blocks_cheaper_count=2,
             blocks_more_expensive_count=2,
-            daily_min=20.0,
-            daily_max=50.0,
-            daily_avg=34.0,
-            daily_median=35.0,
-            daily_spread=30.0,
+            daily_min=0.5,
+            daily_max=1.25,
+            daily_avg=0.85,
+            daily_median=0.875,
+            daily_spread=0.75,
             price_quadrant="Cheap",
             is_relatively_cheap=True,
             is_relatively_expensive=False
@@ -1053,7 +1240,7 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
 
     decision = decision_engine.decide(context)
     # Should NOT charge because rank 3 > 2 cheapest hours (winter logic takes precedence)
-    # Export should be disabled because price (35) < threshold (40)
+    # Export should be disabled because price (0.875) < threshold (1.0)
     assert decision == "regular"  # Export is now always price-based
 
     # Test 3: Summer mode - should NEVER charge from AC
@@ -1063,12 +1250,12 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 0, 30),
-        current_price=20.0,  # Cheapest price
+        current_price=0.5,  # Cheapest price (CZK/kWh)
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=0.8,  # 30.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=0.8,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -1079,11 +1266,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
             percentile=0.0,  # Lowest percentile
             blocks_cheaper_count=0,
             blocks_more_expensive_count=4,
-            daily_min=20.0,
-            daily_max=50.0,
-            daily_avg=34.0,
-            daily_median=35.0,
-            daily_spread=30.0,
+            daily_min=0.5,
+            daily_max=1.25,
+            daily_avg=0.85,
+            daily_median=0.875,
+            daily_spread=0.75,
             price_quadrant="Cheapest",
             is_relatively_cheap=True,
             is_relatively_expensive=False
@@ -1093,7 +1280,7 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
 
     decision = decision_engine.decide(context)
     # Should NOT charge in summer mode, even during cheapest hour
-    # Export should be disabled because price (20) < threshold (40)
+    # Export should be disabled because price (0.5) < threshold (1.0)
     assert decision == "regular"  # Export is now always price-based
 
     # Test 4: Summer mode with moderately expensive hour - still no charging
@@ -1102,12 +1289,12 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 30),
-        current_price=40.0,  # At threshold
+        current_price=1.0,  # At threshold (CZK/kWh)
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=0.8,  # 30.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=0.8,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -1118,11 +1305,11 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
             percentile=75.0,  # Below discharge threshold
             blocks_cheaper_count=3,
             blocks_more_expensive_count=1,
-            daily_min=20.0,
-            daily_max=50.0,
-            daily_avg=34.0,
-            daily_median=35.0,
-            daily_spread=30.0,
+            daily_min=0.5,
+            daily_max=1.25,
+            daily_avg=0.85,
+            daily_median=0.875,
+            daily_spread=0.75,
             price_quadrant="Expensive",
             is_relatively_cheap=False,
             is_relatively_expensive=True
@@ -1132,7 +1319,7 @@ def test_winter_charging_logic(decision_engine: GrowattDecisionEngine) -> None:
 
     decision = decision_engine.decide(context)
     # Should NOT charge in summer mode, regardless of price
-    # Export should be enabled because price (40) >= threshold (40)
+    # Export should be enabled because price (1.0) >= threshold (1.0)
     assert decision == "regular"
 
 
@@ -1140,12 +1327,12 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     """Test smart discharge based on price spread relative to daily minimum."""
     # Create a day with significant price variation
     prices_15min = create_15min_prices({
-        0: 32.0,   # 0.8 CZK/kWh
-        1: 36.0,   # 0.9 CZK/kWh
-        2: 40.0,   # 1.0 CZK/kWh
-        6: 80.0,   # 2.0 CZK/kWh
-        7: 120.0,  # 3.0 CZK/kWh - should discharge
-        8: 140.0,  # 3.5 CZK/kWh - should discharge
+        0: 0.8,   # CZK/kWh
+        1: 0.9,   # CZK/kWh
+        2: 1.0,   # CZK/kWh
+        6: 2.0,   # CZK/kWh
+        7: 3.0,   # CZK/kWh - should discharge
+        8: 3.5,   # CZK/kWh - should discharge
     })
 
     # For this test, no blocks are marked as cheapest (not charging time)
@@ -1159,11 +1346,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         percentile=83.3,
         blocks_cheaper_count=4,
         blocks_more_expensive_count=1,
-        daily_min=32.0,  # 0.8 CZK/kWh
-        daily_max=140.0,
-        daily_avg=73.0,
-        daily_median=60.0,
-        daily_spread=108.0,
+        daily_min=0.8,  # CZK/kWh
+        daily_max=3.5,
+        daily_avg=1.8667,
+        daily_median=1.5,
+        daily_spread=2.7,
         price_quadrant="Most Expensive",
         is_relatively_cheap=False,
         is_relatively_expensive=True
@@ -1174,12 +1361,12 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 7, 30),
-        current_price=120.0,  # 3.0 CZK/kWh
+        current_price=3.0,  # CZK/kWh
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=3.0,  # Changed from 1.5 to match test intent
             battery_efficiency=0.85
@@ -1201,12 +1388,12 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 6, 30),
-        current_price=80.0,  # 2.0 CZK/kWh
+        current_price=2.0,  # CZK/kWh
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=3.0,  # Changed from 1.5 to match test intent
             battery_efficiency=0.85
@@ -1217,11 +1404,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             percentile=66.7,
             blocks_cheaper_count=3,
             blocks_more_expensive_count=2,
-            daily_min=32.0,  # 0.8 CZK/kWh
-            daily_max=140.0,
-            daily_avg=73.0,
-            daily_median=60.0,
-            daily_spread=108.0,
+            daily_min=0.8,  # CZK/kWh
+            daily_max=3.5,
+            daily_avg=1.8667,
+            daily_median=1.5,
+            daily_spread=2.7,
             price_quadrant="Expensive",
             is_relatively_cheap=False,
             is_relatively_expensive=True
@@ -1240,13 +1427,13 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 2, 30),
-        current_price=40.0,  # 1.0 CZK/kWh
+        current_price=1.0,  # CZK/kWh
         current_block_key=("02:00", "02:15"),  # Current block
         prices_15min=prices_15min,
         cheapest_blocks=cheapest_blocks,  # Empty - not a charging block
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh (not used with new logic)
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh (not used with new logic)
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=3.0,  # Changed from 1.5 for consistency
             battery_efficiency=0.85
@@ -1257,11 +1444,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             percentile=50.0,
             blocks_cheaper_count=2,
             blocks_more_expensive_count=3,
-            daily_min=32.0,
-            daily_max=140.0,
-            daily_avg=73.0,
-            daily_median=60.0,
-            daily_spread=108.0,
+            daily_min=0.8,
+            daily_max=3.5,
+            daily_avg=1.8667,
+            daily_median=1.5,
+            daily_spread=2.7,
             price_quadrant="Cheap",
             is_relatively_cheap=True,
             is_relatively_expensive=False
@@ -1274,10 +1461,10 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
 
     # Test 4: Flat price day - should NOT discharge even at high prices
     flat_prices_15min = create_15min_prices({
-        0: 76.0,  # 1.9 CZK/kWh
-        1: 80.0,  # 2.0 CZK/kWh
-        2: 84.0,  # 2.1 CZK/kWh
-        3: 88.0,  # 2.2 CZK/kWh
+        0: 1.9,  # CZK/kWh
+        1: 2.0,  # CZK/kWh
+        2: 2.1,  # CZK/kWh
+        3: 2.2,  # CZK/kWh
     })
 
     context = DecisionContext(
@@ -1285,13 +1472,13 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
         high_loads_active=False,
         battery_soc=50.0,
         current_time=datetime(2024, 1, 1, 3, 30),
-        current_price=88.0,  # 2.2 CZK/kWh
+        current_price=2.2,  # CZK/kWh
         current_block_key=("03:30", "03:45"),
         prices_15min=flat_prices_15min,
         cheapest_blocks=set(),
         price_thresholds=PriceThresholds(
-            charge_price_max=2.0,  # 80.0 EUR/MWh
-            export_price_min=1.0,  # 40.0 EUR/MWh
+            charge_price_max=2.0,  # CZK/kWh
+            export_price_min=1.0,  # CZK/kWh
             discharge_price_min=2.0,
             discharge_profit_margin=1.5,
             battery_efficiency=0.85
@@ -1302,11 +1489,11 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
             percentile=100.0,
             blocks_cheaper_count=3,
             blocks_more_expensive_count=0,
-            daily_min=76.0,  # 1.9 CZK/kWh
-            daily_max=88.0,
-            daily_avg=82.0,
-            daily_median=82.0,
-            daily_spread=12.0,
+            daily_min=1.9,  # CZK/kWh
+            daily_max=2.2,
+            daily_avg=2.05,
+            daily_median=2.05,
+            daily_spread=0.3,
             price_quadrant="Most Expensive",
             is_relatively_cheap=False,
             is_relatively_expensive=True
@@ -1314,5 +1501,212 @@ def test_price_spread_discharge_logic(decision_engine: GrowattDecisionEngine) ->
     )
 
     decision = decision_engine.decide(context)
-    # Should NOT discharge: 2.2 >= 2.0 threshold BUT 2.2 < 1.9*3 = 5.7
+    # Should NOT discharge: 2.2 >= 2.0 threshold BUT 2.2 < 1.9 * 3 = 5.7
     assert decision == "regular"  # No discharge on flat days
+
+
+# ===== Phase 1 Tests: Summer Mode, Distribution Tariff =====
+
+
+class TestSummerModeCharging:
+    """Tests for summer mode with price-gated charging (Phase 1.1)."""
+
+    def _make_context(self, price_czk_kwh: float, is_summer: bool,
+                      in_cheapest: bool = True) -> DecisionContext:
+        block_key = ("13:00", "13:15")
+        cheapest = {block_key} if in_cheapest else set()
+        return DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=50.0,
+            current_time=datetime(2026, 7, 15, 13, 0),
+            current_price=price_czk_kwh,
+            current_block_key=block_key,
+            cheapest_blocks=cheapest,
+            is_summer_mode=is_summer,
+            price_thresholds=PriceThresholds(
+                charge_price_max=1.5,
+                export_price_min=1.0,
+                discharge_price_min=5.0,
+                discharge_profit_margin=4.0,
+                battery_efficiency=0.85,
+                summer_charge_price_max=0.0,
+            ),
+        )
+
+    def test_summer_negative_price_charges(self) -> None:
+        """Summer + negative price + in cheapest → should charge."""
+        ctx = self._make_context(price_czk_kwh=-1.0, is_summer=True)
+        # -1.0 CZK/kWh < 0.0 threshold
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_summer_positive_price_no_charge(self) -> None:
+        """Summer + positive price → should NOT charge."""
+        ctx = self._make_context(price_czk_kwh=2.0, is_summer=True)
+        # 2.0 CZK/kWh > 0.0 threshold
+        assert ctx.is_battery_charging_scheduled is False
+
+    def test_summer_zero_price_charges(self) -> None:
+        """Summer + exactly 0 price → should charge (≤ threshold)."""
+        ctx = self._make_context(price_czk_kwh=0.0, is_summer=True)
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_summer_not_in_cheapest_no_charge(self) -> None:
+        """Summer + negative price but NOT in cheapest blocks → no charge."""
+        ctx = self._make_context(price_czk_kwh=-1.0, is_summer=True, in_cheapest=False)
+        assert ctx.is_battery_charging_scheduled is False
+
+    def test_winter_cheapest_block_charges(self) -> None:
+        """Winter mode: in cheapest blocks → charges (regression test)."""
+        ctx = self._make_context(price_czk_kwh=2.0, is_summer=False)
+        assert ctx.is_battery_charging_scheduled is True
+
+    def test_winter_not_in_cheapest_no_charge(self) -> None:
+        """Winter mode: not in cheapest → no charge (regression test)."""
+        ctx = self._make_context(price_czk_kwh=2.0, is_summer=False, in_cheapest=False)
+        assert ctx.is_battery_charging_scheduled is False
+
+
+class TestDistributionTariff:
+    """Tests for distribution tariff logic (Phase 1.2)."""
+
+    def _make_thresholds(self) -> PriceThresholds:
+        return PriceThresholds(
+            charge_price_max=1.5,
+            export_price_min=1.0,
+            discharge_price_min=5.0,
+            discharge_profit_margin=4.0,
+            battery_efficiency=0.85,
+            distribution_tariff_high=1.5,
+            distribution_tariff_low=0.5,
+            low_tariff_hours="0-6,22-24",
+        )
+
+    def test_low_tariff_during_night(self) -> None:
+        thresholds = self._make_thresholds()
+        for hour in [0, 1, 3, 5, 22, 23]:
+            rate = GrowattDecisionEngine._get_distribution_tariff(hour, thresholds)
+            assert rate == 0.5, f"Hour {hour} should be low tariff"
+
+    def test_high_tariff_during_day(self) -> None:
+        thresholds = self._make_thresholds()
+        for hour in [6, 7, 12, 18, 21]:
+            rate = GrowattDecisionEngine._get_distribution_tariff(hour, thresholds)
+            assert rate == 1.5, f"Hour {hour} should be high tariff"
+
+    def test_discharge_blocked_by_self_consumption_value(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Discharge should be blocked when self-consumption value exceeds spot price."""
+        # Spot: 4.0 CZK/kWh, cheapest: 1.0, margin threshold: 4.0
+        # Self-consumption floor: 1.0/0.85 + 1.5 = 2.68
+        # All thresholds: max(5.0, 4.0, 2.68) = 5.0
+        # Current 4.0 < 5.0 → no discharge
+        prices = create_15min_prices({h: 1.0 for h in range(24)})  # 1.0 CZK/kWh base
+        prices[("18:00", "18:15")] = 4.0  # 4.0 CZK/kWh for current block
+
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=80.0,
+            current_time=datetime(2026, 4, 11, 18, 0),
+            current_price=4.0,  # CZK/kWh
+            current_block_key=("18:00", "18:15"),
+            prices_15min=prices,
+            price_thresholds=self._make_thresholds(),
+        )
+
+        decision = decision_engine.decide(ctx)
+        assert decision == "regular"  # 4.0 < 5.0, no discharge
+
+    def test_discharge_allowed_above_all_thresholds(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Discharge allowed when price exceeds ALL thresholds including self-consumption."""
+        # Spot: 7.0 CZK/kWh, cheapest: 1.0
+        # margin: 1.0 * 4.0 = 4.0
+        # self-consumption: 1.0/0.85 + 1.5 = 2.68
+        # effective: max(5.0, 4.0, 2.68) = 5.0
+        # 7.0 >= 5.0 → discharge
+        prices = create_15min_prices({h: 1.0 for h in range(24)})  # CZK/kWh
+        prices[("18:00", "18:15")] = 7.0  # 7.0 CZK/kWh
+
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=80.0,
+            current_time=datetime(2026, 4, 11, 18, 0),
+            current_price=7.0,  # CZK/kWh
+            current_block_key=("18:00", "18:15"),
+            prices_15min=prices,
+            price_thresholds=self._make_thresholds(),
+        )
+
+        decision = decision_engine.decide(ctx)
+        assert decision == "discharge_to_grid"
+
+
+class TestSellProductionDecision:
+    """Tests for the optimizer-scheduled sell_production decision node."""
+
+    def test_sell_production_node_selected(self, decision_engine: GrowattDecisionEngine) -> None:
+        """Block flagged by optimizer for sell_production picks that mode."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "sell_production"
+
+    def test_sell_production_blocked_by_high_loads(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """High-load protection takes precedence over sell_production."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=True,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "high_load_protected"
+
+    def test_sell_production_yields_to_manual_override(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """Manual override beats sell_production."""
+        block = ("08:00", "08:15")
+        ctx = DecisionContext(
+            manual_override_active=True,
+            manual_override_mode="regular",
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=block,
+            optimizer_sell_production_blocks={block},
+        )
+        assert decision_engine.decide(ctx) == "regular"
+
+    def test_no_sell_production_when_block_not_scheduled(
+        self, decision_engine: GrowattDecisionEngine
+    ) -> None:
+        """When the current block is not in the optimizer set, sell_production does not fire."""
+        ctx = DecisionContext(
+            manual_override_active=False,
+            high_loads_active=False,
+            battery_soc=70.0,
+            current_time=datetime(2026, 4, 11, 8, 0),
+            current_price=1.5,
+            current_block_key=("08:00", "08:15"),
+            optimizer_sell_production_blocks={("10:00", "10:15")},
+        )
+        assert decision_engine.decide(ctx) == "regular"

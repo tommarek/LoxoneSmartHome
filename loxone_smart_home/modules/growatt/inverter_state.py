@@ -1,6 +1,6 @@
 """Inverter state tracking for preventing redundant commands."""
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import datetime
 from typing import List, Dict, Any, Optional
 
@@ -26,9 +26,17 @@ class InverterState:
     ac_charge_enabled: bool  # Whether AC charging from grid is enabled
     export_enabled: bool  # Whether export to grid is enabled
 
-    # Metadata
-    timestamp: datetime  # When this state was created
-    source: str  # Source of state change: "evaluation", "manual", "schedule", etc.
+    # Metadata — excluded from equality so two states with identical operational
+    # settings compare equal regardless of when/why they were built. Without this
+    # the per-tick fresh timestamp made `desired == current` always False, so the
+    # no-op guard in _apply_decided_mode was dead (it re-applied every tick).
+    timestamp: datetime = field(compare=False)  # When this state was created
+    source: str = field(compare=False)  # "evaluation", "manual", "schedule", …
+
+    # Inverter physical on/off via Modbus holding register 0. True by default
+    # so old code paths that build InverterState without this field assume
+    # the inverter is running.
+    inverter_on: bool = True
 
     def significant_changes(self, other: Optional['InverterState']) -> List[str]:
         """Return list of significant changes that require commands.
@@ -73,6 +81,10 @@ class InverterState:
         if self.export_enabled != other.export_enabled:
             export_state = "enabled" if self.export_enabled else "disabled"
             changes.append(f"Export: {export_state}")
+
+        # Check inverter on/off changes
+        if self.inverter_on != other.inverter_on:
+            changes.append(f"Inverter: {'ON' if self.inverter_on else 'OFF'}")
 
         return changes
 

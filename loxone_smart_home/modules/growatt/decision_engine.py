@@ -30,7 +30,12 @@ class PriceThresholds:
     discharge_price_min: float  # Discharge battery when price above this
     discharge_profit_margin: float  # Required profit margin (e.g., 1.5 = 50% profit)
     battery_efficiency: float  # Battery round-trip efficiency
-    target_soc: float = 100.0  # Target SOC when charging from grid
+    summer_charge_price_max: float = 0.0  # Max CZK/kWh to charge in summer (0 = only negative)
+    # Defaults mirror GrowattConfig (config/settings.py) so a default-constructed
+    # PriceThresholds computes the real D57d schedule, not a placeholder.
+    distribution_tariff_high: float = 0.919  # High tariff distribution cost CZK/kWh
+    distribution_tariff_low: float = 0.281  # Low tariff distribution cost CZK/kWh
+    low_tariff_hours: str = "0-10,11-12,13-14,15-17,18-24"  # Hour ranges for low tariff
 
 
 @dataclass
@@ -65,7 +70,7 @@ class DecisionContext:
     current_mode: Optional[str] = None
     current_load: float = 0.0  # Current home load in kW
     solar_power: float = 0.0  # Current solar generation in kW
-    current_price: float = 0.0  # Current 15-minute block price EUR/MWh
+    current_price: float = 0.0  # Current 15-minute block price CZK/kWh
     current_block_key: Optional[Tuple[str, str]] = None  # Current 15-minute block
     prices_15min: Dict[Tuple[str, str], float] = field(default_factory=dict)  # 96 15-min blocks
     # Set of cheapest charging blocks
@@ -76,20 +81,82 @@ class DecisionContext:
     sunset: Optional[time] = None
     is_summer_mode: bool = False
     is_battery_charging_scheduled: bool = False
+    # Configured discharge power rate (%) — used only for explanation text so it
+    # matches the value the controller actually applies.
+    discharge_power_pct: float = 25.0
+    # High load details (which loads are active)
+    high_load_details: Dict[str, Any] = field(default_factory=dict)
+    # Battery SOC limits (from config, avoids hardcoding)
+    min_soc: float = 20.0
+    max_soc: float = 100.0
+    # Optimizer-scheduled discharge blocks
+    optimizer_discharge_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_discharge_scheduled: bool = False
+    # Optimizer-scheduled sell-production blocks (export solar, battery passive)
+    optimizer_sell_production_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_sell_production_scheduled: bool = False
+    # Optimizer-scheduled battery-hold blocks: preserve the battery (no discharge),
+    # serve the house from grid. Actuated as the battery_hold mode so the hardware
+    # matches the optimizer's "hold" plan rather than draining via load_first.
+    optimizer_hold_blocks: Set[Tuple[str, str]] = field(default_factory=set)
+    is_optimizer_hold_scheduled: bool = False
+    # True when the MILP optimizer is the active scheduling engine. When set, the
+    # optimizer's per-block charge decisions (cheapest_blocks) are the single
+    # source of truth: the model owns charge economics (including price), so the
+    # rule-based summer charge gate does NOT apply. The model is kept from
+    # grid-charging at peak for the reserve by the price-aware reserve penalty in
+    # the MILP, not by a seasonal heuristic.
+    optimizer_active: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
-        # Summer mode: NO AC charging at all
-        if self.is_summer_mode:
-            self.is_battery_charging_scheduled = False
-        # Check if current block is in the cheapest charging blocks
+        # CHARGE authority:
+        #  - Optimizer active → the model owns charge economics (incl. price):
+        #    actuate exactly its scheduled charge set. Its reserve is
+        #    objective-driven, so no seasonal gate is needed — the model decides.
+        #  - Optimizer inactive (rule-based fallback) → apply the summer gate
+        #    (only grid-charge at/below summer_charge_price_max, default 0) /
+        #    cheapest-blocks logic.
+        if self.optimizer_active:
+            self.is_battery_charging_scheduled = bool(
+                self.current_block_key
+                and self.current_block_key in self.cheapest_blocks
+            )
+        elif self.is_summer_mode:
+            if self.current_block_key and self.cheapest_blocks:
+                in_cheapest = self.current_block_key in self.cheapest_blocks
+                current_czk = self.current_price  # Already CZK/kWh
+                max_price = (
+                    self.price_thresholds.summer_charge_price_max
+                    if self.price_thresholds else 0.0
+                )
+                self.is_battery_charging_scheduled = in_cheapest and current_czk <= max_price
+            else:
+                self.is_battery_charging_scheduled = False
         elif self.current_block_key and self.cheapest_blocks:
             self.is_battery_charging_scheduled = (
                 self.current_block_key in self.cheapest_blocks
             )
-        # No fallback to price threshold - only charge during cheapest blocks
         else:
             self.is_battery_charging_scheduled = False
+
+        # Check if optimizer scheduled discharge for this block
+        if self.current_block_key and self.optimizer_discharge_blocks:
+            self.is_optimizer_discharge_scheduled = (
+                self.current_block_key in self.optimizer_discharge_blocks
+            )
+
+        # Check if optimizer scheduled sell_production for this block
+        if self.current_block_key and self.optimizer_sell_production_blocks:
+            self.is_optimizer_sell_production_scheduled = (
+                self.current_block_key in self.optimizer_sell_production_blocks
+            )
+
+        # Check if optimizer scheduled a battery-hold for this block
+        if self.current_block_key and self.optimizer_hold_blocks:
+            self.is_optimizer_hold_scheduled = (
+                self.current_block_key in self.optimizer_hold_blocks
+            )
 
 
 @dataclass
@@ -127,25 +194,31 @@ MODE_DEFINITIONS = {
     "regular": {
         "description": "Normal operation - load first",
         "inverter_mode": "load_first",
-        "stop_soc": 20,  # Default minimum SOC
+        "stop_soc": "min_soc",  # Resolved from config at runtime
         "ac_charge": False
     },
     "high_load_protected": {
         "description": "High load protection - prevent battery discharge",
-        "inverter_mode": "load_first",
-        "stop_soc": 100,  # Prevent any discharge
+        # load_first DISCHARGES the battery to cover a load deficit (it ignores
+        # stop_soc as a discharge floor on the SPH), so it does NOT protect the
+        # battery when a big load like an EV pulls more than solar — it would
+        # drain into the car. Use battery_first like battery_hold: the battery is
+        # passive (grid+solar serve the load, no discharge). stop_soc is pinned to
+        # the LIVE SOC in the controller so it also won't grid-charge.
+        "inverter_mode": "battery_first",
+        "stop_soc": "max_soc",  # overridden to live SOC in _build_desired_state
         "ac_charge": False
     },
     "charge_from_grid": {
         "description": "Charging battery from grid to 100%",
         "inverter_mode": "battery_first",
-        "stop_soc": 100,  # Charge to full
+        "stop_soc": "max_soc",  # Charge to full
         "ac_charge": True
     },
     "battery_first_ac_charge": {
         "description": "Battery-first with AC charging (high load + cheap price)",
         "inverter_mode": "battery_first",
-        "stop_soc": 100,  # Charge to full and prevent discharge
+        "stop_soc": "max_soc",  # Charge to full and prevent discharge
         "ac_charge": True,
         "high_load_compatible": True  # Can run with high loads
     },
@@ -158,7 +231,23 @@ MODE_DEFINITIONS = {
     "sell_production": {
         "description": "Sell only solar production",
         "inverter_mode": "grid_first",
-        "stop_soc": 100,  # Don't discharge battery
+        "stop_soc": "max_soc",  # Don't discharge battery
+        "ac_charge": False
+    },
+    "battery_hold": {
+        "description": "Preserve battery — no discharge, no grid charge",
+        # battery_first prevents the battery from DISCHARGING for the house (the
+        # house is served from grid) — the "hold". stop_soc is pinned to the LIVE
+        # SOC in the controller (_build_desired_state), NOT max_soc: on the SPH,
+        # battery_first charges UP to stop_soc from the GRID even with ac_charge
+        # off (the flag does not gate grid-charging), so max_soc would make the
+        # hold grid-charge to 100% at the spot price. With stop_soc=live SOC there
+        # is no charge headroom → no grid charge, no discharge; surplus solar
+        # exports rather than being banked (banking can't be done here without
+        # also grid-charging). max_soc below is just the resolver default — the
+        # live-SOC pin overrides it.
+        "inverter_mode": "battery_first",
+        "stop_soc": "max_soc",
         "ac_charge": False
     }
 }
@@ -200,7 +289,7 @@ class GrowattDecisionEngine:
                 priority=Priority.SCHEDULED_BATTERY_CHARGING,
                 condition=lambda ctx: (
                     ctx.high_loads_active
-                    and ctx.battery_soc < 100
+                    and ctx.battery_soc < ctx.max_soc
                     and ctx.is_battery_charging_scheduled
                 ),
                 action="battery_first_ac_charge",
@@ -215,11 +304,13 @@ class GrowattDecisionEngine:
                 name="Scheduled Battery Charging",
                 priority=Priority.SCHEDULED_BATTERY_CHARGING,
                 condition=lambda ctx: (
-                    ctx.battery_soc < 100
+                    ctx.battery_soc < ctx.max_soc
                     and ctx.is_battery_charging_scheduled
                 ),
                 action="charge_from_grid",
-                explanation="Cheapest electricity blocks - charging battery to 100%"
+                explanation=lambda ctx: (
+                    f"Cheapest electricity blocks - charging battery to {ctx.max_soc:.0f}%"
+                )
             ),
 
             # Priority 3: High Load Protection - Prevent ALL battery discharge
@@ -231,12 +322,66 @@ class GrowattDecisionEngine:
                     and not ctx.is_battery_charging_scheduled
                 ),
                 action="high_load_protected",
-                explanation=(
-                    "High loads active - load-first mode with 100% stop SOC (no discharge)"
+                explanation=lambda ctx: self._high_load_explanation(ctx),
+            ),
+
+            # Priority 4A: Optimizer-scheduled discharge (sells battery + solar excess)
+            DecisionNode(
+                name="Optimizer Scheduled Discharge",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_discharge_scheduled
+                    and ctx.battery_soc > ctx.min_soc
+                    and not ctx.high_loads_active
+                ),
+                action="discharge_to_grid",
+                explanation=lambda ctx: (
+                    f"Optimizer scheduled discharge: "
+                    f"{ctx.current_price:.2f} CZK/kWh, "
+                    f"discharging at {ctx.discharge_power_pct:.0f}% power"
                 )
             ),
 
-            # Priority 4: Check for battery discharge opportunity
+            # Priority 4A': Optimizer-scheduled sell_production
+            # Solar excess → grid, battery passive (no drain). Used when
+            # battery export wouldn't cover amortisation but solar export
+            # is still profitable AND a cheaper refill is available later.
+            DecisionNode(
+                name="Optimizer Scheduled Sell Production",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_sell_production_scheduled
+                    and not ctx.high_loads_active
+                ),
+                action="sell_production",
+                explanation=lambda ctx: (
+                    f"Optimizer scheduled solar export: "
+                    f"spot {ctx.current_price:.2f} CZK/kWh, "
+                    f"battery preserved for cheaper recharge later"
+                )
+            ),
+
+            # Priority 4C: Optimizer-scheduled battery HOLD — preserve the battery
+            # (no discharge), serve the house from grid. Sits below charge/
+            # discharge/sell (mutually exclusive by construction) and above the
+            # default load_first, which would otherwise DRAIN the battery,
+            # diverging from the optimizer's "hold" plan. Yields to high loads
+            # (high_load_protected, priority 3, already holds identically).
+            DecisionNode(
+                name="Optimizer Battery Hold",
+                priority=Priority.SCHEDULED_MODE,
+                condition=lambda ctx: (
+                    ctx.is_optimizer_hold_scheduled
+                    and not ctx.high_loads_active
+                ),
+                action="battery_hold",
+                explanation=lambda ctx: (
+                    "Optimizer preserves battery — house served from grid, "
+                    "no discharge this block"
+                )
+            ),
+
+            # Priority 4B: Price-based battery discharge (fallback when no optimizer)
             DecisionNode(
                 name="Battery Discharge Control",
                 priority=Priority.SCHEDULED_MODE,
@@ -244,8 +389,8 @@ class GrowattDecisionEngine:
                 action="discharge_to_grid",
                 explanation=lambda ctx: (
                     f"Battery discharge profitable: "
-                    f"{ctx.current_price:.1f} EUR/MWh meets spread requirement, "
-                    f"discharging at 25% power"
+                    f"{ctx.current_price:.2f} CZK/kWh meets spread requirement, "
+                    f"discharging at {ctx.discharge_power_pct:.0f}% power"
                 )
             ),
 
@@ -377,13 +522,17 @@ class GrowattDecisionEngine:
     def test_scenario(self,
                       manual_override: bool = False,
                       high_loads: bool = False,
-                      battery_soc: float = 50.0) -> Dict[str, Any]:
+                      battery_soc: float = 50.0,
+                      min_soc: float = 20.0,
+                      max_soc: float = 100.0) -> Dict[str, Any]:
         """Test a specific scenario for debugging.
 
         Args:
             manual_override: Whether manual override is active
             high_loads: Whether high loads are active
             battery_soc: Current battery SOC
+            min_soc: Minimum SOC from config
+            max_soc: Maximum SOC from config
 
         Returns:
             Decision explanation for the scenario
@@ -392,6 +541,8 @@ class GrowattDecisionEngine:
             manual_override_active=manual_override,
             high_loads_active=high_loads,
             battery_soc=battery_soc,
+            min_soc=min_soc,
+            max_soc=max_soc,
             current_time=datetime.now(),
             manual_override_mode="regular" if manual_override else None,
             current_mode=None
@@ -411,6 +562,42 @@ class GrowattDecisionEngine:
 
     # Price-aware decision helper methods
 
+    @staticmethod
+    def _get_distribution_tariff(hour: int, thresholds: PriceThresholds) -> float:
+        """Get the distribution tariff for a given hour based on low/high tariff schedule.
+
+        Args:
+            hour: Hour of day (0-23)
+            thresholds: Price thresholds containing tariff config
+
+        Returns:
+            Distribution tariff in CZK/kWh
+        """
+        for range_str in thresholds.low_tariff_hours.split(","):
+            range_str = range_str.strip()
+            if "-" in range_str:
+                parts = range_str.split("-")
+                start_h, end_h = int(parts[0]), int(parts[1])
+                # Ranges are validated start<end (validate_low_tariff_hours), so
+                # they never wrap midnight — express an overnight window as two
+                # ranges, e.g. "22-24,0-6".
+                if start_h <= hour < end_h:
+                    return thresholds.distribution_tariff_low
+        return thresholds.distribution_tariff_high
+
+    @staticmethod
+    def _high_load_explanation(ctx: DecisionContext) -> str:
+        """Build detailed explanation of which high loads are active."""
+        parts = []
+        details = ctx.high_load_details
+        if details.get("heating_relays"):
+            relays = details["heating_relays"]
+            parts.append(f"Heating: {', '.join(relays)}")
+        if details.get("ev_charging"):
+            parts.append(f"EV charging: {details['ev_power']:.1f}kW")  # ev_power is kW
+        detail = " + ".join(parts) if parts else "High loads active"
+        return f"{detail} — no discharge ({ctx.max_soc:.0f}% stop SOC)"
+
     def _should_discharge_battery(self, context: DecisionContext) -> bool:
         """Determine if battery should discharge based on simple price thresholds.
 
@@ -429,8 +616,17 @@ class GrowattDecisionEngine:
         Returns:
             True if battery should discharge to grid
         """
+        # FALLBACK ONLY: when the optimizer is the active engine it owns the
+        # discharge schedule (Priority 4A) — it reserves the battery for the
+        # highest-value blocks and protects the overnight reserve. This simple
+        # price-threshold path must defer to it, otherwise it would discharge
+        # EXTRA blocks the optimizer deliberately left as "hold", diverging from
+        # the displayed optimizer schedule.
+        if context.optimizer_active:
+            return False
+
         # Don't discharge if battery is too low
-        if context.battery_soc <= 20:
+        if context.battery_soc <= context.min_soc:
             return False
 
         # Don't discharge during high loads
@@ -441,23 +637,52 @@ class GrowattDecisionEngine:
         if not context.price_thresholds or context.current_price <= 0:
             return False
 
-        # Convert current price to CZK/kWh (EUR/MWh * 25 / 1000)
-        current_price_czk = context.current_price * 25 / 1000
+        # Prices are already in CZK/kWh (converted at storage time)
+        current_price_czk = context.current_price
 
-        # Find the absolute cheapest 15-minute block price
+        # Find the cheapest 15-minute block price. This is used as the recharge-
+        # cost BASIS — a proxy for the price at which the discharged energy will be
+        # replaced. The day's cheapest block (even an already-elapsed overnight
+        # trough) is the right proxy because recharge happens at the RECURRING
+        # daily trough (e.g. tomorrow ~03:00 at ~the same price); restricting to
+        # forward-today blocks would, at the evening peak, leave only expensive
+        # blocks and wrongly suppress legitimate peak discharge.
         if not context.prices_15min:
             return False
 
-        cheapest_block_price = min(context.prices_15min.values())
-        cheapest_block_czk = cheapest_block_price * 25 / 1000
+        cheapest_block_key, cheapest_block_czk = min(
+            context.prices_15min.items(), key=lambda kv: kv[1]
+        )
 
         # Calculate required price based on profit margin
         required_by_margin = cheapest_block_czk * context.price_thresholds.discharge_profit_margin
 
-        # Effective threshold is the higher of absolute minimum or margin-based requirement
+        # Self-consumption opportunity cost: if we discharge now, we need to
+        # recharge later (at cheapest price + its distribution tariff) and we
+        # lose the distribution tariff savings from self-consuming now
+        current_hour = context.current_time.hour
+        current_dist = self._get_distribution_tariff(current_hour, context.price_thresholds)
+        # Cost to recharge 1 kWh at the cheapest future block: its spot price PLUS
+        # that block's own distribution tariff (import pays distribution), all over
+        # round-trip efficiency. The recharge block's tariff must be included or
+        # the recharge cost is understated and discharge fires below break-even.
+        try:
+            recharge_hour = int(cheapest_block_key[0].split(":")[0])
+        except (ValueError, IndexError, AttributeError, TypeError):
+            recharge_hour = current_hour
+        recharge_dist = self._get_distribution_tariff(
+            recharge_hour, context.price_thresholds
+        )
+        recharge_cost = (
+            cheapest_block_czk + recharge_dist
+        ) / context.price_thresholds.battery_efficiency
+        self_consumption_floor = recharge_cost + current_dist
+
+        # Effective threshold is the highest of all requirements
         effective_threshold = max(
             context.price_thresholds.discharge_price_min,
-            required_by_margin
+            required_by_margin,
+            self_consumption_floor
         )
 
         if current_price_czk >= effective_threshold:
@@ -465,44 +690,20 @@ class GrowattDecisionEngine:
                 f"Discharge profitable: {current_price_czk:.2f} CZK/kWh ≥ "
                 f"{effective_threshold:.2f} CZK/kWh "
                 f"(absolute min: {context.price_thresholds.discharge_price_min:.2f}, "
-                f"cheapest block: {cheapest_block_czk:.2f} × "
+                f"margin: {cheapest_block_czk:.2f} × "
                 f"{context.price_thresholds.discharge_profit_margin:.1f} = "
-                f"{required_by_margin:.2f})"
+                f"{required_by_margin:.2f}, "
+                f"self-consumption: {self_consumption_floor:.2f} "
+                f"[recharge {recharge_cost:.2f} + dist {current_dist:.2f}])"
             )
             return True
         else:
             self.logger.debug(
                 f"No discharge: {current_price_czk:.2f} CZK/kWh < "
                 f"{effective_threshold:.2f} CZK/kWh required "
-                f"(cheapest 15min block: {cheapest_block_czk:.2f} × "
-                f"{context.price_thresholds.discharge_profit_margin:.1f})"
+                f"(margin: {required_by_margin:.2f}, "
+                f"self-consumption: {self_consumption_floor:.2f})"
             )
-            return False
-
-    def _is_hour_in_range(self, hour: str, start: str, end: str) -> bool:
-        """Check if an hour is within a time range.
-
-        Args:
-            hour: Hour to check (HH:MM)
-            start: Range start (HH:MM)
-            end: Range end (HH:MM)
-
-        Returns:
-            True if hour is in range
-        """
-        try:
-            # Handle both HH:MM and HH:00 formats
-            h_time = datetime.strptime(hour[:5], "%H:%M").time()
-            s_time = datetime.strptime(start[:5], "%H:%M").time()
-            e_time = datetime.strptime(end[:5], "%H:%M").time()
-
-            if s_time <= e_time:
-                return s_time <= h_time < e_time
-            else:
-                # Handles overnight ranges
-                return h_time >= s_time or h_time < e_time
-        except (ValueError, IndexError) as e:
-            self.logger.warning(f"Invalid time format in range check: {e}")
             return False
 
     def has_mode_changed(self, new_mode: str) -> bool:
@@ -517,26 +718,6 @@ class GrowattDecisionEngine:
         changed = self._last_mode != new_mode
         self._last_mode = new_mode
         return changed
-
-    def _validate_price_data(self, hourly_prices: Dict[Tuple[str, str], float]) -> bool:
-        """Validate price data integrity.
-
-        Args:
-            hourly_prices: Hour price mapping to validate
-
-        Returns:
-            True if data is valid
-        """
-        if not hourly_prices:
-            return False
-
-        # Check for reasonable price range (0-1000 EUR/MWh)
-        for price in hourly_prices.values():
-            if not 0 <= price <= 1000:
-                self.logger.warning(f"Suspicious price detected: {price} EUR/MWh")
-                return False
-
-        return True
 
     def calculate_price_ranking(
         self,

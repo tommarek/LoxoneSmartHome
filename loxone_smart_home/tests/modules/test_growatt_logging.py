@@ -70,6 +70,10 @@ class TestGrowattControllerLogging:
 
         controller = GrowattController(mqtt_client, influxdb_client, settings)
         controller.logger = MagicMock()
+        # Schedule logging was extracted into ScheduleCoordinator, which holds
+        # its own logger reference captured at construction. Point it at the
+        # same mock so delegated log calls are observable in these tests.
+        controller._schedule.logger = controller.logger
 
         return controller
 
@@ -96,13 +100,12 @@ class TestGrowattControllerLogging:
         blocks = [
             (datetime(2024, 1, 1, 10, 0), datetime(2024, 1, 1, 11, 0), 100.0)
         ]
-        eur_czk_rate = 25.0
-
-        summary = controller._format_price_summary(blocks, eur_czk_rate)
+        summary = controller._format_price_summary(blocks)
 
         assert "10:00-11:00" in summary
         assert "1 blocks" in summary
-        assert "2.50 CZK/kWh" in summary
+        # Prices are CZK/kWh-native (no EUR conversion); eur_czk_rate is ignored.
+        assert "100.00 CZK/kWh" in summary
 
     def test_format_price_summary_multiple_blocks(self, controller):
         """Test price summary formatting for multiple non-consecutive blocks."""
@@ -111,9 +114,7 @@ class TestGrowattControllerLogging:
             (datetime(2024, 1, 1, 14, 0), datetime(2024, 1, 1, 15, 0), 120.0),
             (datetime(2024, 1, 1, 18, 0), datetime(2024, 1, 1, 19, 0), 80.0)
         ]
-        eur_czk_rate = 25.0
-
-        summary = controller._format_price_summary(blocks, eur_czk_rate)
+        summary = controller._format_price_summary(blocks)
 
         assert "3 blocks" in summary
         assert "3 periods" in summary
@@ -128,20 +129,16 @@ class TestGrowattControllerLogging:
             (datetime(2024, 1, 1, 11, 0), datetime(2024, 1, 1, 12, 0), 100.0),
             (datetime(2024, 1, 1, 12, 0), datetime(2024, 1, 1, 13, 0), 100.0)
         ]
-        eur_czk_rate = 25.0
-
-        summary = controller._format_price_summary(blocks, eur_czk_rate)
+        summary = controller._format_price_summary(blocks)
 
         assert "10:00-13:00" in summary
         assert "3 blocks" in summary
-        assert "2.50 CZK/kWh" in summary
+        assert "100.00 CZK/kWh" in summary
 
     def test_format_price_summary_empty(self, controller):
         """Test price summary formatting with no blocks."""
         blocks = []
-        eur_czk_rate = 25.0
-
-        summary = controller._format_price_summary(blocks, eur_czk_rate)
+        summary = controller._format_price_summary(blocks)
 
         assert summary == "No blocks"
 
@@ -176,7 +173,7 @@ class TestGrowattControllerLogging:
         assert "Status:" in call_args
         assert "Mode: battery_first" in call_args
         assert "Battery: 76%" in call_args
-        assert "Price: 3.00 CZK/kWh" in call_args
+        assert "Price: 120.00 CZK/kWh" in call_args
         assert "Commands: 10 sent, 2 skipped" in call_args
 
     @patch('modules.growatt_controller.datetime')
@@ -271,14 +268,12 @@ class TestGrowattControllerLogging:
             (datetime(2024, 1, 1, 18, 0), datetime(2024, 1, 1, 19, 0), 200.0)
         ]
         discharge_tomorrow = []
-        eur_czk_rate = 25.0
 
         controller._log_compact_schedule(
             charging_today,
             charging_tomorrow,
             discharge_today,
             discharge_tomorrow,
-            eur_czk_rate
         )
 
         # Verify all schedules were logged

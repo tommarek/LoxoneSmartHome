@@ -1,8 +1,13 @@
 """Growatt controller module - manages solar battery based on energy prices."""
 
 import asyncio
+import functools
 import json
+import math
+import os
+import signal
 import zoneinfo
+from dataclasses import replace
 from datetime import datetime
 from datetime import date as date_type
 from datetime import time as dt_time
@@ -31,8 +36,24 @@ from .growatt.decision_engine import (
     GrowattDecisionEngine, DecisionContext, PriceThresholds, MODE_DEFINITIONS
 )
 from .growatt.inverter_state import InverterState
-from utils.schedule_calculator import calculate_optimal_schedule
+from .growatt.solar_forecast import SolarForecast
+from .growatt.consumption_forecast import ConsumptionForecast
+from .growatt.optimizer import compute_charge_power_rates, compute_rate_ceiling
+from .growatt.deferrable_loads import DeferrableLoad, DeferrableLoadSchedule
+from utils.schedule_calculator import calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
+from .growatt.schedule_coordinator import ScheduleCoordinator
+
+
+def _block_key(start_dt: datetime, end_dt: datetime) -> Tuple[str, str]:
+    """Build an (start, end) HH:MM block key matching the price-table /
+    current-block-key convention: a block that ends at next-day midnight uses
+    the '24:00' sentinel (not '00:00'), so the last block of the day (23:45)
+    matches `_current_prices` / `current_block_key` and is actually actuated."""
+    end_str = "24:00" if (
+        end_dt.hour == 0 and end_dt.minute == 0 and end_dt.date() > start_dt.date()
+    ) else end_dt.strftime("%H:%M")
+    return (start_dt.strftime("%H:%M"), end_str)
 
 
 class GrowattController(BaseModule):
@@ -98,11 +119,11 @@ class GrowattController(BaseModule):
         # Set sensible defaults for optional flags in a separate dict
         # (Pydantic models don't allow dynamic attribute assignment)
         self._optional_config = {
-            "dst_merge_policy": getattr(self.config, "dst_merge_policy", "avg"),
-            "eur_czk_rate": getattr(self.config, "eur_czk_rate", 25.0),
-            "temperature_avg_days": getattr(self.config, "temperature_avg_days", 3),
-            "summer_temp_threshold": getattr(self.config, "summer_temp_threshold", 15.0),
-            "simulation_mode": getattr(self.config, "simulation_mode", False),
+            "dst_merge_policy": self.config.dst_merge_policy if hasattr(self.config, "dst_merge_policy") else "avg",
+            "eur_czk_rate": self.config.eur_czk_rate,
+            "temperature_avg_days": self.config.temperature_avg_days,
+            "summer_temp_threshold": self.config.summer_temp_threshold,
+            "simulation_mode": self.config.simulation_mode,
         }
 
         # Note: All config validation is handled by Pydantic Field constraints
@@ -123,6 +144,27 @@ class GrowattController(BaseModule):
         )
         self.config = settings.growatt
 
+        # Layer any dashboard-edited overrides on top of the .env defaults. This
+        # mutates self.config in place (before the optimizer/forecasters capture
+        # the reference), so persisted edits take effect on startup. A
+        # missing/invalid file is ignored — the service must always boot.
+        from config.settings_overrides import (
+            DEFAULT_OVERRIDES_PATH,
+            apply_overrides,
+            load_overrides,
+        )
+        self._overrides_path = DEFAULT_OVERRIDES_PATH
+        try:
+            _stored = load_overrides(self._overrides_path)
+            if _stored:
+                applied = apply_overrides(self.config, _stored)
+                self.logger.info(
+                    f"Applied {len(applied)} persisted setting override(s): "
+                    f"{', '.join(sorted(applied))}"
+                )
+        except Exception as e:  # never let a bad overrides file block startup
+            self.logger.warning(f"Ignoring config overrides ({self._overrides_path}): {e}")
+
         # Optional config will be set during validation
 
         # Validate config and set defaults
@@ -132,7 +174,13 @@ class GrowattController(BaseModule):
         self._last_evaluation_hour: Optional[int] = None
         self._last_evaluation_reason: Optional[str] = None
         self._evaluation_lock = asyncio.Lock()
+        # Serializes _calculate_cross_day_optimal_schedule: the periodic tick,
+        # next-day price fetch, pre-midnight refresh and model-rebuild task can
+        # all call it concurrently, and it writes the shared schedule sets that
+        # the inverter on/off gate and decision engine then read.
+        self._schedule_lock = asyncio.Lock()
         self._periodic_check_task: Optional[asyncio.Task[None]] = None
+        self._models_task: Optional[asyncio.Task[None]] = None
 
         # Initialize state tracking
         self._current_inverter_state = None
@@ -167,7 +215,7 @@ class GrowattController(BaseModule):
         self._cheapest_charging_blocks: Set[Tuple[str, str]] = set()
         self._pre_discharge_blocks: Set[Tuple[str, str]] = set()
         self._peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
-        self._combined_charging_blocks: Set[Tuple[str, str]] = set()
+        # _combined_charging_blocks is a property proxy to self._schedule
         self._prices_date: Optional[str] = None
         self._prices_updated: Optional[datetime] = None
 
@@ -183,14 +231,180 @@ class GrowattController(BaseModule):
 
         self._last_command_results: Dict[str, Dict[str, Any]] = {}
 
+        # Adaptive charge/discharge rate: per-block inverter powerRate% from the
+        # last plan (empty unless the matching feature is enabled). Block ts → %.
+        self._charge_power_rate_by_ts: Dict[datetime, int] = {}
+        self._discharge_power_rate_by_ts: Dict[datetime, int] = {}
+
         # Initialize refactored modules
         self._price_analyzer = PriceAnalyzer(self.logger, self._local_tz, self._optional_config)
-        self._mode_manager = ModeManager(self)
+        self._mode_manager = ModeManager(
+            logger=self.logger,
+            mqtt_client=self.mqtt_client,
+            config=self.config,
+            optional_config=self._optional_config,
+            local_tz=self._local_tz,
+            last_applied=self._last_applied,
+            adapter=self,
+        )
         self._decision_engine = GrowattDecisionEngine(self.logger)
+
+        # Solar forecast (Phase 2)
+        self._solar_forecast: Optional[SolarForecast] = None
+        if self.config.solar_forecast_enabled:
+            self._solar_forecast = SolarForecast.from_config(
+                self.config, self.logger, settings=self.settings
+            )
+            self.logger.info(
+                f"Solar forecast enabled: {len(self._solar_forecast.arrays)} arrays, "
+                f"total {sum(a.kwp for a in self._solar_forecast.arrays):.1f} kWp"
+            )
+
+        # Consumption forecast (Phase 3.1) — engine-switchable
+        self._consumption_forecast: Optional[ConsumptionForecast] = None
+        self._ml_consumption_forecast = None  # Optional[MLConsumptionForecast]
+        if self.config.consumption_forecast_enabled:
+            self._consumption_forecast = ConsumptionForecast(self.logger)
+            engine = getattr(self.config, "consumption_forecast_engine", "binned")
+            if engine == "ml":
+                try:
+                    from .growatt.ml_consumption_forecast import MLConsumptionForecast
+                    ml = MLConsumptionForecast(self.logger)
+                    if ml.available:
+                        self._ml_consumption_forecast = ml
+                        self.logger.info(
+                            "ML consumption forecaster enabled (skforecast)"
+                        )
+                    else:
+                        self.logger.warning(
+                            "consumption_forecast_engine=ml but skforecast is not "
+                            "installed — falling back to binned model"
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        f"ML consumption forecaster init failed: {e} — "
+                        f"falling back to binned model"
+                    )
+            self.logger.info("Consumption forecast enabled (model will build on startup)")
+
+        # Battery optimizer — MILP only. Even when PuLP is missing the MILP
+        # instance still loads; its optimize() routes through the minimal safe
+        # fallback, so the controller's dispatch path is identical either way.
+        self._optimizer: Optional["MILPBatteryOptimizer"] = None
+        if self.config.optimizer_enabled:
+            from .growatt.milp_optimizer import MILPBatteryOptimizer
+            self._optimizer = MILPBatteryOptimizer(self.logger)
+            if self._optimizer.is_available():
+                self.logger.info("Battery optimizer enabled (MILP engine)")
+            else:
+                self.logger.warning(
+                    "Battery optimizer enabled (MILP) but PuLP isn't installed "
+                    "— solves will use the minimal safe fallback"
+                )
+
+        # Hourly forecast temperatures stashed from the OpenMeteo fetch in
+        # _update_solar_forecast: {local_date: {local_hour: °C}}. Used by the
+        # consumption forecast so tomorrow is predicted with tomorrow's
+        # temperatures instead of yesterday's actuals (cold-front days).
+        self._forecast_temps_by_date: Dict[Any, Dict[int, float]] = {}
+        self._forecast_temps_fetched_at: Optional[datetime] = None
+
+        # When the solar production model was last (re)built / attempted. A
+        # container can run for weeks across UI/deploy-driven restarts, so the
+        # periodic loop rebuilds the model weekly — and retries hourly while
+        # there is no model at all (failed startup build, e.g. InfluxDB
+        # unreachable right after a restart).
+        self._solar_model_built_at: Optional[datetime] = None
+        # Initialized to NOW (not None): the periodic loop starts BEFORE the
+        # Phase-3 startup build task is assigned to _models_task, so a slow
+        # startup evaluation (>60s) would otherwise let the first tick spawn
+        # a duplicate build and have Phase 3 overwrite/orphan it. Seeding the
+        # attempt timestamp keeps the trigger quiet for the first hour.
+        self._solar_model_attempted_at: Optional[datetime] = datetime.now(
+            self._local_tz
+        )
+
+        # Solcast PV forecast (optional). If configured, used as an
+        # additional input to the consensus alongside forecast.solar and
+        # the trained production model.
+        self._solcast_forecast = None  # Optional[SolcastForecast]
+        if getattr(self.config, "solcast_api_key", ""):
+            try:
+                from .growatt.solcast_forecast import SolcastForecast
+                self._solcast_forecast = SolcastForecast(
+                    api_key=self.config.solcast_api_key,
+                    rooftop_id=getattr(self.config, "solcast_rooftop_id", ""),
+                    logger=self.logger,
+                    quantile=getattr(self.config, "solcast_quantile", "p50"),
+                )
+                if self._solcast_forecast.enabled:
+                    self.logger.info("Solcast PV forecast enabled")
+                else:
+                    # Diagnose precisely: the client strips both values, so a
+                    # whitespace-only key also lands here — don't blame the
+                    # rooftop id for that.
+                    if self._solcast_forecast.api_key is None:
+                        reason = "SOLCAST_API_KEY is empty/whitespace"
+                    else:
+                        reason = "SOLCAST_ROOFTOP_ID is missing/empty"
+                    self.logger.warning(f"Solcast disabled: {reason}")
+                    self._solcast_forecast = None
+            except Exception as e:
+                self.logger.warning(f"Solcast init failed: {e}")
+                self._solcast_forecast = None
+
+        # Deferrable loads — parsed from JSON config
+        self._deferrable_loads: List[DeferrableLoad] = []
+        self._deferrable_scheduler = None
+        try:
+            import json as _json
+            from datetime import time as _time
+            from .growatt.deferrable_loads import DeferrableLoadScheduler
+            spec = _json.loads(
+                getattr(self.config, "deferrable_loads_json", "[]") or "[]"
+            )
+            # Shape and invariants (incl. mqtt_topic_on-requires-off) are enforced
+            # fail-fast by GrowattConfig.validate_deferrable_loads_json, so by the
+            # time we read the already-validated config string here we only need
+            # to build the dataclasses.
+            for entry in spec:
+                self._deferrable_loads.append(DeferrableLoad(
+                    name=entry["name"],
+                    energy_required_kwh=float(entry["energy_required_kwh"]),
+                    power_kw=float(entry["power_kw"]),
+                    earliest_start=_time.fromisoformat(entry.get("earliest_start", "00:00")),
+                    latest_end=_time.fromisoformat(entry.get("latest_end", "23:59")),
+                    interruptible=bool(entry.get("interruptible", True)),
+                    mqtt_topic_on=entry.get("mqtt_topic_on"),
+                    mqtt_topic_off=entry.get("mqtt_topic_off"),
+                    payload_on=entry.get("payload_on"),
+                    payload_off=entry.get("payload_off"),
+                ))
+            if self._deferrable_loads:
+                self._deferrable_scheduler = DeferrableLoadScheduler(self.logger)
+                self.logger.info(
+                    f"Deferrable loads enabled: "
+                    f"{', '.join(l.name for l in self._deferrable_loads)}"
+                )
+        except Exception as e:
+            self.logger.warning(f"Could not parse deferrable_loads_json: {e}")
+            self._deferrable_loads = []
+            self._deferrable_scheduler = None
+
+        # Cached schedule for status / dashboard / actual MQTT firing
+        self._deferrable_schedules: List[DeferrableLoadSchedule] = []
+        self._deferrable_active: Set[str] = set()
+        self._deferrable_completed_blocks: Set[Tuple[str, datetime]] = set()
 
         # Home status monitoring for high load detection
         self._home_status: Dict[str, Any] = {}
         self._high_loads_active: bool = False
+        self._high_load_details: Dict[str, Any] = {}
+        # EV high-load state, refreshed from InfluxDB by _high_load_poll_loop
+        # (EV charging is not in the loxone/status MQTT cache).
+        self._ev_high_load: bool = False
+        self._ev_high_load_power: float = 0.0
+        self._high_load_poll_task: Optional[asyncio.Task[None]] = None
         self._home_status_topic = "loxone/status"
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
@@ -208,29 +422,8 @@ class GrowattController(BaseModule):
         self._price_fetch_task: Optional[asyncio.Task[None]] = None  # Retry task for price fetching
         self._last_price_fetch_attempt: Optional[datetime] = None  # Last fetch attempt time
 
-        # Two-day lookahead state (defer charging if tomorrow significantly cheaper)
-        # NOTE: This defer logic will be replaced by cross-day optimization
-        self._defer_charging_to_tomorrow: bool = False  # Flag: skip today's charging for tomorrow
-        self._tomorrow_cheaper_by: Optional[float] = None  # How much cheaper tomorrow is (%)
-
-        # Cross-day scheduling (NEW: date-aware optimization across available window)
-        # Today's optimal blocks
-        self._cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's blocks
-        self._cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()
-        # Today's pre-discharge
-        self._pre_discharge_blocks_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's pre-discharge
-        self._pre_discharge_blocks_tomorrow: Set[Tuple[str, str]] = set()
-        # Today's discharge periods
-        self._discharge_periods_today: Set[Tuple[str, str]] = set()
-        # Tomorrow's discharge
-        self._discharge_periods_tomorrow: Set[Tuple[str, str]] = set()
-
-        # Queued schedules for midnight application
-        self._queued_tomorrow_charging: List[Tuple[datetime, datetime, float]] = []
-        self._queued_tomorrow_pre_discharge: List[Tuple[datetime, datetime, float]] = []
-        self._queued_tomorrow_discharge: List[Tuple[datetime, datetime, float]] = []
+        # Schedule state is owned by ScheduleCoordinator (self._schedule).
+        # Property proxies below delegate to it for backward compatibility.
 
         # Command queue for managing multiple concurrent commands
         self._command_queue = CommandQueue(self.logger)
@@ -243,6 +436,9 @@ class GrowattController(BaseModule):
             self.logger.warning(
                 f"Invalid Growatt log level '{self.config.log_level}', using DETAIL"
             )
+
+        # Schedule coordinator (owns schedule state and price logging)
+        self._schedule = ScheduleCoordinator(self.logger, self._log_level)
 
         # Pre-register MQTT subscriptions before connection
         # This ensures subscriptions are active before the message loop starts
@@ -259,36 +455,144 @@ class GrowattController(BaseModule):
         """Check if we should log at given level."""
         return self._log_level >= level
 
+    # ── Property proxies delegating schedule state to ScheduleCoordinator ──
+
+    @property
+    def _cheapest_charging_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.cheapest_charging_blocks_today
+
+    @_cheapest_charging_blocks_today.setter
+    def _cheapest_charging_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.cheapest_charging_blocks_today = value
+
+    @property
+    def _cheapest_charging_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.cheapest_charging_blocks_tomorrow
+
+    @_cheapest_charging_blocks_tomorrow.setter
+    def _cheapest_charging_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.cheapest_charging_blocks_tomorrow = value
+
+    @property
+    def _pre_discharge_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.pre_discharge_blocks_today
+
+    @_pre_discharge_blocks_today.setter
+    def _pre_discharge_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.pre_discharge_blocks_today = value
+
+    @property
+    def _pre_discharge_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.pre_discharge_blocks_tomorrow
+
+    @_pre_discharge_blocks_tomorrow.setter
+    def _pre_discharge_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.pre_discharge_blocks_tomorrow = value
+
+    @property
+    def _discharge_periods_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.discharge_periods_today
+
+    @_discharge_periods_today.setter
+    def _discharge_periods_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.discharge_periods_today = value
+
+    @property
+    def _discharge_periods_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.discharge_periods_tomorrow
+
+    @_discharge_periods_tomorrow.setter
+    def _discharge_periods_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.discharge_periods_tomorrow = value
+
+    @property
+    def _sell_production_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.sell_production_blocks_today
+
+    @_sell_production_blocks_today.setter
+    def _sell_production_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.sell_production_blocks_today = value
+
+    @property
+    def _sell_production_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.sell_production_blocks_tomorrow
+
+    @_sell_production_blocks_tomorrow.setter
+    def _sell_production_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.sell_production_blocks_tomorrow = value
+
+    @property
+    def _hold_blocks_today(self) -> Set[Tuple[str, str]]:
+        return self._schedule.hold_blocks_today
+
+    @_hold_blocks_today.setter
+    def _hold_blocks_today(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.hold_blocks_today = value
+
+    @property
+    def _hold_blocks_tomorrow(self) -> Set[Tuple[str, str]]:
+        return self._schedule.hold_blocks_tomorrow
+
+    @_hold_blocks_tomorrow.setter
+    def _hold_blocks_tomorrow(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.hold_blocks_tomorrow = value
+
+    @property
+    def _combined_charging_blocks(self) -> Set[Tuple[str, str]]:
+        return self._schedule.combined_charging_blocks
+
+    @_combined_charging_blocks.setter
+    def _combined_charging_blocks(self, value: Set[Tuple[str, str]]) -> None:
+        self._schedule.combined_charging_blocks = value
+
+    @property
+    def _queued_tomorrow_charging(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_charging
+
+    @_queued_tomorrow_charging.setter
+    def _queued_tomorrow_charging(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_charging = value
+
+    @property
+    def _queued_tomorrow_pre_discharge(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_pre_discharge
+
+    @_queued_tomorrow_pre_discharge.setter
+    def _queued_tomorrow_pre_discharge(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_pre_discharge = value
+
+    @property
+    def _queued_tomorrow_discharge(self) -> List[Tuple[datetime, datetime, float]]:
+        return self._schedule.queued_tomorrow_discharge
+
+    @_queued_tomorrow_discharge.setter
+    def _queued_tomorrow_discharge(self, value: List[Tuple[datetime, datetime, float]]) -> None:
+        self._schedule.queued_tomorrow_discharge = value
+
+    @property
+    def _defer_charging_to_tomorrow(self) -> bool:
+        return self._schedule.defer_charging_to_tomorrow
+
+    @_defer_charging_to_tomorrow.setter
+    def _defer_charging_to_tomorrow(self, value: bool) -> None:
+        self._schedule.defer_charging_to_tomorrow = value
+
+    @property
+    def _tomorrow_cheaper_by(self) -> Optional[float]:
+        return self._schedule.tomorrow_cheaper_by
+
+    @_tomorrow_cheaper_by.setter
+    def _tomorrow_cheaper_by(self, value: Optional[float]) -> None:
+        self._schedule.tomorrow_cheaper_by = value
+
+    # ── Delegated methods ──
+
     def _format_price_summary(
         self,
         blocks: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float
     ) -> str:
-        """Format a compact price summary for DETAIL level logging."""
-        if not blocks:
-            return "No blocks"
-
-        prices_czk = [p * eur_czk_rate / 1000 for _, _, p in blocks]
-        min_price = min(prices_czk)
-        max_price = max(prices_czk)
-        avg_price = sum(prices_czk) / len(prices_czk)
-
-        # Group consecutive blocks for compact display
-        groups = self._group_consecutive_blocks_datetime(blocks)
-
-        if len(groups) == 1:
-            group = groups[0]
-            start = group[0][0]
-            end = group[-1][1]
-            return (
-                f"{start.strftime('%H:%M')}-{end.strftime('%H:%M')} "
-                f"({len(blocks)} blocks, avg {avg_price:.2f} CZK/kWh)"
-            )
-        else:
-            return (
-                f"{len(blocks)} blocks in {len(groups)} periods, "
-                f"avg {avg_price:.2f} CZK/kWh (min {min_price:.2f}, max {max_price:.2f})"
-            )
+        """Format a compact price summary. Delegates to ScheduleCoordinator."""
+        return self._schedule.format_price_summary(blocks)
 
     def _log_compact_schedule(
         self,
@@ -296,26 +600,11 @@ class GrowattController(BaseModule):
         charging_tomorrow: List[Tuple[datetime, datetime, float]],
         discharge_today: List[Tuple[datetime, datetime, float]],
         discharge_tomorrow: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float
     ) -> None:
-        """Log compact schedule summary for DETAIL level."""
-        self.logger.info("📊 Schedule Summary:")
-
-        if charging_today:
-            summary = self._format_price_summary(charging_today, eur_czk_rate)
-            self.logger.info(f"  🔋 Charging today: {summary}")
-
-        if charging_tomorrow:
-            summary = self._format_price_summary(charging_tomorrow, eur_czk_rate)
-            self.logger.info(f"  🔋 Charging tomorrow: {summary}")
-
-        if discharge_today:
-            summary = self._format_price_summary(discharge_today, eur_czk_rate)
-            self.logger.info(f"  ⚡ Discharge today: {summary}")
-
-        if discharge_tomorrow:
-            summary = self._format_price_summary(discharge_tomorrow, eur_czk_rate)
-            self.logger.info(f"  ⚡ Discharge tomorrow: {summary}")
+        """Log compact schedule summary. Delegates to ScheduleCoordinator."""
+        self._schedule.log_compact_schedule(
+            charging_today, charging_tomorrow, discharge_today, discharge_tomorrow
+        )
 
     async def _log_periodic_summary(self) -> None:
         """Log a periodic summary of the current state and statistics.
@@ -340,16 +629,14 @@ class GrowattController(BaseModule):
         # Battery status
         summary_parts.append(f"Battery: {self._battery_soc:.0f}%")
 
-        # Current price
-        time_str = f"{current_hour:02d}:{current_minute:02d}"
-        end_minute = (current_minute + 15) % 60
-        end_hour = current_hour if end_minute > current_minute else (current_hour + 1) % 24
-        end_str = f"{end_hour:02d}:{end_minute:02d}"
-        block_key = (time_str, end_str)
+        # Current price — use the shared block-key helper so the last block of
+        # the day (23:45) resolves with the '24:00' sentinel and matches.
+        from datetime import timedelta as _td
+        _start = now.replace(minute=(current_minute // 15) * 15, second=0, microsecond=0)
+        block_key = _block_key(_start, _start + _td(minutes=15))
 
         if block_key in self._current_prices:
-            price_eur = self._current_prices[block_key]
-            price_czk = price_eur * (self._eur_czk_rate or 25.0) / 1000
+            price_czk = self._current_prices[block_key]
             summary_parts.append(f"Price: {price_czk:.2f} CZK/kWh")
 
         # Command statistics
@@ -507,7 +794,7 @@ class GrowattController(BaseModule):
                     self._mode_manager.get_battery_first_slots()
                     if hasattr(self, '_mode_manager') else {}
                 ),
-                "grid_first": {}  # No longer tracking grid-first slots
+                "grid_first": {}  # Grid-first slots are not tracked
             }
 
         state = {}
@@ -656,11 +943,6 @@ class GrowattController(BaseModule):
             self.logger.debug(f"🔍 DEBUG _to_device_hhmm: Converted {s!r} to {result!r}")
         return result
 
-    async def _set_mode(self, mode: str, *args: Any) -> None:
-        """Set the inverter mode (thin dispatcher to individual setters)."""
-        # These direct calls are no longer used - decision engine handles modes
-        pass
-
     def _get_local_date_string(self, days_ahead: int = 1) -> str:
         """Get date string in local timezone for API calls."""
         local_date = self._get_local_now() + timedelta(days=days_ahead)
@@ -698,7 +980,7 @@ class GrowattController(BaseModule):
         enabling true global optimization across day boundaries.
 
         Returns:
-            List of (start_datetime, end_datetime, price_eur) sorted chronologically
+            List of (start_datetime, end_datetime, price_czk) sorted chronologically
             Empty list if no price data available
         """
         now = self._get_local_now()
@@ -767,244 +1049,54 @@ class GrowattController(BaseModule):
     def _group_consecutive_blocks_datetime(
         self, blocks: List[Tuple[datetime, datetime, float]]
     ) -> List[List[Tuple[datetime, datetime, float]]]:
-        """Group consecutive datetime-based blocks into periods.
-
-        Args:
-            blocks: List of (start_dt, end_dt, price) tuples
-
-        Returns:
-            List of groups, where each group is a list of consecutive blocks
-        """
-        if not blocks:
-            return []
-
-        # Sort by start time
-        sorted_blocks = sorted(blocks, key=lambda x: x[0])
-
-        groups: List[List[Tuple[datetime, datetime, float]]] = []
-        current_group = [sorted_blocks[0]]
-
-        for i in range(1, len(sorted_blocks)):
-            prev_end = current_group[-1][1]
-            curr_start = sorted_blocks[i][0]
-
-            # Check if consecutive (end of prev equals start of current)
-            if prev_end == curr_start:
-                current_group.append(sorted_blocks[i])
-            else:
-                # Gap found - save current group and start new one
-                groups.append(current_group)
-                current_group = [sorted_blocks[i]]
-
-        # Add the last group
-        groups.append(current_group)
-
-        return groups
+        """Group consecutive blocks. Delegates to ScheduleCoordinator."""
+        return ScheduleCoordinator.group_consecutive_blocks(blocks)
 
     async def _log_cross_day_price_table(
-        self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float,
+        self, window: List[Tuple[datetime, datetime, float]],
         force_display: bool = False
     ) -> None:
-        """Log comprehensive cross-day price table showing all available blocks.
-
-        Displays a compact table with visual markers for each block's treatment:
-        - 🔋 = Regular charging block
-        - 🔌 = Pre-discharge charging block
-        - ⚡ = Discharge block
-        - (blank) = No special action
-
-        Args:
-            window: List of (start_dt, end_dt, price_eur) covering available price window
-            eur_czk_rate: Exchange rate for EUR to CZK conversion
-            force_display: If True, always show table regardless of log level (for startup)
-        """
-        if not window:
-            return
-
-        # When force_display, re-fetch window with past blocks included
+        """Log cross-day price table. Delegates to ScheduleCoordinator."""
+        # Provide full_window when force_display needs past blocks
+        full_window = None
         if force_display:
-            full_window = self._get_combined_price_window(include_past=True)
-            if full_window:
-                window = full_window
+            full_window = self._get_combined_price_window(include_past=True) or None
 
-        # Only show full table at VERBOSE level (unless forced for startup)
-        if not force_display and not self._should_log(GrowattLogLevel.VERBOSE):
-            # At DETAIL level, just show a summary
-            if self._should_log(GrowattLogLevel.DETAIL):
-                all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
-                min_price = min(all_prices_czk)
-                max_price = max(all_prices_czk)
-                avg_price = sum(all_prices_czk) / len(all_prices_czk)
-
-                self.logger.info(
-                    f"📊 Price summary ({len(window)} blocks): "
-                    f"Min={min_price:.2f} CZK/kWh, Max={max_price:.2f} CZK/kWh, "
-                    f"Avg={avg_price:.2f} CZK/kWh"
-                )
-            return
-
-        now = self._get_local_now()
-        today = now.date()
-
-        # Create lookup sets for fast classification
-        charging_today = self._cheapest_charging_blocks_today
-        charging_tomorrow = self._cheapest_charging_blocks_tomorrow
-        pre_discharge_today = self._pre_discharge_blocks_today
-        pre_discharge_tomorrow = self._pre_discharge_blocks_tomorrow
-        discharge_today = self._discharge_periods_today
-        discharge_tomorrow = self._discharge_periods_tomorrow
-
-        self.logger.info("")
-        self.logger.info("=" * 70)
-        self.logger.info("📊 COMPREHENSIVE PRICE TABLE (entire available window)")
-        self.logger.info("=" * 70)
-
-        # Group blocks by date
-        today_blocks = [(s, e, p) for s, e, p in window if s.date() == today]
-        tomorrow_blocks = [(s, e, p) for s, e, p in window if s.date() > today]
-
-        # Display today's prices (if any remaining)
-        if today_blocks:
-            self._log_price_table_for_date(
-                today_blocks,
-                today,
-                eur_czk_rate,
-                charging_today,
-                pre_discharge_today,
-                discharge_today,
-                "TODAY"
-            )
-
-        # Display tomorrow's prices (if available)
-        if tomorrow_blocks:
-            tomorrow_date = tomorrow_blocks[0][0].date()
-            self._log_price_table_for_date(
-                tomorrow_blocks,
-                tomorrow_date,
-                eur_czk_rate,
-                charging_tomorrow,
-                pre_discharge_tomorrow,
-                discharge_tomorrow,
-                "TOMORROW"
-            )
-
-        # Display legend
-        self.logger.info("")
-        legend_items = []
-        if charging_today or charging_tomorrow:
-            legend_items.append("🔋=Regular charge")
-        if pre_discharge_today or pre_discharge_tomorrow:
-            legend_items.append("🔌=Pre-discharge charge")
-        if discharge_today or discharge_tomorrow:
-            legend_items.append("⚡=Discharge")
-        if legend_items:
-            self.logger.info(f"Legend: {', '.join(legend_items)}")
-
-        # Display summary statistics across entire window
-        all_prices_czk = [p * eur_czk_rate / 1000 for _, _, p in window]
-        min_price = min(all_prices_czk)
-        max_price = max(all_prices_czk)
-        avg_price = sum(all_prices_czk) / len(all_prices_czk)
-
-        self.logger.info(
-            f"Window summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
-            f"Avg={avg_price:.3f} CZK/kWh"
+        self._schedule.log_cross_day_price_table(
+            window,
+            force_display=force_display,
+            now=self._get_local_now(),
+            full_window=full_window,
+            has_optimizer=self._optimizer is not None,
         )
-        self.logger.info("=" * 70)
 
     def _log_price_table_for_date(
         self,
         blocks: List[Tuple[datetime, datetime, float]],
         date: date_type,
-        eur_czk_rate: float,
         charging_blocks: Set[Tuple[str, str]],
         pre_discharge_blocks: Set[Tuple[str, str]],
         discharge_blocks: Set[Tuple[str, str]],
-        title: str
+        title: str,
     ) -> None:
-        """Log price table for a single date in 4-column format.
-
-        Args:
-            blocks: List of (start_dt, end_dt, price_eur) for this date
-            date: Date being displayed
-            eur_czk_rate: Exchange rate
-            charging_blocks: Set of (start_str, end_str) for charging
-            pre_discharge_blocks: Set of (start_str, end_str) for pre-discharge
-            discharge_blocks: Set of (start_str, end_str) for discharge
-            title: Title to display for this table
-        """
-        self.logger.info("")
-        self.logger.info(f"--- {title} ({date.strftime('%Y-%m-%d')}) ---")
-        self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
-        self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
-        self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
-
-        # Create a dict for fast lookup by time string
-        block_dict = {}
-        for start_dt, end_dt, price in blocks:
-            start_str = start_dt.strftime("%H:%M")
-            end_str = end_dt.strftime("%H:%M")
-            block_dict[(start_str, end_str)] = price
-
-        # Process by hour (4 blocks per hour)
-        # Determine hour range from actual blocks
-        if blocks:
-            start_hour = blocks[0][0].hour
-            end_hour = blocks[-1][0].hour
-
-            for hour in range(start_hour, end_hour + 1):
-                row_prices = []
-
-                # Process 4 quarter-hour blocks
-                for quarter in range(4):
-                    minute = quarter * 15
-                    next_minute = (quarter + 1) * 15
-
-                    start_str = f"{hour:02d}:{minute:02d}"
-                    if next_minute < 60:
-                        end_str = f"{hour:02d}:{next_minute:02d}"
-                    else:
-                        end_str = f"{(hour + 1) % 24:02d}:00"
-
-                    # Find matching block
-                    block_key = (start_str, end_str)
-                    if block_key in block_dict:
-                        price_eur = block_dict[block_key]
-                        price_czk = price_eur * eur_czk_rate / 1000
-
-                        # Determine marker
-                        if block_key in pre_discharge_blocks:
-                            marker = "🔌"
-                        elif block_key in charging_blocks:
-                            marker = "🔋"
-                        elif block_key in discharge_blocks:
-                            marker = "⚡"
-                        else:
-                            marker = " "
-
-                        row_prices.append(f"{price_czk:5.2f}{marker}")
-                    else:
-                        row_prices.append("   -   ")
-
-                # Pad if we don't have all 4 blocks
-                while len(row_prices) < 4:
-                    row_prices.append("   -   ")
-
-                self.logger.info(
-                    f"│ {hour:02d}:00   │ {row_prices[0]} │ {row_prices[1]} │ "
-                    f"{row_prices[2]} │ {row_prices[3]} │"
-                )
-
-        self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
+        """Log price table for a single date. Delegates to ScheduleCoordinator."""
+        self._schedule.log_price_table_for_date(
+            blocks, date, charging_blocks, pre_discharge_blocks, discharge_blocks, title
+        )
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
-        # Check cache first (refresh once per day)
+        # Check cache first. A successfully parsed rate is cached for 24h; a
+        # FALLBACK (CNB unreachable / unparseable) is cached only ~10 min so a
+        # transient outage — e.g. CNB unreachable right after a NAS restart while
+        # the network settles — is retried within minutes instead of pinning the
+        # flat 25.0 rate (and skewing every CZK/kWh conversion) for a full day.
         now = self._get_local_now()
+        ttl = 600 if getattr(self, "_eur_czk_rate_is_fallback", False) else 86400
         if (
             self._eur_czk_rate is not None
             and self._eur_czk_rate_updated is not None
-            and (now - self._eur_czk_rate_updated).total_seconds() < 86400  # 24 hours
+            and (now - self._eur_czk_rate_updated).total_seconds() < ttl
         ):
             return self._eur_czk_rate
 
@@ -1024,9 +1116,11 @@ class GrowattController(BaseModule):
                         fallback = float(
                             self._optional_config.get("eur_czk_rate", 25.0)
                         )
-                        # Cache the fallback to avoid repeated API calls
+                        # Cache the fallback briefly (see TTL above) to avoid
+                        # hammering CNB while still retrying within minutes.
                         self._eur_czk_rate = fallback
                         self._eur_czk_rate_updated = now
+                        self._eur_czk_rate_is_fallback = True
                         return fallback
 
                     # Read raw bytes and try different encodings
@@ -1050,9 +1144,10 @@ class GrowattController(BaseModule):
                         if rate <= 0:
                             raise ValueError(f"Invalid EUR/CZK rate from CNB: {rate}")
 
-                        # Cache the rate
+                        # Cache the parsed rate for the full 24h.
                         self._eur_czk_rate = rate
                         self._eur_czk_rate_updated = now
+                        self._eur_czk_rate_is_fallback = False
 
                         self.logger.info(f"Updated EUR/CZK exchange rate: {rate:.3f}")
                         return rate
@@ -1060,18 +1155,20 @@ class GrowattController(BaseModule):
             self.logger.warning("EUR not found in CNB exchange rate data")
             # Return default fallback (25 CZK per EUR is typical)
             fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
-            # Cache the fallback to avoid repeated API calls
+            # Cache the fallback briefly (short TTL) so we retry soon.
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
+            self._eur_czk_rate_is_fallback = True
             return fallback
 
         except Exception as e:
             self.logger.error(f"Error fetching EUR/CZK exchange rate: {e}")
             # Return default fallback (25 CZK per EUR is typical)
             fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
-            # Cache the fallback to avoid repeated API calls on errors
+            # Cache the fallback briefly (short TTL) so we retry soon.
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
+            self._eur_czk_rate_is_fallback = True
             return fallback
 
     async def _get_inverter_time(self) -> Optional[datetime]:
@@ -1277,8 +1374,27 @@ class GrowattController(BaseModule):
                 minutes=total_buffer
             )
 
-            # Keep the original stop time (should be 23:59 for all-day modes)
+            # Keep the original stop time (should be 23:59 for all-day modes).
             adjusted_stop_dt = stop_dt
+            # Near midnight the future-shifted start can reach/pass the stop,
+            # which would emit an invalid start>=stop slot. _fmt emits only HH:MM
+            # (no day), so pushing the stop to the next day would render identical
+            # to the start (degenerate). Clamp the stop to 23:59 of the start's
+            # day, and if the start is itself in the final minute(s), snap it back
+            # to 23:58 so start<stop always holds within HH:MM.
+            if adjusted_start_dt >= adjusted_stop_dt:
+                end_of_day = adjusted_start_dt.replace(
+                    hour=23, minute=59, second=0, microsecond=0
+                )
+                if adjusted_start_dt >= end_of_day:
+                    adjusted_start_dt = adjusted_start_dt.replace(
+                        hour=23, minute=58, second=0, microsecond=0
+                    )
+                adjusted_stop_dt = end_of_day
+                self.logger.warning(
+                    f"Immediate-activation start crossed the stop time; clamped to "
+                    f"{_fmt(adjusted_start_dt)}-{_fmt(adjusted_stop_dt)}"
+                )
 
             direction = 'behind' if self._clock_drift_seconds > 0 else 'ahead'
             skew_desc = (
@@ -1302,6 +1418,14 @@ class GrowattController(BaseModule):
                 adjusted_stop_dt = adjusted_start_dt + duration
             else:
                 adjusted_stop_dt = stop_dt  # keep original stop
+
+            # Prevent a collapsed window: if bumping the start to the future
+            # collided with the stop (same HH:MM, e.g. near a 23:59 boundary),
+            # snap the start back one minute so the window stays non-empty. A
+            # collapsed start==stop would make the mode setters skip actuation
+            # and desync tracked vs hardware.
+            if _fmt(adjusted_start_dt) == _fmt(adjusted_stop_dt):
+                adjusted_start_dt = adjusted_stop_dt - timedelta(minutes=1)
 
             msg = (
                 f"Adjusting start time from {start_str} to {_fmt(adjusted_start_dt)} "
@@ -1384,111 +1508,118 @@ class GrowattController(BaseModule):
         self._season_mode_updated = now
         return self._season_mode
 
-    async def _log_price_table(
-        self, prices_15min: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
-    ) -> None:
-        """Log 15-minute interval prices in a compact table format."""
-        # Use provided rate for consistency
+    async def _fetch_recent_hourly_temps(self) -> Dict[int, float]:
+        """Fetch hourly outdoor temperatures from the last 24 hours.
 
-        self.logger.info(f"Energy prices for {date} (15-minute intervals):")
+        Returns a dict {hour_of_day: temperature_celsius} that can be used as
+        a proxy for the next 24h forecast — diurnal patterns repeat reliably
+        enough day-to-day for the consumption model's coarse temp bins. Empty
+        dict on error or no data; caller should fall back to base_load_profile.
+        """
+        if not self.influxdb_client:
+            return {}
+        try:
+            query = f'''
+from(bucket: "{self.settings.influxdb.bucket_loxone}")
+  |> range(start: -24h)
+  |> filter(fn: (r) => r._measurement == "temperature")
+  |> filter(fn: (r) => r._field == "temperature_outside")
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
+'''
+            result = await self.influxdb_client.query(query)
+            temps: Dict[int, float] = {}
+            for table in result:
+                for record in table.records:
+                    # Bucket on the LOCAL hour: both the binned and ML
+                    # consumption models train on local-hour bins (their
+                    # _to_local fix), and predict_hourly is queried by local
+                    # hour. Keying these temps in UTC would shift each hour's
+                    # temperature by the UTC offset (1-2h) vs. the model's bins.
+                    t = record.get_time()
+                    if getattr(t, "tzinfo", None) is not None:
+                        t = t.astimezone(self._local_tz)
+                    hour = t.hour
+                    val = record.get_value()
+                    if isinstance(val, (int, float)):
+                        # Last reading wins per hour (more recent = more relevant)
+                        temps[hour] = float(val)
+            return temps
+        except Exception as e:
+            self.logger.debug(f"Could not fetch hourly outdoor temps: {e}")
+            return {}
 
-        # If we have 96 blocks, show in compact 4-column format (one per quarter-hour)
-        if len(prices_15min) >= 90:
-            # Sort blocks by time
-            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
+    def _stash_forecast_temps(self, weather_hours: List[Dict[str, Any]]) -> None:
+        """Cache OpenMeteo hourly forecast temperatures per (local date, hour).
 
-            self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
-            self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
-            self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
+        The OpenMeteo request in _update_solar_forecast uses timezone=auto, so
+        the "time" strings are already local wall-clock ("2026-06-12T14:00").
+        """
+        by_date: Dict[Any, Dict[int, float]] = {}
+        for wh in weather_hours:
+            # Per-entry tolerance: one malformed entry must not discard the
+            # whole 48h stash (tomorrow would silently fall back to
+            # yesterday's actual temps).
+            try:
+                ts = datetime.fromisoformat(str(wh.get("time", "")))
+                # Prefer the raw (un-defaulted) temperature: a missing
+                # OpenMeteo value must be SKIPPED here, not stashed as the
+                # 15 °C sentinel — _temps_for_date would let it override a
+                # real measured temperature for that hour.
+                if "temperature_2m_raw" in wh:
+                    temp = wh["temperature_2m_raw"]
+                else:
+                    temp = wh.get("temperature_2m")
+                if isinstance(temp, (int, float)):
+                    by_date.setdefault(ts.date(), {})[ts.hour] = float(temp)
+            except (ValueError, TypeError):
+                continue
+        if by_date:
+            self._forecast_temps_by_date = by_date
+            self._forecast_temps_fetched_at = datetime.now(self._local_tz)
 
-            # Process 4 blocks at a time (one hour)
-            for hour in range(24):
-                hour_blocks = sorted_blocks[hour * 4:(hour + 1) * 4]
-                if len(hour_blocks) < 4:
-                    break
+    def _temps_for_date(
+        self, target_date: Any, recent_temps: Dict[int, float]
+    ) -> Dict[int, float]:
+        """Best available {hour: °C} for `target_date`.
 
-                # Get prices for each 15-minute block in CZK/kWh
-                prices = []
-                for (start, end), price_eur in hour_blocks:
-                    price_czk = price_eur * eur_czk_rate / 1000
-                    # Mark blocks: 🔋=regular charge, 🔌=pre-discharge charge, ⚡=discharge
-                    if (hasattr(self, '_pre_discharge_blocks') and
-                            (start, end) in self._pre_discharge_blocks):
-                        prices.append(f"{price_czk:5.2f}🔌")
-                    elif (start, end) in self._cheapest_charging_blocks:
-                        prices.append(f"{price_czk:5.2f}🔋")
-                    elif (hasattr(self, '_discharge_periods') and
-                          (start, end) in self._discharge_periods):
-                        prices.append(f"{price_czk:5.2f}⚡")
-                    else:
-                        prices.append(f"{price_czk:6.2f} ")
-
-                # Pad if we don't have all 4 blocks
-                while len(prices) < 4:
-                    prices.append("   -   ")
-
-                self.logger.info(
-                    f"│ {hour:02d}:00   │ {prices[0]} │ {prices[1]} │ {prices[2]} │ {prices[3]} │"
-                )
-
-            self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
-
-            # Show legend
-            legend_items = []
-            if self._cheapest_charging_blocks:
-                legend_items.append("🔋=Charge")
-            if hasattr(self, '_pre_discharge_blocks') and self._pre_discharge_blocks:
-                legend_items.append("🔌=Pre-discharge")
-            if hasattr(self, '_discharge_periods') and self._discharge_periods:
-                legend_items.append("⚡=Discharge")
-            if legend_items:
-                self.logger.info(f"Legend: {', '.join(legend_items)}")
-
-            # Show summary statistics
-            all_prices = list(prices_15min.values())
-            min_price = min(all_prices) * eur_czk_rate / 1000
-            max_price = max(all_prices) * eur_czk_rate / 1000
-            avg_price = sum(all_prices) / len(all_prices) * eur_czk_rate / 1000
-
-            self.logger.info(
-                f"Summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
-                f"Avg={avg_price:.3f} CZK/kWh"
-            )
-        else:
-            # Fallback for fewer blocks - show as list
-            self.logger.info("┌──────────────┬────────────┬──────────────┐")
-            self.logger.info("│   Period     │ EUR/MWh    │   CZK/kWh    │")
-            self.logger.info("├──────────────┼────────────┼──────────────┤")
-
-            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
-            for (start, end), price_eur_mwh in sorted_blocks:
-                price_czk_kwh = price_eur_mwh * eur_czk_rate / 1000
-                period = f"{start}-{end}"
-                self.logger.info(
-                    f"│ {period:12s} │ {price_eur_mwh:8.2f}   │   {price_czk_kwh:7.3f}    │"
-                )
-
-            self.logger.info("└──────────────┴────────────┴──────────────┘")
+        Forecast temps (when fresh, <12h old) win over the recent-actuals
+        proxy — yesterday's temperatures are systematically wrong for
+        tomorrow on weather-change days, which are exactly the days where
+        heating-driven consumption (and thus reserve sizing) matters most.
+        Recent actuals fill any hours the forecast is missing.
+        """
+        merged = dict(recent_temps)
+        fetched_at = self._forecast_temps_fetched_at
+        if fetched_at is not None and (
+            datetime.now(self._local_tz) - fetched_at
+        ) < timedelta(hours=12):
+            merged.update(self._forecast_temps_by_date.get(target_date, {}))
+        return merged
 
     async def start(self) -> None:
-        """Start the Growatt controller."""
+        """Start the Growatt controller.
+
+        Designed for fast startup: fetches prices and SOC, starts the periodic
+        evaluation loop immediately, then builds ML models in the background.
+        Models improve optimizer quality but aren't needed for basic operation.
+        """
         self._running = True
 
         # Note: MQTT subscriptions are pre-registered in __init__ to ensure they're
         # active before the message loop starts (avoids asyncio-mqtt race conditions)
+
+        # === PHASE 1: Quick startup (seconds) ===
 
         # Sync inverter time on startup
         self.logger.info("Checking inverter time synchronization...")
         await self._sync_inverter_time()
 
         # Check if we should fetch tomorrow's prices at startup
-        # (if we're past the configured fetch hour and haven't fetched yet)
         now = self._get_local_now()
         fetch_hour = self.config.price_fetch_hour
         will_fetch_tomorrow = now.hour >= fetch_hour and not self._next_day_prices_fetched
 
-        # Fetch initial prices (suppress schedule print if we're about to fetch tomorrow's)
-        # Always show full table at startup
+        # Fetch initial prices (needed for mode decisions)
         await self._fetch_prices(
             suppress_schedule_print=will_fetch_tomorrow,
             force_table_display=True
@@ -1503,13 +1634,242 @@ class GrowattController(BaseModule):
                 self._fetch_next_day_prices_task()
             )
 
-        # Start periodic evaluation loop
-        self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
+        # Initialize battery SOC from InfluxDB (quick query, last value only)
+        if self.influxdb_client:
+            try:
+                soc_query = f'''
+from(bucket: "{self.settings.influxdb.bucket_solar}")
+  |> range(start: -1h)
+  |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
+  |> last()
+'''
+                soc_result = await self.influxdb_client.query(soc_query)
+                if soc_result:
+                    for table in soc_result:
+                        for record in table.records:
+                            val = record.get_value()
+                            if isinstance(val, (int, float)) and 0 <= val <= 100:
+                                self._battery_soc = float(val)
+                                self._last_battery_soc = float(val)
+                                self.logger.info(
+                                    f"🔋 Initial battery SOC from InfluxDB: {val:.0f}%"
+                                )
+            except Exception as e:
+                self.logger.debug(f"Could not load initial SOC: {e}")
 
-        # Perform initial evaluation
+        # Restore delivered deferrable-load blocks so a restart mid delivery-cycle
+        # doesn't re-schedule already-delivered energy (no-op unless configured).
+        await self._reload_deferrable_completed()
+
+        # === PHASE 2: Go operational (controller responds to events) ===
+
+        # Start periodic evaluation loop BEFORE model builds
+        # Controller is now operational with price data + SOC
+        self._periodic_check_task = asyncio.create_task(self._periodic_evaluation_loop())
+        # Poll EV charging from InfluxDB (high-load protection — EV isn't in the
+        # MQTT cache). Heating stays event-driven via _on_home_status.
+        self._high_load_poll_task = asyncio.create_task(self._high_load_poll_loop())
+        # Supervise BOTH long-lived loops: if either dies with an exception
+        # (outside its own per-iteration try/except), log loudly and restart —
+        # otherwise the controller would silently stop evaluating, or stop polling
+        # EV high-load state (degrading discharge protection), while the process
+        # still looks healthy.
+        self._periodic_check_task.add_done_callback(
+            self._make_task_guard("periodic_evaluation", self._periodic_evaluation_loop)
+        )
+        self._high_load_poll_task.add_done_callback(
+            self._make_task_guard("high_load_poll", self._high_load_poll_loop)
+        )
+
+        # Perform initial evaluation (mode decision with available data)
         await self._evaluate_conditions("startup")
 
         self.logger.info("Growatt controller started with event-driven evaluation")
+
+        # === PHASE 3: Build models in background (minutes) ===
+        # Models improve optimizer quality but aren't needed for basic operation.
+        # Keep a strong reference: the event loop only holds a weak ref, so an
+        # un-stored task can be GC'd mid-run (these are long InfluxDB queries).
+        # stop() cancels it so a late-finishing build can't re-issue inverter
+        # commands after safe-shutdown or touch a disconnected client.
+        self._models_task = asyncio.create_task(self._build_models_background())
+        # One-shot: just surface a crash (no restart — a failed build degrades to
+        # the existing/binned models, which is handled inside the builder).
+        self._models_task.add_done_callback(self._make_task_guard("model_builds", None))
+
+    def _make_task_guard(self, name: str, restart):
+        """Done-callback factory for long-lived background tasks: log loudly on an
+        unexpected death and, if `restart` is given and we're still running,
+        recreate the task (with the same guard) so a transient crash can't leave
+        the controller silently brain-dead."""
+        def _cb(task: "asyncio.Task[Any]") -> None:
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc is None:
+                return
+            self.logger.error(
+                f"Background task '{name}' died: {exc!r}", exc_info=exc
+            )
+            if restart is not None and self._running:
+                self.logger.warning(f"Restarting background task '{name}'")
+                new_task = asyncio.create_task(restart())
+                new_task.add_done_callback(self._make_task_guard(name, restart))
+                # Re-point the strong reference so stop() can still cancel the
+                # restarted task (the event loop only holds a weak ref).
+                if name == "periodic_evaluation":
+                    self._periodic_check_task = new_task
+                elif name == "high_load_poll":
+                    self._high_load_poll_task = new_task
+        return _cb
+
+    async def _rebuild_solar_model_background(self) -> None:
+        """Periodic (weekly, or hourly while modelless) solar model rebuild.
+
+        Runs as a background task so the heavy ~730-day InfluxDB queries
+        never stall the 60s evaluation loop; the trigger in
+        _periodic_evaluation_loop gates on `_models_task.done()` so builds
+        can't overlap (incl. the startup build).
+        """
+        if not self._solar_forecast:
+            return
+        try:
+            success = await self._solar_forecast.build_production_model(
+                self.influxdb_client, self.settings, local_tz=self._local_tz
+            )
+            if success and self._solar_forecast._production_model:
+                self._solar_model_built_at = datetime.now(self._local_tz)
+            self.logger.info(
+                f"Periodic solar production model rebuild: "
+                f"{'ok' if success else 'declined'}"
+            )
+        except Exception as e:
+            self.logger.warning(f"Periodic solar model rebuild failed: {e}")
+
+    async def _maybe_snapshot_expected_gain(self, now) -> None:
+        """Once per day, record the optimizer's expected full-day gain so the
+        dashboard's weekly/monthly stats can show predicted-vs-realized savings.
+
+        Captured at the first eval of each local day that has a plan — early, so
+        it reflects the morning full-day projection (realized-so-far + remaining
+        plan). Persisted to economics_snapshots.json on the config_state volume
+        so the prediction history survives container restarts.
+        """
+        today = now.date()
+        if getattr(self, "_expected_snapshot_date", None) == today:
+            return
+        from modules.growatt import dashboard as _dash
+        today_str = today.strftime("%Y-%m-%d")
+        # _expected_snapshot_date is in-memory only, so a mid-day RESTART would
+        # otherwise re-enter here and overwrite today's snapshot with a recompute
+        # off a truncated (rest-of-day) plan horizon — losing the stable morning
+        # full-day projection. If today's snapshot is already persisted, adopt it
+        # and skip: the first capture of the day stands.
+        if today_str in _dash._load_expected_snapshots(self):
+            self._expected_snapshot_date = today
+            return
+        opt = getattr(self, "_optimizer", None)
+        if not opt or not getattr(opt, "_last_decisions", None):
+            return  # no plan yet — try again next tick
+        econ = await _dash._build_economics(self, opt)
+        eg = econ.get("expected_daily_gain_czk")
+        if eg is None:
+            return
+        _dash.persist_expected_snapshot(self, today.strftime("%Y-%m-%d"), eg)
+        self._expected_snapshot_date = today
+        self.logger.info(
+            f"📈 Recorded optimizer expected gain for {today}: {eg:+.1f} CZK"
+        )
+
+    async def _build_models_background(self) -> None:
+        """Build ML models in background without blocking controller operation.
+
+        Queries InfluxDB for historical data (730 days solar, 365 days consumption,
+        90 days base load). When complete, recalculates the schedule with better data.
+        """
+        try:
+            self.logger.info("Starting background model builds...")
+
+            # Solar production model (730 days, ~10 InfluxDB queries)
+            if self._solar_forecast:
+                try:
+                    self._solar_model_attempted_at = datetime.now(self._local_tz)
+                    success = await self._solar_forecast.build_production_model(
+                        self.influxdb_client, self.settings, local_tz=self._local_tz
+                    )
+                    if success and self._solar_forecast._production_model:
+                        self._solar_model_built_at = datetime.now(self._local_tz)
+                        m = self._solar_forecast._production_model
+                        self.logger.info(
+                            f"Solar production model ready: {m.data_points} hours, "
+                            f"{m.curtailed_filtered} curtailed filtered, "
+                            f"{len(m.median_2d)} bins"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build solar production model: {e}")
+
+            # Solar forecast API
+            if self._solar_forecast:
+                try:
+                    await self._update_solar_forecast()
+                except Exception as e:
+                    self.logger.warning(f"Failed to fetch solar forecast: {e}")
+
+            # Consumption model (365 days, 2 queries)
+            if self._consumption_forecast:
+                try:
+                    success = await self._consumption_forecast.build_model(
+                        self.influxdb_client, self.settings,
+                        local_tz=self._local_tz,
+                    )
+                    if success:
+                        summary = self._consumption_forecast.get_model_summary()
+                        self.logger.info(
+                            f"📊 Consumption model ready: {summary['data_points']} data points, "
+                            f"{summary['bins']} bins, range {summary['date_range']}"
+                        )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build consumption model: {e}")
+
+            # ML consumption forecaster (skforecast AR + exog).
+            # Trained alongside the binned model so we can compare/A-B.
+            if self._ml_consumption_forecast is not None:
+                try:
+                    ok = await self._ml_consumption_forecast.build_model(
+                        self.influxdb_client, self.settings,
+                        local_tz=self._local_tz,
+                    )
+                    if not ok:
+                        self.logger.info(
+                            "ML consumption training declined (insufficient/gappy data) "
+                            "— controller will use binned model"
+                        )
+                except Exception as e:
+                    self.logger.warning(
+                        f"ML consumption training failed: {e} — using binned fallback"
+                    )
+
+            # Base load profile (90 days, 3 queries)
+            if self._optimizer:
+                try:
+                    await self._optimizer.build_base_load_profile(
+                        self.influxdb_client,
+                        self.settings.influxdb.bucket_solar,
+                        self.settings.influxdb.bucket_loxone,
+                    )
+                except Exception as e:
+                    self.logger.warning(f"Failed to build base load profile: {e}")
+
+            # Recalculate schedule with all models ready
+            if self._optimizer and self._current_prices:
+                self.logger.info("Recalculating optimizer schedule with all models ready...")
+                await self._calculate_cross_day_optimal_schedule()
+                await self._evaluate_conditions("models_ready")
+
+            self.logger.info("✅ All background models built successfully")
+
+        except Exception as e:
+            self.logger.error(f"Background model build failed: {e}", exc_info=True)
 
     async def stop(self) -> None:
         """Stop the Growatt controller."""
@@ -1526,6 +1886,25 @@ class GrowattController(BaseModule):
             except asyncio.CancelledError:
                 pass
             self._periodic_check_task = None
+
+        # Cancel EV high-load poll task
+        if self._high_load_poll_task and not self._high_load_poll_task.done():
+            self._high_load_poll_task.cancel()
+            try:
+                await self._high_load_poll_task
+            except asyncio.CancelledError:
+                pass
+            self._high_load_poll_task = None
+
+        # Cancel background model-build task (long InfluxDB queries that, if left
+        # running, could re-issue a mode evaluation after safe-shutdown).
+        if self._models_task and not self._models_task.done():
+            self._models_task.cancel()
+            try:
+                await self._models_task
+            except asyncio.CancelledError:
+                pass
+            self._models_task = None
 
         # Cancel price fetch task
         if self._price_fetch_task and not self._price_fetch_task.done():
@@ -1591,31 +1970,12 @@ class GrowattController(BaseModule):
                             self._battery_soc = float(soc_value)
                             break
 
-            # Detect high loads from the raw data
-            high_loads = self._detect_high_loads_from_status(data)
-            was_high_load = self._high_loads_active
-
-            self._high_loads_active = high_loads["active"]
-
-            # Log significant changes
-            if self._high_loads_active != was_high_load:
-                if self._high_loads_active:
-                    details = []
-                    if high_loads.get("ev_charging"):
-                        details.append(f"EV: {high_loads['ev_power']:.0f}W")
-                    if high_loads.get("heating_active"):
-                        details.append(
-                            f"Heating: {len(high_loads.get('heating_relays', []))} relays"
-                        )
-                    self.logger.debug(
-                        f"⚡ High loads detected! {', '.join(details)} - Checking if action needed"
-                    )
-                    # Handle high load start
-                    await self._handle_high_load_start()
-                else:
-                    self.logger.debug("✅ High loads cleared - Restoring scheduled operation")
-                    # Re-evaluate conditions to determine what mode to apply now
-                    await self._evaluate_conditions("high_load_cleared")
+            # Detect HEATING high-load from the MQTT payload (Loxone sends
+            # heating-relay state via UDP → it lands in this cache). EV is NOT
+            # in this payload (it comes from teslamate → InfluxDB), so it is
+            # merged in separately by _recompute_high_load_state.
+            heating = self._detect_high_loads_from_status(data)
+            await self._recompute_high_load_state(heating)
 
         except Exception as e:
             self.logger.error(f"Failed to process home status: {e}", exc_info=True)
@@ -1677,6 +2037,359 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to handle high load start: {e}", exc_info=True)
 
+    async def _recompute_high_load_state(self, heating: Dict[str, Any]) -> None:
+        """Merge HEATING (from MQTT) with EV (from InfluxDB poll) into the
+        single high-load state the decision engine gates on, and re-evaluate on
+        a transition.
+
+        `heating` is the result of _detect_high_loads_from_status (we use only
+        its heating fields; its MQTT-derived EV fields are always empty here).
+        EV comes from self._ev_high_load, refreshed by _high_load_poll_loop.
+        The whole feature is gated by high_load_protection_enabled: when off,
+        the merged state is forced inactive so nothing is ever gated.
+        """
+        enabled = getattr(self.config, "high_load_protection_enabled", True)
+        heating_active = bool(heating.get("heating_active"))
+        heating_relays = heating.get("heating_relays", []) or []
+        ev_active = bool(self._ev_high_load)
+
+        active = enabled and (heating_active or ev_active)
+        details = {
+            "active": active,
+            "ev_charging": ev_active,
+            "ev_power": self._ev_high_load_power,
+            "heating_active": heating_active,
+            "heating_relays": heating_relays,
+        }
+        was_active = self._high_loads_active
+        self._high_loads_active = active
+        self._high_load_details = details
+
+        if active == was_active:
+            return
+        if active:
+            parts = []
+            if ev_active:
+                # _ev_high_load_power is in kW (see _query_ev_charging_from_influx)
+                parts.append(f"EV: {self._ev_high_load_power:.1f}kW")
+            if heating_active:
+                parts.append(f"Heating: {len(heating_relays)} relay(s)")
+            self.logger.info(f"⚡ High loads ACTIVE ({', '.join(parts)}) — protecting battery")
+            await self._handle_high_load_start()
+        else:
+            self.logger.info("✅ High loads cleared — restoring scheduled operation")
+            await self._evaluate_conditions("high_load_cleared")
+
+    async def _query_ev_charging_from_influx(self) -> Tuple[bool, float]:
+        """Return (ev_charging_active, power_w) from InfluxDB.
+
+        EV charging is published by teslamate into the `ev` measurement of the
+        loxone bucket (fields ev_charging 0/1, ev_charging_power in **kW**). It
+        never reaches the loxone/status MQTT cache, so it must be read from
+        InfluxDB. A recent window + last() means a quiet/idle car (no rows) reads
+        as not-charging. Any error → (False, 0) so a transient query failure can
+        never wedge the battery into protection.
+
+        IMPORTANT: ev_charging is written ON CHANGE (e.g. once when charging
+        starts), so it ages out of the 30-min window during a long charge — the
+        continuously-updated ev_charging_power is the reliable signal. It is in
+        kW, so it must be converted to W before comparing to the W threshold,
+        otherwise the battery would discharge into the car mid-charge.
+        Returns power in kW.
+        """
+        if not self.influxdb_client:
+            return (False, 0.0)
+        threshold = getattr(self.config, "ev_charging_power_threshold_w", 100)
+        bucket = self.settings.influxdb.bucket_loxone
+        query = f'''
+            from(bucket: "{bucket}")
+              |> range(start: -30m)
+              |> filter(fn: (r) => r._measurement == "ev")
+              |> filter(fn: (r) => r._field == "ev_charging" or r._field == "ev_charging_power")
+              |> last()
+        '''
+        try:
+            result = await self.influxdb_client.query(query)
+            charging_flag = False
+            power = 0.0
+            for table in result:
+                for record in table.records:
+                    field = record.get_field()
+                    value = record.get_value()
+                    if value is None:
+                        continue
+                    if field == "ev_charging" and float(value) >= 1:
+                        charging_flag = True
+                    elif field == "ev_charging_power":
+                        power = float(value)  # kW
+            # power is kW; threshold is W → convert before comparing.
+            active = charging_flag or (power * 1000.0) > threshold
+            return (active, power if active else 0.0)
+        except Exception as e:
+            self.logger.warning(f"EV charging InfluxDB query failed: {e}")
+            return (False, 0.0)
+
+    async def _high_load_poll_loop(self) -> None:
+        """Periodically refresh EV high-load state from InfluxDB and re-merge.
+
+        Heating is event-driven (MQTT) but EV must be polled because teslamate
+        data only lands in InfluxDB. On each tick we re-derive the heating part
+        from the last cached home status so the merged state stays consistent.
+        """
+        interval = max(15, getattr(self.config, "ev_high_load_poll_seconds", 60))
+        while self._running:
+            try:
+                if getattr(self.config, "high_load_protection_enabled", True):
+                    ev_active, power = await self._query_ev_charging_from_influx()
+                    self._ev_high_load = ev_active
+                    self._ev_high_load_power = power
+                # Re-merge with the latest heating state (from the cached status).
+                heating = self._detect_high_loads_from_status(self._home_status or {})
+                await self._recompute_high_load_state(heating)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error(f"High-load poll loop error: {e}", exc_info=True)
+            await asyncio.sleep(interval)
+
+    async def _update_solar_forecast(self) -> None:
+        """Fetch and update solar production forecast from all sources."""
+        if not self._solar_forecast:
+            return
+
+        try:
+            # Source 1: forecast.solar API
+            result = await self._solar_forecast.fetch_api_forecast()
+            if result:
+                # Persist to InfluxDB so it survives restarts
+                await self._solar_forecast.save_to_influxdb(
+                    self.influxdb_client, self.settings.influxdb.bucket_solar
+                )
+        except Exception as e:
+            self.logger.warning(f"Failed to fetch forecast.solar API: {e}")
+
+        # Source 1b: Solcast (if configured). Independent API; throttled
+        # internally to stay under the 10-req/day free-tier cap.
+        solcast = getattr(self, '_solcast_forecast', None)
+        if solcast is not None:
+            try:
+                hourly = await solcast.fetch_hourly_today_tomorrow(
+                    local_tz=self._local_tz
+                )
+                if hourly:
+                    self._solar_forecast.set_solcast_hourly(hourly)
+            except Exception as e:
+                # WARNING, not debug: the client logs per-site HTTP errors
+                # itself, so anything landing here is an unexpected failure
+                # that would otherwise be invisible at the prod log level.
+                self.logger.warning(f"Solcast fetch failed: {e}")
+
+        # If API failed or was rate-limited, try fallbacks in order
+        if not self._solar_forecast._api_forecast:
+            # Fallback 1: Load from InfluxDB cache
+            try:
+                await self._solar_forecast.load_from_influxdb(
+                    self.influxdb_client, self.settings.influxdb.bucket_solar
+                )
+            except Exception as e:
+                self.logger.debug(f"Could not load cached forecast: {e}")
+
+        if not self._solar_forecast._api_forecast:
+            # Fallback 2: OpenMeteo radiation API (no rate limit)
+            try:
+                await self._solar_forecast.fetch_openmeteo_radiation()
+            except Exception as e:
+                self.logger.debug(f"OpenMeteo fallback failed: {e}")
+
+        # Fetch a fresh 48h OpenMeteo weather forecast. Used for the learned
+        # model's prediction AND to stash forecast temperatures for the
+        # consumption models — so it runs even when the production model is
+        # absent (fresh install / failed build), keeping tomorrow's
+        # consumption forecast on real forecast temps.
+        if self._solar_forecast is not None:
+            try:
+                # Fetch fresh 48h weather forecast from OpenMeteo
+                from modules.growatt.solar_forecast import _effective_cloud_cover
+                url = (
+                    f"https://api.open-meteo.com/v1/forecast"
+                    f"?latitude={self._solar_forecast.latitude}"
+                    f"&longitude={self._solar_forecast.longitude}"
+                    f"&hourly=shortwave_radiation,cloudcover,cloudcover_low,cloudcover_mid,cloudcover_high,temperature_2m"
+                    f"&forecast_days=2&timezone=auto"
+                )
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            hourly = data.get("hourly", {})
+                            times = hourly.get("time", [])
+                            ghi = hourly.get("shortwave_radiation", [])
+                            cloud_low = hourly.get("cloudcover_low", [])
+                            cloud_mid = hourly.get("cloudcover_mid", [])
+                            cloud_high = hourly.get("cloudcover_high", [])
+                            cloud_total = hourly.get("cloudcover", [])
+                            temps = hourly.get("temperature_2m", [])
+                            weather_hours = []
+                            for i, t in enumerate(times):
+                                g = (ghi[i] if i < len(ghi) else 0) or 0
+                                # None-check, NOT `or 15`: a genuine 0.0 °C
+                                # reading is falsy and would become 15 °C —
+                                # these temps feed the heating-driven
+                                # consumption models via _stash_forecast_temps,
+                                # where that error is large on freezing days.
+                                # tp_raw keeps the None so the stash can SKIP
+                                # missing hours instead of stashing the 15 °C
+                                # sentinel as a "forecast" that would override
+                                # a real measured temperature.
+                                tp_raw = temps[i] if i < len(temps) else None
+                                tp = 15 if tp_raw is None else tp_raw
+                                if cloud_low and i < len(cloud_low):
+                                    c = _effective_cloud_cover(
+                                        cloud_low[i] or 0,
+                                        (cloud_mid[i] or 0) if cloud_mid and i < len(cloud_mid) else 0,
+                                        (cloud_high[i] or 0) if cloud_high and i < len(cloud_high) else 0,
+                                    )
+                                else:
+                                    c = (cloud_total[i] if cloud_total and i < len(cloud_total) else 50) or 50
+                                weather_hours.append({
+                                    "time": t,
+                                    "shortwave_radiation": g,
+                                    "cloudcover": c,
+                                    "temperature_2m": tp,
+                                    "temperature_2m_raw": tp_raw,
+                                })
+                            self._stash_forecast_temps(weather_hours)
+                            # Without a learned model (fresh install / failed
+                            # build) the fetch still served the temp stash
+                            # above; there is just nothing to predict.
+                            if self._solar_forecast._production_model:
+                                model_result = self._solar_forecast.predict_from_model(
+                                    weather_hours
+                                )
+                                if model_result:
+                                    total = sum(
+                                        f.total_kwh for f in model_result.values()
+                                    )
+                                    self.logger.info(
+                                        f"Solar model prediction: {total:.1f} kWh "
+                                        f"across {len(model_result)} days "
+                                        f"(from learned model)"
+                                    )
+            except Exception as e:
+                # WARNING: this fetch now also feeds the consumption models'
+                # forecast temperatures — a persistent OpenMeteo outage
+                # silently reverts tomorrow's consumption to yesterday's
+                # actual temps, which must be visible at the prod log level.
+                self.logger.warning(
+                    f"OpenMeteo weather fetch / model prediction failed: {e}"
+                )
+
+        # Calibrate confidence from actual production data (full year on startup)
+        try:
+            await self._solar_forecast.calibrate_from_actuals(
+                self.influxdb_client,
+                self.settings.influxdb.bucket_solar,
+                days=365,
+                local_tz=self._local_tz,
+            )
+        except Exception as e:
+            self.logger.warning(f"Solar calibration failed: {e}")
+
+        # Build consensus from available sources
+        self._solar_forecast.build_consensus()
+
+        # Persist consensus for calibration across restarts
+        try:
+            await self._solar_forecast.save_consensus_to_influxdb(
+                self.influxdb_client, self.settings.influxdb.bucket_solar
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not persist consensus forecast: {e}")
+
+        # Log summary
+        now = self._get_local_now()
+        today_kwh = self._solar_forecast.get_expected_production_kwh(now.date())
+        tomorrow_kwh = self._solar_forecast.get_expected_production_kwh(
+            now.date() + timedelta(days=1)
+        )
+        reliable = self._solar_forecast.has_reliable_forecast()
+        reliability_tag = "" if reliable else " [UNRELIABLE - will not adjust charging]"
+        # Determine source for logging
+        today_str = now.date().strftime("%Y-%m-%d")
+        today_fc = self._solar_forecast._consensus.get(today_str)
+        source_info = today_fc.source if today_fc else "none"
+        has_model = source_info.startswith("model")
+        discount_info = "(from learned model)" if has_model else f"(after {self._solar_forecast.confidence:.0%} confidence discount)"
+        self.logger.info(
+            f"☀️ Solar forecast: today {today_kwh:.1f} kWh, "
+            f"tomorrow {tomorrow_kwh:.1f} kWh "
+            f"{discount_info}{reliability_tag}"
+        )
+
+        # Store to InfluxDB
+        await self._store_solar_forecast_to_influxdb()
+
+    async def _get_weather_radiation_data(self) -> Optional[Dict[Any, Any]]:
+        """Query weather radiation forecast from InfluxDB."""
+        if not self.influxdb_client:
+            return None
+
+        try:
+            bucket = self.settings.influxdb.bucket_weather
+            query = f'''
+from(bucket: "{bucket}")
+  |> range(start: -1h, stop: 48h)
+  |> filter(fn: (r) => r._measurement == "weather_forecast")
+  |> filter(fn: (r) => r._field == "shortwave_radiation")
+  |> filter(fn: (r) => r.type == "hour")
+  |> filter(fn: (r) => r.source == "openmeteo")
+  |> sort(columns: ["_time"])
+'''
+            result = await self.influxdb_client.query(query)
+            if not result:
+                return None
+
+            hourly = []
+            for table in result:
+                for record in table.records:
+                    hourly.append({
+                        "time": record.get_time().isoformat(),
+                        "shortwave_radiation": record.get_value(),
+                    })
+
+            return {"hourly": hourly} if hourly else None
+
+        except Exception as e:
+            self.logger.debug(f"Could not query weather radiation: {e}")
+            return None
+
+    async def _store_solar_forecast_to_influxdb(self) -> None:
+        """Store solar forecast data to InfluxDB for Grafana visualization."""
+        if not self.influxdb_client or not self._solar_forecast:
+            return
+
+        try:
+            now = self._get_local_now()
+            summary = self._solar_forecast.get_forecast_summary()
+
+            for date_str, forecast_info in summary.get("forecasts", {}).items():
+                await self.influxdb_client.write_point(
+                    bucket=self.settings.influxdb.bucket_solar,
+                    measurement="solar_forecast",
+                    fields={
+                        "total_kwh": float(forecast_info["total_kwh"]),
+                        "discounted_kwh": float(forecast_info["discounted_kwh"]),
+                        "peak_kwh": float(forecast_info.get("peak_kwh", 0)),
+                    },
+                    tags={
+                        "source": forecast_info["source"],
+                        "date": date_str,
+                    },
+                    timestamp=now,
+                )
+        except Exception as e:
+            self.logger.debug(f"Failed to store solar forecast to InfluxDB: {e}")
+
     async def _fetch_prices(
         self, suppress_schedule_print: bool = False, force_table_display: bool = False
     ) -> None:
@@ -1706,20 +2419,23 @@ class GrowattController(BaseModule):
                 prices_15min = self._price_analyzer.generate_mock_prices(target_date)
 
             if prices_15min:
-                # Store prices in cache (now 15-minute intervals)
-                self._current_prices = prices_15min
+                # Get exchange rate first (needed for conversion)
+                self._eur_czk_rate = await self._get_eur_czk_rate()
+
+                # Store prices converted to CZK/kWh (single conversion point)
+                from .growatt.price_utils import convert_price_dict
+                self._current_prices = convert_price_dict(
+                    prices_15min, self._eur_czk_rate
+                )
                 self._prices_date = target_date
                 self._prices_updated = datetime.now()
-
-                # Get exchange rate
-                self._eur_czk_rate = await self._get_eur_czk_rate()
 
                 self.logger.info(
                     f"📊 Fetched {len(prices_15min)} price blocks for {target_date}"
                 )
 
-                # NEW: Use cross-day optimal scheduling
-                # This will find globally cheapest blocks across today+tomorrow window
+                # Use cross-day optimal scheduling: find the globally cheapest
+                # blocks across the today+tomorrow window
                 await self._calculate_cross_day_optimal_schedule(
                     suppress_print=suppress_schedule_print,
                     force_table=force_table_display
@@ -1736,6 +2452,21 @@ class GrowattController(BaseModule):
     async def _calculate_cross_day_optimal_schedule(
         self, suppress_print: bool = False, force_table: bool = False
     ) -> None:
+        """Serialize schedule recomputation behind _schedule_lock.
+
+        Multiple tasks invoke this concurrently (periodic tick, next-day price
+        fetch, pre-midnight refresh, model rebuild); the lock prevents their
+        reads/writes of the shared schedule sets from interleaving into a torn
+        schedule that the inverter on/off gate and decision engine would act on.
+        """
+        async with self._schedule_lock:
+            await self._calculate_cross_day_optimal_schedule_impl(
+                suppress_print=suppress_print, force_table=force_table
+            )
+
+    async def _calculate_cross_day_optimal_schedule_impl(
+        self, suppress_print: bool = False, force_table: bool = False
+    ) -> None:
         """Calculate optimal charging/discharge schedule across entire available price window.
 
         This is the core cross-day optimization method that:
@@ -1749,8 +2480,6 @@ class GrowattController(BaseModule):
         Args:
             suppress_print: If True, skip printing schedule (used during startup)
             force_table: If True, always show full table regardless of log level
-
-        This replaces the old separate-day approach with true global optimization.
         """
         # Get combined price window with absolute timestamps
         window = self._get_combined_price_window()
@@ -1761,28 +2490,539 @@ class GrowattController(BaseModule):
 
         now = self._get_local_now()
         today = now.date()
-        rate = self._eur_czk_rate or 25.0
 
         # === STEP 1: Use shared scheduling logic to find optimal blocks ===
-        charge_blocks_count = getattr(self.config, 'battery_charge_blocks', 8)
         discharge_threshold_czk = self.config.discharge_price_min
 
-        # Convert window format for shared function: (start_dt, end_dt, price_eur) -> (start_dt, price_czk)
-        price_blocks_czk = [(start_dt, price_eur * rate / 1000) for start_dt, end_dt, price_eur in window]
+        # Window prices are already in CZK/kWh (converted at storage time)
+        price_blocks_czk = [(start_dt, price_czk) for start_dt, end_dt, price_czk in window]
 
-        discharge_profit_margin = self.config.discharge_profit_margin
+        # Determine charge block count (dynamic or fixed)
+        if self.config.dynamic_charge_blocks:
+            all_prices = [price for _, price in price_blocks_czk]
+            # Self-consumption value basis = median spot + average distribution.
+            # NOTE: a stored kWh's true avoided cost is the price at DISCHARGE
+            # (typically the evening VT peak), not the window median, so this is
+            # INTENTIONALLY CONSERVATIVE — it charges fewer blocks when the window
+            # contains a pronounced peak. This block-count heuristic
+            # (dynamic_charge_blocks defaults OFF; dispatch is MILP-only) is
+            # kept deliberately cautious about grid charging.
+            sorted_p = sorted(all_prices)
+            median_price = sorted_p[len(sorted_p) // 2] if sorted_p else 2.0
+            avg_dist = (
+                self.config.distribution_tariff_high
+                + self.config.distribution_tariff_low
+            ) / 2
+            self_consumption_value = median_price + avg_dist
+            charge_blocks_count = calculate_dynamic_block_count(
+                prices_czk=all_prices,
+                min_blocks=self.config.min_charge_blocks,
+                max_blocks=self.config.max_charge_blocks,
+                self_consumption_value=self_consumption_value,
+                battery_efficiency=self.config.battery_efficiency,
+            )
+            self.logger.info(
+                f"Dynamic charging: {charge_blocks_count} blocks "
+                f"(self-consumption value: {self_consumption_value:.2f} CZK/kWh, "
+                f"range: {self.config.min_charge_blocks}-"
+                f"{self.config.max_charge_blocks})"
+            )
+        else:
+            charge_blocks_count = self.config.battery_charge_blocks
 
-        # Call shared function to get charge/discharge timestamps
-        charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
-            price_blocks_czk,
-            charge_blocks_count=charge_blocks_count,
-            discharge_threshold_czk=discharge_threshold_czk,
-            discharge_profit_margin=discharge_profit_margin
-        )
+        # Solar forecast adjustment: reduce grid charging when solar will fill battery
+        # Only count FUTURE solar production (hours that haven't happened yet)
+        # SKIP adjustment entirely if forecast data is unreliable
+        if self._solar_forecast and self._solar_forecast.has_reliable_forecast():
+            current_hour = now.hour
+            # Sum future solar: remaining hours today + all of tomorrow
+            future_solar = 0.0
+            today_hourly = self._solar_forecast.get_hourly_production(today)
+            for hour, kwh in today_hourly.items():
+                if hour > current_hour:
+                    future_solar += kwh
+            tomorrow = today + timedelta(days=1)
+            tomorrow_hourly = self._solar_forecast.get_hourly_production(tomorrow)
+            future_solar += sum(tomorrow_hourly.values())
+
+            if future_solar > 0:
+                battery_headroom = (
+                    (self.config.max_soc - self._battery_soc) / 100
+                    * self.config.battery_capacity
+                )
+                efficiency = self.config.battery_efficiency
+                grid_needed_kwh = max(0, battery_headroom - future_solar * efficiency)
+                # Each 15-min block charges roughly capacity/4 * charge_rate
+                # Conservative estimate: ~0.625 kWh per block for a 10kWh battery
+                kwh_per_block = self.config.battery_capacity / 16
+                solar_adjusted = max(
+                    self.config.min_charge_blocks,
+                    min(charge_blocks_count, math.ceil(grid_needed_kwh / kwh_per_block))
+                )
+                if solar_adjusted < charge_blocks_count:
+                    self.logger.info(
+                        f"☀️ Solar adjustment: {charge_blocks_count} → {solar_adjusted} blocks "
+                        f"(future solar: {future_solar:.1f} kWh, "
+                        f"battery headroom: {battery_headroom:.1f} kWh, "
+                        f"grid needed: {grid_needed_kwh:.1f} kWh)"
+                    )
+                    charge_blocks_count = solar_adjusted
+        elif self._solar_forecast and not self._solar_forecast.has_reliable_forecast():
+            self.logger.info(
+                "☀️ Solar forecast unreliable — skipping adjustment, using default charging"
+            )
+
+        # Use the MILP optimizer if enabled, otherwise hold (no scheduling)
+        if self._optimizer:
+            from .growatt.decision_engine import GrowattDecisionEngine
+            tomorrow = today + timedelta(days=1)
+            solar_hourly: Dict[Any, float] = {}
+            if self._solar_forecast:
+                for target_day in (today, tomorrow):
+                    for hour, kwh in self._solar_forecast.get_hourly_production(target_day).items():
+                        solar_hourly[(target_day, hour)] = kwh
+
+            # Merge today's remaining + tomorrow's solar. With date-aware keys
+            # the optimizer can safely evaluate cross-day windows where the same
+            # hour appears on both dates.
+            today_solar = (
+                self._solar_forecast.get_hourly_production(today)
+                if self._solar_forecast else {}
+            )
+
+            # Intraday calibration: scale today's REMAINING hours by the ratio
+            # of recent actual production vs what the forecast had predicted
+            # for the same hours. Catches systematic under/over-forecasts
+            # (e.g., model says cloudy, reality is sunny). Tomorrow stays
+            # untouched — different weather window.
+            calibration_ratio = None
+            if self._solar_forecast and self.influxdb_client:
+                calibration_ratio = await self._solar_forecast.compute_intraday_calibration(
+                    self.influxdb_client,
+                    self.settings.influxdb.bucket_solar,
+                    current_hour=now.hour,
+                    target_date=today,
+                    local_tz=self._local_tz,
+                )
+                # Surface the latest intraday calibration ratio for the dashboard
+                # (how far today's actual solar diverged from the forecast).
+                self._last_solar_calibration_ratio = calibration_ratio
+
+            # Live persistence anchor: scale today's REMAINING hours up to
+            # match current measured solar production. Inspired by EMHASS:
+            # current hour dominated by live observation, smoothly decaying
+            # to model over the next 2 hours. Catches the case where the
+            # model under-predicts present-moment sun (e.g., forecast said
+            # cloudy, reality is bright).
+            live_solar_kw = 0.0
+            try:
+                from .growatt.api import _telemetry_cache
+                live_w = _telemetry_cache.get("InputPower") if _telemetry_cache else None
+                if isinstance(live_w, (int, float)) and live_w > 0:
+                    live_solar_kw = float(live_w) / 1000.0
+            except Exception:
+                pass
+
+            # Apply scaling + persistence to today's remaining hours, then
+            # merge into solar_hourly (which already has tomorrow's data).
+            scaled_today: Dict[int, float] = {}
+            for h, kwh in today_solar.items():
+                if h >= now.hour:  # include current hour for persistence anchor
+                    scaled_today[h] = kwh * calibration_ratio if calibration_ratio else kwh
+            if self._solar_forecast and live_solar_kw > 0:
+                scaled_today = self._solar_forecast.apply_live_persistence(
+                    scaled_today, live_solar_kw, current_hour=now.hour,
+                    minutes_elapsed=now.minute,
+                )
+                self.logger.info(
+                    f"☀️  Live solar persistence: anchoring near-future forecast "
+                    f"to live {live_solar_kw:.2f} kW reading"
+                )
+            for h, kwh in scaled_today.items():
+                if h >= now.hour:
+                    # Current incomplete hour: optimizer's blocks list includes
+                    # the current 15-min block, so we still want a forecast value.
+                    solar_hourly[(today, h)] = kwh
+
+            # Consumption forecast: prefer the temperature-aware total-load model
+            # (heating + EV included) over the heating-excluded base load profile.
+            # Order PER DATE: ML (if enabled+trained) → binned model → base load
+            # profile → flat floor. Per-date so a partial ML result (e.g. only
+            # today, when tomorrow's prediction horizon goes stale first) can't
+            # suppress the binned fallback for the missing day — that day would
+            # otherwise be planned at 0 kWh load via _forecast_value's default.
+            consumption_hourly: Dict[Any, float] = {}
+            recent_temps = await self._fetch_recent_hourly_temps()
+            ml_cf = getattr(self, '_ml_consumption_forecast', None)
+            for target_day in (today, tomorrow):
+                # Temps are keyed by LOCAL hour, matching the local-hour bins
+                # both consumption models train on and the optimizer's local-
+                # hour output. Forecast temps win over the recent-actuals
+                # proxy when fresh (see _temps_for_date).
+                temps = self._temps_for_date(target_day, recent_temps)
+                day_hourly: Dict[int, float] = {}
+
+                if ml_cf and ml_cf.is_trained and temps:
+                    try:
+                        # Recursive RF inference is CPU-bound — run off the loop.
+                        day_hourly = await asyncio.to_thread(
+                            ml_cf.predict_hourly, temps, target_day
+                        )
+                    except Exception as e:
+                        self.logger.warning(
+                            f"ML predict_hourly({target_day}) failed: {e}"
+                        )
+
+                if (
+                    not day_hourly
+                    and self._consumption_forecast
+                    and self._consumption_forecast.model
+                    and temps
+                ):
+                    day_hourly = self._consumption_forecast.predict_hourly(
+                        temps, target_day
+                    )
+
+                if (
+                    not day_hourly
+                    and self._optimizer
+                    and self._optimizer._base_load_profile.profile
+                ):
+                    is_weekend = target_day.weekday() >= 5
+                    day_hourly = {
+                        h: self._optimizer._base_load_profile.get(h, is_weekend)
+                        for h in range(24)
+                    }
+
+                if not day_hourly:
+                    # Last resort (no models, no temps, no learned profile —
+                    # e.g. InfluxDB unreachable right after a restart): plan a
+                    # conservative flat load. Planning a day at 0 kWh (no
+                    # reserve, maximal discharge) must never happen silently.
+                    self.logger.warning(
+                        f"No consumption forecast available for {target_day}; "
+                        f"using flat 1.0 kWh/h floor"
+                    )
+                    day_hourly = {h: 1.0 for h in range(24)}
+
+                if len(day_hourly) < 24:
+                    # A PARTIAL model result (e.g. ML right after a rebuild
+                    # whose training window ends in the current hour predicts
+                    # only from hour+1) would leave the missing hours planned
+                    # at 0 kWh via _forecast_value's default. Fill them from
+                    # the next fallbacks in the chain.
+                    is_weekend = target_day.weekday() >= 5
+                    binned_fill: Dict[int, float] = {}
+                    if (
+                        self._consumption_forecast
+                        and self._consumption_forecast.model
+                        and temps
+                    ):
+                        binned_fill = self._consumption_forecast.predict_hourly(
+                            temps, target_day
+                        )
+                    day_mean = (
+                        sum(day_hourly.values()) / len(day_hourly)
+                        if day_hourly else 1.0
+                    )
+                    for h in range(24):
+                        if h in day_hourly:
+                            continue
+                        if h in binned_fill:
+                            day_hourly[h] = binned_fill[h]
+                        elif (
+                            self._optimizer
+                            and self._optimizer._base_load_profile.profile
+                        ):
+                            day_hourly[h] = self._optimizer._base_load_profile.get(
+                                h, is_weekend
+                            )
+                        else:
+                            day_hourly[h] = day_mean
+
+                for hour, kwh in day_hourly.items():
+                    consumption_hourly[(target_day, hour)] = kwh
+
+            dist_thresholds = PriceThresholds(
+                charge_price_max=self.config.charge_price_max,
+                export_price_min=self.config.export_price_min,
+                discharge_price_min=self.config.discharge_price_min,
+                discharge_profit_margin=self.config.discharge_profit_margin,
+                battery_efficiency=self.config.battery_efficiency,
+                summer_charge_price_max=self.config.summer_charge_price_max,
+                distribution_tariff_high=self.config.distribution_tariff_high,
+                distribution_tariff_low=self.config.distribution_tariff_low,
+                low_tariff_hours=self.config.low_tariff_hours,
+            )
+            dist_func = lambda h: GrowattDecisionEngine._get_distribution_tariff(
+                h, dist_thresholds
+            )
+
+            # Deferrable loads. The MILP optimizer CO-OPTIMIZES them: each load
+            # becomes a decision variable placed where total cost is lowest
+            # (incl. PV surplus & battery state). We hand the specs to optimize()
+            # and read the chosen placement back off the optimizer after the
+            # solve. An optimizer that can't co-optimize (CO_OPTIMIZES_DEFERRABLE
+            # false) gets each load pre-scheduled into its cheapest in-window
+            # blocks, with the per-block draw ADDED to consumption_hourly so the
+            # battery at least plans around it.
+            co_opt_deferrable = getattr(
+                self._optimizer, "CO_OPTIMIZES_DEFERRABLE", False
+            )
+            deferrable_for_milp: List[DeferrableLoad] = []
+            if self._deferrable_scheduler and self._deferrable_loads:
+                try:
+                    # Bound memory: drop blocks older than any plausible cycle.
+                    safety_cutoff = now - timedelta(hours=48)
+                    self._deferrable_completed_blocks = {
+                        (name, ts) for name, ts in self._deferrable_completed_blocks
+                        if ts >= safety_cutoff
+                    }
+                    adjusted_loads: List[DeferrableLoad] = []
+                    for load in self._deferrable_loads:
+                        # Count only energy delivered in this load's CURRENT
+                        # delivery cycle. A flat 24h window mis-counts a window
+                        # that wraps midnight (e.g. EV 22:00-06:00): early blocks
+                        # age out mid-cycle and the load gets re-scheduled for
+                        # energy it already received (extra grid import). The
+                        # cycle starts at the most recent `earliest_start`
+                        # boundary at/before now.
+                        cycle_start = datetime.combine(
+                            now.date(), load.earliest_start, tzinfo=self._local_tz
+                        )
+                        if cycle_start > now:
+                            cycle_start -= timedelta(days=1)
+                        # Count only blocks that have FULLY ELAPSED (start+15min
+                        # <= now). A block is recorded as soon as the load is
+                        # active at its start, so the in-progress block hasn't
+                        # delivered its energy yet — counting it would under-state
+                        # remaining_kwh and cut an interruptible load one block short.
+                        block_elapsed_cutoff = now - timedelta(minutes=15)
+                        completed = sum(
+                            1 for name, ts in self._deferrable_completed_blocks
+                            if name == load.name
+                            and ts >= cycle_start and ts <= block_elapsed_cutoff
+                        )
+                        delivered_kwh = completed * load.power_kw * 0.25
+                        remaining_kwh = max(0.0, load.energy_required_kwh - delivered_kwh)
+                        if remaining_kwh > 0:
+                            adjusted_loads.append(
+                                replace(load, energy_required_kwh=remaining_kwh)
+                            )
+                    if co_opt_deferrable:
+                        # Hand specs to the optimizer; placement returns post-solve.
+                        deferrable_for_milp = adjusted_loads
+                    else:
+                        schedules = self._deferrable_scheduler.schedule_all(
+                            adjusted_loads, price_blocks_czk, dist_func,
+                        )
+                        self._deferrable_schedules = schedules
+                        loads_by_name = {l.name: l for l in adjusted_loads}
+                        overlay = self._deferrable_scheduler.consumption_overlay(
+                            schedules, loads_by_name,
+                        )
+                        for key, extra_kwh in overlay.items():
+                            if isinstance(key, datetime):
+                                # `is not None` (not `or`): a real 0.0-kWh block
+                                # must not fall through to another day's value.
+                                base_kwh = consumption_hourly.get(key)
+                                if base_kwh is None:
+                                    base_kwh = consumption_hourly.get(
+                                        (key.date(), key.hour)
+                                    )
+                                if base_kwh is None:
+                                    base_kwh = consumption_hourly.get(key.hour, 0.0)
+                                consumption_hourly[key] = base_kwh + extra_kwh
+                            else:
+                                consumption_hourly[key] = (
+                                    consumption_hourly.get(key, 0.0) + extra_kwh
+                                )
+                        for sched in schedules:
+                            if sched.blocks:
+                                self.logger.info(
+                                    f"📋 Deferrable {sched.load_name}: "
+                                    f"{len(sched.blocks)} blocks scheduled, "
+                                    f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                                )
+                except Exception as e:
+                    self.logger.warning(f"Deferrable scheduling failed: {e}")
+                    self._deferrable_schedules = []
+
+            # Run the optimizer off the event loop. The MILP engine shells out
+            # to CBC (a blocking subprocess that can run up to its solve
+            # time-limit); a 96-block solve is pure CPU work that must not freeze
+            # MQTT handling or the 15-min decision cadence.
+            opt_kwargs: Dict[str, Any] = dict(
+                blocks=price_blocks_czk,
+                solar_hourly=solar_hourly,
+                consumption_hourly=consumption_hourly,
+                distribution_func=dist_func,
+                battery_capacity_kwh=self.config.battery_capacity,
+                current_soc=self._battery_soc,
+                min_soc=self.config.min_soc,
+                max_soc=self.config.max_soc,
+                # Adaptive charging lets the optimizer plan faster-than-gentle
+                # charging (up to the true hardware max) so it can fill a short
+                # cheap/negative window it would otherwise miss at 2.5 kW.
+                charge_rate_kw=(
+                    min(self.config.battery_charge_max_kw,
+                        getattr(self.config, "max_charge_power_kw",
+                                self.config.battery_charge_max_kw))
+                    if getattr(self.config, "adaptive_charge_rate", False)
+                    else self.config.battery_charge_rate_kw
+                ),
+                # Symmetric: let the optimizer plan faster discharge to fully
+                # drain into a short high-price spike it would otherwise miss —
+                # but never above the operational C-rate ceiling.
+                discharge_rate_kw=(
+                    min(self.config.battery_discharge_max_kw,
+                        getattr(self.config, "max_discharge_power_kw",
+                                self.config.battery_discharge_max_kw))
+                    if getattr(self.config, "adaptive_discharge_rate", False)
+                    else self.config.battery_discharge_rate_kw
+                ),
+                discharge_power_pct=self.config.discharge_power_rate,
+                efficiency=self.config.battery_efficiency,
+                sell_fee_czk=self.config.sell_fee_czk,
+                battery_amortisation_czk=self.config.battery_amortisation_czk,
+                # Optional export-only wear penalty (None → shared base cost).
+                # Raises the arbitrage hurdle without touching battery→house
+                # self-consumption economics.
+                battery_amortisation_export_czk=getattr(
+                    self.config, "battery_amortisation_export_czk", None
+                ),
+                # Strict engine-agnostic rules the plan must respect so it never
+                # promises an export/PV action the hardware gates then block.
+                export_price_min=self.config.export_price_min,
+                # Use the gate's LOWER deadband edge (threshold - hysteresis) so
+                # the plan only assumes the inverter is OFF where the actuation
+                # gate definitely powers it off; otherwise the plan and hardware
+                # would disagree for prices inside the hysteresis band.
+                inverter_off_price=(
+                    self.config.inverter_off_price_threshold_czk
+                    - self.config.inverter_off_price_hysteresis_czk
+                ),
+            )
+            # MILP-only knobs. co_opt_deferrable is the MILP marker (only MILP
+            # sets CO_OPTIMIZES_DEFERRABLE), so gate MILP-only kwargs on it.
+            if co_opt_deferrable:
+                opt_kwargs["switch_penalty_czk"] = getattr(
+                    self.config, "milp_switch_penalty_czk", 0.0
+                )
+                if deferrable_for_milp:
+                    opt_kwargs["deferrable_loads"] = deferrable_for_milp
+            # Keep the optimizer's sell_production SOC gate in sync with the
+            # controller's actuation remap.
+            opt_kwargs["sell_production_min_soc_margin"] = getattr(
+                self.config, "sell_production_min_soc_margin", 2.0
+            )
+            _optimize_call = functools.partial(self._optimizer.optimize, **opt_kwargs)
+            charge_times, discharge_times, sell_production_times, decisions = (
+                await asyncio.to_thread(_optimize_call)
+            )
+            # Battery-hold blocks: the optimizer chose to PRESERVE the battery and
+            # serve the house from grid (action "hold_idle"). Derived from the
+            # decisions (the 4-tuple contract is unchanged) and actuated as the
+            # battery_hold mode so the hardware matches the plan.
+            hold_idle_times = {
+                d.timestamp for d in decisions if d.action == "hold_idle"
+            }
+            # Per-leg SOC-loss factor to convert the optimizer's ΔSOC to
+            # grid-side energy, using the sqrt-split per-leg efficiency
+            # convention shared by the MILP and the reserve helper.
+            _leg_eta = self.config.battery_efficiency ** 0.5
+            # Adaptive charge rate: per-charge-window inverter powerRate% so the
+            # hardware charges at the gentlest rate that still fills each window.
+            # Empty when the feature is off → falls back to the fixed rate.
+            if getattr(self.config, "adaptive_charge_rate", False):
+                _chg_max_rate = compute_rate_ceiling(
+                    self.config.battery_charge_max_kw,
+                    getattr(self.config, "max_charge_power_kw",
+                            self.config.battery_charge_max_kw),
+                )
+                self._charge_power_rate_by_ts = compute_charge_power_rates(
+                    decisions,
+                    self.config.battery_capacity,
+                    self.config.battery_charge_max_kw,
+                    int(self.config.min_charge_power_rate),
+                    max_power_rate=_chg_max_rate,
+                    efficiency=_leg_eta,
+                )
+                if self._charge_power_rate_by_ts:
+                    _rates = sorted(set(self._charge_power_rate_by_ts.values()))
+                    self.logger.info(
+                        f"⚡ Adaptive charge rates: {len(self._charge_power_rate_by_ts)} "
+                        f"charge block(s), powerRate(s)={_rates}%"
+                    )
+            else:
+                self._charge_power_rate_by_ts = {}
+            # Symmetric adaptive DISCHARGE rate (grid_first powerRate per window).
+            if getattr(self.config, "adaptive_discharge_rate", False):
+                _dis_max_rate = compute_rate_ceiling(
+                    self.config.battery_discharge_max_kw,
+                    getattr(self.config, "max_discharge_power_kw",
+                            self.config.battery_discharge_max_kw),
+                )
+                self._discharge_power_rate_by_ts = compute_charge_power_rates(
+                    decisions,
+                    self.config.battery_capacity,
+                    self.config.battery_discharge_max_kw,
+                    int(self.config.discharge_power_rate),
+                    action="discharge",
+                    max_power_rate=_dis_max_rate,
+                    efficiency=_leg_eta,
+                )
+                if self._discharge_power_rate_by_ts:
+                    _drates = sorted(set(self._discharge_power_rate_by_ts.values()))
+                    self.logger.info(
+                        f"⚡ Adaptive discharge rates: {len(self._discharge_power_rate_by_ts)} "
+                        f"discharge block(s), powerRate(s)={_drates}%"
+                    )
+            else:
+                self._discharge_power_rate_by_ts = {}
+            # With MILP co-optimization the deferrable placement is decided by
+            # the solver; adopt it (for the dashboard + MQTT actuation).
+            if co_opt_deferrable and self._deferrable_loads:
+                self._deferrable_schedules = list(
+                    getattr(self._optimizer, "_last_deferrable_schedules", []) or []
+                )
+                for sched in self._deferrable_schedules:
+                    if sched.blocks:
+                        self.logger.info(
+                            f"📋 Deferrable {sched.load_name}: "
+                            f"{len(sched.blocks)} blocks (MILP co-optimized), "
+                            f"saves {sched.savings_czk:+.2f} CZK vs naive"
+                        )
+            summary = self._optimizer.summarize(decisions)
+            sp_count = summary.get('sell_production_blocks', 0)
+            sp_str = f", {sp_count} sell-production" if sp_count else ""
+            hold_idle_count = summary.get('hold_idle_blocks', 0)
+            hold_idle_str = f", {hold_idle_count} battery-hold" if hold_idle_count else ""
+            self.logger.info(
+                f"🧠 Optimizer: {summary['charge_blocks']} charge, "
+                f"{summary['discharge_blocks']} discharge, "
+                f"{summary['hold_blocks']} hold{hold_idle_str}{sp_str} blocks "
+                f"(avg charge: {summary['avg_charge_price']:.2f}, "
+                f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
+            )
+            # Discharge threshold for the log line below.
+            effective_discharge_threshold = min(
+                (b.price_czk for b in decisions if b.action == "discharge"),
+                default=discharge_threshold_czk,
+            )
+        else:
+            # Optimizer disabled (optimizer_enabled=False) — no scheduling.
+            # "Disabled" means hold: the decision_engine's safety gates
+            # (battery protection, export, inverter-off) still apply.
+            charge_times = set()
+            discharge_times = set()
+            sell_production_times = set()
+            hold_idle_times: Set[datetime] = set()
+            effective_discharge_threshold = discharge_threshold_czk
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
-            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
             if start_dt in charge_times
         ]
         cheapest_sorted = sorted(cheapest_blocks, key=lambda x: x[0])  # Sort chronologically
@@ -1803,19 +3043,17 @@ class GrowattController(BaseModule):
             if charging_today or charging_tomorrow:
                 self.logger.info("📊 Charging Schedule:")
                 if charging_today:
-                    summary = self._format_price_summary(charging_today, rate)
-                    self.logger.info(f"  Today: {summary}")
-                    for start_dt, end_dt, price in charging_today:
-                        price_czk = price * rate / 1000
+                    price_summary = self._format_price_summary(charging_today)
+                    self.logger.info(f"  Today: {price_summary}")
+                    for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
                         )
                 if charging_tomorrow:
-                    summary = self._format_price_summary(charging_tomorrow, rate)
-                    self.logger.info(f"  Tomorrow: {summary}")
-                    for start_dt, end_dt, price in charging_tomorrow:
-                        price_czk = price * rate / 1000
+                    price_summary = self._format_price_summary(charging_tomorrow)
+                    self.logger.info(f"  Tomorrow: {price_summary}")
+                    for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -1842,8 +3080,7 @@ class GrowattController(BaseModule):
                 if charging_today:
                     self.logger.info("")
                     self.logger.info(f"🔋 CHARGING TODAY ({len(charging_today)} blocks):")
-                    for start_dt, end_dt, price in charging_today:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
                             f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -1853,24 +3090,49 @@ class GrowattController(BaseModule):
                 if charging_tomorrow:
                     self.logger.info("")
                     self.logger.info(f"🔋 CHARGING TOMORROW ({len(charging_tomorrow)} blocks):")
-                    for start_dt, end_dt, price in charging_tomorrow:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
                             f"   {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
                         )
 
-        # === STEP 2: Use discharge times from shared function ===
-        # Already calculated above via calculate_optimal_schedule()
+        # === STEP 2: Use discharge times computed above ===
+        # (from the MILP plan, or empty when the optimizer is disabled)
 
         # Rebuild discharge schedule in original format for compatibility
         discharge_blocks = [
-            (start_dt, end_dt, price_eur) for start_dt, end_dt, price_eur in window
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
             if start_dt in discharge_times
         ]
 
         discharge_today = [(s, e, p) for s, e, p in discharge_blocks if s.date() == today]
         discharge_tomorrow = [(s, e, p) for s, e, p in discharge_blocks if s.date() > today]
+
+        # Sell-production blocks (export solar excess to grid, battery passive)
+        sell_production_blocks = [
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
+            if start_dt in sell_production_times
+        ]
+        sell_production_today = [
+            (s, e, p) for s, e, p in sell_production_blocks if s.date() == today
+        ]
+        sell_production_tomorrow = [
+            (s, e, p) for s, e, p in sell_production_blocks if s.date() > today
+        ]
+
+        # Battery-hold blocks (preserve battery, serve house from grid)
+        hold_blocks = [
+            (start_dt, end_dt, price_czk) for start_dt, end_dt, price_czk in window
+            if start_dt in hold_idle_times
+        ]
+        hold_today = [(s, e, p) for s, e, p in hold_blocks if s.date() == today]
+        hold_tomorrow = [(s, e, p) for s, e, p in hold_blocks if s.date() > today]
+        if (not suppress_print or force_table) and sell_production_blocks:
+            self.logger.info(
+                f"☀️  Sell-production: {len(sell_production_blocks)} blocks "
+                f"({len(sell_production_today)} today, "
+                f"{len(sell_production_tomorrow)} tomorrow)"
+            )
 
         if (not suppress_print or force_table) and discharge_blocks:
             self.logger.info(
@@ -1879,11 +3141,11 @@ class GrowattController(BaseModule):
                 f"threshold: {effective_discharge_threshold:.2f} CZK/kWh"
             )
             if discharge_today:
-                summary = self._format_price_summary(discharge_today, rate)
-                self.logger.info(f"  Discharge today: {summary}")
+                price_summary = self._format_price_summary(discharge_today)
+                self.logger.info(f"  Discharge today: {price_summary}")
             if discharge_tomorrow:
-                summary = self._format_price_summary(discharge_tomorrow, rate)
-                self.logger.info(f"  Discharge tomorrow: {summary}")
+                price_summary = self._format_price_summary(discharge_tomorrow)
+                self.logger.info(f"  Discharge tomorrow: {price_summary}")
 
             # VERBOSE level - full details
             if self._should_log(GrowattLogLevel.VERBOSE):
@@ -1903,7 +3165,7 @@ class GrowattController(BaseModule):
                     for group in groups:
                         start = group[0][0]
                         end = group[-1][1]
-                        avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
+                        avg_price = sum(p for _, _, p in group) / len(group)
                         self.logger.info(
                             f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
                             f"{avg_price:.3f} CZK/kWh avg"
@@ -1914,19 +3176,25 @@ class GrowattController(BaseModule):
                     self.logger.info(
                         f"   Tomorrow: {len(discharge_tomorrow)} blocks in {len(groups)} period(s)"
                     )
-                for group in groups:
-                    start = group[0][0]
-                    end = group[-1][1]
-                    avg_price = sum(p for _, _, p in group) / len(group) * rate / 1000
-                    self.logger.info(
-                        f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
-                        f"{avg_price:.3f} CZK/kWh avg"
-                    )
+                    for group in groups:
+                        start = group[0][0]
+                        end = group[-1][1]
+                        avg_price = sum(p for _, _, p in group) / len(group)
+                        self.logger.info(
+                            f"      {start.strftime('%H:%M')}-{end.strftime('%H:%M')}: "
+                            f"{avg_price:.3f} CZK/kWh avg"
+                        )
 
         # === STEP 3: Calculate pre-discharge charging ===
+        # ONLY when the optimizer is disabled. When the optimizer is active it
+        # already plans charge-before-discharge inside its energy-flow model
+        # (charge_times above), so a separate heuristic here would just produce
+        # phantom charge blocks the decision engine never actuates (the chart
+        # would then show "pre-discharge charging" the inverter never enters).
+        # The optimizer is the single source of truth for charging.
         pre_discharge_blocks: List[Tuple[datetime, datetime, float]] = []
 
-        if discharge_blocks:
+        if discharge_blocks and not self._optimizer:
             # Group discharge blocks into consecutive periods
             discharge_groups = self._group_consecutive_blocks_datetime(discharge_blocks)
 
@@ -1944,7 +3212,7 @@ class GrowattController(BaseModule):
                 merged_groups.append(current_merged)
 
             # For each discharge period, find cheapest blocks before it
-            max_pre_charge = getattr(self.config, 'pre_discharge_charge_blocks', 8)
+            max_pre_charge = self.config.pre_discharge_charge_blocks
 
             for group in merged_groups:
                 discharge_start = group[0][0]
@@ -1987,8 +3255,7 @@ class GrowattController(BaseModule):
 
                 if pre_discharge_today:
                     self.logger.info(f"   Today: {len(pre_discharge_today)} blocks")
-                    for start_dt, end_dt, price in pre_discharge_today:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in pre_discharge_today:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -1996,8 +3263,7 @@ class GrowattController(BaseModule):
 
                 if pre_discharge_tomorrow:
                     self.logger.info(f"   Tomorrow: {len(pre_discharge_tomorrow)} blocks")
-                    for start_dt, end_dt, price in pre_discharge_tomorrow:
-                        price_czk = price * rate / 1000
+                    for start_dt, end_dt, price_czk in pre_discharge_tomorrow:
                         self.logger.info(
                             f"      {start_dt.strftime('%H:%M')}-{end_dt.strftime('%H:%M')}: "
                             f"{price_czk:.3f} CZK/kWh"
@@ -2013,30 +3279,46 @@ class GrowattController(BaseModule):
 
         # Today's schedules (apply immediately)
         self._cheapest_charging_blocks_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in charging_today
         }
         self._pre_discharge_blocks_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in pre_discharge_today
         }
         self._discharge_periods_today = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in discharge_today
+        }
+        self._sell_production_blocks_today = {
+            _block_key(s, e)
+            for s, e, _ in sell_production_today
+        }
+        self._hold_blocks_today = {
+            _block_key(s, e)
+            for s, e, _ in hold_today
         }
 
         # Tomorrow's schedules (queue for midnight)
         self._cheapest_charging_blocks_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in charging_tomorrow
         }
         self._pre_discharge_blocks_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in pre_discharge_tomorrow
         }
         self._discharge_periods_tomorrow = {
-            (s.strftime("%H:%M"), e.strftime("%H:%M"))
+            _block_key(s, e)
             for s, e, _ in discharge_tomorrow
+        }
+        self._sell_production_blocks_tomorrow = {
+            _block_key(s, e)
+            for s, e, _ in sell_production_tomorrow
+        }
+        self._hold_blocks_tomorrow = {
+            _block_key(s, e)
+            for s, e, _ in hold_tomorrow
         }
 
         # Store queued schedules for midnight application
@@ -2053,16 +3335,114 @@ class GrowattController(BaseModule):
 
         if not suppress_print or force_table:
             # Display comprehensive cross-day price table
-            await self._log_cross_day_price_table(window, rate, force_display=force_table)
+            await self._log_cross_day_price_table(window, force_display=force_table)
 
             if not suppress_print:
+                discharge_count = len(self._discharge_periods_today)
+                source = "MILP" if self._optimizer else "disabled"
                 self.logger.info(
-                    f"✅ Cross-day schedule updated: "
-                    f"{len(self._combined_charging_blocks)} charging blocks active today"
+                    f"✅ Cross-day schedule updated ({source}): "
+                    f"{len(self._combined_charging_blocks)} charge + "
+                    f"{discharge_count} discharge blocks today"
                 )
 
         # Store schedule data to InfluxDB for web API consumption
         await self._store_schedule_to_influxdb()
+
+    async def _write_inverter_state_point(self, source: str = "change") -> None:
+        """Persist current inverter state + operational mode to InfluxDB.
+
+        Used both event-driven (after each state change) and on a periodic
+        heartbeat (every 5 min) so historical queries can resolve "what was
+        the state at time T" via a simple last() over a small window.
+
+        Failures (no client, write rejected) are logged at debug — telemetry
+        storage must never block inverter control.
+        """
+        if not self.influxdb_client or not self._current_inverter_state:
+            return
+        try:
+            state = self._current_inverter_state
+            await self.influxdb_client.write_point(
+                bucket=self.settings.influxdb.bucket_solar,
+                measurement="inverter_state",
+                tags={
+                    "inverter_mode": state.inverter_mode,
+                    "operational_mode": self._current_mode or "unknown",
+                    "source": source,
+                },
+                fields={
+                    "export_enabled": int(state.export_enabled),
+                    "stop_soc": int(state.stop_soc),
+                    "power_rate": int(state.power_rate),
+                    "ac_charge_enabled": int(state.ac_charge_enabled),
+                    "inverter_on": int(state.inverter_on),
+                },
+                timestamp=self._get_local_now(),
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not write inverter_state point: {e}")
+
+    async def _persist_deferrable_completed(
+        self, load_name: str, block_start: datetime
+    ) -> None:
+        """Persist a delivered deferrable-load block to InfluxDB.
+
+        Without this, ``_deferrable_completed_blocks`` is in-memory only, so a
+        restart mid delivery-cycle resets delivered energy to 0 and the load is
+        re-scheduled for energy it already received (extra paid grid import).
+        Best-effort: a failure here must never block actuation.
+        """
+        if not self.influxdb_client:
+            return
+        try:
+            await self.influxdb_client.write_point(
+                bucket=self.settings.influxdb.bucket_solar,
+                measurement="deferrable_completed",
+                tags={"load": load_name},
+                fields={"delivered": 1},
+                timestamp=block_start,
+            )
+        except Exception as e:
+            self.logger.debug(f"Could not persist deferrable_completed point: {e}")
+
+    async def _reload_deferrable_completed(self) -> None:
+        """Rebuild ``_deferrable_completed_blocks`` from InfluxDB on startup so a
+        restart mid delivery-cycle does not re-schedule already-delivered energy.
+
+        Reloads the last 48h — the same safety window the runtime prune uses.
+        Best-effort: on any failure we keep the empty set (prior behaviour).
+        """
+        if not self.influxdb_client or not self._deferrable_loads:
+            return
+        try:
+            q = f'''
+from(bucket: "{self.settings.influxdb.bucket_solar}")
+  |> range(start: -48h)
+  |> filter(fn: (r) => r._measurement == "deferrable_completed" and r._field == "delivered")
+'''
+            result = await self.influxdb_client.query(q)
+            restored = 0
+            for table in result:
+                for record in table.records:
+                    name = record.values.get("load")
+                    ts = record.get_time()
+                    if not name or ts is None:
+                        continue
+                    # Stored at the local-time block start; convert back to local
+                    # tz-aware so it matches the runtime cycle_start comparisons.
+                    if getattr(ts, "tzinfo", None) is not None:
+                        ts = ts.astimezone(self._local_tz)
+                    block_start = ts.replace(second=0, microsecond=0)
+                    self._deferrable_completed_blocks.add((name, block_start))
+                    restored += 1
+            if restored:
+                self.logger.info(
+                    f"Restored {restored} delivered deferrable-load block(s) "
+                    f"from InfluxDB"
+                )
+        except Exception as e:
+            self.logger.debug(f"Could not reload deferrable_completed blocks: {e}")
 
     async def _store_schedule_to_influxdb(self) -> None:
         """Store current schedule data to InfluxDB for web service consumption."""
@@ -2121,45 +3501,6 @@ class GrowattController(BaseModule):
         except Exception as e:
             self.logger.error(f"Failed to store schedule to InfluxDB: {e}", exc_info=True)
 
-    def _calculate_discharge_periods(
-        self,
-        prices: Dict[Tuple[str, str], float],
-        rate: float
-    ) -> List[Tuple[str, str, float]]:
-        """Calculate periods when battery discharge would be profitable.
-
-        Args:
-            prices: Dictionary of 15-minute price blocks
-            rate: EUR to CZK conversion rate
-
-        Returns:
-            List of tuples (start_time, end_time, price_eur) for discharge periods
-        """
-        if not prices:
-            return []
-
-        discharge_periods = []
-
-        # Get thresholds from config
-        discharge_min_czk = self.config.discharge_price_min
-        profit_margin = self.config.discharge_profit_margin
-
-        # Find cheapest block price
-        cheapest_price_eur = min(prices.values())
-        cheapest_price_czk = cheapest_price_eur * rate / 1000
-
-        # Calculate effective threshold
-        required_by_margin = cheapest_price_czk * profit_margin
-        effective_threshold_czk = max(discharge_min_czk, required_by_margin)
-
-        # Find all periods above threshold
-        for (start, end), price_eur in sorted(prices.items()):
-            price_czk = price_eur * rate / 1000
-            if price_czk >= effective_threshold_czk:
-                discharge_periods.append((start, end, price_eur))
-
-        return discharge_periods
-
     def get_schedule_table_data(self) -> Dict[str, Any]:
         """Get schedule table data for web API display.
 
@@ -2168,8 +3509,8 @@ class GrowattController(BaseModule):
 
         Returns:
             Dictionary containing:
-            - today_prices: Dict of (start, end) -> price_eur for today
-            - tomorrow_prices: Dict of (start, end) -> price_eur for tomorrow
+            - today_prices: Dict of (start, end) -> price_czk_kwh for today
+            - tomorrow_prices: Dict of (start, end) -> price_czk_kwh for tomorrow
             - today_date: ISO date string for today
             - tomorrow_date: ISO date string for tomorrow (or None)
             - charging_blocks_today: Set of (start, end) time tuples
@@ -2186,7 +3527,7 @@ class GrowattController(BaseModule):
 
         # Return current schedule state
         return {
-            # Price data (in EUR/MWh, same as stored internally)
+            # Price data (in CZK/kWh, converted at storage time)
             "today_prices": self._current_prices.copy() if self._current_prices else {},
             "tomorrow_prices": self._next_day_prices.copy() if self._next_day_prices else {},
             "today_date": self._prices_date or today_date,
@@ -2208,315 +3549,9 @@ class GrowattController(BaseModule):
             "next_day_prices_fetched": self._next_day_prices_fetched,
         }
 
-    async def _log_price_analysis(
-        self,
-        prices: Dict[Tuple[str, str], float],
-        date: str,
-        charging_schedule: List[Tuple[str, str, float]],
-        charge_blocks: int,
-        pre_discharge_schedule: Optional[List[Tuple[str, str, float]]] = None,
-        peak_to_precharge_map: Optional[Dict[str, List[Tuple[str, str, float]]]] = None
-    ) -> None:
-        """Log comprehensive price analysis including table and charging schedule.
-
-        Args:
-            prices: Dictionary of 15-minute price blocks
-            date: Date string for the prices
-            charging_schedule: List of cheapest charging blocks
-            charge_blocks: Number of blocks configured for charging
-            pre_discharge_schedule: Optional list of pre-discharge charging blocks
-            peak_to_precharge_map: Optional mapping of peaks to their pre-charge blocks
-        """
-        # Ensure we have exchange rate
-        if not self._eur_czk_rate:
-            self._eur_czk_rate = await self._get_eur_czk_rate()
-
-        rate = self._eur_czk_rate or 25.0
-
-        # Calculate discharge periods
-        discharge_periods = self._calculate_discharge_periods(prices, rate)
-
-        # Store discharge periods for price table display
-        self._discharge_periods = set(
-            (period[0], period[1]) for period in discharge_periods
-        )
-
-        # Log price table (will now show discharge periods too)
-        await self._log_price_table(prices, date, rate)
-
-        if charging_schedule:
-            # Calculate average price for charging blocks
-            avg_price = sum(block[2] for block in charging_schedule) / len(charging_schedule)
-            avg_czk = avg_price * rate / 1000
-            charge_duration_hours = charge_blocks * 0.25  # 15 minutes = 0.25 hours
-
-            # Log charging schedule
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"🔋 CHARGING SCHEDULE "
-                f"({charge_blocks} blocks = {charge_duration_hours:.1f} hours)"
-            )
-            self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
-            self.logger.info("   Charging blocks:")
-
-            for start, end, price_eur in charging_schedule:
-                price_czk = price_eur * rate / 1000
-                self.logger.info(
-                    f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
-                )
-
-            # Calculate savings vs peak
-            all_prices = list(prices.values())
-            max_price = max(all_prices) if all_prices else avg_price
-            savings_pct = (
-                ((max_price - avg_price) / max_price * 100)
-                if max_price > 0 else 0
-            )
-            self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
-            self.logger.info("=" * 50)
-
-        # Log discharge schedule if there are discharge periods
-        if discharge_periods:
-            # Calculate average price for discharge blocks
-            avg_discharge_price = sum(p[2] for p in discharge_periods) / len(discharge_periods)
-            avg_discharge_czk = avg_discharge_price * rate / 1000
-            discharge_duration_hours = len(discharge_periods) * 0.25
-
-            # Get cheapest price for profit calculation
-            cheapest_price_eur = min(prices.values())
-            cheapest_price_czk = cheapest_price_eur * rate / 1000
-
-            # Calculate profit margin
-            profit_margin = avg_discharge_czk / cheapest_price_czk if cheapest_price_czk > 0 else 0
-
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"⚡ DISCHARGE SCHEDULE "
-                f"({len(discharge_periods)} blocks = {discharge_duration_hours:.1f} hours)"
-            )
-            self.logger.info(f"   Average price: {avg_discharge_czk:.3f} CZK/kWh")
-            self.logger.info(f"   Cheapest block: {cheapest_price_czk:.3f} CZK/kWh")
-            self.logger.info(f"   Profit margin: {profit_margin:.1f}x")
-            self.logger.info(
-                f"   Discharge threshold: {self.config.discharge_price_min:.2f} CZK/kWh"
-            )
-            self.logger.info("   Discharge blocks:")
-
-            # Group consecutive blocks for cleaner display
-            grouped_periods = []
-            current_group = [discharge_periods[0]]
-
-            for i in range(1, len(discharge_periods)):
-                prev_end = current_group[-1][1]
-                curr_start = discharge_periods[i][0]
-
-                # Check if consecutive (end time of prev equals start time of current)
-                if prev_end == curr_start:
-                    current_group.append(discharge_periods[i])
-                else:
-                    # Start new group
-                    grouped_periods.append(current_group)
-                    current_group = [discharge_periods[i]]
-
-            # Add the last group
-            grouped_periods.append(current_group)
-
-            # Display grouped periods
-            for group in grouped_periods:
-                start = group[0][0]
-                end = group[-1][1]
-                avg_group_price = sum(p[2] for p in group) / len(group)
-                avg_group_czk = avg_group_price * rate / 1000
-                if len(group) > 1:
-                    self.logger.info(
-                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh "
-                        f"(avg of {len(group)} blocks)"
-                    )
-                else:
-                    self.logger.info(
-                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh"
-                    )
-
-            self.logger.info("=" * 50)
-
-        # Log pre-discharge preparation schedule if available
-        if pre_discharge_schedule and peak_to_precharge_map:
-            # Calculate totals
-            total_unique_blocks = len(self._combined_charging_blocks)
-            total_hours = total_unique_blocks * 0.25
-            pre_discharge_count = len(self._pre_discharge_blocks)
-
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"🔌 PRE-DISCHARGE: {pre_discharge_count} blocks added "
-                f"(total charging: {total_unique_blocks} blocks = {total_hours:.1f}h)"
-            )
-            self.logger.info("=" * 50)
-
     async def _on_price_update(self) -> None:
         """Handle new price data availability."""
         await self._evaluate_conditions("price_update")
-
-    async def _analyze_tomorrow_vs_today(self) -> None:
-        """DEPRECATED: Replaced by cross-day optimal scheduling.
-
-        The new `_calculate_cross_day_optimal_schedule()` method handles this
-        automatically by finding globally optimal blocks across the entire window.
-        """
-        # No-op: Cross-day scheduling handles this automatically
-        return
-
-        # OLD CODE BELOW (kept for reference, not executed)
-        """Compare tomorrow's prices vs today's remaining hours.
-
-        If tomorrow is significantly cheaper (based on defer_to_tomorrow_threshold),
-        set flag to defer charging until tomorrow.
-        """
-        if not self._next_day_prices or not self._current_prices:
-            return
-
-        now = self._get_local_now()
-        current_block = (now.hour, now.minute // 15)
-
-        # Get remaining today's prices (from now to 23:59)
-        remaining_today: Dict[Tuple[str, str], float] = {}
-        for (start, end), price in self._current_prices.items():
-            start_hour, start_min = map(int, start.split(':'))
-            block = (start_hour, start_min // 15)
-            if block >= current_block:
-                remaining_today[(start, end)] = price
-
-        if not remaining_today:
-            # No remaining hours today
-            self.logger.debug("No remaining hours today for comparison")
-            return
-
-        # Find cheapest N blocks from today's remaining
-        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-        today_schedule, today_avg = self._price_analyzer.get_charging_schedule(
-            remaining_today, num_blocks=min(charge_blocks, len(remaining_today))
-        )
-
-        # Find cheapest N blocks from tomorrow
-        tomorrow_schedule, tomorrow_avg = self._price_analyzer.get_charging_schedule(
-            self._next_day_prices, num_blocks=charge_blocks
-        )
-
-        # Get exchange rate
-        rate = self._eur_czk_rate or 25.0
-
-        # Compare averages
-        if today_avg > 0:
-            cheaper_by_percent = (1 - tomorrow_avg / today_avg) * 100
-
-            # Convert to CZK/kWh for display
-            today_avg_czk = today_avg * rate / 1000
-            tomorrow_avg_czk = tomorrow_avg * rate / 1000
-
-            # Decision threshold from config
-            defer_threshold = self.config.defer_to_tomorrow_threshold
-
-            self.logger.info("=" * 50)
-            self.logger.info("📊 TWO-DAY PRICE COMPARISON")
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"Today's remaining {len(today_schedule)} cheapest blocks: "
-                f"avg {today_avg_czk:.2f} CZK/kWh"
-            )
-            self.logger.info(
-                f"Tomorrow's {len(tomorrow_schedule)} cheapest blocks: "
-                f"avg {tomorrow_avg_czk:.2f} CZK/kWh"
-            )
-            self.logger.info(
-                f"Difference: {cheaper_by_percent:+.1f}% "
-                f"(threshold: {defer_threshold:.1f}%)"
-            )
-
-            if cheaper_by_percent >= defer_threshold:
-                self._defer_charging_to_tomorrow = True
-                self._tomorrow_cheaper_by = cheaper_by_percent
-
-                self.logger.info(
-                    f"🚫 DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
-                    f"(≥{defer_threshold:.1f}% threshold)"
-                )
-                self.logger.info(
-                    "   ⏸️  Deferring all charging to tomorrow's cheaper hours"
-                )
-                self.logger.info(
-                    f"   💰 Potential savings: "
-                    f"{(today_avg_czk - tomorrow_avg_czk):.2f} CZK/kWh"
-                )
-            else:
-                self._defer_charging_to_tomorrow = False
-                self._tomorrow_cheaper_by = None
-
-                self.logger.info(
-                    f"✅ DECISION: Tomorrow is {cheaper_by_percent:.1f}% cheaper "
-                    f"(<{defer_threshold:.1f}% threshold)"
-                )
-                self.logger.info(
-                    "   ▶️  Continue with today's charging schedule"
-                )
-
-            self.logger.info("=" * 50)
-
-    async def _display_next_day_prices(self) -> None:
-        """DEPRECATED: Replaced by cross-day optimal scheduling.
-
-        The new `_calculate_cross_day_optimal_schedule()` method displays
-        comprehensive cross-day schedule including tomorrow's blocks.
-        """
-        # No-op: Cross-day scheduling displays this automatically
-        return
-
-        # OLD CODE BELOW (kept for reference, not executed)
-        """Display next-day price table and charging schedule."""
-        if not self._next_day_prices or not self._next_day_prices_date:
-            return
-
-        self.logger.info("")
-        self.logger.info("=" * 50)
-        self.logger.info(f"📅 NEXT DAY PRICES ({self._next_day_prices_date})")
-        self.logger.info("=" * 50)
-
-        # Calculate schedule for tomorrow
-        charge_blocks = getattr(self.config, 'battery_charge_blocks', 8)
-        charging_schedule, _ = self._price_analyzer.get_charging_schedule(
-            self._next_day_prices, num_blocks=charge_blocks
-        )
-
-        # Calculate discharge periods
-        rate = self._eur_czk_rate or 25.0
-        discharge_periods = self._calculate_discharge_periods(
-            self._next_day_prices, rate
-        )
-
-        # Calculate pre-discharge schedule
-        pre_discharge_schedule: List[Tuple[str, str, float]] = []
-        peak_to_precharge_map: Dict[str, List[Tuple[str, str, float]]] = {}
-        if discharge_periods:
-            pre_discharge_charge_blocks = getattr(
-                self.config, 'pre_discharge_charge_blocks', 8
-            )
-
-            pre_discharge_schedule, peak_to_precharge_map = (
-                self._price_analyzer.calculate_pre_discharge_schedule(
-                    self._next_day_prices,
-                    discharge_periods,
-                    pre_discharge_charge_blocks
-                )
-            )
-
-        # Display the table
-        await self._log_price_analysis(
-            self._next_day_prices,
-            self._next_day_prices_date,
-            charging_schedule,
-            charge_blocks,
-            pre_discharge_schedule,
-            peak_to_precharge_map
-        )
 
     async def _fetch_next_day_prices_task(self) -> None:
         """Background task to fetch next day's prices with infinite retry.
@@ -2544,8 +3579,12 @@ class GrowattController(BaseModule):
             )
 
             if prices:
-                # Store next day's prices
-                self._next_day_prices = prices
+                # Store next day's prices converted to CZK/kWh
+                from .growatt.price_utils import convert_price_dict
+                # Refresh the rate (cached daily) so tomorrow's prices use the
+                # same live EUR/CZK as today's, not the stale config fallback.
+                rate = await self._get_eur_czk_rate()
+                self._next_day_prices = convert_price_dict(prices, rate)
                 self._next_day_prices_date = tomorrow_date
                 self._next_day_prices_fetched = True
 
@@ -2553,8 +3592,8 @@ class GrowattController(BaseModule):
                     f"✅ Successfully fetched {len(prices)} price blocks for {tomorrow_date}"
                 )
 
-                # NEW: Recalculate cross-day optimal schedule with tomorrow's data
-                # This will find globally optimal blocks across remaining today + full tomorrow
+                # Recalculate cross-day optimal schedule with tomorrow's data:
+                # globally optimal blocks across remaining today + full tomorrow
                 await self._calculate_cross_day_optimal_schedule(force_table=True)
 
                 # Trigger re-evaluation with the updated schedule
@@ -2595,14 +3634,37 @@ class GrowattController(BaseModule):
         """Handle manual override changes."""
         await self._evaluate_conditions("manual_override")
 
-    async def _evaluate_conditions(self, reason: str) -> None:
+    async def _evaluate_conditions(self, reason: str, force: bool = False) -> None:
         """Re-evaluate decision tree when conditions change.
 
         Args:
             reason: What triggered the re-evaluation
+            force: If True, clear ALL idempotency tracking inside the lock first,
+                so every command is re-issued even when the decided state is
+                unchanged (a manual "re-apply current state" / hardware re-sync).
+                Done under the lock so the reset+evaluate is atomic w.r.t. the
+                periodic triggers.
         """
         async with self._evaluation_lock:
             try:
+                if force:
+                    # Mirror a fresh startup sync: every gate diffs against these,
+                    # so nulling them makes _apply_decided_mode / the export and
+                    # inverter-on/off gates treat the state as new and re-send.
+                    self._last_applied.clear()  # shared dict → also clears mode_manager
+                    if self._mode_manager is not None:
+                        self._mode_manager._inverter_on = None
+                        # AC-charge / export flags are separate attrs (not in
+                        # _last_applied); null them too — to a sentinel no bool
+                        # target equals — so set_ac_charge/set_export re-issue in
+                        # BOTH directions on a forced drift-recovery re-sync.
+                        self._mode_manager._ac_enabled = None
+                        self._mode_manager._export_enabled = None
+                    if self._decision_engine is not None:
+                        self._decision_engine._last_mode = None
+                    self._current_mode = None
+                    self._current_inverter_state = None
+
                 self._last_evaluation_reason = reason
 
                 # Build complete decision context with price data
@@ -2611,9 +3673,14 @@ class GrowattController(BaseModule):
                 # Get decision from engine
                 new_mode = self._decision_engine.decide(context)
 
-                # NEW: Check defer flag - override charging if tomorrow cheaper
+                # Check defer flag - override charging if tomorrow cheaper.
+                # Never override a MANUAL override (Priority 1): a user-requested
+                # charge must win over the auto defer-to-tomorrow heuristic.
+                # (_defer_charging_to_tomorrow is never set True in practice, but
+                # guard the precedence regardless.)
                 if (
-                    self._defer_charging_to_tomorrow
+                    not context.manual_override_active
+                    and self._defer_charging_to_tomorrow
                     and new_mode in ("charge_from_grid", "battery_first_ac_charge")
                 ):
                     # Decision engine wants to charge, but we're deferring
@@ -2624,31 +3691,135 @@ class GrowattController(BaseModule):
                     )
                     # Switch to regular mode (don't charge from grid)
                     new_mode = "regular"
-
-                # Check if mode changed
-                if self._decision_engine.has_mode_changed(new_mode):
-                    # Get explanation for logging
-                    explanation = self._decision_engine.explain_decision()
-                    # Log mode change with state details (done in _apply_decided_mode)
-
-                    # Apply the new mode (will log consolidated one-liner)
-                    await self._apply_decided_mode(new_mode, reason=reason, explanation=explanation)
-                    self._current_mode = new_mode
+                    # The engine's _last_decision still holds the (overridden)
+                    # charge node, so explain_decision() would log "charging…"
+                    # next to the applied "regular" — contradictory. Use a
+                    # synthetic explanation that matches what we actually did.
+                    _defer_explanation = {
+                        "reason": (
+                            f"Deferring charge to tomorrow "
+                            f"({self._tomorrow_cheaper_by:.1f}% cheaper)"
+                        )
+                    }
                 else:
+                    _defer_explanation = None
+
+                # Re-derive and (re)apply the desired hardware state EVERY
+                # evaluation. The decided mode STRING can be unchanged while the
+                # resolved hardware state still differs — e.g. the passive-hold
+                # modes (sell_production / battery_hold / high_load_protected) pin
+                # stop_soc to the LIVE SOC, which drifts between ticks, or an
+                # adaptive per-window powerRate changes mid-mode. Gating on the
+                # mode string alone would skip those reactuations until the next
+                # 15-min decide(). has_mode_changed() is kept (it advances the
+                # engine's _last_mode) for the log line; _apply_decided_mode
+                # no-ops internally when nothing actually changed.
+                mode_changed = self._decision_engine.has_mode_changed(new_mode)
+                explanation = _defer_explanation or self._decision_engine.explain_decision()
+                # Carry manual-override custom params (stop_soc/power_rate) into
+                # actuation — the decision path only carries the mode string, so
+                # without this a custom override SOC/rate is silently dropped and
+                # the config default is actuated while the status API reports the
+                # requested value (plan-vs-reality).
+                mode_params = (
+                    self._manual_override_period.params
+                    if self._manual_override_period else None
+                )
+                applied = await self._apply_decided_mode(
+                    new_mode, params=mode_params, reason=reason,
+                    explanation=explanation, context=context,
+                )
+                # Report the EFFECTIVE (built) mode. This normally echoes the
+                # decided mode; it differs only when _build_desired_state remaps
+                # an unknown mode to "regular". (sell_production etc. are NOT mode-
+                # swapped — they stay their own mode with stop_soc pinned to live
+                # SOC.) operational_mode must match the state written alongside.
+                self._current_mode = getattr(self, "_last_built_mode", new_mode)
+                if applied:
+                    await self._write_inverter_state_point(source="mode_change")
+                elif not mode_changed:
                     self.logger.debug(f"Evaluation ({reason}): Mode unchanged ({new_mode})")
 
                 # Always re-evaluate export state based on current price,
                 # even when mode hasn't changed
                 if self._current_inverter_state and context.price_thresholds:
                     if context.current_block_key in context.prices_15min:
-                        current_price_czk = context.current_price * 25 / 1000
+                        current_price_czk = context.current_price  # Already CZK/kWh
                         should_export = current_price_czk >= context.price_thresholds.export_price_min
                         if should_export != self._current_inverter_state.export_enabled:
                             if should_export:
-                                await self._mode_manager.enable_export()
+                                export_ok = await self._mode_manager.enable_export()
                             else:
-                                await self._mode_manager.disable_export()
-                            # Update tracked state (InverterState is frozen, must recreate)
+                                export_ok = await self._mode_manager.disable_export()
+                            if not export_ok:
+                                # Command failed — leave tracked state unchanged so
+                                # the next re-evaluation retries (mirrors the
+                                # inverter on/off gate). Advancing it here would
+                                # desync tracked vs hardware and never re-fire.
+                                self.logger.warning(
+                                    "Export state change failed; will retry next evaluation"
+                                )
+                            else:
+                                # Update tracked state (InverterState is frozen, must recreate)
+                                self._current_inverter_state = InverterState(
+                                    inverter_mode=self._current_inverter_state.inverter_mode,
+                                    stop_soc=self._current_inverter_state.stop_soc,
+                                    power_rate=self._current_inverter_state.power_rate,
+                                    time_start=self._current_inverter_state.time_start,
+                                    time_stop=self._current_inverter_state.time_stop,
+                                    ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
+                                    export_enabled=should_export,
+                                    timestamp=self._get_local_now(),
+                                    source="export_price_update",
+                                    # Preserve gate-controlled power state; the frozen
+                                    # dataclass defaults inverter_on=True otherwise.
+                                    inverter_on=self._current_inverter_state.inverter_on,
+                                )
+                                await self._write_inverter_state_point(source="export_price_update")
+                                state_str = "ENABLED" if should_export else "DISABLED"
+                                self.logger.info(
+                                    f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
+                                    f"threshold: {context.price_thresholds.export_price_min:.2f})"
+                                )
+
+                # Inverter on/off gate: power the inverter off when the spot
+                # price is below the configured threshold (with hysteresis)
+                # AND the block is not in the optimizer's charge schedule.
+                # Scheduled charge blocks always force the inverter ON so AC
+                # charging works at the cheapest hours.
+                if self._current_inverter_state and context.current_block_key in context.prices_15min:
+                    current_price_czk = context.current_price
+                    threshold = self.config.inverter_off_price_threshold_czk
+                    hysteresis = self.config.inverter_off_price_hysteresis_czk
+                    current_state_on = self._current_inverter_state.inverter_on
+                    is_scheduled_charge = (
+                        context.current_block_key in self._combined_charging_blocks
+                    )
+                    if is_scheduled_charge:
+                        desired_inverter_on = True
+                    elif current_price_czk < threshold - hysteresis:
+                        desired_inverter_on = False
+                    elif current_price_czk > threshold + hysteresis:
+                        desired_inverter_on = True
+                    else:
+                        desired_inverter_on = current_state_on  # deadband holds
+                    if desired_inverter_on != current_state_on:
+                        # Pace after any same-cycle Modbus write to respect
+                        # the 850 ms minimum between writes.
+                        await asyncio.sleep(1.0)
+                        # Only commit tracked state if the Modbus write actually
+                        # succeeded — otherwise the controller would believe the
+                        # inverter changed, skip future retries, and leave the
+                        # hardware stuck in the wrong state.
+                        ok = await self._mode_manager.set_inverter_power(desired_inverter_on)
+                        if not ok:
+                            self.logger.error(
+                                f"Inverter power change to "
+                                f"{'ON' if desired_inverter_on else 'OFF'} failed; "
+                                f"keeping tracked state {'ON' if current_state_on else 'OFF'} "
+                                f"so the next evaluation retries"
+                            )
+                        else:
                             self._current_inverter_state = InverterState(
                                 inverter_mode=self._current_inverter_state.inverter_mode,
                                 stop_soc=self._current_inverter_state.stop_soc,
@@ -2656,14 +3827,20 @@ class GrowattController(BaseModule):
                                 time_start=self._current_inverter_state.time_start,
                                 time_stop=self._current_inverter_state.time_stop,
                                 ac_charge_enabled=self._current_inverter_state.ac_charge_enabled,
-                                export_enabled=should_export,
+                                export_enabled=self._current_inverter_state.export_enabled,
                                 timestamp=self._get_local_now(),
-                                source="export_price_update"
+                                source="price_threshold_gate",
+                                inverter_on=desired_inverter_on,
                             )
-                            state_str = "ENABLED" if should_export else "DISABLED"
+                            await self._write_inverter_state_point(source="price_threshold_gate")
+                            emoji = "⚡" if desired_inverter_on else "🛑"
+                            state_word = "ON" if desired_inverter_on else "OFF"
+                            scheduled_note = ", scheduled charge" if is_scheduled_charge else ""
                             self.logger.info(
-                                f"📊 Export {state_str} (price: {current_price_czk:.2f} CZK/kWh, "
-                                f"threshold: {context.price_thresholds.export_price_min:.2f})"
+                                f"{emoji} Inverter {state_word} "
+                                f"(price: {current_price_czk:+.2f} CZK/kWh, "
+                                f"threshold: {threshold:.2f} ±{hysteresis:.2f}"
+                                f"{scheduled_note})"
                             )
 
             except Exception as e:
@@ -2677,6 +3854,23 @@ class GrowattController(BaseModule):
             DecisionContext with current system state and price data
         """
         now = self._get_local_now()
+
+        # Enforce manual-override expiry on EVERY evaluation tick. The expiry was
+        # only checked on-demand by the status getter (which doesn't clear it), so
+        # a time-limited override (e.g. 1h discharge) would otherwise keep forcing
+        # the battery indefinitely until a manual reset.
+        if (
+            self._manual_override_period
+            and self._manual_override_end_time
+            and now >= self._manual_override_end_time
+        ):
+            self.logger.info(
+                f"⏱️ Manual override ({self._manual_override_period.kind}) expired "
+                f"at {self._manual_override_end_time:%H:%M} — reverting to auto"
+            )
+            self._manual_override_period = None
+            self._manual_override_end_time = None
+            self._manual_override_source = ""
 
         # Calculate current 15-minute block
         current_minute = now.minute
@@ -2703,11 +3897,15 @@ class GrowattController(BaseModule):
 
         # Create price thresholds from config (all in CZK/kWh)
         price_thresholds = PriceThresholds(
-            charge_price_max=getattr(self.config, 'charge_price_max', 1.5),
-            export_price_min=getattr(self.config, 'export_price_min', 1.0),
-            discharge_price_min=getattr(self.config, 'discharge_price_min', 3.0),
-            discharge_profit_margin=getattr(self.config, 'discharge_profit_margin', 4.0),
-            battery_efficiency=getattr(self.config, 'battery_efficiency', 0.85)
+            charge_price_max=self.config.charge_price_max,
+            export_price_min=self.config.export_price_min,
+            discharge_price_min=self.config.discharge_price_min,
+            discharge_profit_margin=self.config.discharge_profit_margin,
+            battery_efficiency=self.config.battery_efficiency,
+            summer_charge_price_max=self.config.summer_charge_price_max,
+            distribution_tariff_high=self.config.distribution_tariff_high,
+            distribution_tariff_low=self.config.distribution_tariff_low,
+            low_tariff_hours=self.config.low_tariff_hours,
         )
 
         # Calculate price ranking for current 15-minute block
@@ -2722,7 +3920,7 @@ class GrowattController(BaseModule):
                     f"{price_ranking.total_blocks} "
                     f"(percentile {price_ranking.percentile:.1f}%, "
                     f"{price_ranking.price_quadrant}), "
-                    f"spread {price_ranking.daily_spread:.2f} EUR/MWh"
+                    f"spread {price_ranking.daily_spread:.2f} CZK/kWh"
                 )
 
         return DecisionContext(
@@ -2733,7 +3931,10 @@ class GrowattController(BaseModule):
             ),
             # System state
             high_loads_active=self._high_loads_active,
+            high_load_details=self._high_load_details,
             battery_soc=self._battery_soc,
+            min_soc=float(self.config.min_soc),
+            max_soc=float(self.config.max_soc),
             current_mode=self._current_mode,
             current_load=self._current_load,
             solar_power=self._solar_power,
@@ -2745,14 +3946,51 @@ class GrowattController(BaseModule):
             cheapest_blocks=self._combined_charging_blocks.copy(),  # Combined charging blocks
             price_thresholds=price_thresholds,
             price_ranking=price_ranking,  # Include price ranking
+            # Optimizer discharge blocks (when optimizer is enabled)
+            optimizer_discharge_blocks=(
+                self._discharge_periods_today.copy() if self._optimizer else set()
+            ),
+            # Optimizer sell-production blocks (export solar, battery passive)
+            optimizer_sell_production_blocks=(
+                self._sell_production_blocks_today.copy() if self._optimizer else set()
+            ),
+            # Optimizer battery-hold blocks (preserve battery, house from grid)
+            optimizer_hold_blocks=(
+                self._hold_blocks_today.copy() if self._optimizer else set()
+            ),
+            # When the optimizer drives, its charge blocks (in cheapest_blocks)
+            # are actuated without the summer price gate.
+            optimizer_active=bool(self._optimizer),
             # Solar schedule
             sunrise=sunrise,
             sunset=sunset,
-            is_summer_mode=(await self._get_season_mode() == "summer")
+            is_summer_mode=(await self._get_season_mode() == "summer"),
+            discharge_power_pct=self._current_discharge_power_pct(),
         )
 
+    def _current_discharge_power_pct(self) -> float:
+        """The discharge powerRate% the inverter will ACTUALLY use this block.
+
+        Mirrors _build_desired_state: when adaptive_discharge_rate is on and a
+        per-block rate is planned for the current block, that rate is actuated;
+        otherwise the static config rate. Surfacing it here keeps the decision-
+        engine discharge explanations honest (they'd otherwise always report the
+        config rate, e.g. "25% power" while the inverter runs at 100%).
+        """
+        if (getattr(self.config, "adaptive_discharge_rate", False)
+                and self._discharge_power_rate_by_ts):
+            now = self._get_local_now()
+            cur_ts = now.replace(
+                minute=(now.minute // 15) * 15, second=0, microsecond=0
+            )
+            drate = self._discharge_power_rate_by_ts.get(cur_ts)
+            if drate is not None:
+                return float(drate)
+        return float(self.config.discharge_power_rate)
+
     async def _build_desired_state(
-        self, mode: str, params: Optional[Dict[str, Any]] = None
+        self, mode: str, params: Optional[Dict[str, Any]] = None,
+        context: Optional["DecisionContext"] = None,
     ) -> InverterState:
         """Build the complete desired inverter state.
 
@@ -2772,50 +4010,197 @@ class GrowattController(BaseModule):
             mode = "regular"
             mode_def = MODE_DEFINITIONS["regular"]
 
-        # Determine actual SOC value
-        stop_soc_raw = mode_def.get("stop_soc", 20)
-        stop_soc: int = 20
-        if stop_soc_raw == "configurable":
+        # Determine actual SOC value — resolve string markers from MODE_DEFINITIONS
+        stop_soc_raw = mode_def.get("stop_soc", "min_soc")
+        stop_soc: int = int(self.config.min_soc)
+        if stop_soc_raw == "min_soc":
+            stop_soc = int(self.config.min_soc)
+        elif stop_soc_raw == "max_soc":
+            stop_soc = int(self.config.max_soc)
+        elif stop_soc_raw == "configurable":
             # Use appropriate default based on mode type
             if mode == "discharge_to_grid":
-                default_soc = self.config.discharge_min_soc  # Use 20% for discharge
+                default_soc = self.config.discharge_min_soc
             elif mode == "charge_from_grid":
-                default_soc = self.config.max_soc  # Use 100% for charging
+                default_soc = self.config.max_soc
             else:
-                default_soc = self.config.max_soc  # Default to max for other modes
+                default_soc = self.config.max_soc
 
             soc_param = params.get("stop_soc", default_soc)
             stop_soc = int(soc_param) if soc_param is not None else int(default_soc)
-        elif isinstance(stop_soc_raw, (int, float, str)):
+        elif isinstance(stop_soc_raw, (int, float)):
             stop_soc = int(stop_soc_raw)
+
+        # Pin stop_soc to the LIVE SOC for the two "battery passive" modes, so the
+        # inverter neither charges the battery in nor discharges it out:
+        #
+        #   sell_production (grid_first): export surplus solar, battery passive.
+        #   battery_hold    (battery_first): the optimizer's "hold" — preserve the
+        #     battery, serve the house from grid, no discharge.
+        #
+        # On the SPH, stop_soc is the level the inverter MAINTAINS in BOTH modes:
+        # it charges UP to stop_soc (from GRID too, even with ac_charge off — the
+        # ac_charge flag does NOT prevent battery_first grid-charging) and
+        # discharges DOWN to it. With stop_soc=max_soc battery_hold would
+        # grid-charge the battery toward 100% at the spot price (confirmed from
+        # telemetry: ChargePower>0 while importing from grid during a hold).
+        # Pinning to the live SOC removes the charge headroom → no grid charge;
+        # any surplus solar exports instead of being banked (export is
+        # price-gated below). Banking surplus solar during a hold is NOT
+        # achievable on this inverter without also grid-charging, so we prefer
+        # "export surplus, never grid-charge".
+        if mode in ("sell_production", "battery_hold", "high_load_protected"):
+            # FLOOR, not round: rounding a live SOC of e.g. 50.6 UP to 51 would
+            # leave ~0.4% of charge headroom, and on this SPH battery_first
+            # charges UP TO stop_soc from the grid even with ac_charge off — i.e.
+            # a rounded-up pin lets the inverter pull a little grid power into the
+            # battery during a hold, the exact thing these modes prevent. Floor
+            # guarantees stop_soc <= live SOC (no discharge risk: battery_first
+            # serves the house from grid, it does not discharge below stop_soc).
+            stop_soc = int(math.floor(max(
+                self.config.min_soc, min(self.config.max_soc, self._battery_soc)
+            )))
 
         # Determine power rate
         # AC charge from mode definition
         ac_charge_enabled = bool(mode_def.get("ac_charge", False))
 
-        # If AC charging is enabled, ALWAYS use 100% power rate to charge quickly within the slot
         if ac_charge_enabled:
-            power_rate = 100
-            self.logger.debug("AC charging enabled - setting power_rate to 100%")
+            if params.get("power_rate") is not None:
+                # A manual charge_from_grid override with an explicit rate wins
+                # over both the adaptive map and the config default.
+                power_rate = int(params["power_rate"])
+            elif getattr(self.config, "adaptive_charge_rate", False):
+                # Adaptive: use the per-window rate the optimizer chose for the
+                # CURRENT block (gentle unless the cheap window is short). Falls
+                # back to 100% if this block has no planned rate (e.g. a manual
+                # charge outside the optimizer's plan); force_power_rate writes it.
+                power_rate = 100
+                now = self._get_local_now()
+                cur_ts = now.replace(
+                    minute=(now.minute // 15) * 15, second=0, microsecond=0
+                )
+                rate = self._charge_power_rate_by_ts.get(cur_ts)
+                if rate is not None:
+                    power_rate = int(rate)
+            else:
+                # Non-adaptive: write an EXPLICIT gentle rate matching the
+                # optimizer's battery_charge_rate_kw, so the inverter doesn't
+                # silently inherit a stale powerRate from a prior grid-first
+                # discharge (set_battery_first writes any rate != 100).
+                hw = getattr(self.config, "battery_charge_max_kw", 9.8) or 9.8
+                power_rate = max(10, min(100, round(
+                    self.config.battery_charge_rate_kw / hw * 100
+                )))
+            self.logger.debug(
+                f"AC charging enabled - power_rate={power_rate}%"
+            )
         else:
-            # For other modes, use configured or default rate
-            default_rate = 100
-            if hasattr(self.config, 'discharge_power_rate'):
-                default_rate = self.config.discharge_power_rate
+            # powerRate means DIFFERENT things per inverter mode:
+            #   grid_first  → discharge-to-grid rate  (gentle default)
+            #   battery_first (ac off, e.g. battery_hold) → CHARGE rate
+            # so a battery_hold must NOT inherit discharge_power_rate (that would
+            # throttle surplus-solar banking to ~25%). Bank solar at the charge
+            # ceiling (respecting the C-rate cap); only solar feeds it (ac off).
+            inv_mode = str(mode_def.get("inverter_mode", "load_first"))
+            if inv_mode == "battery_first":
+                hw = getattr(self.config, "battery_charge_max_kw", 9.8) or 9.8
+                cap = getattr(self.config, "max_charge_power_kw", hw)
+                default_rate = max(10, min(100, round(min(hw, cap) / hw * 100)))
+            elif inv_mode == "grid_first":
+                default_rate = getattr(self.config, 'discharge_power_rate', 100)
+            else:
+                # load_first: set_load_first does NOT actuate powerRate, so use a
+                # FIXED sentinel (100) — otherwise a varying value would key
+                # significant_changes() and trigger spurious mode re-applies for a
+                # field the hardware never sees.
+                default_rate = 100
             power_rate = int(params.get("power_rate", default_rate))
+            # Adaptive discharge: for a grid_first discharge block, override the
+            # gentle default with the per-window rate the optimizer chose for the
+            # CURRENT block (faster only when a short high-price spike needs it).
+            # Skip when a manual override supplied an explicit power_rate — that
+            # request must win over the optimizer's planned rate.
+            if (inv_mode == "grid_first"
+                    and "power_rate" not in params
+                    and getattr(self.config, "adaptive_discharge_rate", False)):
+                now = self._get_local_now()
+                cur_ts = now.replace(
+                    minute=(now.minute // 15) * 15, second=0, microsecond=0
+                )
+                drate = self._discharge_power_rate_by_ts.get(cur_ts)
+                if drate is not None:
+                    power_rate = int(drate)
+                    self.logger.debug(
+                        f"Adaptive discharge - power_rate={power_rate}%"
+                    )
 
         # Map mode to inverter mode
         inverter_mode = str(mode_def.get("inverter_mode", "load_first"))
 
-        # Determine export based on price
-        export_enabled = True  # Default
+        # Determine export based on price. Reuse the caller's already-built
+        # context when supplied (the evaluation loop builds one per tick) so we
+        # don't redundantly rebuild it — a rebuild re-runs price/forecast lookups
+        # and has side effects (e.g. the override-expiry check).
+        # Default conservatively when the current block has no price: preserve
+        # the tracked export state if known, else OFF — never force export ON
+        # without a price basis (the steady-state export gate is itself gated on
+        # the same price availability, so it couldn't turn a spurious ON back off).
+        export_enabled = (
+            self._current_inverter_state.export_enabled
+            if self._current_inverter_state is not None else False
+        )
         try:
-            context = await self._build_decision_context()
+            if context is None:
+                context = await self._build_decision_context()
             if context.price_thresholds and context.current_block_key in context.prices_15min:
-                current_price_czk = context.current_price * 25 / 1000  # EUR/MWh to CZK/kWh
+                current_price_czk = context.current_price  # Already CZK/kWh
                 export_enabled = current_price_czk >= context.price_thresholds.export_price_min
         except Exception as e:
-            self.logger.debug(f"Could not determine export state: {e}, defaulting to enabled")
+            self.logger.debug(f"Could not determine export state: {e}; preserving prior")
+
+        # Preserve the current inverter on/off state — it's owned by the
+        # price-threshold gate, NOT mode evaluation. Without this, every
+        # mode change would reset it to the dataclass default (True),
+        # causing spurious ON commands during deep-negative blocks where
+        # the gate had correctly turned the inverter off.
+        if self._current_inverter_state is not None:
+            current_inverter_on = self._current_inverter_state.inverter_on
+        else:
+            # Startup / force re-apply: there is no tracked state to preserve.
+            # Seed from the SAME price-threshold gate the steady-state loop uses
+            # so the very first Modbus write is the correct direction, instead of
+            # a blind ON that the gate would immediately reverse during a
+            # deep-negative-price block. Default ON (safe/normal) on any error or
+            # inside the hysteresis deadband.
+            current_inverter_on = True
+            try:
+                threshold = self.config.inverter_off_price_threshold_czk
+                hysteresis = self.config.inverter_off_price_hysteresis_czk
+                # A SCHEDULED charge block forces the inverter ON even at a
+                # deep-negative price (mirrors the steady-state gate) — otherwise
+                # the seed writes OFF and the same-tick gate immediately flips it
+                # back ON, a spurious OFF→ON Modbus flap during the charge.
+                is_scheduled_charge = (
+                    context is not None
+                    and context.current_block_key in self._combined_charging_blocks
+                )
+                if (
+                    not is_scheduled_charge
+                    and context is not None
+                    and context.price_thresholds
+                    and context.current_block_key in context.prices_15min
+                    and context.current_price < threshold - hysteresis
+                ):
+                    current_inverter_on = False
+            except Exception as e:
+                self.logger.debug(f"Could not seed inverter_on from price gate: {e}")
+
+        # Stash the EFFECTIVE built mode so the caller reports the actuated mode
+        # as operational_mode. This echoes the decided `mode` except where it was
+        # remapped above (an unknown mode → "regular"). The passive-hold modes are
+        # NOT swapped — they keep their name and go passive via the stop_soc pin.
+        self._last_built_mode = mode
 
         return InverterState(
             inverter_mode=inverter_mode,
@@ -2826,7 +4211,8 @@ class GrowattController(BaseModule):
             ac_charge_enabled=ac_charge_enabled,
             export_enabled=export_enabled,
             timestamp=self._get_local_now(),
-            source="evaluation"
+            source="evaluation",
+            inverter_on=current_inverter_on,
         )
 
     async def _apply_state_changes_with_rollback(
@@ -2854,6 +4240,12 @@ class GrowattController(BaseModule):
                     self.logger.info("✅ Rollback successful")
                 except Exception as rollback_error:
                     self.logger.error(f"❌ Rollback failed: {rollback_error}")
+                    # Hardware is now in a mixed/unknown state and tracked state
+                    # can no longer be trusted. Null it so the next evaluation
+                    # re-sends EVERY sub-command (old_state=None path) instead of
+                    # diffing against a stale tracked state that might match the
+                    # next desired value and skip the broken field forever.
+                    self._current_inverter_state = None
             raise
 
     async def _apply_state_changes(
@@ -2917,13 +4309,36 @@ class GrowattController(BaseModule):
                 new_state.time_start == "00:00" and new_state.time_stop == "23:59"
             )
 
+            # Raise on a failed mode command so the rollback wrapper fires and
+            # _apply_decided_mode does NOT commit desired_state — otherwise the
+            # controller's tracked mode would advance while the hardware stays in
+            # the old (wrong) mode and, since the next desired state matches the
+            # wrongly-tracked one, the change would never be retried. This is the
+            # most safety-critical path (it sets charge/discharge direction), so
+            # it must mirror the export/inverter-on/ac-charge hardening below.
+            mode_ok = True
             if new_state.inverter_mode == "load_first":
-                await self._mode_manager.set_load_first(
+                mode_ok = await self._mode_manager.set_load_first(
                     stop_soc=new_state.stop_soc,
                     previous_mode=previous_mode
                 )
             elif new_state.inverter_mode == "battery_first":
-                await self._mode_manager.set_battery_first(
+                mode_ok = await self._mode_manager.set_battery_first(
+                    new_state.time_start,
+                    new_state.time_stop,
+                    stop_soc=new_state.stop_soc,
+                    power_rate=new_state.power_rate,
+                    immediate_activation=immediate_activation,
+                    previous_mode=previous_mode,
+                    # Always write the exact battery-first powerRate (even at
+                    # 100%) so the inverter can't keep a stale 25% from a prior
+                    # grid_first discharge. Both adaptive charging AND battery_hold
+                    # (which banks solar at the charge ceiling, often 100%) need
+                    # this — battery_first is always an explicit-charge state.
+                    force_power_rate=True,
+                )
+            elif new_state.inverter_mode == "grid_first":
+                mode_ok = await self._mode_manager.set_grid_first(
                     new_state.time_start,
                     new_state.time_stop,
                     stop_soc=new_state.stop_soc,
@@ -2931,36 +4346,63 @@ class GrowattController(BaseModule):
                     immediate_activation=immediate_activation,
                     previous_mode=previous_mode
                 )
-            elif new_state.inverter_mode == "grid_first":
-                await self._mode_manager.set_grid_first(
-                    new_state.time_start,
-                    new_state.time_stop,
-                    stop_soc=new_state.stop_soc,
-                    power_rate=new_state.power_rate,
-                    immediate_activation=immediate_activation,
-                    previous_mode=previous_mode
+            if not mode_ok:
+                raise RuntimeError(
+                    f"Failed to set inverter mode to {new_state.inverter_mode}"
                 )
 
             await asyncio.sleep(0.5)
 
-        # Export change
+        # Export change. Raise on a failed command so the rollback wrapper fires
+        # and _apply_decided_mode does NOT commit desired_state — otherwise the
+        # controller's tracked export_enabled would advance while the hardware
+        # never changed, and the steady-state export-price gate would then see
+        # tracked == desired and never retry (same desync class as inverter
+        # on/off below).
         if not old_state or old_state.export_enabled != new_state.export_enabled:
             self._commands_sent_count += 1
             if new_state.export_enabled:
-                await self._mode_manager.enable_export()
+                if not await self._mode_manager.enable_export():
+                    raise RuntimeError("Failed to enable export")
                 self.logger.debug(
                     f"⚡ Export to grid ENABLED (source: {new_state.source})"
                 )
             else:
-                await self._mode_manager.disable_export()
+                if not await self._mode_manager.disable_export():
+                    raise RuntimeError("Failed to disable export")
                 self.logger.debug(
                     f"⚡ Export to grid DISABLED (source: {new_state.source})"
                 )
 
-        # AC charge change
+        # Inverter on/off change. On startup (old_state is None) we ALWAYS
+        # send the desired state to recover from a previous run that may have
+        # left the hardware in the opposite state — the controller's
+        # in-memory default of True can otherwise mask a hardware-OFF.
+        if (
+            not old_state
+            or old_state.inverter_on != new_state.inverter_on
+        ):
+            self._commands_sent_count += 1
+            # Raise on a failed Modbus write so the rollback wrapper triggers and
+            # _apply_decided_mode does NOT commit desired_state — otherwise the
+            # controller's tracked inverter_on would advance while the hardware
+            # never changed (same desync class as the price-threshold gate).
+            if not await self._mode_manager.set_inverter_power(new_state.inverter_on):
+                raise RuntimeError(
+                    f"Failed to set inverter power to "
+                    f"{'ON' if new_state.inverter_on else 'OFF'}"
+                )
+
+        # AC charge change. Raise on failure so the rollback wrapper fires and
+        # tracked ac_charge_enabled is not advanced past the hardware (same
+        # desync class as inverter on/off and export above).
         if not old_state or old_state.ac_charge_enabled != new_state.ac_charge_enabled:
             self._commands_sent_count += 1
-            await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled)
+            if not await self._mode_manager.set_ac_charge(new_state.ac_charge_enabled):
+                raise RuntimeError(
+                    f"Failed to set AC charge to "
+                    f"{'ENABLED' if new_state.ac_charge_enabled else 'DISABLED'}"
+                )
             if new_state.ac_charge_enabled:
                 self.logger.debug(
                     f"🔌 AC charging from grid ENABLED (source: {new_state.source})"
@@ -2975,8 +4417,9 @@ class GrowattController(BaseModule):
         mode: str,
         params: Optional[Dict[str, Any]] = None,
         reason: Optional[str] = None,
-        explanation: Optional[Dict[str, Any]] = None
-    ) -> None:
+        explanation: Optional[Dict[str, Any]] = None,
+        context: Optional["DecisionContext"] = None,
+    ) -> bool:
         """Apply a mode based on its definition from MODE_DEFINITIONS.
 
         Args:
@@ -2984,9 +4427,13 @@ class GrowattController(BaseModule):
             params: Optional parameters for configurable modes
             reason: What triggered the mode change
             explanation: Decision explanation from decision engine
+            context: Already-built decision context to reuse (avoids a rebuild)
+
+        Returns:
+            True if the desired state differed and was applied, False on no-op.
         """
-        # Build desired state from mode and current conditions
-        desired_state = await self._build_desired_state(mode, params)
+        # Build desired state from mode and current conditions (reuse context)
+        desired_state = await self._build_desired_state(mode, params, context=context)
 
         # Check if anything actually changed
         if self._current_inverter_state and desired_state == self._current_inverter_state:
@@ -2995,7 +4442,7 @@ class GrowattController(BaseModule):
                 f"State unchanged after evaluation: {desired_state.summary()} "
                 f"(skipped: {self._commands_skipped_count}, sent: {self._commands_sent_count})"
             )
-            return
+            return False
 
         # Log consolidated one-liner with all essential info
         if self._current_inverter_state:
@@ -3018,14 +4465,114 @@ class GrowattController(BaseModule):
 
         # Track if we're in high load protected mode
         self._high_load_protected_mode_active = (mode == "high_load_protected")
+        return True
 
     # Event-driven evaluation methods
+
+    async def _apply_deferrable_load_schedule(self, now: datetime) -> None:
+        """Publish on/off commands for deferrable loads according to schedule."""
+        loads_by_name = {load.name: load for load in self._deferrable_loads}
+        desired_active: Set[str] = set()
+        current_block_start = now.replace(
+            minute=(now.minute // 15) * 15,
+            second=0,
+            microsecond=0,
+        )
+
+        for sched in self._deferrable_schedules:
+            if current_block_start in sched.block_datetimes:
+                desired_active.add(sched.load_name)
+
+        already_active = set(self._deferrable_active)  # active BEFORE this cycle
+        to_start = desired_active - self._deferrable_active
+        to_stop = self._deferrable_active - desired_active
+
+        def _payload(value: Any, default: Dict[str, int]) -> str:
+            if value is None:
+                return json.dumps(default)
+            return value if isinstance(value, str) else json.dumps(value)
+
+        simulate = self._optional_config.get("simulation_mode", False)
+        # A fire-and-forget MQTT publish only ENQUEUES; during a broker outage
+        # the command can be dropped silently. Only treat a load as actually
+        # actuated when we are either simulating or holding a live connection,
+        # so we never credit undelivered energy (which would under-schedule the
+        # load on the next solve). The next cycle re-issues ON until it sticks.
+        mqtt_live = simulate or bool(
+            self.mqtt_client and self.mqtt_client.is_connected
+        )
+
+        for load_name in sorted(to_start):
+            load = loads_by_name.get(load_name)
+            if not load or not load.mqtt_topic_on:
+                continue
+            if not mqtt_live:
+                self.logger.warning(
+                    f"Deferrable load {load.name}: MQTT not connected — "
+                    "deferring ON command (will retry next cycle)"
+                )
+                continue
+            payload = _payload(load.payload_on, {"value": 1})
+            if simulate:
+                self.logger.info(f"[SIMULATE] Deferrable load {load.name} ON")
+            else:
+                assert self.mqtt_client is not None
+                await self.mqtt_client.publish(load.mqtt_topic_on, payload)
+            self._deferrable_active.add(load_name)
+            self.logger.info(f"📋 Deferrable load {load.name}: ON")
+
+        # Credit a block as delivered only when the load is active AND we have a
+        # live connection (or are simulating) — otherwise the ON command this
+        # cycle could have been dropped and the appliance never ran. Persist each
+        # newly-credited block so a mid-cycle restart does not re-schedule
+        # already-delivered energy (which would double-import from grid).
+        if mqtt_live:
+            for load_name in sorted(desired_active & self._deferrable_active):
+                # RE-ISSUE ON each cycle for loads that were ALREADY active in a
+                # prior cycle (not the ones just started above — those published
+                # moments ago). A publish only enqueues; if the broker connection
+                # drops within the publish TTL the message is dropped, and
+                # `to_start` (desired − active) would NOT re-fire it because the
+                # load is already in _deferrable_active. Re-sending value:1 is
+                # idempotent and makes the credit below honest — the command keeps
+                # getting retried until the block ends, so a single dropped publish
+                # self-heals on the next tick.
+                load = loads_by_name.get(load_name)
+                if (load_name in already_active and load and load.mqtt_topic_on
+                        and not simulate and self.mqtt_client):
+                    payload = _payload(load.payload_on, {"value": 1})
+                    await self.mqtt_client.publish(load.mqtt_topic_on, payload)
+                key = (load_name, current_block_start)
+                if key not in self._deferrable_completed_blocks:
+                    self._deferrable_completed_blocks.add(key)
+                    await self._persist_deferrable_completed(
+                        load_name, current_block_start
+                    )
+
+        for load_name in sorted(to_stop):
+            load = loads_by_name.get(load_name)
+            if not load or not load.mqtt_topic_off:
+                self.logger.warning(
+                    f"Deferrable load {load_name}: no OFF topic available; "
+                    "forgetting active state"
+                )
+                self._deferrable_active.discard(load_name)
+                continue
+            payload = _payload(load.payload_off, {"value": 0})
+            if simulate:
+                self.logger.info(f"[SIMULATE] Deferrable load {load.name} OFF")
+            else:
+                assert self.mqtt_client is not None
+                await self.mqtt_client.publish(load.mqtt_topic_off, payload)
+            self._deferrable_active.discard(load_name)
+            self.logger.info(f"📋 Deferrable load {load.name}: OFF")
 
     async def _periodic_evaluation_loop(self) -> None:
         """Periodically check for condition changes that need re-evaluation."""
         last_midnight_check = None
         last_fetch_check = None
         last_pre_midnight_check = None
+        last_solar_forecast_update: Optional[datetime] = None
 
         last_summary_hour = None  # Track last hour we logged summary
 
@@ -3035,13 +4582,119 @@ class GrowattController(BaseModule):
 
                 now = self._get_local_now()
 
+                # Refresh battery SOC from live inverter telemetry. The
+                # home_status MQTT path that feeds self._battery_soc can lag
+                # or stop updating; the telemetry topic is the freshest source
+                # the inverter exposes. Keeping these in sync ensures the
+                # optimizer (and every downstream consumer) builds schedules
+                # against real SOC, not a stale cached value.
+                try:
+                    from .growatt.api import _telemetry_cache
+                    live_soc = _telemetry_cache.get("SOC") if _telemetry_cache else None
+                    if isinstance(live_soc, (int, float)) and 0 <= live_soc <= 100:
+                        self._battery_soc = float(live_soc)
+                except Exception:
+                    pass  # telemetry cache absent — fall back to existing value
+
                 # Log periodic summary once per hour at SUMMARY level
                 if now.hour != last_summary_hour:
                     last_summary_hour = now.hour
                     await self._log_periodic_summary()
 
-                # Check if it's time to start fetching next day's prices
-                if now.hour == self.config.price_fetch_hour and now.minute == 0:
+                # Refresh solar forecast periodically
+                if self._solar_forecast:
+                    update_interval = getattr(
+                        self.config, 'solar_forecast_update_hours', 6
+                    ) * 3600
+                    if (
+                        last_solar_forecast_update is None
+                        or (now - last_solar_forecast_update).total_seconds() >= update_interval
+                    ):
+                        last_solar_forecast_update = now
+                        try:
+                            await self._update_solar_forecast()
+                        except Exception as e:
+                            self.logger.warning(f"Solar forecast refresh failed: {e}")
+
+                # Rebuild the solar production model weekly. It trains on a
+                # 730-day window; since restarts are UI/deploy-driven a
+                # container can run for weeks, so the model must refresh on a
+                # timer rather than only at startup. While there is NO model at
+                # all (startup build failed/declined), retry hourly instead —
+                # otherwise the controller would run modelless forever.
+                solar_rebuild_due = False
+                if self._solar_forecast and (
+                    self._models_task is None or self._models_task.done()
+                ):
+                    now_local = datetime.now(self._local_tz)
+                    # 1h attempt-backoff applies to BOTH branches so a failing
+                    # rebuild (730-day queries) can't re-fire every 60s tick.
+                    attempt_ok = (
+                        self._solar_model_attempted_at is None
+                        or now_local - self._solar_model_attempted_at
+                        > timedelta(hours=1)
+                    )
+                    if self._solar_model_built_at is not None:
+                        solar_rebuild_due = attempt_ok and (
+                            now_local - self._solar_model_built_at
+                            > timedelta(days=7)
+                        )
+                    else:
+                        solar_rebuild_due = attempt_ok
+                if solar_rebuild_due:
+                    self._solar_model_attempted_at = datetime.now(self._local_tz)
+                    # Run in the background — the build issues ~24 monthly
+                    # 730-day InfluxDB queries and would otherwise stall this
+                    # 60s loop (live SOC refresh, 15-min block actuation) for
+                    # minutes. Stored in _models_task so the gate above
+                    # (`_models_task.done()`) prevents overlapping builds.
+                    self._models_task = asyncio.create_task(
+                        self._rebuild_solar_model_background()
+                    )
+                    self._models_task.add_done_callback(
+                        self._make_task_guard("solar_model_rebuild", None)
+                    )
+
+                # Snapshot the optimizer's expected daily gain once per day so
+                # the weekly/monthly stats can show predicted-vs-realized. The
+                # snapshot is persisted (survives restarts) like the Solcast
+                # quota. Best-effort — never disrupt dispatch.
+                try:
+                    await self._maybe_snapshot_expected_gain(now)
+                except Exception as e:
+                    self.logger.debug(f"Expected-gain snapshot failed: {e}")
+
+                # Rebuild consumption model if needed (weekly)
+                if self._consumption_forecast and self._consumption_forecast.needs_rebuild():
+                    try:
+                        await self._consumption_forecast.build_model(
+                            self.influxdb_client, self.settings,
+                            local_tz=self._local_tz,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Consumption model rebuild failed: {e}")
+
+                # Rebuild the ML consumption model too. A recursive AR model is
+                # anchored at its training-end, so it must be refreshed often
+                # (needs_rebuild defaults to 1 day) to keep its prediction
+                # horizon near 'now' — otherwise it silently stops producing.
+                ml_cf = getattr(self, "_ml_consumption_forecast", None)
+                if ml_cf is not None and ml_cf.needs_rebuild():
+                    try:
+                        await ml_cf.build_model(
+                            self.influxdb_client, self.settings,
+                            local_tz=self._local_tz,
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"ML consumption model rebuild failed: {e}")
+
+                # Check if it's time to start fetching next day's prices.
+                # Use `>=` (not minute == 0): the 60s loop is `sleep(60) + work`
+                # so its phase drifts and can skip an exact minute. The
+                # once-per-day date latch below (last_fetch_check) makes this
+                # fire at most once, so a skipped :00 minute just fires on the
+                # next tick instead of being lost for the whole day.
+                if now.hour >= self.config.price_fetch_hour:
                     current_fetch_check = now.date()
                     should_fetch = (
                         last_fetch_check != current_fetch_check
@@ -3067,8 +4720,10 @@ class GrowattController(BaseModule):
                             self._fetch_next_day_prices_task()
                         )
 
-                # Check for pre-midnight (23:55) - ensure next day prices are ready
-                if now.hour == 23 and now.minute == 55:
+                # Check for pre-midnight (>= 23:55) - ensure next day prices are
+                # ready. `>=` (not minute == 55) so loop drift can't skip the
+                # backstop; the date latch below fires it at most once per day.
+                if now.hour == 23 and now.minute >= 55:
                     current_pre_midnight_check = now.date()
                     if last_pre_midnight_check != current_pre_midnight_check:
                         last_pre_midnight_check = current_pre_midnight_check
@@ -3102,154 +4757,210 @@ class GrowattController(BaseModule):
                             self.logger.info("📋 Displaying tomorrow's schedule:")
                             await self._calculate_cross_day_optimal_schedule(force_table=True)
 
-                # Check for midnight - update date display
-                if now.hour == 0 and now.minute == 0:
-                    # Only process once per midnight
-                    current_midnight = now.date()
-                    if last_midnight_check != current_midnight:
-                        last_midnight_check = current_midnight
-                        self.logger.info("🕛 Midnight - new day starting...")
+                # Initialize the rollover marker on the first tick so startup
+                # doesn't fire a spurious day-rollover.
+                if last_midnight_check is None:
+                    last_midnight_check = now.date()
 
-                        # Cancel any ongoing fetch task (if exists)
-                        if self._price_fetch_task and not self._price_fetch_task.done():
-                            self.logger.debug(
-                                "Cancelling previous price fetch task (midnight rollover)"
-                            )
-                            self._price_fetch_task.cancel()
-                            try:
-                                await self._price_fetch_task
-                            except asyncio.CancelledError:
-                                pass
-                            self._price_fetch_task = None
+                # Day rollover — fire once when the local DATE changes, not at an
+                # exact 00:00 minute. The 60s loop is `sleep(60) + work`, so its
+                # phase drifts and can skip the 00:00 tick entirely; an exact
+                # equality check would then miss the rollover and leave
+                # yesterday's prices/schedule active for the whole day.
+                current_midnight = now.date()
+                if last_midnight_check != current_midnight:
+                    last_midnight_check = current_midnight
+                    self.logger.info("🕛 Midnight - new day starting...")
 
-                        # NEW: Apply cross-day schedule transition at midnight
+                    # Cancel any ongoing fetch task (if exists)
+                    if self._price_fetch_task and not self._price_fetch_task.done():
+                        self.logger.debug(
+                            "Cancelling previous price fetch task (midnight rollover)"
+                        )
+                        self._price_fetch_task.cancel()
+                        try:
+                            await self._price_fetch_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._price_fetch_task = None
+
+                    # Apply the cross-day schedule transition at midnight:
+                    # what was "tomorrow" is now "today".
+
+                    # Move next-day prices to current prices
+                    if self._next_day_prices_fetched and self._next_day_prices:
+                        self._current_prices = self._next_day_prices
+                        self._prices_date = self._next_day_prices_date
+                        self._prices_updated = now
+
+                        self.logger.info(
+                            f"✅ Activated next-day prices for {self._prices_date} "
+                            f"({len(self._current_prices)} blocks)"
+                        )
+
+                        # Clear next-day storage
+                        self._next_day_prices = {}
+                        self._next_day_prices_date = None
+                        self._next_day_prices_fetched = False
+
+                        # Shift queued tomorrow schedules to today
+                        self.logger.info(
+                            "🔄 Applying queued tomorrow's schedule as today's schedule"
+                        )
+
                         # What was "tomorrow" is now "today"
+                        self._cheapest_charging_blocks_today = (
+                            self._cheapest_charging_blocks_tomorrow.copy()
+                        )
+                        self._pre_discharge_blocks_today = (
+                            self._pre_discharge_blocks_tomorrow.copy()
+                        )
+                        self._discharge_periods_today = (
+                            self._discharge_periods_tomorrow.copy()
+                        )
+                        self._sell_production_blocks_today = (
+                            self._sell_production_blocks_tomorrow.copy()
+                        )
+                        self._hold_blocks_today = (
+                            self._hold_blocks_tomorrow.copy()
+                        )
 
-                        # Move next-day prices to current prices
-                        if self._next_day_prices_fetched and self._next_day_prices:
-                            self._current_prices = self._next_day_prices
-                            self._prices_date = self._next_day_prices_date
-                            self._prices_updated = now
+                        # Clear tomorrow's schedules
+                        self._cheapest_charging_blocks_tomorrow = set()
+                        self._pre_discharge_blocks_tomorrow = set()
+                        self._discharge_periods_tomorrow = set()
+                        self._sell_production_blocks_tomorrow = set()
+                        self._hold_blocks_tomorrow = set()
 
-                            self.logger.info(
-                                f"✅ Activated next-day prices for {self._prices_date} "
-                                f"({len(self._current_prices)} blocks)"
-                            )
+                        # Clear queues
+                        self._queued_tomorrow_charging = []
+                        self._queued_tomorrow_pre_discharge = []
+                        self._queued_tomorrow_discharge = []
 
-                            # Clear next-day storage
-                            self._next_day_prices = {}
-                            self._next_day_prices_date = None
-                            self._next_day_prices_fetched = False
+                        # Update backward-compatible sets
+                        self._cheapest_charging_blocks = (
+                            self._cheapest_charging_blocks_today.copy()
+                        )
+                        self._pre_discharge_blocks = (
+                            self._pre_discharge_blocks_today.copy()
+                        )
+                        self._combined_charging_blocks = (
+                            self._cheapest_charging_blocks_today
+                            | self._pre_discharge_blocks_today
+                        )
 
-                            # NEW: Shift queued tomorrow schedules to today
-                            self.logger.info(
-                                "🔄 Applying queued tomorrow's schedule as today's schedule"
-                            )
+                        # Clear the defer flag (superseded by cross-day logic)
+                        self._defer_charging_to_tomorrow = False
+                        self._tomorrow_cheaper_by = None
 
-                            # What was "tomorrow" is now "today"
-                            self._cheapest_charging_blocks_today = (
-                                self._cheapest_charging_blocks_tomorrow.copy()
-                            )
-                            self._pre_discharge_blocks_today = (
-                                self._pre_discharge_blocks_tomorrow.copy()
-                            )
-                            self._discharge_periods_today = (
-                                self._discharge_periods_tomorrow.copy()
-                            )
+                        self.logger.info(
+                            f"✅ Schedule shift complete: "
+                            f"{len(self._combined_charging_blocks)} charging blocks "
+                            f"active today"
+                        )
 
-                            # Clear tomorrow's schedules
-                            self._cheapest_charging_blocks_tomorrow = set()
-                            self._pre_discharge_blocks_tomorrow = set()
-                            self._discharge_periods_tomorrow = set()
+                        # Print full schedule table for the new day
+                        window = self._get_combined_price_window()
+                        if window:
+                            await self._log_cross_day_price_table(window, force_display=True)
 
-                            # Clear queues
-                            self._queued_tomorrow_charging = []
-                            self._queued_tomorrow_pre_discharge = []
-                            self._queued_tomorrow_discharge = []
+                        # Recalculate schedule with today's prices (optimizer needs this)
+                        if self._current_prices:
+                            await self._calculate_cross_day_optimal_schedule()
 
-                            # Update backward-compatible sets
-                            self._cheapest_charging_blocks = (
-                                self._cheapest_charging_blocks_today.copy()
-                            )
-                            self._pre_discharge_blocks = (
-                                self._pre_discharge_blocks_today.copy()
-                            )
-                            self._combined_charging_blocks = (
-                                self._cheapest_charging_blocks_today
-                                | self._pre_discharge_blocks_today
-                            )
+                        # Trigger re-evaluation with recalculated schedule
+                        await self._on_price_update()
 
-                            # Clear old defer flag (replaced by cross-day logic)
-                            self._defer_charging_to_tomorrow = False
-                            self._tomorrow_cheaper_by = None
+                        # Daily solar calibration: recalibrate from yesterday's actuals
+                        if self._solar_forecast:
+                            try:
+                                await self._solar_forecast.calibrate_from_actuals(
+                                    self.influxdb_client,
+                                    self.settings.influxdb.bucket_solar,
+                                    local_tz=self._local_tz,
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"Daily solar calibration failed: {e}")
 
-                            self.logger.info(
-                                f"✅ Schedule shift complete: "
-                                f"{len(self._combined_charging_blocks)} charging blocks "
-                                f"active today"
-                            )
+                        # Daily base load profile update with yesterday's data
+                        if self._optimizer:
+                            try:
+                                await self._optimizer.update_profile_with_yesterday(
+                                    self.influxdb_client,
+                                    self.settings.influxdb.bucket_solar,
+                                    self.settings.influxdb.bucket_loxone,
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"Base load profile update failed: {e}")
 
-                            # Print full schedule table for the new day
-                            window = self._get_combined_price_window()
-                            if window:
-                                rate = self._eur_czk_rate or 25.0
-                                await self._log_cross_day_price_table(window, rate, force_display=True)
+                        # Start background fetch for NEW next day's prices (non-blocking)
+                        # This task will retry indefinitely with smart time-based backoff
+                        self._price_fetch_task = asyncio.create_task(
+                            self._fetch_next_day_prices_task()
+                        )
+                        self.logger.info(
+                            "🔄 Started background fetch for next day's prices "
+                            "(will retry with smart backoff until successful)"
+                        )
+                    else:
+                        # No next-day prices available - CRITICAL: Fetch TODAY's prices!
+                        current_date = self._get_local_date_string(days_ahead=0)
 
-                            # Trigger re-evaluation with shifted schedule
-                            # Note: We don't recalculate here because we don't have new
-                            # tomorrow prices yet. The background fetch will recalculate
-                            # when new tomorrow data arrives.
-                            await self._on_price_update()
+                        self.logger.warning(
+                            "⚠️  Next-day prices not available at midnight! "
+                            "This should not happen if pre-fetch worked correctly."
+                        )
+                        self.logger.info(
+                            f"📊 Fetching prices for TODAY ({current_date}) immediately..."
+                        )
 
-                            # Start background fetch for NEW next day's prices (non-blocking)
-                            # This task will retry indefinitely with smart time-based backoff
-                            self._price_fetch_task = asyncio.create_task(
-                                self._fetch_next_day_prices_task()
-                            )
-                            self.logger.info(
-                                "🔄 Started background fetch for next day's prices "
-                                "(will retry with smart backoff until successful)"
-                            )
-                        else:
-                            # No next-day prices available - CRITICAL: Fetch TODAY's prices!
-                            current_date = self._get_local_date_string(days_ahead=0)
+                        # Reset the fetch flag for the new day
+                        self._next_day_prices_fetched = False
+                        self._next_day_prices = {}
+                        self._next_day_prices_date = None
 
-                            self.logger.warning(
-                                "⚠️  Next-day prices not available at midnight! "
-                                "This should not happen if pre-fetch worked correctly."
-                            )
-                            self.logger.info(
-                                f"📊 Fetching prices for TODAY ({current_date}) immediately..."
-                            )
+                        # Clear defer flag (new day, new decisions)
+                        self._defer_charging_to_tomorrow = False
+                        self._tomorrow_cheaper_by = None
 
-                            # Reset the fetch flag for the new day
-                            self._next_day_prices_fetched = False
-                            self._next_day_prices = {}
-                            self._next_day_prices_date = None
+                        # Fetch TODAY's prices immediately so control logic uses
+                        # the correct prices.
+                        await self._fetch_prices()
 
-                            # Clear defer flag (new day, new decisions)
-                            self._defer_charging_to_tomorrow = False
-                            self._tomorrow_cheaper_by = None
-
-                            # CRITICAL FIX: Fetch TODAY's prices immediately
-                            # This ensures control logic uses correct prices
-                            await self._fetch_prices()
-
-                            self.logger.info(
-                                f"⏰ Next-day prices will be fetched at "
-                                f"{self.config.price_fetch_hour}:00 when OTE publishes them"
-                            )
+                        self.logger.info(
+                            f"⏰ Next-day prices will be fetched at "
+                            f"{self.config.price_fetch_hour}:00 when OTE publishes them"
+                        )
 
                 # Check for 15-minute block change (price changes every 15 minutes)
                 current_block = (now.hour, now.minute // 15)
                 if self._last_evaluation_block != current_block:
                     self._last_evaluation_block = current_block
+
+                    # Re-run optimizer with current real SOC + remaining future blocks
+                    if self._optimizer and self._current_prices:
+                        old_charge = self._combined_charging_blocks.copy()
+                        old_discharge = self._discharge_periods_today.copy()
+                        await self._calculate_cross_day_optimal_schedule(suppress_print=True)
+                        if self._combined_charging_blocks != old_charge or self._discharge_periods_today != old_discharge:
+                            ch = len(self._combined_charging_blocks)
+                            dis = len(self._discharge_periods_today)
+                            self.logger.info(
+                                f"🔄 Schedule updated (SOC {self._battery_soc:.0f}%): "
+                                f"{ch} charge, {dis} discharge blocks"
+                            )
+
                     await self._evaluate_conditions("15min_block_change")
 
                 # Check for battery SOC change (>5%)
                 if abs(self._battery_soc - self._last_battery_soc) >= 5:
                     self._last_battery_soc = self._battery_soc
                     await self._evaluate_conditions("battery_soc_change")
+
+                try:
+                    await self._apply_deferrable_load_schedule(now)
+                except Exception as e:
+                    self.logger.warning(f"Deferrable load actuation failed: {e}")
 
             except asyncio.CancelledError:
                 break
@@ -3319,8 +5030,10 @@ class GrowattController(BaseModule):
             raise ValueError(f"Invalid duration type: {duration_type}")
 
         # Set default params if not provided based on mode
-        if params is None:
-            params = {}
+        # Own an independent copy so the stored Period.params (read every tick
+        # for actuation) doesn't alias the caller's dict and our setdefault()s
+        # don't mutate it.
+        params = dict(params or {})
 
         # Set sensible defaults for modes that need params
         if mode == "charge_from_grid":
@@ -3392,6 +5105,146 @@ class GrowattController(BaseModule):
                 "success": True,
                 "message": "No manual override was active"
             }
+
+    async def reapply_current_state(self) -> Dict[str, Any]:
+        """Force a re-send of the current decided mode + inverter commands to the
+        hardware, bypassing idempotency tracking. Use this when a control command
+        failed (or the inverter drifted out of sync) to push the intended state
+        again without waiting for the next 15-min tick.
+
+        The idempotency reset + re-evaluation happen atomically under the
+        evaluation lock (force=True), so a concurrent periodic tick can't run on
+        half-reset state, and every command (mode, stop-SOC, power, export,
+        inverter on/off) is re-issued even when the decided state is unchanged.
+        """
+        sent_before = self._commands_sent_count
+        try:
+            # Clear stale per-command results so `failed` reflects ONLY commands
+            # issued during THIS re-apply. The dict persists across evaluations
+            # and is never otherwise cleared, so an old failure for a command
+            # type not re-issued now would mis-report success=false.
+            self._last_command_results.clear()
+            await self._evaluate_conditions("manual_reapply", force=True)
+
+            results = getattr(self, "_last_command_results", {}) or {}
+            failed = [k for k, v in results.items() if not v.get("success", True)]
+            return {
+                "success": not failed,
+                "mode": self._current_mode,
+                "commands_sent": max(0, self._commands_sent_count - sent_before),
+                "failed_commands": failed,
+                "message": (
+                    "Re-applied current state"
+                    + (f" ({len(failed)} command(s) failed: {', '.join(failed)})"
+                       if failed else " — all commands acknowledged")
+                ),
+            }
+        except Exception as e:
+            self.logger.error(f"Re-apply current state failed: {e}", exc_info=True)
+            return {"success": False, "message": f"Re-apply failed: {e}"}
+
+    def get_settings_schema(self) -> List[Dict[str, Any]]:
+        """Grouped editable-settings schema + current values for the dashboard."""
+        from config.settings_overrides import build_settings_schema
+        return build_settings_schema(self.config)
+
+    async def apply_setting_overrides(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Validate, persist and (where possible) hot-apply edited settings.
+
+        `updates` maps GrowattConfig field name -> new value (strings from the
+        web form are coerced/validated by Pydantic, including cross-field rules).
+
+        Hot fields (read fresh each evaluation tick) take effect immediately:
+        the live config is mutated and a full schedule recompute + re-evaluation
+        is triggered so the new economics actuate without waiting for the next
+        15-min tick. Fields consumed only at startup (forecaster/optimizer
+        construction, log level) are persisted and reported as needing a restart.
+        """
+        from config.settings_overrides import (
+            EDITABLE_FIELDS,
+            apply_overrides,
+            load_overrides,
+            save_overrides,
+        )
+        try:
+            # Validate + mutate live config in place (raises on any bad value,
+            # leaving the live config untouched on failure).
+            applied = apply_overrides(self.config, updates)
+        except Exception as e:
+            return {"success": False, "message": f"Invalid settings: {e}"}
+
+        if not applied:
+            return {"success": False, "message": "No editable settings in request"}
+
+        # Persist: merge onto whatever is already stored so unrelated prior
+        # overrides survive.
+        try:
+            stored = load_overrides(self._overrides_path)
+            for key in applied:
+                stored[key] = getattr(self.config, key)
+            save_overrides(stored, self._overrides_path)
+            persisted = True
+        except Exception as e:
+            self.logger.error(f"Failed to persist setting overrides: {e}")
+            persisted = False
+
+        restart_required = sorted(
+            k for k in applied if not EDITABLE_FIELDS[k].hot
+        )
+        hot_applied = sorted(k for k in applied if EDITABLE_FIELDS[k].hot)
+
+        # Re-run the optimizer + decision tree so hot economic changes actuate
+        # now. Recompute the schedule first (that's where optimize() reads the
+        # new config), then force a re-evaluation to push any mode change.
+        reevaluated = False
+        if hot_applied:
+            try:
+                await self._calculate_cross_day_optimal_schedule(force_table=True)
+                await self._evaluate_conditions("settings_update", force=True)
+                reevaluated = True
+            except Exception as e:
+                self.logger.error(f"Re-evaluation after settings change failed: {e}")
+
+        msg_parts = [f"Saved {len(applied)} setting(s)"]
+        if hot_applied:
+            msg_parts.append(
+                "applied live" if reevaluated else "applied (re-eval failed)"
+            )
+        if restart_required:
+            msg_parts.append(
+                f"restart required for: {', '.join(restart_required)}"
+            )
+        if not persisted:
+            msg_parts.append("WARNING: not persisted to disk")
+
+        return {
+            "success": True,
+            "applied": sorted(applied),
+            "hot_applied": hot_applied,
+            "restart_required": restart_required,
+            "persisted": persisted,
+            "reevaluated": reevaluated,
+            "message": " — ".join(msg_parts),
+        }
+
+    async def request_restart(self, reason: str = "settings change") -> Dict[str, Any]:
+        """Restart the controller process so startup-only settings take effect.
+
+        There is no docker socket, so we can't recreate our own container
+        directly. Instead we send ourselves SIGTERM, which main.py's signal
+        handler turns into a graceful shutdown; the process then exits and
+        Docker's ``restart: unless-stopped`` policy recreates the container,
+        re-reading config_overrides.json (incl. the ml consumption engine) on
+        boot. SIGTERM is scheduled ~1s in the future so this HTTP response is
+        delivered before the process dies.
+        """
+        self.logger.warning(f"🔄 Restart requested ({reason}) — sending SIGTERM in 1s")
+        loop = asyncio.get_event_loop()
+        loop.call_later(1.0, lambda: os.kill(os.getpid(), signal.SIGTERM))
+        return {
+            "success": True,
+            "message": "Restarting controller — it will be back in ~30–40s.",
+        }
 
     def get_manual_override_status(self) -> Dict[str, Any]:
         """Get current manual override status."""

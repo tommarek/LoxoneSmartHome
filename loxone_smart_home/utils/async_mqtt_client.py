@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from typing import Any, Callable, Dict, Optional, Set
 
 from asyncio_mqtt import Client, MqttError
@@ -31,8 +32,14 @@ class AsyncMQTTClient:
         self._pre_registered_subscriptions: Dict[str, Set[Callable[[str, Any], Any]]] = {}
         self._pre_registration_lock = asyncio.Lock()
 
-        # Publish queue for reliability
-        self.publish_queue: asyncio.Queue[tuple[str, Any, bool]] = asyncio.Queue()
+        # Publish queue for reliability. Items are (topic, payload, retain, qos,
+        # enqueue_monotonic). Bounded + TTL'd so a long broker outage can't grow
+        # it without bound or replay stale inverter commands on reconnect.
+        self.publish_queue: "asyncio.Queue[tuple[str, Any, bool, int, float]]" = (
+            asyncio.Queue()
+        )
+        self._max_publish_queue = 1000
+        self._publish_ttl_s = 120.0
 
         # Background tasks
         self._read_task: Optional[asyncio.Task[None]] = None
@@ -179,28 +186,74 @@ class AsyncMQTTClient:
             f"reconnects={self.reconnect_attempts}"
         )
 
+    @property
+    def is_connected(self) -> bool:
+        """True when the client currently holds a live broker connection.
+
+        Callers that must not credit a fire-and-forget command as delivered
+        (e.g. deferrable-load completion accounting) can gate on this so a
+        command queued during a broker outage is not counted as actuated.
+        """
+        return self._connected
+
     async def publish(self, topic: str, payload: Any, retain: bool = False, qos: int = 1) -> None:
         """Queue a message for publishing with reliability."""
-        await self.publish_queue.put((topic, payload, retain))
+        # Bound the queue: under a sustained broker outage, drop the OLDEST queued
+        # message rather than grow without limit (commands are regenerated each
+        # cycle, so the newest intent matters most).
+        if self.publish_queue.qsize() >= self._max_publish_queue:
+            try:
+                self.publish_queue.get_nowait()
+                self.logger.warning(
+                    "Publish queue full — dropped oldest queued message"
+                )
+            except asyncio.QueueEmpty:
+                pass
+        await self.publish_queue.put((topic, payload, retain, qos, time.monotonic()))
 
     async def _publish_loop(self) -> None:
         """Background task to publish queued messages."""
         while self._running:
             try:
+                # While disconnected, idle at ~1 Hz WITHOUT draining the queue —
+                # leave messages in place (they still age out via TTL below on the
+                # next successful pop). The previous pop+re-queue+0.1s pattern
+                # churned the entire queue ~10×/s during a broker outage.
+                if not self._connected:
+                    await asyncio.sleep(1.0)
+                    continue
+
                 # Wait for message with timeout to allow periodic checks
-                topic, payload, retain = await asyncio.wait_for(
+                topic, payload, retain, qos, ts = await asyncio.wait_for(
                     self.publish_queue.get(), timeout=1.0
                 )
 
+                # Drop stale commands instead of replaying them after a long
+                # outage (a stale schedule re-applied to the inverter is worse
+                # than a dropped one — the next cycle re-issues the current one).
+                age = time.monotonic() - ts
+                if age > self._publish_ttl_s:
+                    self.logger.warning(
+                        f"Dropping stale MQTT message to {topic} ({age:.0f}s old)"
+                    )
+                    continue
+
                 # Ensure we're connected
                 if not self._connected:
-                    # Re-queue the message
-                    await self.publish_queue.put((topic, payload, retain))
+                    # Re-queue the message, preserving its enqueue time so it can
+                    # still expire (don't reset the TTL on every retry).
+                    await self.publish_queue.put((topic, payload, retain, qos, ts))
                     await asyncio.sleep(0.1)
                     continue
 
-                # Publish with retry
-                await self._publish_with_retry(topic, payload, retain)
+                # Publish with retry. On exhaustion, re-queue (within TTL) so a
+                # transient failure doesn't silently drop a control command — the
+                # reliability queue's whole purpose. The preserved enqueue time
+                # still lets it expire via the TTL check above.
+                ok = await self._publish_with_retry(topic, payload, retain, qos)
+                if not ok and (time.monotonic() - ts) <= self._publish_ttl_s:
+                    await self.publish_queue.put((topic, payload, retain, qos, ts))
+                    await asyncio.sleep(0.5)
 
             except asyncio.TimeoutError:
                 continue
@@ -208,18 +261,24 @@ class AsyncMQTTClient:
                 self.logger.error(f"Error in publish loop: {e}", exc_info=True)
 
     async def _publish_with_retry(
-        self, topic: str, payload: Any, retain: bool, max_retries: int = 3
-    ) -> None:
-        """Publish a message with retry logic."""
+        self, topic: str, payload: Any, retain: bool, qos: int = 1, max_retries: int = 3
+    ) -> bool:
+        """Publish a message with retry logic. Returns True if it was actually
+        published, False if all attempts failed (so the caller can re-queue)."""
         for attempt in range(max_retries):
             try:
                 async with self.connection_lock:
-                    if self.client and self._connected:
-                        await self.client.publish(topic, payload, retain=retain)
+                    if not (self.client and self._connected):
+                        # Broker dropped between the loop's pre-check and here.
+                        # Raise so the retry/backoff path runs instead of silently
+                        # falling through to count a publish that never happened.
+                        raise ConnectionError("MQTT not connected at publish time")
+                    await self.client.publish(topic, payload, retain=retain, qos=qos)
 
+                # Only count a publish that actually executed.
                 self.messages_published += 1
                 self.logger.debug(f"Published to {topic}: {payload}")
-                return
+                return True
 
             except Exception as e:
                 if attempt < max_retries - 1:
@@ -229,6 +288,7 @@ class AsyncMQTTClient:
                     self.logger.error(
                         f"Failed to publish to {topic} after " f"{max_retries} attempts: {e}"
                     )
+        return False
 
     async def subscribe(self, topic: str, callback: Callable[[str, Any], Any]) -> None:
         """Subscribe to a topic with a callback.

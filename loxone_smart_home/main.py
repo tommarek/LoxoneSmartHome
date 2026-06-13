@@ -23,6 +23,7 @@ from modules.ote_price_collector import OTEPriceCollector
 from modules.udp_listener import UDPListener
 from modules.weather_scraper import WeatherScraper
 from modules.growatt.api import create_growatt_api
+from modules.growatt.dashboard import start_api_dashboard
 from utils.async_influxdb_client import AsyncInfluxDBClient
 from utils.async_mqtt_client import AsyncMQTTClient
 from utils.logging import TimezoneAwareFormatter
@@ -48,14 +49,19 @@ class LoxoneSmartHome:
         self.growatt_controller: Optional[GrowattController] = None
         self.ote_collector: Optional[OTEPriceCollector] = None
 
-        # Web Service (new monitoring dashboard - runs in separate process)
+        # Web Service (monitoring dashboard - runs in separate process)
         self.web_service = None
         self.web_service_task: Optional[asyncio.Task[None]] = None
 
-        # API server (legacy, will be replaced by web service)
+        # Legacy aiohttp API server (used only when the web service is disabled)
         self.api_app: Optional[web.Application] = None
         self.api_runner: Optional[web.AppRunner] = None
         self.api_site: Optional[web.TCPSite] = None
+
+        # Controller-backed dashboard API runner (internal port 5556,
+        # DASHBOARD_API_PORT) — tracked for cleanup. The public pages on 5555 are
+        # served by the separate loxone_web container (run_web_apps.py).
+        self.dashboard_runner: Optional[web.AppRunner] = None
 
         # Shutdown event
         self.shutdown_event = asyncio.Event()
@@ -210,7 +216,7 @@ class LoxoneSmartHome:
             self.modules.append(task)
             logger.info("OTE Price Collector started")
 
-        # Start Web Service (replaces old API server)
+        # Start Web Service
         if self.settings.web_service.enabled:
             await self.start_web_service()
             logger.info(f"Web monitoring service started on port {self.settings.web_service.port}")
@@ -218,6 +224,20 @@ class LoxoneSmartHome:
             # Fallback to legacy API if web service is disabled
             await self.start_api_server()
             logger.info("Legacy API server started on port 8080")
+
+        # Start the controller-backed dashboard API on an internal port. The
+        # public pages (and /api proxy) are served by the separate loxone_web
+        # container so the UI can be restarted without bouncing the controller.
+        # DASHBOARD_API_PORT lets the combined/dev setup override it.
+        if self.growatt_controller:
+            api_port = int(os.getenv("DASHBOARD_API_PORT", "5556"))
+            try:
+                self.dashboard_runner = await start_api_dashboard(
+                    self.growatt_controller, port=api_port
+                )
+                logger.info(f"Dashboard API started on port {api_port}")
+            except Exception as e:
+                logger.warning(f"Failed to start dashboard API: {e}")
 
     async def shutdown(self) -> None:
         """Gracefully shutdown all modules."""
@@ -236,6 +256,11 @@ class LoxoneSmartHome:
             await self.stop_web_service()
         else:
             await self.stop_api_server()
+
+        # Stop controller-backed dashboard API (internal port 5556)
+        if self.dashboard_runner:
+            await self.dashboard_runner.cleanup()
+            self.dashboard_runner = None
 
         # Disconnect shared clients
         await self.mqtt_client.disconnect()
