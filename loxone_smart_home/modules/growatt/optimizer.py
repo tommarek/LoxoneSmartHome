@@ -17,7 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 class BlockDecision:
     """Decision for a single 15-minute block."""
     timestamp: datetime
-    action: str  # "charge", "discharge", "hold", "sell_production"
+    action: str  # "charge", "discharge", "hold", "hold_idle", "sell_production"
     price_czk: float  # Spot price CZK/kWh
     distribution_czk: float  # Distribution tariff CZK/kWh
     solar_kwh: float  # Expected solar production this block
@@ -188,28 +188,6 @@ class BaseLoadProfile:
         # Global fallback: ~500W average
         return 0.5
 
-    def get_reserve_until(
-        self, from_hour: int, until_hour: int, is_weekend: bool,
-        battery_capacity_kwh: float, min_soc: float, efficiency: float,
-    ) -> float:
-        """Calculate SOC needed to cover base load from from_hour to until_hour.
-
-        Returns effective minimum SOC percentage.
-        """
-        reserve_kwh = 0.0
-        h = from_hour
-        while h != until_hour:
-            reserve_kwh += self.get(h, is_weekend)
-            h = (h + 1) % 24
-            if reserve_kwh > battery_capacity_kwh:
-                break  # Can't reserve more than battery holds
-        # Account for efficiency loss
-        reserve_kwh = reserve_kwh / efficiency
-        # Clamp to usable capacity
-        max_reserve = battery_capacity_kwh * (100 - min_soc) / 100 * 0.8
-        reserve_kwh = min(reserve_kwh, max_reserve)
-        return min_soc + (reserve_kwh / battery_capacity_kwh) * 100
-
     def summary(self) -> str:
         """Human-readable summary of the profile."""
         if not self.profile:
@@ -222,6 +200,32 @@ class BaseLoadProfile:
             peak_h = max(range(24), key=lambda h: self.get(h, is_wknd))
             lines.append(f"{label}: {total:.1f} kWh/day, peak {self.get(peak_h, is_wknd):.2f} kWh at {peak_h:02d}h")
         return "; ".join(lines)
+
+
+def _resolve_local_tz(local_tz: Any) -> Any:
+    """Timezone for bucketing InfluxDB's UTC record times into local keys.
+
+    The base-load profile is consumed with LOCAL (hour, weekday/weekend)
+    keys, so training records must be converted to the same wall clock
+    before extracting hour/weekday. Callers that don't pass the
+    controller's tz get Europe/Prague — the controller's own default —
+    so the default path is correct without caller changes.
+    """
+    if local_tz is not None:
+        return local_tz
+    import zoneinfo
+    return zoneinfo.ZoneInfo("Europe/Prague")
+
+
+def _record_local_time(t: Any, local_tz: Any) -> Any:
+    """Convert a tz-aware record timestamp to local time.
+
+    Naive timestamps pass through unchanged (assumed already-local),
+    mirroring the forecasters' ``_to_local`` convention.
+    """
+    if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+        return t.astimezone(local_tz)
+    return t
 
 
 class BatteryOptimizer:
@@ -242,12 +246,10 @@ class BatteryOptimizer:
         self._profile_updated: Optional[datetime] = None
         self._last_reserve_info: Dict[str, Any] = {}
         self._last_decisions: List[BlockDecision] = []
-        self._night_reserve_kwh: float = 5.0
-        self._night_reserve_updated: Optional[datetime] = None
 
     async def build_base_load_profile(
         self, influxdb_client: Any, solar_bucket: str, loxone_bucket: str,
-        days: int = 90
+        days: int = 90, local_tz: Any = None
     ) -> BaseLoadProfile:
         """Build hourly non-heating base load profile from historical data.
 
@@ -261,20 +263,26 @@ class BatteryOptimizer:
             solar_bucket: Solar bucket (for INVPowerToLocalLoad)
             loxone_bucket: Loxone bucket (for relay data)
             days: Days of history
+            local_tz: Timezone for the profile's (hour, weekend) keys
+                (None → Europe/Prague). The consumer queries the profile
+                with LOCAL hours, so records must be bucketed the same way.
 
         Returns:
             BaseLoadProfile with 48 slots
         """
         try:
             self.logger.info("Building base load profile from historical data...")
+            local_tz = _resolve_local_tz(local_tz)
 
-            # Query heating relay activity: which hours had heating ON
+            # Query heating relay activity: which hours had heating ON.
+            # timeSrc:"_start" — the Flux default labels windows by their
+            # STOP time, which would shift every hour key +1h.
             heating_query = f'''
 from(bucket: "{loxone_bucket}")
   |> range(start: -{days}d)
   |> filter(fn: (r) => r._measurement == "relay" and r.tag1 == "heating")
   |> filter(fn: (r) => r._value == 1)
-  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false, timeSrc: "_start")
 '''
             # Query EV charging: which hours had EV charging active
             ev_query = f'''
@@ -282,23 +290,26 @@ from(bucket: "{loxone_bucket}")
   |> range(start: -{days}d)
   |> filter(fn: (r) => r._measurement == "ev" and r._field == "ev_charging")
   |> filter(fn: (r) => r._value == 1)
-  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false, timeSrc: "_start")
 '''
             heating_result = await influxdb_client.query(heating_query)
             ev_result = await influxdb_client.query(ev_query)
 
-            # Build set of hours where heating OR EV charging was active
+            # Build set of hours where heating OR EV charging was active.
+            # Keys are LOCAL hours — must match the load-record keys below.
             high_load_hours: set = set()  # "YYYY-MM-DD-HH" keys
             if heating_result:
                 for table in heating_result:
                     for record in table.records:
-                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+                        t = _record_local_time(record.get_time(), local_tz)
+                        high_load_hours.add(t.strftime("%Y-%m-%d-%H"))
             heating_count = len(high_load_hours)
 
             if ev_result:
                 for table in ev_result:
                     for record in table.records:
-                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+                        t = _record_local_time(record.get_time(), local_tz)
+                        high_load_hours.add(t.strftime("%Y-%m-%d-%H"))
             ev_count = len(high_load_hours) - heating_count
 
             self.logger.debug(f"Found {heating_count} heating + {ev_count} EV hours to exclude")
@@ -308,7 +319,7 @@ from(bucket: "{loxone_bucket}")
 from(bucket: "{solar_bucket}")
   |> range(start: -{days}d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
   |> filter(fn: (r) => r._value > 0)
 '''
             load_result = await influxdb_client.query(load_query)
@@ -316,7 +327,9 @@ from(bucket: "{solar_bucket}")
                 self.logger.warning("No load data for base load profile")
                 return self._base_load_profile
 
-            # Bin by (hour, is_weekend), excluding heating hours
+            # Bin by LOCAL (hour, is_weekend), excluding heating hours.
+            # Raw UTC hour/weekday would land the profile 1-2h late and
+            # misclassify weekday/weekend near midnight.
             import statistics
             bins: Dict[Tuple[int, bool], List[float]] = {}
             total = 0
@@ -324,7 +337,7 @@ from(bucket: "{solar_bucket}")
 
             for table in load_result:
                 for record in table.records:
-                    t = record.get_time()
+                    t = _record_local_time(record.get_time(), local_tz)
                     key = t.strftime("%Y-%m-%d-%H")
 
                     # Skip hours where heating was active
@@ -365,39 +378,48 @@ from(bucket: "{solar_bucket}")
             return self._base_load_profile
 
     async def update_profile_with_yesterday(
-        self, influxdb_client: Any, solar_bucket: str, loxone_bucket: str
+        self, influxdb_client: Any, solar_bucket: str, loxone_bucket: str,
+        local_tz: Any = None
     ) -> None:
-        """Update profile with yesterday's actual data using EMA (0.9 old + 0.1 new)."""
+        """Update profile with yesterday's actual data using EMA (0.9 old + 0.1 new).
+
+        Records are keyed by LOCAL (hour, weekend) — same convention as
+        build_base_load_profile (local_tz None → Europe/Prague).
+        """
         try:
-            # Query yesterday's heating + EV hours
+            local_tz = _resolve_local_tz(local_tz)
+            # Query yesterday's heating + EV hours (start-labeled windows —
+            # the Flux default stop-labeling would shift hour keys +1h)
             heating_result = await influxdb_client.query(f'''
 from(bucket: "{loxone_bucket}")
   |> range(start: -1d, stop: -0d)
   |> filter(fn: (r) => r._measurement == "relay" and r.tag1 == "heating" and r._value == 1)
-  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false, timeSrc: "_start")
 ''')
             ev_result = await influxdb_client.query(f'''
 from(bucket: "{loxone_bucket}")
   |> range(start: -1d, stop: -0d)
   |> filter(fn: (r) => r._measurement == "ev" and r._field == "ev_charging" and r._value == 1)
-  |> aggregateWindow(every: 1h, fn: max, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: max, createEmpty: false, timeSrc: "_start")
 ''')
             high_load_hours: set = set()
             if heating_result:
                 for table in heating_result:
                     for record in table.records:
-                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+                        t = _record_local_time(record.get_time(), local_tz)
+                        high_load_hours.add(t.strftime("%Y-%m-%d-%H"))
             if ev_result:
                 for table in ev_result:
                     for record in table.records:
-                        high_load_hours.add(record.get_time().strftime("%Y-%m-%d-%H"))
+                        t = _record_local_time(record.get_time(), local_tz)
+                        high_load_hours.add(t.strftime("%Y-%m-%d-%H"))
 
             # Query yesterday's load
             load_result = await influxdb_client.query(f'''
 from(bucket: "{solar_bucket}")
   |> range(start: -1d, stop: -0d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
   |> filter(fn: (r) => r._value > 0)
 ''')
             if not load_result:
@@ -405,7 +427,7 @@ from(bucket: "{solar_bucket}")
 
             for table in load_result:
                 for record in table.records:
-                    t = record.get_time()
+                    t = _record_local_time(record.get_time(), local_tz)
                     key = t.strftime("%Y-%m-%d-%H")
                     if key in high_load_hours:
                         continue
@@ -424,71 +446,6 @@ from(bucket: "{solar_bucket}")
 
         except Exception as e:
             self.logger.debug(f"Profile update failed: {e}")
-
-    async def calibrate_night_reserve(
-        self, influxdb_client: Any, solar_bucket: str, days: int = 90
-    ) -> float:
-        """Calculate overnight base load from historical data.
-
-        Queries last N days of INVPowerToLocalLoad during night hours (18-07),
-        caps at 500W/hr to exclude heating (which disables battery discharge),
-        and computes the average overnight energy need.
-
-        Args:
-            influxdb_client: Async InfluxDB client
-            solar_bucket: Solar InfluxDB bucket name
-            days: Days of history to analyze
-
-        Returns:
-            Overnight reserve in kWh
-        """
-        try:
-            query = f'''
-from(bucket: "{solar_bucket}")
-  |> range(start: -{days}d)
-  |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
-  |> filter(fn: (r) => r._value > 0 and r._value < 2000)
-'''
-            result = await influxdb_client.query(query)
-            if not result:
-                return self._night_reserve_kwh
-
-            # Sum night hours (18-07), capped at 500W to exclude heating
-            night_watts: Dict[int, List[float]] = {}
-            for table in result:
-                for record in table.records:
-                    h = record.get_time().hour
-                    if h >= 18 or h < 7:
-                        w = min(record.get_value(), 500)  # Cap at 500W (non-heating)
-                        if h not in night_watts:
-                            night_watts[h] = []
-                        night_watts[h].append(w)
-
-            if not night_watts:
-                return self._night_reserve_kwh
-
-            # Average kWh per night hour, sum across 13 night hours
-            total_kwh = 0
-            for h, watts_list in night_watts.items():
-                avg_w = sum(watts_list) / len(watts_list)
-                total_kwh += avg_w / 1000  # W -> kWh for 1 hour
-
-            # Clamp to reasonable range
-            reserve = max(3.0, min(8.0, total_kwh))
-            old = self._night_reserve_kwh
-            self._night_reserve_kwh = reserve
-            self._night_reserve_updated = datetime.now()
-
-            self.logger.info(
-                f"Night reserve calibrated: {reserve:.1f} kWh "
-                f"(was {old:.1f}, from {days}d of overnight base load data)"
-            )
-            return reserve
-
-        except Exception as e:
-            self.logger.warning(f"Night reserve calibration failed: {e}")
-            return self._night_reserve_kwh
 
     def _compute_reserve_soc_per_block(
         self,
@@ -513,6 +470,12 @@ from(bucket: "{solar_bucket}")
         n = len(blocks)
         if n == 0:
             return []
+
+        # Per-leg loss factor: `efficiency` is ROUND-TRIP, so each physical
+        # conversion leg (charge OR discharge) costs sqrt(efficiency) — the
+        # same convention as the MILP SOC continuity and the greedy SOC
+        # simulation, so the reserve floor and the SOC it constrains agree.
+        leg_eta = max(1e-3, efficiency) ** 0.5
 
         sorted_prices = sorted(prices)
         price_threshold = sorted_prices[n // 4] if n > 4 else sorted_prices[0]
@@ -547,8 +510,8 @@ from(bucket: "{solar_bucket}")
             # [block_idx+1, window_end) horizon for load, solar and grid credit
             # so they can't disagree. Per block, solar first offsets the
             # concurrent base load; only the deficit must come from the battery
-            # (charged at a discharge loss → /efficiency) and only the surplus
-            # charges it (at a charge loss → *efficiency). This avoids the old
+            # (drawn at the discharge-leg loss → /leg_eta) and only the surplus
+            # charges it (at the charge-leg loss → *leg_eta). This avoids the old
             # double-count where full solar was credited as incoming charge while
             # the full load was still booked into the reserve.
             gross_reserve_kwh = 0.0
@@ -562,9 +525,9 @@ from(bucket: "{solar_bucket}")
                 solar_block = max(0.0, _forecast_value(solar_hourly, ts_j) / 4.0)
                 net = base_block - solar_block
                 if net > 0:
-                    gross_reserve_kwh += net / efficiency
+                    gross_reserve_kwh += net / leg_eta
                 else:
-                    incoming_kwh += (-net) * efficiency
+                    incoming_kwh += (-net) * leg_eta
 
                 # A cheap-ish grid block before the recharge gives ONE top-up
                 # opportunity. Only note it here — crediting a fresh full charge
@@ -579,7 +542,7 @@ from(bucket: "{solar_bucket}")
                     has_cheap_topup = True
 
             if has_cheap_topup:
-                incoming_kwh += kwh_per_block * efficiency
+                incoming_kwh += kwh_per_block * leg_eta
 
             reserve_kwh = max(0, gross_reserve_kwh - incoming_kwh)
             reserve_kwh = min(reserve_kwh, max_reserve)
@@ -649,12 +612,16 @@ from(bucket: "{solar_bucket}")
         if not blocks:
             return set(), set(), set(), []
 
-        # Clamp SOC into [min_soc, max_soc]. Live telemetry can report e.g. 100%
-        # while max_soc is 90 (documented real condition); an unclamped value
-        # makes battery_gap_kwh go negative. Downstream consumers floor at 0, but
-        # clamp here so both engines and all fallback paths (incl. the
-        # PuLP-missing greedy fallback) start from the same bounded SOC as MILP.
-        current_soc = max(min_soc, min(max_soc, current_soc))
+        # Clamp SOC at the TOP only. Live telemetry can report e.g. 100% while
+        # max_soc is 90 (documented real condition); an unclamped value makes
+        # battery_gap_kwh go negative. A BELOW-min_soc reading is PRESERVED:
+        # clamping it up would credit phantom stored energy. The simulation is
+        # safe with soc < min_soc — every battery draw floors its available
+        # energy at max(0, battery_kwh - min_battery_kwh) and the discharge
+        # gate rejects non-positive discharge_possible, so the plan simply
+        # cannot spend battery until the SOC recovers above the floor. (The
+        # MILP keeps the two-sided clamp for LP feasibility and logs instead.)
+        current_soc = min(max_soc, current_soc)
 
         # Battery energy parameters. discharge_rate_kw is the ACTUAL grid-discharge
         # power at the configured discharge_power_rate (~2.5 kW at 25% on this
@@ -664,6 +631,14 @@ from(bucket: "{solar_bucket}")
         # dropped while the real battery fell ~2.5 kW.
         kwh_per_block = charge_rate_kw * 0.25  # 15 minutes
         discharge_kwh_per_block = discharge_rate_kw * 0.25
+
+        # Per-leg loss factor: `efficiency` is ROUND-TRIP, so each physical
+        # conversion leg (charge OR discharge) costs sqrt(efficiency). The SOC
+        # simulation applies this per leg — same convention as the MILP's SOC
+        # continuity (eta_chg * eta_dis == efficiency). Economic VALUE terms
+        # that price a full grid→battery→load replacement cycle keep the
+        # round-trip `efficiency` (e.g. recharge_cost) — those model two legs.
+        leg_eta = max(1e-3, efficiency) ** 0.5
 
         # Wear cost charged on battery→GRID export. Defaults to the shared wear
         # cost; an explicit export override raises the hurdle for arbitrage
@@ -705,9 +680,45 @@ from(bucket: "{solar_bucket}")
             future_min_price[i] = running_min
             future_min_price_hour[i] = running_min_hour
 
+        # Terminal value of leftover SOC at horizon end — mirrors the MILP's
+        # terminal valuation (milp_optimizer.py) exactly so the engines stay in
+        # parity: retained energy is worth the median self-consumption saving
+        # (spot + dist - amort), capped at the cheapest grid-charge break-even
+        # over the FULL round-trip efficiency. The cap uses round-trip on
+        # purpose (not the per-leg eta): the break-even for "charge cheap now,
+        # use later" is the whole charge→store→discharge cycle. The 0.99
+        # discount makes a CERTAIN present saving win ties against this
+        # estimated future value. Without it, leftover SOC is worth 0 and the
+        # plan dumps the battery into the last evening blocks before tomorrow's
+        # DAM prices arrive.
+        sc_values = sorted(
+            prices[i] + distribution_func(blocks[i][0].hour)
+            - battery_amortisation_czk
+            for i in range(n)
+        )
+        terminal_value_per_kwh = (
+            max(0.0, sc_values[n // 2]) if sc_values else 0.0
+        )
+        min_charge_cost = min(
+            prices[i] + distribution_func(blocks[i][0].hour) for i in range(n)
+        )
+        terminal_value_per_kwh = max(0.0, min(
+            terminal_value_per_kwh, min_charge_cost / max(1e-3, efficiency)
+        ))
+        terminal_value_per_kwh *= 0.99
+
         # Future best discharge value: for each block, what's the maximum
         # discharge profit achievable in remaining blocks? Used to avoid
         # spending battery on mediocre blocks when better ones are ahead.
+        # NOT floored at the terminal value: entries here are NET arbitrage
+        # profits (sell_rev - recharge_cost; the battery ends refilled), while
+        # the terminal value is the GROSS worth of a retained kWh — mixing the
+        # two conventions over-blocked genuinely profitable mid-horizon
+        # arbitrage (a dv>0 discharge with a real cheap recharge ahead pockets
+        # dv AND preserves the terminal energy — strictly better than
+        # holding). End-of-horizon dumps are prevented directly in the
+        # discharge decision instead: the GROSS sell value per delivered kWh
+        # must beat terminal_value_per_kwh (selling must beat retaining).
         future_max_discharge_value = [0.0] * n
         running_max = float('-inf')
         for i in range(n - 1, -1, -1):
@@ -730,16 +741,37 @@ from(bucket: "{solar_bucket}")
         # Only counts hours where consumption > solar (battery needed).
         # Also tracks cumulative kWh of future battery-needed consumption
         # so we know when the battery has excess beyond self-consumption needs.
+        # Floored at the terminal value: even past the last in-horizon
+        # consumption, retained energy is worth terminal_value_per_kwh (it
+        # offsets tomorrow's imports), so late blocks never see a 0 hold value.
         future_sc_value = [0.0] * n
+        # Strictly-future variant: best SC value AFTER block i (block i itself
+        # EXCLUDED). future_sc_value[i] folds in block i before assignment, so
+        # it cannot distinguish "the peak is now" from "the peak is later" —
+        # the hold_idle remap needs that distinction (idling THROUGH the peak
+        # the energy was retained for strands the battery forever on a rolling
+        # horizon, which always contains some future peak).
+        future_sc_value_excl = [0.0] * n
         future_sc_kwh = [0.0] * n  # Cumulative kWh needing battery from block i onward
-        running_best_sc = 0.0
+        running_best_sc = terminal_value_per_kwh
         running_sc_kwh = 0.0
         for i in range(n - 1, -1, -1):
             ts_i = blocks[i][0]
             h_i = ts_i.hour
             solar_i = _forecast_value(solar_hourly, ts_i) / 4.0
             cons_i = _forecast_value(consumption_hourly, ts_i) / 4.0
+            # Same base-load fallback _single_pass applies per block: the
+            # VALUE model must see the same house load the SOC simulation
+            # serves, or a sparse consumption forecast would zero out the
+            # future-SC values (no "deficits") while the simulation still
+            # drains the battery for base load — and the forward-looking
+            # charge gate below would then refuse plainly profitable charging.
+            if cons_i <= 0:
+                cons_i = self._base_load_profile.get(
+                    h_i, ts_i.weekday() >= 5
+                ) / 4.0
             net_cons = max(0, cons_i - solar_i)
+            future_sc_value_excl[i] = running_best_sc  # before folding in block i
             if net_cons > 0:
                 # Net SC value after battery wear: avoided buy minus amortisation.
                 # If non-positive, SC from battery is worse than just buying from
@@ -751,18 +783,79 @@ from(bucket: "{solar_bucket}")
             future_sc_value[i] = running_best_sc
             future_sc_kwh[i] = running_sc_kwh
 
+        # Energy-aware retention need for the hold_idle remap: for block i,
+        # the DELIVERED-side kWh of strictly-better future deficits — the sum
+        # over j > i of deficit kWh at blocks whose per-delivered SC value
+        # exceeds block i's. The remap may only idle block i while the usable
+        # stored energy cannot cover that need; a quantity-blind remap (any
+        # strictly-better block ⇒ idle) imported today's peak from grid even
+        # when the battery held enough for today AND tomorrow, and on a
+        # rolling horizon (always another, slightly-better peak ahead) it
+        # pinned the battery at max SOC forever. O(n²) like the reserve
+        # helper — n ≈ 128-200, negligible.
+        block_sc_value = [0.0] * n
+        block_deficit_kwh = [0.0] * n
+        for i in range(n):
+            ts_i = blocks[i][0]
+            solar_i = _forecast_value(solar_hourly, ts_i) / 4.0
+            cons_i = _forecast_value(consumption_hourly, ts_i) / 4.0
+            # Same base-load fallback as future_sc_value above — the two
+            # retention arrays must agree on what counts as a deficit.
+            if cons_i <= 0:
+                cons_i = self._base_load_profile.get(
+                    ts_i.hour, ts_i.weekday() >= 5
+                ) / 4.0
+            block_deficit_kwh[i] = max(0.0, cons_i - solar_i)
+            block_sc_value[i] = (
+                prices[i] + distribution_func(ts_i.hour)
+                - battery_amortisation_czk
+            )
+        strictly_better_sc_need = [0.0] * n
+        for i in range(n):
+            v_i = block_sc_value[i]
+            need = 0.0
+            for j in range(i + 1, n):
+                if block_deficit_kwh[j] > 0 and block_sc_value[j] > v_i:
+                    need += block_deficit_kwh[j]
+            strictly_better_sc_need[i] = need
+
         # Pre-select charge blocks: pick cheapest N blocks where charging is
         # profitable vs buying from grid later. Don't charge at 1.28 CZK when
         # -2.0 blocks are available — better to sit at min SOC and buy from grid.
-        # The "or p < 0" safety covers deeply-negative days where the median
-        # itself is below zero and the multiplicative threshold would otherwise
-        # filter out marginally-negative blocks we still want as fallback.
-        median_price = sorted_prices[n // 2] if n > 0 else 2.0
-        charge_threshold = median_price * efficiency  # Only charge below this
-        profitable_charge_blocks = [
-            (ts, p) for ts, p in blocks if p < charge_threshold or p < 0
+        #
+        # The break-even compares the FULL import cost (spot + distribution)
+        # against the FORWARD-LOOKING value of the charged energy: charging 1
+        # grid kWh delivers `efficiency` kWh later, each worth the best future
+        # deficit self-consumption value (future_sc_value, per-delivered-kWh,
+        # amortisation-adjusted, terminal-floored). The previous gate valued a
+        # charged kWh at median_import_cost * efficiency, which fails whenever
+        # cheap blocks are the horizon MAJORITY (negative/windy days, cheap-NT
+        # tariff bands): the median sits in the cheap mode, cheap*efficiency <
+        # cheap, zero candidates — and the `p < 0` fallback was dead because
+        # the actuation gate used the same algebra. Valuing against the best
+        # future deficit keeps the iteration-1 property (distribution priced
+        # on both sides — high-dist/low-spread days still don't cycle) AND is
+        # wear-consistent: future_sc_value subtracts battery_amortisation_czk,
+        # so cycling that is cash-positive but wear-negative no longer charges.
+        #
+        # Candidate pre-selection is POSITION-INDEPENDENT on purpose: it uses
+        # the permissive bound future_sc_value[0] (best SC value anywhere in
+        # the horizon); the per-block actuation gate in _single_pass
+        # (import_cost < future_sc_value[i] * efficiency) does the real
+        # position-aware vetting. The "or p < 0" retention keeps negative-spot
+        # blocks in the pool even above the bound — negative FULL cost always
+        # actuates (future_sc_value >= 0), positive full cost is re-vetted.
+        import_costs = [
+            prices[i] + distribution_func(blocks[i][0].hour) for i in range(n)
         ]
-        profitable_charge_blocks.sort(key=lambda x: x[1])  # Cheapest first
+        # Best charged-kWh value anywhere in the horizon (CZK per GRID kWh).
+        max_charge_value = (future_sc_value[0] if n > 0 else 0.0) * efficiency
+        profitable_charge_blocks = [
+            (blocks[i][0], import_costs[i])
+            for i in range(n)
+            if import_costs[i] < max_charge_value or prices[i] < 0
+        ]
+        profitable_charge_blocks.sort(key=lambda x: x[1])  # Cheapest full cost first
 
         # Calculate how much grid charging we actually need:
         # Total battery gap minus expected net solar charging (solar - consumption)
@@ -773,11 +866,15 @@ from(bucket: "{solar_bucket}")
             consumption_h = _forecast_value(consumption_hourly, ts) / 4.0
             net = solar_h - consumption_h
             if net > 0:
-                expected_solar_charge += net * efficiency
+                # Single charge leg (solar→battery banking): per-leg eta, so
+                # selection sizing matches what the SOC simulation will bank.
+                expected_solar_charge += net * leg_eta
         grid_needed_kwh = max(0, battery_gap_kwh - expected_solar_charge)
 
-        # Convert to blocks needed (min 4 to always grab the cheapest/negative prices)
-        kwh_per_charge = kwh_per_block * efficiency
+        # Convert to blocks needed (min 4 to always grab the cheapest/negative
+        # prices). Grid→battery is one charge leg → per-leg eta, matching the
+        # simulation's per-block SOC gain.
+        kwh_per_charge = kwh_per_block * leg_eta
         blocks_to_fill = max(4, int(grid_needed_kwh / kwh_per_charge) + 1) if kwh_per_charge > 0 else 4
 
         # Pick exactly the cheapest N needed. Do NOT union with all-negatives:
@@ -809,13 +906,15 @@ from(bucket: "{solar_bucket}")
             max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
             effective_min_socs, future_min_price, future_min_price_hour,
             future_max_discharge_value, future_sc_value, future_sc_kwh,
+            future_sc_value_excl, strictly_better_sc_need,
             sorted_prices, sell_fee_czk, battery_amortisation_czk,
             first_block_ts, sell_production_min_soc_margin, amort_export,
+            terminal_value_per_kwh,
         )
 
         # Pass 2: refine charge block selection using actual SOC trajectory
         refined_set = self._refine_charge_blocks(
-            blocks, charge_block_set, decisions, max_soc, charge_threshold
+            blocks, charge_block_set, decisions, max_soc, max_charge_value
         )
         if refined_set != charge_block_set:
             moved = len(charge_block_set - refined_set)
@@ -830,8 +929,10 @@ from(bucket: "{solar_bucket}")
                 max_soc, kwh_per_block, discharge_kwh_per_block, efficiency,
                 effective_min_socs, future_min_price, future_min_price_hour,
                 future_max_discharge_value, future_sc_value, future_sc_kwh,
+                future_sc_value_excl, strictly_better_sc_need,
                 sorted_prices, sell_fee_czk, battery_amortisation_czk,
-                first_block_ts, sell_production_min_soc_margin,
+                first_block_ts, sell_production_min_soc_margin, amort_export,
+                terminal_value_per_kwh,
             )
 
         self._last_decisions = decisions
@@ -880,6 +981,11 @@ from(bucket: "{solar_bucket}")
         n = len(blocks)
         if n == 0:
             return set()
+
+        # Single charge-leg loss for solar→battery banking credits (the
+        # grid_replacement value below keeps round-trip `efficiency` — that
+        # one prices a full grid→battery→load replacement cycle).
+        leg_eta = max(1e-3, efficiency) ** 0.5
 
         max_battery_kwh = battery_capacity_kwh * max_soc / 100
         current_battery_kwh = battery_capacity_kwh * current_soc / 100
@@ -935,8 +1041,9 @@ from(bucket: "{solar_bucket}")
                 continue
 
             grid_replacement = future_min_charge_after[i]
+            # Solar surplus banks into the battery over ONE charge leg.
             solar_only_refills = (
-                future_solar_surplus[i + 1] * efficiency >= battery_gap_remaining
+                future_solar_surplus[i + 1] * leg_eta >= battery_gap_remaining
             )
             solar_replacement = (
                 future_min_export_revenue_after[i] if solar_only_refills
@@ -957,12 +1064,15 @@ from(bucket: "{solar_bucket}")
         if not candidates:
             return set()
 
-        # Aggregate refill budget: cheap grid charging capacity + future solar
+        # Aggregate refill budget: cheap grid charging capacity + future solar.
+        # Both are single charge legs (grid→battery / solar→battery), so the
+        # banked energy is input × leg_eta — round-trip here under-stated the
+        # budget by another sqrt(efficiency).
         cheap_charge_kwh = sum(
-            kwh_per_block * efficiency
+            kwh_per_block * leg_eta
             for ts, _ in blocks if ts in charge_block_set
         )
-        refill_budget = cheap_charge_kwh + future_solar_surplus[0] * efficiency
+        refill_budget = cheap_charge_kwh + future_solar_surplus[0] * leg_eta
 
         # Allocate top-down by swap profit
         candidates.sort()  # smallest -profit = highest profit first
@@ -981,7 +1091,7 @@ from(bucket: "{solar_bucket}")
         original_charge_set: Set[datetime],
         decisions: List[BlockDecision],
         max_soc: float,
-        charge_threshold: float,
+        max_charge_value: float,
     ) -> Set[datetime]:
         """Identify wasted charge blocks and replace with better candidates.
 
@@ -989,14 +1099,26 @@ from(bucket: "{solar_bucket}")
         and the charge action barely increased SOC. These wasted slots are
         replaced with the cheapest available hold blocks that had room to charge.
 
-        Replacements MUST still pass the profitability gate (price below
-        charge_threshold, or negative) — otherwise the refine step could inject a
-        loss-making grid charge just to "use up" a freed slot.
+        Replacements MUST still pass the candidate gate (FULL import cost —
+        spot + distribution — below `max_charge_value`, or negative spot) —
+        otherwise the refine step could inject a hopeless grid charge just to
+        "use up" a freed slot. `max_charge_value` is the PERMISSIVE bound from
+        optimize() (best future SC value anywhere in the horizon × efficiency,
+        i.e. future_sc_value[0] * efficiency) — same convention as the primary
+        candidate pre-selection; the Pass-2 re-simulation's per-block
+        actuation gate (import_cost < future_sc_value[i] * efficiency) does
+        the position-aware vetting, so a replacement that lands after the
+        last valuable deficit simply falls through to hold.
 
         Returns the original set if no improvement is possible.
         """
         # Find wasted charge blocks: SOC barely changed (< 1%)
-        # Never consider negative-price blocks as wasted (we get paid to charge)
+        # Never consider negative-price blocks as wasted. SPOT (not full cost)
+        # is intentional here: at negative spot the meter pays us per imported
+        # kWh, so keeping the slot is at worst a no-op (the battery is full —
+        # nothing imports) and at best free money if the SOC trajectory shifts
+        # in the Pass-2 re-simulation; the per-block actuation gate re-vets
+        # the block's full-cost profitability either way.
         wasted = {
             d.timestamp for d in decisions
             if d.action == "charge"
@@ -1006,13 +1128,16 @@ from(bucket: "{solar_bucket}")
         if not wasted:
             return original_charge_set
 
-        # Find candidate replacement blocks: hold blocks with room to charge AND
-        # that pass the profitability gate (price below threshold, or negative).
+        # Find candidate replacement blocks: hold blocks with room to charge
+        # AND that pass the candidate gate (FULL import cost below the
+        # permissive forward-looking bound, or negative spot) — same
+        # convention as the primary selection in optimize().
         candidates = sorted(
-            [(d.timestamp, d.price_czk) for d in decisions
+            [(d.timestamp, d.price_czk + d.distribution_czk) for d in decisions
              if d.action == "hold" and d.soc_before < max_soc - 5
-             and (d.price_czk < charge_threshold or d.price_czk < 0)],
-            key=lambda x: x[1]  # Cheapest first
+             and (d.price_czk + d.distribution_czk < max_charge_value
+                  or d.price_czk < 0)],
+            key=lambda x: x[1]  # Cheapest full cost first
         )
 
         if not candidates:
@@ -1046,12 +1171,15 @@ from(bucket: "{solar_bucket}")
         future_max_discharge_value: List[float],
         future_sc_value: List[float],
         future_sc_kwh: List[float],
+        future_sc_value_excl: List[float],
+        strictly_better_sc_need: List[float],
         sorted_prices: List[float],
         sell_fee_czk: float,
         battery_amortisation_czk: float,
         first_block_ts: datetime,
         sell_production_min_soc_margin: float = SP_MIN_SOC_MARGIN_PCT,
         amort_export: Optional[float] = None,
+        terminal_value_per_kwh: float = 0.0,
     ) -> Tuple[Set[datetime], Set[datetime], Set[datetime], List[BlockDecision]]:
         """Run a single forward simulation pass with given charge block set."""
         n = len(blocks)
@@ -1059,6 +1187,11 @@ from(bucket: "{solar_bucket}")
         # an unset override leaves the self-consumption vs export trade unchanged.
         if amort_export is None:
             amort_export = battery_amortisation_czk
+        # Per-leg loss factor: `efficiency` is ROUND-TRIP; the SOC simulation
+        # applies sqrt(efficiency) per physical conversion leg (charge OR
+        # discharge), matching the MILP's eta. Value terms that price a full
+        # replacement round trip (recharge_cost, future_value) keep `efficiency`.
+        leg_eta = max(1e-3, efficiency) ** 0.5
         soc = current_soc
         decisions: List[BlockDecision] = []
         charge_times: Set[datetime] = set()
@@ -1100,9 +1233,29 @@ from(bucket: "{solar_bucket}")
             future_cheapest = future_min_price[i] if i < n else sorted_prices[0]
 
             # --- CHARGE value ---
+            # FORWARD-LOOKING full-cost economics: charging 1 grid kWh at
+            # (spot + distribution) banks energy that delivers `efficiency`
+            # kWh later (round trip), each worth the best REMAINING deficit
+            # self-consumption value — future_sc_value[i], per delivered kWh,
+            # already amortisation-adjusted and terminal-floored. So charging
+            # is profitable iff import_cost < future_sc_value[i] * efficiency.
+            # The previous benchmark (median import cost × efficiency) broke
+            # on cheap-majority horizons: the median sat in the cheap mode and
+            # cheap*efficiency < cheap vetoed EVERY charge, including ahead of
+            # an expensive evening peak (greedy/MILP parity loss). Position-
+            # aware: past the last valuable deficit, future_sc_value falls to
+            # the terminal value, whose cap (min import cost / efficiency)
+            # guarantees terminal*efficiency < every import cost — trailing
+            # blocks can never charge "for the terminal value" alone.
+            # WEAR NOTE: unlike the pre-iteration-2 gate, this one inherits
+            # the amortisation subtraction inside future_sc_value, so a cycle
+            # that is cash-positive but wear-negative (spread smaller than the
+            # battery wear cost) is correctly refused.
             charge_cost = price_czk + dist
-            median_price = sorted_prices[n // 2] if n > 0 else 0
-            future_value = (median_price + dist) * efficiency
+            future_value = (
+                future_sc_value[i] if i < len(future_sc_value)
+                else terminal_value_per_kwh
+            ) * efficiency
             charge_possible = min(kwh_per_block, (max_battery_kwh - battery_kwh))
             charge_value = (future_value - charge_cost) if charge_possible > 0 else float('-inf')
 
@@ -1119,7 +1272,8 @@ from(bucket: "{solar_bucket}")
             discharge_profit = sell_revenue - recharge_cost
             discharge_possible = min(
                 discharge_kwh_per_block,
-                (battery_kwh - min_battery_kwh) * efficiency
+                # Stored headroom → grid-delivered energy is ONE discharge leg.
+                (battery_kwh - min_battery_kwh) * leg_eta
             )
             if sell_revenue <= 0 or discharge_possible <= 0:
                 discharge_value = float('-inf')
@@ -1137,25 +1291,60 @@ from(bucket: "{solar_bucket}")
             # upcoming price. Only applies when battery energy above reserve
             # is NEEDED for future consumption (not excess that could be sold).
             usable_kwh = battery_kwh - min_battery_kwh
+            retention_hold = False
             if usable_kwh > 0 and i < n:
                 best_future_sc = future_sc_value[i]
-                sc_kwh_needed = future_sc_kwh[i] / efficiency  # Account for losses
+                # Delivered → stored kWh is ONE discharge leg.
+                sc_kwh_needed = future_sc_kwh[i] / leg_eta
                 if best_future_sc > recharge_cost and usable_kwh <= sc_kwh_needed:
                     # Battery is fully needed for self-consumption — don't discharge
-                    hold_value = max(hold_value, best_future_sc - recharge_cost)
+                    retention_value = best_future_sc - recharge_cost
+                    if retention_value > hold_value:
+                        hold_value = retention_value
+                        retention_hold = True
 
             # Pick best action
             soc_before = soc
             action = "hold"
             net_value = hold_value
 
-            if timestamp in charge_block_set and charge_possible > 0:
+            # Actuation gate: a pre-selected charge block must ALSO have a
+            # positive charge_value at simulation time. The candidate set can
+            # contain blocks the value model rejects (the `p < 0` fallback on
+            # deeply-negative days where high distribution still makes the
+            # full import cost exceed the future value, e.g. spot -0.1 + dist
+            # 2.5 vs a low median import); previously such blocks charged
+            # anyway, locking in the loss the engine itself had computed.
+            # Skipping is always safe: nothing in the plan REQUIRES charging
+            # — the dynamic reserve (effective_min_socs) only floors how far
+            # discharge/hold may DRAIN existing energy, it never mandates a
+            # grid charge, so a skipped block simply falls through to
+            # hold/discharge scoring and the deficit imports from grid.
+            if (
+                timestamp in charge_block_set
+                and charge_possible > 0
+                and charge_value > 0
+            ):
                 action = "charge"
                 net_value = charge_value
 
             best_remaining = future_max_discharge_value[i] if i < n else 0
             is_worthwhile = (best_remaining <= 0) or (discharge_value >= best_remaining * 0.8)
-            if discharge_value > 0 and discharge_value > net_value and is_worthwhile:
+            # Selling must beat RETAINING (gross per-delivered-kWh on both
+            # sides). NOTE: with the current terminal cap (min charge cost /
+            # round-trip eff x0.99) this gate is implied by
+            # `discharge_value > 0` — recharge_cost >= min charge cost /
+            # efficiency > terminal — so it is belt-and-braces, NOT the
+            # active dump protection. It only binds if the terminal-value or
+            # recharge-cost conventions ever drift apart. (The old terminal
+            # FLOOR on future_max_discharge_value compared a gross retained
+            # value against NET arbitrage profits and wrongly blocked
+            # profitable mid-horizon discharges with a cheap recharge ahead.)
+            sell_beats_retention = sell_revenue > terminal_value_per_kwh
+            if (
+                discharge_value > 0 and discharge_value > net_value
+                and is_worthwhile and sell_beats_retention
+            ):
                 if discharge_possible > 0 and soc > effective_min_soc:
                     action = "discharge"
                     net_value = discharge_value
@@ -1174,6 +1363,62 @@ from(bucket: "{solar_bucket}")
                 solar_excess_now = max(0.0, solar - consumption)
                 net_value = (price_czk - sell_fee_czk) * solar_excess_now
 
+            # On this SPH a plain "hold" actuates as load_first, which DRAINS
+            # the battery into any consumption deficit. When the hold's value
+            # came from RETAINING energy for future self-consumption, that
+            # drain is exactly what the plan wants to avoid — so mark deficit
+            # blocks above the reserve as "hold_idle" (actuated as battery_hold:
+            # battery passive, deficit served from grid), same action string the
+            # MILP emits and the controller already maps to battery_hold.
+            #
+            # Only idle when retaining is STRICTLY better than spending now:
+            # compare the best STRICTLY-future SC value (future_sc_value_excl,
+            # which excludes block i) against THIS block's self-consumption
+            # value — both per delivered kWh, amort-adjusted (price + dist -
+            # amortisation), so the comparison is convention-consistent.
+            # Gating on future_sc_value[i] instead would idle the battery
+            # straight through its own peak (the inclusive array counts block
+            # i as "future"), stranding the energy forever on a rolling
+            # horizon that always has another peak ahead. With the strict
+            # comparison, peak blocks (now == best) self-consume via plain
+            # hold and only genuinely-cheaper blocks idle.
+            #
+            # AND only while the battery actually NEEDS all its energy for
+            # those strictly-better future blocks (quantity gate): a value-
+            # only comparison idled the current peak whenever ANY marginally
+            # better block existed ahead, even with enough energy for both —
+            # importing today's peak at full price and, on a rolling horizon
+            # with drifting peaks, pinning the battery at max SOC forever.
+            # strictly_better_sc_need is DELIVERED-side kWh; usable_kwh is
+            # STORED-side — one discharge leg (/leg_eta) converts, applied
+            # exactly once. Once usable energy exceeds the strictly-better
+            # need, the surplus is spent NOW via plain hold (load_first).
+            strictly_future_sc = (
+                future_sc_value_excl[i]
+                if i < len(future_sc_value_excl) else 0.0
+            )
+            strictly_better_need_kwh = (
+                strictly_better_sc_need[i]
+                if i < len(strictly_better_sc_need) else 0.0
+            )
+            # AND only when spending now cannot be profitably replaced by a
+            # future recharge (value gate #2): when self-consuming this block
+            # is worth MORE than the cheapest future refill costs, spend-now
+            # + refill strictly dominates idling — regardless of how much the
+            # strictly-better future "needs". Without this, the quantity gate
+            # degenerates whenever future need >= usable energy (the common
+            # winter regime: tomorrow's marginally-better peak "needs" all of
+            # it, today idles, and on a rolling horizon with upward-drifting
+            # peaks the battery pins at max SOC forever).
+            if (
+                action == "hold" and retention_hold
+                and net_solar < 0 and soc > effective_min_soc
+                and strictly_future_sc > self_consumption_value
+                and self_consumption_value < recharge_cost
+                and usable_kwh <= strictly_better_need_kwh / leg_eta
+            ):
+                action = "hold_idle"
+
             # === SOC SIMULATION ===
             # `consumption` already carries the base-load fallback applied above,
             # so the simulated house load matches the scored net_solar exactly.
@@ -1183,25 +1428,25 @@ from(bucket: "{solar_bucket}")
 
             if action == "charge":
                 grid_charge = kwh_per_block
-                soc += (grid_charge * efficiency) / battery_capacity_kwh * 100
+                soc += (grid_charge * leg_eta) / battery_capacity_kwh * 100
                 if net_from_solar > 0:
                     # Remaining headroom must exclude the grid charge just added,
                     # else solar banking double-spends capacity and over-states
                     # soc_after before the clamp.
                     solar_to_batt = min(
-                        net_from_solar * efficiency,
-                        max_battery_kwh - (battery_kwh + grid_charge * efficiency),
+                        net_from_solar * leg_eta,
+                        max_battery_kwh - (battery_kwh + grid_charge * leg_eta),
                     )
                     soc += max(0.0, solar_to_batt) / battery_capacity_kwh * 100
                 soc = min(max_soc, soc)
             elif action == "discharge":
                 # `discharge_possible` is the GRID-DELIVERED energy and already
-                # respects the per-block dynamic reserve (battery_kwh-min)*eff,
+                # respects the per-block dynamic reserve (battery_kwh-min)*leg,
                 # so it can't push SOC below effective_min_soc. Delivering that
-                # to the grid drains battery_delivered/efficiency of stored
-                # energy (inverter/round-trip loss). Mirrors the MILP, which
-                # drains battery by grid_export / eta.
-                battery_drain = discharge_possible / efficiency
+                # to the grid drains battery_delivered/leg_eta of stored energy
+                # (one discharge leg). Mirrors the MILP, which drains battery by
+                # grid_export / eta with eta = sqrt(round-trip efficiency).
+                battery_drain = discharge_possible / leg_eta
                 if net_from_solar < 0:
                     # The house deficit is ALSO served from the battery. Both the
                     # grid-export drain and the deficit drain draw from the SAME
@@ -1209,7 +1454,7 @@ from(bucket: "{solar_bucket}")
                     # export drain against what's left after the deficit instead of
                     # letting each independently drain to the floor (which the SOC
                     # clamp would silently absorb — an energy-conservation leak).
-                    deficit_drain = abs(net_from_solar) / efficiency
+                    deficit_drain = abs(net_from_solar) / leg_eta
                     avail = max(0.0, battery_kwh - min_battery_kwh)
                     battery_drain = min(
                         battery_drain, max(0.0, avail - deficit_drain)
@@ -1217,21 +1462,26 @@ from(bucket: "{solar_bucket}")
                 soc -= battery_drain / battery_capacity_kwh * 100
                 soc = max(effective_min_soc, soc)
             elif action == "sell_production":
-                # Solar excess flows to grid (battery does NOT charge from it).
-                # Battery only drains if loads exceed solar (auto-SC), and only
-                # down to the dynamic reserve — preserve overnight energy the
-                # same way the discharge branch does (was: hardware floor).
-                if net_from_solar < 0:
-                    need = abs(net_from_solar) / efficiency  # battery-side, lossy
-                    avail = max(0.0, battery_kwh - min_battery_kwh)
-                    battery_drain = min(need, avail)
-                    if battery_drain > 0:
-                        soc -= battery_drain / battery_capacity_kwh * 100
-                        soc = max(effective_min_soc, soc)
-                # net_from_solar >= 0: solar covers loads, excess to grid, SOC unchanged.
+                # Battery-PASSIVE on this SPH: sell_production actuates as
+                # grid-first with stop_soc pinned to the live SOC, so the
+                # battery neither banks the surplus (it exports) nor serves a
+                # consumption deficit (the grid does). SOC carries over
+                # unchanged — matching the MILP (batt_to_load forbidden on
+                # is_sp blocks) and the backtest harness, which both model SP
+                # deficits as grid-served. Draining the battery here projected
+                # SOC the hardware would never reach.
+                pass
+            elif action == "hold_idle":
+                # Battery-passive preserve: actuated as battery_hold
+                # (battery_first with stop_soc pinned to the live SOC), so the
+                # battery neither discharges into the deficit (grid serves it)
+                # nor grid-charges. SOC carries over unchanged. Only deficit
+                # blocks are remapped to hold_idle, so there is no surplus
+                # solar to bank here.
+                pass
             else:  # hold
                 if net_from_solar > 0:
-                    solar_to_batt = min(net_from_solar * efficiency,
+                    solar_to_batt = min(net_from_solar * leg_eta,
                                         max_battery_kwh - battery_kwh)
                     if solar_to_batt > 0:
                         soc += solar_to_batt / battery_capacity_kwh * 100
@@ -1240,8 +1490,8 @@ from(bucket: "{solar_bucket}")
                     # Pure self-consumption: serve the deficit from the battery
                     # down to the per-block DYNAMIC reserve (not the hardware
                     # floor) so holding preserves overnight energy. Battery-side
-                    # draw is lossy, matching the value model.
-                    need = abs(net_from_solar) / efficiency
+                    # draw is one lossy discharge leg, matching the MILP.
+                    need = abs(net_from_solar) / leg_eta
                     avail = max(0.0, battery_kwh - min_battery_kwh)
                     draw = min(need, avail)
                     if draw > 0:
@@ -1278,8 +1528,9 @@ from(bucket: "{solar_bucket}")
         charge_blocks = [d for d in decisions if d.action == "charge"]
         discharge_blocks = [d for d in decisions if d.action == "discharge"]
         hold_blocks = [d for d in decisions if d.action == "hold"]
-        # Battery-hold (preserve): grid serves the house, battery idle. Only the
-        # MILP emits this; greedy holds stay "hold" (load_first self-consume).
+        # Battery-hold (preserve): grid serves the house, battery idle. Both
+        # engines emit this — the MILP for grid-serves-load blocks with usable
+        # battery, the greedy for retention holds with a consumption deficit.
         hold_idle_blocks = [d for d in decisions if d.action == "hold_idle"]
         sell_production_blocks = [d for d in decisions if d.action == "sell_production"]
 

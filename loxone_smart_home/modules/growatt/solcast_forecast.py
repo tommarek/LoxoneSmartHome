@@ -13,11 +13,32 @@ API docs:
 - https://docs.solcast.com.au/#0a6da91d-3a07-4f5f-849f-9aa19c8d2614
 """
 
+import asyncio
+import hashlib
+import json
 import logging
+import os
 from datetime import datetime, date, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import aiohttp
+
+
+def _default_quota_path() -> Path:
+    """Sibling of the persisted config overrides (same docker volume).
+
+    Mirrors ``config.settings_overrides.DEFAULT_OVERRIDES_PATH``: the quota
+    file must survive container restarts (the UI restart button, deploys)
+    or every restart resets the ≤9/day Solcast budget and re-spends it.
+    Overridable via the CONFIG_OVERRIDES_PATH env var for local runs/tests.
+    """
+    overrides = Path(
+        os.environ.get(
+            "CONFIG_OVERRIDES_PATH", "/app/config_state/config_overrides.json"
+        )
+    )
+    return overrides.parent / "solcast_quota.json"
 
 
 class SolcastForecast:
@@ -40,6 +61,7 @@ class SolcastForecast:
         rooftop_id: Optional[str],
         logger: Optional[logging.Logger] = None,
         quantile: str = "p50",
+        quota_path: Optional[Path] = None,
     ):
         self.api_key = (api_key or "").strip() or None
         # One or more rooftop sites (comma/semicolon/space separated). A home
@@ -73,10 +95,104 @@ class SolcastForecast:
         # has no await between gate and counter bump, so asyncio's cooperative
         # scheduling makes it atomic across concurrent callers.)
         self._auth_failed: bool = False
+        # Persist the throttle state across container restarts (UI restart
+        # button, deploys) — otherwise every restart resets the ≤9/day budget
+        # and re-spends requests / re-hammers a bad key. Path is injectable
+        # for tests; the default lives next to config_overrides.json on the
+        # loxone_config_state volume.
+        self._quota_path: Path = Path(quota_path) if quota_path else _default_quota_path()
+        self._load_quota_state()
 
     @property
     def enabled(self) -> bool:
         return bool(self.api_key and self.rooftop_ids)
+
+    def _api_key_fingerprint(self) -> Optional[str]:
+        """Short non-reversible fingerprint of the API key.
+
+        Stored alongside the persisted ``auth_failed`` latch so the latch is
+        only honoured while the SAME key is configured — fixing the key and
+        restarting must re-enable Solcast, not stay latched forever.
+        """
+        if not self.api_key:
+            return None
+        return hashlib.sha256(self.api_key.encode("utf-8")).hexdigest()[:16]
+
+    def _load_quota_state(self) -> None:
+        """Restore the persisted throttle state, tolerating a missing or
+        corrupt file (fresh defaults already set by __init__)."""
+        try:
+            raw = json.loads(self._quota_path.read_text())
+        except FileNotFoundError:
+            return  # first run — nothing persisted yet
+        except (OSError, ValueError) as e:
+            self.logger.warning(
+                f"Could not read Solcast quota state at {self._quota_path} "
+                f"({e}) — starting with a fresh throttle state"
+            )
+            return
+        if not isinstance(raw, dict):
+            return
+        try:
+            req_day = (
+                date.fromisoformat(raw["utc_day"]) if raw.get("utc_day") else None
+            )
+            req_count = int(raw.get("req_count", 0))
+            last_attempt = (
+                datetime.fromisoformat(raw["last_attempt_iso"])
+                if raw.get("last_attempt_iso")
+                else None
+            )
+            auth_failed = bool(raw.get("auth_failed", False))
+            key_fp = raw.get("api_key_fingerprint")
+        except (KeyError, TypeError, ValueError):
+            self.logger.warning(
+                f"Solcast quota state at {self._quota_path} is corrupt — "
+                f"starting with a fresh throttle state"
+            )
+            return
+        # All-or-nothing: only apply a fully-parsed state.
+        self._req_day = req_day
+        self._req_count = max(0, req_count)
+        if last_attempt is not None and last_attempt.tzinfo is not None:
+            self._last_attempt = last_attempt
+        # The auth latch only applies while the key it was recorded against
+        # is still in use; a changed key gets a fresh chance.
+        if auth_failed and key_fp == self._api_key_fingerprint():
+            self._auth_failed = True
+            self.logger.warning(
+                "Solcast auth-failure latch restored from persisted state — "
+                "the configured API key was previously rejected (401/403); "
+                "change solcast_api_key to re-enable"
+            )
+
+    def _save_quota_state(self) -> None:
+        """Persist the throttle state atomically (write temp + replace).
+
+        Best-effort: persistence failing (read-only FS in local dev/tests)
+        must never break forecasting — the in-memory state stays authoritative
+        for this process lifetime.
+        """
+        payload = {
+            "utc_day": self._req_day.isoformat() if self._req_day else None,
+            "req_count": self._req_count,
+            "last_attempt_iso": (
+                self._last_attempt.isoformat() if self._last_attempt else None
+            ),
+            "auth_failed": self._auth_failed,
+            "api_key_fingerprint": (
+                self._api_key_fingerprint() if self._auth_failed else None
+            ),
+        }
+        try:
+            self._quota_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._quota_path.with_suffix(self._quota_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            tmp.replace(self._quota_path)
+        except OSError as e:
+            self.logger.warning(
+                f"Could not persist Solcast quota state to {self._quota_path}: {e}"
+            )
 
     async def fetch_hourly_today_tomorrow(
         self,
@@ -133,18 +249,22 @@ class SolcastForecast:
         # account limit — letting a forced refresh blow past it would burn the
         # budget and get later calls rejected by the API.
         if self._req_count + n_sites > self._max_requests_per_day:
-            self.logger.debug(
+            self.logger.warning(
                 "Solcast daily request budget would be exceeded by a "
-                f"{n_sites}-site refresh — using cache"
+                f"{n_sites}-site refresh ({self._req_count}/"
+                f"{self._max_requests_per_day} used) — using cache"
             )
             return dict(self._cached)
 
         # Reserve the interval slot AND the whole batch's budget up front, before
         # any await, so two concurrent refreshes can't both pass the gate and
-        # then over-spend the daily quota. Every site below counts (success or
-        # not), so no refund is needed.
+        # then over-spend the daily quota. Every site that gets an HTTP response
+        # counts (success or error status); only connect-level failures where
+        # the request provably never went out (ClientConnectorError) are
+        # refunded below — they can't have touched Solcast's real quota.
         self._last_attempt = now_utc
         self._req_count += n_sites
+        self._save_quota_state()
 
         params = {"format": "json", "hours": 48}
         headers = {"Authorization": f"Bearer {self.api_key}"}
@@ -158,17 +278,20 @@ class SolcastForecast:
                 # Budget already reserved atomically above (self._req_count +=
                 # n_sites), so do NOT increment per-site here (double-count).
                 url = f"{self.BASE_URL}/{rid}/forecasts"
+                got_response = False
                 try:
                     async with session.get(url, params=params, headers=headers) as resp:
+                        got_response = True
                         if resp.status != 200:
                             body = await resp.text()
                             if resp.status in (401, 403):
                                 # Bad key — permanent for the whole account.
                                 self._auth_failed = True
+                                self._save_quota_state()
                                 self.logger.error(
                                     f"Solcast auth failed ({resp.status}) for "
-                                    f"site {rid} — disabling until restart. "
-                                    f"Check solcast_api_key. Body: {body}"
+                                    f"site {rid} — disabling until the API key "
+                                    f"changes. Check solcast_api_key. Body: {body}"
                                 )
                                 return dict(self._cached)
                             # 429 / transient: skip this site, keep others.
@@ -177,6 +300,27 @@ class SolcastForecast:
                             )
                             continue
                         payload = await resp.json()
+                except (aiohttp.ClientConnectionError, asyncio.TimeoutError) as e:
+                    # Refund ONLY when the request provably never went out
+                    # (DNS failure / connection refused = ClientConnectorError,
+                    # raised before anything was sent) — a LAN/WAN outage must
+                    # not zero the day's budget. A TIMEOUT is NOT refunded: the
+                    # request may have reached Solcast and been counted by its
+                    # real ledger, and refunding locally could let us exceed
+                    # the actual quota. Anything after a received response
+                    # (body read failure) always counts.
+                    refund = not got_response and isinstance(
+                        e, aiohttp.ClientConnectorError
+                    )
+                    if refund:
+                        self._req_count = max(0, self._req_count - 1)
+                        self._save_quota_state()
+                    self.logger.warning(
+                        f"Solcast connection failed for site {rid}: "
+                        f"{type(e).__name__}: {e}"
+                        + (" (request refunded)" if refund else "")
+                    )
+                    continue
                 except Exception as e:
                     self.logger.warning(f"Solcast fetch failed for site {rid}: {e}")
                     continue

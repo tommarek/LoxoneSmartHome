@@ -314,6 +314,28 @@ class GrowattController(BaseModule):
                 self._optimizer = BatteryOptimizer(self.logger)
                 self.logger.info("Battery optimizer enabled (greedy engine)")
 
+        # Hourly forecast temperatures stashed from the OpenMeteo fetch in
+        # _update_solar_forecast: {local_date: {local_hour: °C}}. Used by the
+        # consumption forecast so tomorrow is predicted with tomorrow's
+        # temperatures instead of yesterday's actuals (cold-front days).
+        self._forecast_temps_by_date: Dict[Any, Dict[int, float]] = {}
+        self._forecast_temps_fetched_at: Optional[datetime] = None
+
+        # When the solar production model was last (re)built / attempted. The
+        # build used to be once-per-process; with UI/deploy-driven restarts a
+        # container can run for weeks, so the periodic loop rebuilds it weekly
+        # — and retries hourly while there is no model at all (failed startup
+        # build, e.g. InfluxDB unreachable right after a restart).
+        self._solar_model_built_at: Optional[datetime] = None
+        # Initialized to NOW (not None): the periodic loop starts BEFORE the
+        # Phase-3 startup build task is assigned to _models_task, so a slow
+        # startup evaluation (>60s) would otherwise let the first tick spawn
+        # a duplicate build and have Phase 3 overwrite/orphan it. Seeding the
+        # attempt timestamp keeps the trigger quiet for the first hour.
+        self._solar_model_attempted_at: Optional[datetime] = datetime.now(
+            self._local_tz
+        )
+
         # Solcast PV forecast (optional). If configured, used as an
         # additional input to the consensus alongside forecast.solar and
         # the trained production model.
@@ -330,6 +352,14 @@ class GrowattController(BaseModule):
                 if self._solcast_forecast.enabled:
                     self.logger.info("Solcast PV forecast enabled")
                 else:
+                    # Diagnose precisely: the client strips both values, so a
+                    # whitespace-only key also lands here — don't blame the
+                    # rooftop id for that.
+                    if self._solcast_forecast.api_key is None:
+                        reason = "SOLCAST_API_KEY is empty/whitespace"
+                    else:
+                        reason = "SOLCAST_ROOFTOP_ID is missing/empty"
+                    self.logger.warning(f"Solcast disabled: {reason}")
                     self._solcast_forecast = None
             except Exception as e:
                 self.logger.warning(f"Solcast init failed: {e}")
@@ -1499,7 +1529,7 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
   |> range(start: -24h)
   |> filter(fn: (r) => r._measurement == "temperature")
   |> filter(fn: (r) => r._field == "temperature_outside")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             result = await self.influxdb_client.query(query)
             temps: Dict[int, float] = {}
@@ -1522,6 +1552,54 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
         except Exception as e:
             self.logger.debug(f"Could not fetch hourly outdoor temps: {e}")
             return {}
+
+    def _stash_forecast_temps(self, weather_hours: List[Dict[str, Any]]) -> None:
+        """Cache OpenMeteo hourly forecast temperatures per (local date, hour).
+
+        The OpenMeteo request in _update_solar_forecast uses timezone=auto, so
+        the "time" strings are already local wall-clock ("2026-06-12T14:00").
+        """
+        by_date: Dict[Any, Dict[int, float]] = {}
+        for wh in weather_hours:
+            # Per-entry tolerance: one malformed entry must not discard the
+            # whole 48h stash (tomorrow would silently fall back to
+            # yesterday's actual temps).
+            try:
+                ts = datetime.fromisoformat(str(wh.get("time", "")))
+                # Prefer the raw (un-defaulted) temperature: a missing
+                # OpenMeteo value must be SKIPPED here, not stashed as the
+                # 15 °C sentinel — _temps_for_date would let it override a
+                # real measured temperature for that hour.
+                if "temperature_2m_raw" in wh:
+                    temp = wh["temperature_2m_raw"]
+                else:
+                    temp = wh.get("temperature_2m")
+                if isinstance(temp, (int, float)):
+                    by_date.setdefault(ts.date(), {})[ts.hour] = float(temp)
+            except (ValueError, TypeError):
+                continue
+        if by_date:
+            self._forecast_temps_by_date = by_date
+            self._forecast_temps_fetched_at = datetime.now(self._local_tz)
+
+    def _temps_for_date(
+        self, target_date: Any, recent_temps: Dict[int, float]
+    ) -> Dict[int, float]:
+        """Best available {hour: °C} for `target_date`.
+
+        Forecast temps (when fresh, <12h old) win over the recent-actuals
+        proxy — yesterday's temperatures are systematically wrong for
+        tomorrow on weather-change days, which are exactly the days where
+        heating-driven consumption (and thus reserve sizing) matters most.
+        Recent actuals fill any hours the forecast is missing.
+        """
+        merged = dict(recent_temps)
+        fetched_at = self._forecast_temps_fetched_at
+        if fetched_at is not None and (
+            datetime.now(self._local_tz) - fetched_at
+        ) < timedelta(hours=12):
+            merged.update(self._forecast_temps_by_date.get(target_date, {}))
+        return merged
 
     async def _log_price_table(
         self, prices_15min: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
@@ -1726,6 +1804,29 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     self._periodic_check_task = new_task
         return _cb
 
+    async def _rebuild_solar_model_background(self) -> None:
+        """Periodic (weekly, or hourly while modelless) solar model rebuild.
+
+        Runs as a background task so the heavy ~730-day InfluxDB queries
+        never stall the 60s evaluation loop; the trigger in
+        _periodic_evaluation_loop gates on `_models_task.done()` so builds
+        can't overlap (incl. the startup build).
+        """
+        if not self._solar_forecast:
+            return
+        try:
+            success = await self._solar_forecast.build_production_model(
+                self.influxdb_client, self.settings, local_tz=self._local_tz
+            )
+            if success and self._solar_forecast._production_model:
+                self._solar_model_built_at = datetime.now(self._local_tz)
+            self.logger.info(
+                f"Periodic solar production model rebuild: "
+                f"{'ok' if success else 'declined'}"
+            )
+        except Exception as e:
+            self.logger.warning(f"Periodic solar model rebuild failed: {e}")
+
     async def _build_models_background(self) -> None:
         """Build ML models in background without blocking controller operation.
 
@@ -1738,10 +1839,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             # Solar production model (730 days, ~10 InfluxDB queries)
             if self._solar_forecast:
                 try:
+                    self._solar_model_attempted_at = datetime.now(self._local_tz)
                     success = await self._solar_forecast.build_production_model(
                         self.influxdb_client, self.settings, local_tz=self._local_tz
                     )
                     if success and self._solar_forecast._production_model:
+                        self._solar_model_built_at = datetime.now(self._local_tz)
                         m = self._solar_forecast._production_model
                         self.logger.info(
                             f"Solar production model ready: {m.data_points} hours, "
@@ -2121,7 +2224,10 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 if hourly:
                     self._solar_forecast.set_solcast_hourly(hourly)
             except Exception as e:
-                self.logger.debug(f"Solcast fetch failed: {e}")
+                # WARNING, not debug: the client logs per-site HTTP errors
+                # itself, so anything landing here is an unexpected failure
+                # that would otherwise be invisible at the prod log level.
+                self.logger.warning(f"Solcast fetch failed: {e}")
 
         # If API failed or was rate-limited, try fallbacks in order
         if not self._solar_forecast._api_forecast:
@@ -2140,8 +2246,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except Exception as e:
                 self.logger.debug(f"OpenMeteo fallback failed: {e}")
 
-        # Use learned model with OpenMeteo weather forecast for predictions
-        if self._solar_forecast._production_model:
+        # Fetch a fresh 48h OpenMeteo weather forecast. Used for the learned
+        # model's prediction AND to stash forecast temperatures for the
+        # consumption models — so it runs even when the production model is
+        # absent (fresh install / failed build), keeping tomorrow's
+        # consumption forecast on real forecast temps.
+        if self._solar_forecast is not None:
             try:
                 # Fetch fresh 48h weather forecast from OpenMeteo
                 from modules.growatt.solar_forecast import _effective_cloud_cover
@@ -2167,7 +2277,17 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             weather_hours = []
                             for i, t in enumerate(times):
                                 g = (ghi[i] if i < len(ghi) else 0) or 0
-                                tp = (temps[i] if i < len(temps) else 15) or 15
+                                # None-check, NOT `or 15`: a genuine 0.0 °C
+                                # reading is falsy and would become 15 °C —
+                                # these temps feed the heating-driven
+                                # consumption models via _stash_forecast_temps,
+                                # where that error is large on freezing days.
+                                # tp_raw keeps the None so the stash can SKIP
+                                # missing hours instead of stashing the 15 °C
+                                # sentinel as a "forecast" that would override
+                                # a real measured temperature.
+                                tp_raw = temps[i] if i < len(temps) else None
+                                tp = 15 if tp_raw is None else tp_raw
                                 if cloud_low and i < len(cloud_low):
                                     c = _effective_cloud_cover(
                                         cloud_low[i] or 0,
@@ -2181,16 +2301,33 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                                     "shortwave_radiation": g,
                                     "cloudcover": c,
                                     "temperature_2m": tp,
+                                    "temperature_2m_raw": tp_raw,
                                 })
-                            model_result = self._solar_forecast.predict_from_model(weather_hours)
-                            if model_result:
-                                total = sum(f.total_kwh for f in model_result.values())
-                                self.logger.info(
-                                    f"Solar model prediction: {total:.1f} kWh "
-                                    f"across {len(model_result)} days (from learned model)"
+                            self._stash_forecast_temps(weather_hours)
+                            # Without a learned model (fresh install / failed
+                            # build) the fetch still served the temp stash
+                            # above; there is just nothing to predict.
+                            if self._solar_forecast._production_model:
+                                model_result = self._solar_forecast.predict_from_model(
+                                    weather_hours
                                 )
+                                if model_result:
+                                    total = sum(
+                                        f.total_kwh for f in model_result.values()
+                                    )
+                                    self.logger.info(
+                                        f"Solar model prediction: {total:.1f} kWh "
+                                        f"across {len(model_result)} days "
+                                        f"(from learned model)"
+                                    )
             except Exception as e:
-                self.logger.debug(f"Model prediction failed: {e}")
+                # WARNING: this fetch now also feeds the consumption models'
+                # forecast temperatures — a persistent OpenMeteo outage
+                # silently reverts tomorrow's consumption to yesterday's
+                # actual temps, which must be visible at the prod log level.
+                self.logger.warning(
+                    f"OpenMeteo weather fetch / model prediction failed: {e}"
+                )
 
         # Calibrate confidence from actual production data (full year on startup)
         try:
@@ -2198,6 +2335,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 self.influxdb_client,
                 self.settings.influxdb.bucket_solar,
                 days=365,
+                local_tz=self._local_tz,
             )
         except Exception as e:
             self.logger.warning(f"Solar calibration failed: {e}")
@@ -2552,60 +2690,102 @@ from(bucket: "{bucket}")
 
             # Consumption forecast: prefer the temperature-aware total-load model
             # (heating + EV included) over the heating-excluded base load profile.
-            # Order: ML (if enabled+trained) → binned model → base_load_profile.
+            # Order PER DATE: ML (if enabled+trained) → binned model → base load
+            # profile → flat floor. Per-date so a partial ML result (e.g. only
+            # today, when tomorrow's prediction horizon goes stale first) can't
+            # suppress the binned fallback for the missing day — that day would
+            # otherwise be planned at 0 kWh load via _forecast_value's default.
             consumption_hourly: Dict[Any, float] = {}
-            forecast_temps = await self._fetch_recent_hourly_temps()
-
+            recent_temps = await self._fetch_recent_hourly_temps()
             ml_cf = getattr(self, '_ml_consumption_forecast', None)
-            if ml_cf and ml_cf.is_trained and forecast_temps:
-                # forecast_temps is keyed by LOCAL hour (see
-                # _fetch_recent_hourly_temps), matching the local-hour bins both
-                # the ML and binned models train on — so the temperature exog
-                # lines up with the model and the local-hour optimizer output.
-                try:
-                    # Recursive RF inference is CPU-bound — run off the loop.
-                    today_hourly = await asyncio.to_thread(
-                        ml_cf.predict_hourly, forecast_temps, today
-                    )
-                    tomorrow_hourly = await asyncio.to_thread(
-                        ml_cf.predict_hourly, forecast_temps, tomorrow
-                    )
-                    if today_hourly or tomorrow_hourly:
-                        for hour, kwh in today_hourly.items():
-                            consumption_hourly[(today, hour)] = kwh
-                        for hour, kwh in tomorrow_hourly.items():
-                            consumption_hourly[(tomorrow, hour)] = kwh
-                        self.logger.debug(
-                            f"Using ML consumption forecast ({len(consumption_hourly)} date-hours)"
+            for target_day in (today, tomorrow):
+                # Temps are keyed by LOCAL hour, matching the local-hour bins
+                # both consumption models train on and the optimizer's local-
+                # hour output. Forecast temps win over the recent-actuals
+                # proxy when fresh (see _temps_for_date).
+                temps = self._temps_for_date(target_day, recent_temps)
+                day_hourly: Dict[int, float] = {}
+
+                if ml_cf and ml_cf.is_trained and temps:
+                    try:
+                        # Recursive RF inference is CPU-bound — run off the loop.
+                        day_hourly = await asyncio.to_thread(
+                            ml_cf.predict_hourly, temps, target_day
                         )
-                except Exception as e:
-                    self.logger.debug(f"ML predict_hourly failed: {e}")
+                    except Exception as e:
+                        self.logger.warning(
+                            f"ML predict_hourly({target_day}) failed: {e}"
+                        )
 
-            if (
-                not consumption_hourly
-                and self._consumption_forecast
-                and self._consumption_forecast.model
-                and forecast_temps
-            ):
-                today_hourly = self._consumption_forecast.predict_hourly(
-                    forecast_temps, today
-                )
-                tomorrow_hourly = self._consumption_forecast.predict_hourly(
-                    forecast_temps, tomorrow
-                )
-                if today_hourly or tomorrow_hourly:
-                    for hour, kwh in today_hourly.items():
-                        consumption_hourly[(today, hour)] = kwh
-                    for hour, kwh in tomorrow_hourly.items():
-                        consumption_hourly[(tomorrow, hour)] = kwh
+                if (
+                    not day_hourly
+                    and self._consumption_forecast
+                    and self._consumption_forecast.model
+                    and temps
+                ):
+                    day_hourly = self._consumption_forecast.predict_hourly(
+                        temps, target_day
+                    )
 
-            if not consumption_hourly and self._optimizer and self._optimizer._base_load_profile.profile:
-                for target_day in (today, tomorrow):
+                if (
+                    not day_hourly
+                    and self._optimizer
+                    and self._optimizer._base_load_profile.profile
+                ):
                     is_weekend = target_day.weekday() >= 5
-                    for h in range(24):
-                        consumption_hourly[(target_day, h)] = (
-                            self._optimizer._base_load_profile.get(h, is_weekend)
+                    day_hourly = {
+                        h: self._optimizer._base_load_profile.get(h, is_weekend)
+                        for h in range(24)
+                    }
+
+                if not day_hourly:
+                    # Last resort (no models, no temps, no learned profile —
+                    # e.g. InfluxDB unreachable right after a restart): plan a
+                    # conservative flat load. Planning a day at 0 kWh (no
+                    # reserve, maximal discharge) must never happen silently.
+                    self.logger.warning(
+                        f"No consumption forecast available for {target_day}; "
+                        f"using flat 1.0 kWh/h floor"
+                    )
+                    day_hourly = {h: 1.0 for h in range(24)}
+
+                if len(day_hourly) < 24:
+                    # A PARTIAL model result (e.g. ML right after a rebuild
+                    # whose training window ends in the current hour predicts
+                    # only from hour+1) would leave the missing hours planned
+                    # at 0 kWh via _forecast_value's default. Fill them from
+                    # the next fallbacks in the chain.
+                    is_weekend = target_day.weekday() >= 5
+                    binned_fill: Dict[int, float] = {}
+                    if (
+                        self._consumption_forecast
+                        and self._consumption_forecast.model
+                        and temps
+                    ):
+                        binned_fill = self._consumption_forecast.predict_hourly(
+                            temps, target_day
                         )
+                    day_mean = (
+                        sum(day_hourly.values()) / len(day_hourly)
+                        if day_hourly else 1.0
+                    )
+                    for h in range(24):
+                        if h in day_hourly:
+                            continue
+                        if h in binned_fill:
+                            day_hourly[h] = binned_fill[h]
+                        elif (
+                            self._optimizer
+                            and self._optimizer._base_load_profile.profile
+                        ):
+                            day_hourly[h] = self._optimizer._base_load_profile.get(
+                                h, is_weekend
+                            )
+                        else:
+                            day_hourly[h] = day_mean
+
+                for hour, kwh in day_hourly.items():
+                    consumption_hourly[(target_day, hour)] = kwh
 
             dist_thresholds = PriceThresholds(
                 charge_price_max=self.config.charge_price_max,
@@ -2794,16 +2974,11 @@ from(bucket: "{bucket}")
                 d.timestamp for d in decisions if d.action == "hold_idle"
             }
             # Per-leg SOC-loss factor to convert each engine's ΔSOC to grid-side
-            # energy: the MILP splits round-trip efficiency sqrt-symmetrically
-            # across the two legs, the greedy puts it all on one leg. Use the
-            # engine that ACTUALLY produced the decisions (a MILP solve that fell
-            # back to greedy carries greedy's convention), not just the configured
-            # engine — _last_engine records it.
-            _engine_used = getattr(self._optimizer, "_last_engine", "greedy")
-            _leg_eta = (
-                self.config.battery_efficiency ** 0.5
-                if _engine_used == "milp" else self.config.battery_efficiency
-            )
+            # energy. BOTH engines now share the sqrt-split convention (the
+            # greedy SOC simulation and the shared reserve helper were unified
+            # with the MILP's per-leg eta), so the conversion no longer depends
+            # on which engine produced the decisions.
+            _leg_eta = self.config.battery_efficiency ** 0.5
             # Adaptive charge rate: per-charge-window inverter powerRate% so the
             # hardware charges at the gentlest rate that still fills each window.
             # Empty when the feature is off → falls back to the fixed rate.
@@ -4627,6 +4802,45 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                         except Exception as e:
                             self.logger.warning(f"Solar forecast refresh failed: {e}")
 
+                # Rebuild the solar production model weekly. It trains on a
+                # 730-day window that previously only refreshed on container
+                # restart — with restarts now UI/deploy-driven the model could
+                # silently age for weeks. While there is NO model at all
+                # (startup build failed/declined), retry hourly instead —
+                # otherwise the controller would run modelless forever.
+                solar_rebuild_due = False
+                if self._solar_forecast and (
+                    self._models_task is None or self._models_task.done()
+                ):
+                    now_local = datetime.now(self._local_tz)
+                    # 1h attempt-backoff applies to BOTH branches so a failing
+                    # rebuild (730-day queries) can't re-fire every 60s tick.
+                    attempt_ok = (
+                        self._solar_model_attempted_at is None
+                        or now_local - self._solar_model_attempted_at
+                        > timedelta(hours=1)
+                    )
+                    if self._solar_model_built_at is not None:
+                        solar_rebuild_due = attempt_ok and (
+                            now_local - self._solar_model_built_at
+                            > timedelta(days=7)
+                        )
+                    else:
+                        solar_rebuild_due = attempt_ok
+                if solar_rebuild_due:
+                    self._solar_model_attempted_at = datetime.now(self._local_tz)
+                    # Run in the background — the build issues ~24 monthly
+                    # 730-day InfluxDB queries and would otherwise stall this
+                    # 60s loop (live SOC refresh, 15-min block actuation) for
+                    # minutes. Stored in _models_task so the gate above
+                    # (`_models_task.done()`) prevents overlapping builds.
+                    self._models_task = asyncio.create_task(
+                        self._rebuild_solar_model_background()
+                    )
+                    self._models_task.add_done_callback(
+                        self._make_task_guard("solar_model_rebuild", None)
+                    )
+
                 # Rebuild consumption model if needed (weekly)
                 if self._consumption_forecast and self._consumption_forecast.needs_rebuild():
                     try:
@@ -4842,6 +5056,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                                     await self._solar_forecast.calibrate_from_actuals(
                                         self.influxdb_client,
                                         self.settings.influxdb.bucket_solar,
+                                        local_tz=self._local_tz,
                                     )
                                 except Exception as e:
                                     self.logger.warning(f"Daily solar calibration failed: {e}")

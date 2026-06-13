@@ -1,7 +1,7 @@
 """Tests for the temperature-aware consumption forecast module."""
 
 import pytest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock
 
 from modules.growatt.consumption_forecast import ConsumptionModel, ConsumptionForecast
@@ -47,15 +47,45 @@ class TestConsumptionModel:
         # Outlier (20.0) should be removed, median should be ~2.5
         assert model.medians[key] < 3.5
 
-    def test_build_few_samples_no_outlier_removal(self) -> None:
+    def test_build_skips_low_support_bins(self) -> None:
         model = ConsumptionModel()
-        key = (10, 8, False)
-        model.bins[key] = [2.0, 10.0]  # Only 2 samples
+        sparse_key = (10, 8, False)
+        rich_key = (10, 8, True)
+        # 3 samples — below MIN_BIN_SAMPLES, must NOT become a trusted median.
+        model.bins[sparse_key] = [2.0, 10.0, 2.2]
+        model.bins[rich_key] = [1.5, 1.8, 1.6, 1.7, 1.9]
 
         model.build()
 
-        # With < 3 samples, no IQR removal, just median
-        assert model.medians[key] == pytest.approx(6.0)
+        assert sparse_key not in model.medians
+        assert rich_key in model.medians
+        # Prediction for the sparse key falls back (opposite day type here)
+        # rather than trusting the noisy 3-sample bin.
+        result = model.predict(temperature=0.0, hour=8, is_weekend=False)
+        assert result == model.medians[rich_key]
+
+    def test_sparse_bins_still_feed_fallbacks(self) -> None:
+        """On a young install EVERY bin can be below MIN_BIN_SAMPLES.
+
+        Sparse bins must not become trusted medians, but their samples
+        still have to feed the hourly fallback and global median —
+        otherwise predictions collapse to the 1.0 kWh hard default."""
+        model = ConsumptionModel()
+        model.bins[(10, 8, False)] = [2.0, 2.2]  # sparse
+        model.bins[(12, 8, False)] = [2.4]       # sparse
+        model.bins[(10, 20, False)] = [1.0]      # sparse
+
+        model.build()
+
+        # No bin reaches MIN_BIN_SAMPLES → no trusted medians ...
+        assert model.medians == {}
+        # ... but the hourly fallback is populated from the sparse bins
+        assert model.hourly_fallback[8] == pytest.approx(2.25)  # median(2.1, 2.4)
+        assert model.hourly_fallback[20] == pytest.approx(1.0)
+        # ... and the global median reflects the data, not the 1.0 default
+        assert model.global_median == pytest.approx(2.1)
+        # Prediction rides the hourly fallback, not the hard default
+        assert model.predict(temperature=0.0, hour=8, is_weekend=False) == pytest.approx(2.25)
 
     def test_predict_exact_match(self) -> None:
         model = ConsumptionModel()
@@ -269,3 +299,142 @@ class TestConsumptionForecast:
                     f"bin {key} median {cf.model.medians[key]} suggests the "
                     f"20 kW contamination wasn't filtered"
                 )
+
+    @pytest.mark.asyncio
+    async def test_build_model_declines_when_no_bin_reaches_min_samples(self) -> None:
+        """≥100 matched points but every bin sparse (young install with
+        fast-moving temperatures) must DECLINE the build instead of
+        installing a model with zero trusted medians."""
+        cf = ConsumptionForecast(logger=MagicMock())
+
+        # 6 days (Mon 2026-03-02 .. Sat 2026-03-07) x 24h = 144 points,
+        # with a different temperature bucket each day so every
+        # (bucket, hour, day-type) bin gets exactly ONE sample.
+        consumption_records = []
+        temp_records = []
+        for day_offset in range(6):
+            for hour in range(24):
+                dt = datetime(2026, 3, 2 + day_offset, hour, 0)
+                c_rec = MagicMock()
+                c_rec.get_time.return_value = dt
+                c_rec.get_value.return_value = 1500.0
+                consumption_records.append(c_rec)
+
+                t_rec = MagicMock()
+                t_rec.get_time.return_value = dt
+                t_rec.get_value.return_value = float(day_offset * 4)  # distinct buckets
+                temp_records.append(t_rec)
+
+        c_table = MagicMock(); c_table.records = consumption_records
+        t_table = MagicMock(); t_table.records = temp_records
+
+        mock_client = AsyncMock()
+        mock_client.query = AsyncMock(side_effect=[[c_table], [t_table], []])
+        mock_settings = MagicMock()
+        mock_settings.influxdb.bucket_solar = "solar"
+        mock_settings.influxdb.bucket_loxone = "loxone"
+
+        ok = await cf.build_model(mock_client, mock_settings)
+        assert ok is False
+        assert cf.model is None  # nothing installed — controller keeps retrying
+
+    @pytest.mark.asyncio
+    async def test_build_queries_use_start_labeled_windows(self) -> None:
+        """aggregateWindow must be start-labeled (timeSrc: "_start").
+
+        The Flux default stamps each window with its STOP time, shifting
+        every hour key +1h and delaying the whole predicted load profile.
+        """
+        cf = ConsumptionForecast(logger=MagicMock())
+
+        captured = []
+
+        async def fake_query(q):
+            captured.append(q)
+            return []
+
+        mock_client = MagicMock()
+        mock_client.query = AsyncMock(side_effect=fake_query)
+        mock_settings = MagicMock()
+        mock_settings.influxdb.bucket_solar = "solar"
+        mock_settings.influxdb.bucket_loxone = "loxone"
+
+        ok = await cf.build_model(mock_client, mock_settings)
+        assert ok is False  # no data — but the queries were issued
+
+        agg_queries = [q for q in captured if "aggregateWindow" in q]
+        assert len(agg_queries) == 2  # consumption + temperature
+        for q in agg_queries:
+            assert 'timeSrc: "_start"' in q
+
+    @pytest.mark.asyncio
+    async def test_needs_rebuild_backoff_after_failed_build(self) -> None:
+        """A failed build must not be retried on every controller poll."""
+        cf = ConsumptionForecast(logger=MagicMock())
+
+        mock_client = AsyncMock()
+        mock_client.query = AsyncMock(side_effect=Exception("influxdb down"))
+        mock_settings = MagicMock()
+        mock_settings.influxdb.bucket_solar = "solar"
+        mock_settings.influxdb.bucket_loxone = "loxone"
+
+        ok = await cf.build_model(mock_client, mock_settings)
+        assert ok is False
+
+        # Within the backoff window: no retry, despite having no model.
+        assert cf.needs_rebuild() is False
+
+        # After the window expires the rebuild is wanted again.
+        cf._last_build_attempt = datetime.now() - timedelta(
+            seconds=cf.failed_build_backoff_seconds + 1
+        )
+        assert cf.needs_rebuild() is True
+
+    def test_needs_rebuild_success_cadence_unchanged(self) -> None:
+        """A SUCCESSFUL build keeps the existing weekly rebuild cadence."""
+        cf = ConsumptionForecast()
+        cf._model = ConsumptionModel()
+        from modules.growatt.consumption_forecast import MODEL_SCHEMA_VERSION
+        cf._model_version = MODEL_SCHEMA_VERSION
+        # Simulate a successful build: attempt recorded, then build completed.
+        cf._last_build_attempt = datetime.now() - timedelta(seconds=10)
+        cf._last_model_build = datetime.now()
+        assert cf.needs_rebuild() is False
+
+        # A week later it rebuilds (backoff must not mask a stale success).
+        cf._last_build_attempt = datetime.now() - timedelta(days=8)
+        cf._last_model_build = datetime.now() - timedelta(days=8, seconds=-10)
+        assert cf.needs_rebuild() is True
+
+    def test_predict_hourly_missing_temps_use_nearest(self) -> None:
+        """Hours missing a forecast temp use the nearest hour's temp, not 10°C."""
+        cf = ConsumptionForecast()
+        model = ConsumptionModel()
+        for hour in range(24):
+            model.medians[(5, hour, False)] = 3.0   # -10°C bucket: heating load
+            model.medians[(15, hour, False)] = 1.0  # 10°C bucket
+        model.hourly_fallback = {h: 2.0 for h in range(24)}
+        model.global_median = 2.0
+        cf._model = model
+
+        # Only hours 0-11 have forecast temps (-10°C); 12-23 are missing.
+        temps = {h: -10.0 for h in range(12)}
+        result = cf.predict_hourly(temps, date(2026, 4, 14))  # weekday
+        # Missing evening hours inherit the nearest available temp (-10°C),
+        # not the old constant 10°C (which would have predicted 1.0 kWh).
+        assert result[23] == 3.0
+
+        # With NO temps at all, the 10°C default still applies.
+        result_empty = cf.predict_hourly({}, date(2026, 4, 14))
+        assert result_empty[12] == 1.0
+
+    def test_fallback_temperature_uses_circular_hour_distance(self) -> None:
+        """Hour distance wraps at midnight: for missing hour 23, hour 1 is
+        2h away circularly (not 22h) and must win over hour 11 (12h away).
+        A linear |h - hour| metric would pick the noon temp for midnight."""
+        from modules.growatt.consumption_forecast import _fallback_temperature
+
+        temps = {1: -10.0, 11: 20.0}
+        assert _fallback_temperature(temps, 23) == -10.0
+        # And the plain nearest case still works.
+        assert _fallback_temperature(temps, 10) == 20.0

@@ -72,7 +72,7 @@ The monitoring dashboard (`modules/growatt/dashboard.py`) is split across the tw
 
 Single-process dev: `create_dashboard_app` / `start_dashboard` still serve pages + API in one process. `_add_api_routes` / `_add_page_routes` are the shared route groups.
 
-Ports: `2000/udp` (Loxone UDP listener), **`5555`** (public dashboard pages, served by `loxone_web`), `5556` (internal API on `loxone_smart_home`). API routes include `/api/status /api/live /api/insights /api/prices /api/projection /api/settings(GET/POST) /api/restart /api/override /api/reapply /api/logs/stream …`. The `selfhosted` Caddy reverse-proxies `energy.markovi.online` → **`loxone_web:5555`** (`{$DOMAIN_ENERGY}` block), behind Caddy forward-auth + **Pocket ID (OIDC SSO)** — so the public page is already authenticated; there is no app-level auth.
+Ports: `2000/udp` (Loxone UDP listener), **`5555`** (public dashboard pages, served by `loxone_web`), `5556` (internal API on `loxone_smart_home`). API routes include `/api/status /api/live /api/insights /api/economics /api/prices /api/projection /api/settings(GET/POST) /api/restart /api/override /api/reapply /api/logs/stream …`. `/api/economics` (and the `economics` block of `/api/insights`, shared via `_build_economics`) reports today's money from meters/actuals: meter-accurate import cost / export revenue (`_today_grid_economics`, no longer silently drops blocks on a price-lookup miss — counts them in `grid_dropped_*`), real battery arbitrage with grid-vs-solar charge attribution (`_today_battery_arbitrage`), and **saved-today vs a no-battery baseline** (`_today_plan_savings`) replacing the old `plan_value_czk = sum(net_value)` (which mixed CZK and CZK/kWh units). Legacy keys `plan_value_czk`/`arbitrage_czk` are kept `null` during the frontend migration. The `selfhosted` Caddy reverse-proxies `energy.markovi.online` → **`loxone_web:5555`** (`{$DOMAIN_ENERGY}` block), behind Caddy forward-auth + **Pocket ID (OIDC SSO)** — so the public page is already authenticated; there is no app-level auth.
 
 ### Settings editor, restart-from-UI, runtime config overrides
 
@@ -164,14 +164,16 @@ The application uses:
   - `hit_level_counts` dict tracks which bin level is used for observability
 - **forecast.solar API**: per-array estimates, rate-limit handling with InfluxDB cache
 - **OpenMeteo weather fallback**: GHI-based calculation with temperature derating (-0.4%/°C above 25°C cell temp)
-- **Consensus**: combines all sources. Model is primary; averages with others when they agree (<30% divergence), trusts model when it predicts higher, uses non-model average when model underpredicts
+- **Consensus**: combines all sources. Averages when they agree (<30% divergence); on divergence the trust is gated by the model's per-hour bin level (`hourly_levels`): well-supported `3d`/`2d` hits trust the model in BOTH directions, `interpolate`/`global` hits use the non-model average. A model zero only vetoes other sources when it's a genuine `below_horizon` zero
 - **Calibration**: auto-tunes confidence by comparing past forecasts vs actuals. Persists consensus to `solar_forecast_history` measurement in InfluxDB so calibration survives restarts
 - **Reliability check**: seasonal thresholds (April-Sept: 0.3 kWh/kWp, Oct-March: 0.1 kWh/kWp)
 
 ### Consumption Forecast (`modules/growatt/consumption_forecast.py`)
 - Temperature-aware model: (temp_bucket, hour, weekday/weekend) → median kWh
 - 30 temperature buckets (-20 to 40°C, 2°C steps), trained on 365 days
-- IQR outlier removal, weekly rebuild with daily EMA updates
+- IQR outlier removal, weekly rebuild; bins need ≥4 samples (sparser bins fall back to opposite day-type → adjacent buckets → hourly)
+- Failed builds back off 1h (`needs_rebuild()` won't re-fire every 60s tick); same for the ML engine
+- Tomorrow is predicted with OpenMeteo forecast temps stashed by `_update_solar_forecast` (`_temps_for_date`), falling back to last-24h actuals
 
 ### Battery Optimizer (`modules/growatt/optimizer.py`)
 - Greedy forward-simulation over 15-minute blocks
@@ -192,9 +194,11 @@ Added on the `feature/battery-optimization-v2` branch. Each is gated behind a co
 
 Notes:
 - `optimizer_engine` / `consumption_forecast_engine` are pattern-validated in `config/settings.py` (`^(greedy|milp)$`, `^(binned|ml)$`) so a typo fails fast at startup instead of silently degrading.
-- **MILP** is a drop-in for the greedy engine (identical signature, same 4-tuple output) using an explicit per-block solar/grid/battery/load energy-flow model; runs off the event loop via `asyncio.to_thread`. Reuses the greedy helper's reserve-SOC computation so both engines protect the same overnight energy.
+- **MILP** is a drop-in for the greedy engine (identical signature, same 4-tuple output) using an explicit per-block solar/grid/battery/load energy-flow model; runs off the event loop via `asyncio.to_thread`. Reserve philosophy DIFFERS by design: the greedy engine enforces the dynamic per-block reserve floor; the MILP's reserve is emergent from the objective (its `RESERVE_SHORTFALL_FLOOR` is deliberately 0.0 after a live incident — see the comment in `milp_optimizer.py`; don't make it nonzero). Both engines use the per-leg sqrt efficiency convention (`leg_eta = round_trip ** 0.5` on each conversion), and the greedy engine values terminal SOC with the same capped economics as the MILP.
 - **Deferrable loads** are added to the optimizer's `consumption_hourly` as an overlay so the battery plans around them. **Only list loads NOT already present in the consumption history** (`INVPowerToLocalLoad`) — otherwise the forecast already learned them and you double-count, over-charging from grid.
-- **Solcast** free tier is 10 req/day per rooftop; the client throttles to ≤9/day with a UTC-monotonic interval guard and counts every attempt (success or failure).
+- **Solcast** free tier is 10 req/day per rooftop; the client throttles to ≤9/day with a UTC-monotonic interval guard. Quota state is persisted to `solcast_quota.json` next to `config_overrides.json` (survives restarts); any received HTTP response counts, and timeouts count too (the request may have reached Solcast's ledger) — only provably-unsent DNS/refused connect errors are refunded.
+- **Deferrable windows** are clamped to the FIRST window instance in the price horizon (`filter_to_current_window_instance`) — the ~32h horizon would otherwise match tomorrow's window too and schedule energy past the current cycle's deadline.
+- **Flux gotcha**: every hour/day-keyed `aggregateWindow` query feeding a MODEL or hour-keyed lookup MUST pass `timeSrc: "_start"` — the Flux default labels windows by `_stop`, which silently shifts all hour keys +1 (this bug affected every model pipeline until June 2026). The dashboard's display-only chart queries (`dashboard.py`) still use the stop-label default; treat any new hour-keyed consumer as needing `_start`.
 - **Optimizer economics are per-block** (not daily-average): both engines build `import_cost[i] = prices[i] + distribution(hour)` and `export = prices[i] - sell_fee` per 15-min block, so negative prices and VT/NT tariff bands are priced correctly. (The dashboard's "Economics (today)" card is a *separate* reporting estimate — it was meter-accurate-ified in `_today_grid_economics`, but never fed dispatch.)
 
 ### High-load protection (EV / heating) — `growatt_controller.py` + `decision_engine.py`

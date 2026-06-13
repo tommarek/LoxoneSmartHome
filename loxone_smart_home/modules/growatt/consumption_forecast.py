@@ -35,6 +35,10 @@ class ConsumptionModel:
     TEMP_BUCKET_SIZE: int = 2  # °C per bucket
     TEMP_MIN: int = -20
     TEMP_MAX: int = 40
+    # Minimum samples for a bin to be trusted as a median. A 1-3 sample
+    # "median" is really just noise, yet an exact-key hit would be preferred
+    # over much richer fallback data (opposite day type, adjacent buckets).
+    MIN_BIN_SAMPLES: int = 4
 
     @staticmethod
     def temp_to_bucket(temp: float) -> int:
@@ -47,38 +51,46 @@ class ConsumptionModel:
     def build(self) -> None:
         """Compute medians from raw bins, with IQR outlier removal."""
         self.medians = {}
+        self.hourly_fallback = {}
         hourly_all: Dict[int, List[float]] = {}
+        all_bin_medians: List[float] = []
 
         for key, values in self.bins.items():
-            if len(values) < 3:
-                # Not enough data points, skip outlier removal
-                self.medians[key] = statistics.median(values)
-            else:
-                # IQR outlier removal
-                sorted_vals = sorted(values)
-                q1_idx = len(sorted_vals) // 4
-                q3_idx = 3 * len(sorted_vals) // 4
-                q1 = sorted_vals[q1_idx]
-                q3 = sorted_vals[q3_idx]
-                iqr = q3 - q1
-                lower = q1 - 1.5 * iqr
-                upper = q3 + 1.5 * iqr
-                filtered = [v for v in values if lower <= v <= upper]
-                self.medians[key] = statistics.median(filtered) if filtered else statistics.median(values)
+            # IQR outlier removal
+            sorted_vals = sorted(values)
+            q1_idx = len(sorted_vals) // 4
+            q3_idx = 3 * len(sorted_vals) // 4
+            q1 = sorted_vals[q1_idx]
+            q3 = sorted_vals[q3_idx]
+            iqr = q3 - q1
+            lower = q1 - 1.5 * iqr
+            upper = q3 + 1.5 * iqr
+            filtered = [v for v in values if lower <= v <= upper]
+            bin_median = statistics.median(filtered) if filtered else statistics.median(values)
 
-            # Collect for hourly fallback
+            if len(values) >= self.MIN_BIN_SAMPLES:
+                self.medians[key] = bin_median
+            # Too few samples to trust as an exact-key median — leave the
+            # key out of medians so the fallback chain (opposite day type →
+            # adjacent temp buckets → hourly) handles it instead. The samples
+            # still feed the hourly/global fallbacks below: on a young
+            # install EVERY bin can be sparse, and gating them out entirely
+            # would leave the fallbacks empty too, collapsing all predictions
+            # to the 1.0 kWh hard default.
+
+            # Collect for hourly + global fallbacks (sparse bins included)
             _, hour, _ = key
             if hour not in hourly_all:
                 hourly_all[hour] = []
-            hourly_all[hour].append(self.medians[key])
+            hourly_all[hour].append(bin_median)
+            all_bin_medians.append(bin_median)
 
         # Build hourly fallbacks
         for hour, vals in hourly_all.items():
             self.hourly_fallback[hour] = statistics.median(vals)
 
         # Global fallback
-        all_medians = list(self.medians.values())
-        self.global_median = statistics.median(all_medians) if all_medians else 1.0
+        self.global_median = statistics.median(all_bin_medians) if all_bin_medians else 1.0
         self.built_at = datetime.now()
 
     def predict(self, temperature: float, hour: int, is_weekend: bool) -> float:
@@ -176,11 +188,34 @@ def _carry_forward_hourly(
     return out
 
 
+def _fallback_temperature(forecast_temps: Dict[int, float], hour: int) -> float:
+    """Temperature for an hour missing from the forecast.
+
+    Uses the nearest available forecast hour's temperature — a constant
+    10°C default would silently halve heating estimates in January. 10°C
+    is used only when no temperatures are available at all.
+    """
+    if not forecast_temps:
+        return 10.0
+    # Circular hour distance: for a missing hour 0 with temps at 12-23,
+    # hour 23 is 1h away (not 23h) and far more representative than noon.
+    nearest = min(
+        forecast_temps, key=lambda h: min(abs(h - hour), 24 - abs(h - hour))
+    )
+    return forecast_temps[nearest]
+
+
 # Bumped when the build_model logic changes in a way that invalidates
 # previously cached models (e.g., new training-data filters). On version
 # mismatch the controller forces a fresh rebuild, even if the cached
 # model is younger than rebuild_interval_days.
-MODEL_SCHEMA_VERSION = 4
+# v5: hourly aggregates are start-labeled (timeSrc: "_start") — the default
+#     stop-labeling shifted every hour key +1h — and bins now need
+#     MIN_BIN_SAMPLES samples to enter medians.
+# v6: sparse (below-MIN_BIN_SAMPLES) bins feed the hourly/global fallbacks
+#     again (v5 dropped them entirely, leaving young installs with empty
+#     fallbacks), and a build with zero trusted bins is declined.
+MODEL_SCHEMA_VERSION = 6
 
 # Upper bound for a "real household" hourly consumption sample (kWh).
 # INVPowerToLocalLoad reports grid passthrough when the inverter is in
@@ -199,6 +234,12 @@ class ConsumptionForecast:
         self._model: Optional[ConsumptionModel] = None
         self._model_version: int = 0  # 0 = no model yet
         self._last_model_build: Optional[datetime] = None
+        # Set on EVERY build attempt (success or failure). The controller
+        # polls needs_rebuild() every minute, so a failing build (cold start,
+        # InfluxDB outage) must back off instead of re-running heavy 365-day
+        # queries on every poll.
+        self._last_build_attempt: Optional[datetime] = None
+        self.failed_build_backoff_seconds: int = 3600
         # Rebuild model weekly
         self.rebuild_interval_days: int = 7
 
@@ -208,12 +249,26 @@ class ConsumptionForecast:
 
     def needs_rebuild(self) -> bool:
         """Check if model needs rebuilding."""
+        if self._failed_attempt_recently():
+            return False
         if self._model is None or self._last_model_build is None:
             return True
         if self._model_version != MODEL_SCHEMA_VERSION:
             return True
         age = (datetime.now() - self._last_model_build).total_seconds()
         return age > self.rebuild_interval_days * 86400
+
+    def _failed_attempt_recently(self) -> bool:
+        """True if the last build attempt failed within the backoff window."""
+        if self._last_build_attempt is None:
+            return False
+        if (
+            self._last_model_build is not None
+            and self._last_model_build >= self._last_build_attempt
+        ):
+            return False  # last attempt succeeded — normal cadence applies
+        age = (datetime.now() - self._last_build_attempt).total_seconds()
+        return age < self.failed_build_backoff_seconds
 
     async def build_model(
         self, influxdb_client: Any, settings: Any, local_tz: Any = None
@@ -231,6 +286,9 @@ class ConsumptionForecast:
         Returns:
             True if model was built successfully
         """
+        # Record the attempt up front so needs_rebuild() can back off if this
+        # attempt fails (query error, too little data, ...).
+        self._last_build_attempt = datetime.now()
         try:
             self.logger.info("Building consumption model from historical data...")
 
@@ -250,7 +308,7 @@ from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -365d)
   |> filter(fn: (r) => r._measurement == "solar")
   |> filter(fn: (r) => r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
   |> yield(name: "consumption")
 '''
             # Query hourly outside temperature
@@ -259,7 +317,7 @@ from(bucket: "{settings.influxdb.bucket_loxone}")
   |> range(start: -365d)
   |> filter(fn: (r) => r._measurement == "temperature")
   |> filter(fn: (r) => r._field == "temperature_outside")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
   |> yield(name: "temperature")
 '''
             # Inverter on/off state changes — used to exclude hours where the
@@ -365,6 +423,19 @@ from(bucket: "{settings.influxdb.bucket_solar}")
             # Build medians with outlier removal
             model.build()
 
+            if not model.medians:
+                # Possible on a young install: ≥100 matched points but every
+                # (temp, hour, day-type) bin below MIN_BIN_SAMPLES. Installing
+                # a model with zero trusted bins would report success while
+                # every prediction rides on thin fallbacks — decline instead
+                # and retry once more data has accumulated.
+                self.logger.warning(
+                    f"Consumption model declined: {matched} matched points but "
+                    f"no bin reached MIN_BIN_SAMPLES={ConsumptionModel.MIN_BIN_SAMPLES} "
+                    f"samples — too little data per (temp, hour, day-type) slot"
+                )
+                return False
+
             self._model = model
             self._model_version = MODEL_SCHEMA_VERSION
             self._last_model_build = datetime.now()
@@ -403,8 +474,10 @@ from(bucket: "{settings.influxdb.bucket_solar}")
         result: Dict[int, float] = {}
 
         for hour in range(24):
-            temp = forecast_temps.get(hour, 10.0)  # Default 10°C if unknown
-            result[hour] = self._model.predict(temp, hour, is_weekend)
+            temp = forecast_temps.get(hour)
+            if temp is None:
+                temp = _fallback_temperature(forecast_temps, hour)
+            result[hour] = max(0.0, self._model.predict(temp, hour, is_weekend))
 
         return result
 
@@ -428,7 +501,7 @@ from(bucket: "{settings.influxdb.bucket_solar}")
         is_weekend = target_date.weekday() >= 5
         total = 0.0
         for hour in range(24):
-            total += self._model.predict(avg_temperature, hour, is_weekend)
+            total += max(0.0, self._model.predict(avg_temperature, hour, is_weekend))
         return total
 
     def get_model_summary(self) -> Dict[str, Any]:

@@ -159,12 +159,13 @@ class TestConsensus:
         # Model=1.0, avg_others=7.5 → model much lower → use other sources only
         assert result["2026-04-11"].hourly[12] == pytest.approx(7.5, abs=0.01)
 
-    def test_model_overpredicts_trusts_model(self, forecast) -> None:
-        """When model predicts more than other sources, trust it (real data)."""
+    def test_model_overpredicts_supported_bin_trusts_model(self, forecast) -> None:
+        """When a well-supported (3d/2d) model bin predicts more, trust it."""
         forecast._model_forecast = {
             "2026-04-11": DailyForecast(
                 date=date(2026, 4, 11), total_kwh=50.0,
                 hourly={12: 10.0}, source="model",
+                hourly_levels={12: "3d"},
             )
         }
         forecast._api_forecast = {
@@ -175,8 +176,189 @@ class TestConsensus:
         }
         forecast._weather_forecast = {}
         result = forecast.build_consensus()
-        # Model=10.0, avg_others=5.0 → model higher → trust model
+        # Model=10.0, avg_others=5.0 → diverging, but bin well-supported → model
         assert result["2026-04-11"].hourly[12] == 10.0
+
+    def test_model_overpredicts_sparse_bin_uses_others(self, forecast) -> None:
+        """A diverging HIGHER model value from a sparse bin no longer wins —
+        the old direction-based rule was a structural over-forecast bias."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=50.0,
+                hourly={12: 10.0}, source="model",
+                hourly_levels={12: "global"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={12: 5.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        assert result["2026-04-11"].hourly[12] == pytest.approx(5.0)
+
+    def test_model_underpredicts_supported_bin_trusts_model(self, forecast) -> None:
+        """A diverging LOWER model value from a well-supported bin wins —
+        trust real installation data in BOTH directions."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=20.0,
+                hourly={12: 4.0}, source="model",
+                hourly_levels={12: "2d"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={12: 8.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=35.0,
+                hourly={12: 7.0}, source="weather",
+            )
+        }
+        result = forecast.build_consensus()
+        # Model=4.0, avg_others=7.5 → diverging, bin well-supported → model
+        assert result["2026-04-11"].hourly[12] == pytest.approx(4.0)
+
+    def test_sparse_2d_bin_underpredicting_uses_others(self, forecast) -> None:
+        """A diverging LOWER value from a 1-sample 2D bin ("2d_sparse") must
+        NOT override the other sources — one anomalous near-zero hour in a
+        bin would otherwise kill Solcast+API+weather for that hour."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=5.0,
+                hourly={12: 0.5}, source="model",
+                hourly_levels={12: "2d_sparse"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=40.0,
+                hourly={12: 8.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=35.0,
+                hourly={12: 7.0}, source="weather",
+            )
+        }
+        result = forecast.build_consensus()
+        # Model=0.5, avg_others=7.5 → diverging, sparse bin → avg_others
+        assert result["2026-04-11"].hourly[12] == pytest.approx(7.5)
+
+    def test_sparse_2d_bin_overpredicting_uses_others(self, forecast) -> None:
+        """A diverging HIGHER value from a sparse 2D bin loses too."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=50.0,
+                hourly={12: 10.0}, source="model",
+                hourly_levels={12: "2d_sparse"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={12: 5.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        assert result["2026-04-11"].hourly[12] == pytest.approx(5.0)
+
+    def test_supported_2d_bin_overpredicting_trusts_model(self, forecast) -> None:
+        """A well-supported "2d" hit (≥ MIN_2D_TRUST_SAMPLES) still wins on
+        divergence in the HIGHER direction (lower direction covered above)."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=50.0,
+                hourly={12: 10.0}, source="model",
+                hourly_levels={12: "2d"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={12: 5.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        assert result["2026-04-11"].hourly[12] == pytest.approx(10.0)
+
+    def test_below_horizon_zero_vetoes_other_sources(self, forecast) -> None:
+        """A genuine below-horizon model zero still zeroes the consensus."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=20.0,
+                hourly={4: 0.0, 12: 10.0}, source="model",
+                hourly_levels={4: "below_horizon", 12: "3d"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={4: 0.5, 12: 9.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        assert result["2026-04-11"].hourly[4] == 0
+
+    def test_non_horizon_model_zero_does_not_veto(self, forecast) -> None:
+        """A model zero that did NOT come from the below-horizon early return
+        (e.g. a sparse/global bin) must not discard positive other sources."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=20.0,
+                hourly={9: 0.0}, source="model",
+                hourly_levels={9: "global"},
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={9: 2.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        # Diverging zero from a weak bin → use the other sources
+        assert result["2026-04-11"].hourly[9] == pytest.approx(2.0)
+
+    def test_no_radiation_zero_does_not_veto(self, forecast) -> None:
+        """GHI=0 with the sun UP (a missing/zero radiation entry at a sunny
+        hour) reports "no_radiation", which must NOT veto — the positive
+        Solcast/API values survive via the normal divergence path (whose
+        denominator (model+others)/2 is positive when others are)."""
+        forecast._model_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=20.0,
+                hourly={11: 0.0}, source="model",
+                hourly_levels={11: "no_radiation"},
+            )
+        }
+        forecast._solcast_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=30.0,
+                hourly={11: 6.0}, source="solcast",
+            )
+        }
+        forecast._api_forecast = {
+            "2026-04-11": DailyForecast(
+                date=date(2026, 4, 11), total_kwh=28.0,
+                hourly={11: 5.0}, source="api",
+            )
+        }
+        forecast._weather_forecast = {}
+        result = forecast.build_consensus()
+        # Model 0 (no_radiation) vs avg(6.0, 5.0)=5.5 → keep the average.
+        assert result["2026-04-11"].hourly[11] == pytest.approx(5.5)
 
     def test_single_source_used_directly(self, forecast) -> None:
         forecast._api_forecast = {
@@ -281,6 +463,50 @@ class TestCalibration:
         assert 0.6 < forecast.confidence < 0.75
 
     @pytest.mark.asyncio
+    async def test_truncated_final_window_dropped(self, forecast) -> None:
+        """With timeSrc:"_start" the final daily window is truncated by the
+        -1d range stop; its partial-day total must not enter the recency-
+        weighted ratios (it would land on the heaviest weight)."""
+        from datetime import timedelta, timezone
+        now = datetime.now(timezone.utc)
+
+        def _day_start(days_back: int) -> datetime:
+            d = now - timedelta(days=days_back)
+            return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        def _rec(t0, value):
+            rec = MagicMock()
+            rec.get_time.return_value = t0
+            rec.get_value.return_value = value
+            return rec
+
+        # 3 complete days (ratio 1.0 each) + the truncated final window whose
+        # partial total would otherwise contribute a wild ratio.
+        records = []
+        forecast._api_forecast = {}
+        for days_back in (4, 3, 2):
+            t0 = _day_start(days_back)
+            forecast._api_forecast[t0.strftime("%Y-%m-%d")] = DailyForecast(
+                date=t0.date(), total_kwh=40.0, hourly={}, source="api",
+            )
+            records.append(_rec(t0, 40.0))
+        t_partial = _day_start(1)  # window end > range stop → incomplete
+        forecast._api_forecast[t_partial.strftime("%Y-%m-%d")] = DailyForecast(
+            date=t_partial.date(), total_kwh=40.0, hourly={}, source="api",
+        )
+        records.append(_rec(t_partial, 5.0))  # partial-day total
+
+        table = MagicMock()
+        table.records = records
+        client = AsyncMock()
+        client.query = AsyncMock(return_value=[table])
+
+        await forecast.calibrate_from_actuals(client, "solar", days=7)
+        # Surviving ratios are all 1.0; the partial day (ratio 5/40 → clamped
+        # 0.3 at the heaviest weight) would have dragged confidence to ≈0.72.
+        assert forecast.confidence == pytest.approx(1.0, abs=0.01)
+
+    @pytest.mark.asyncio
     async def test_calibration_no_data(self, forecast) -> None:
         """No data available — confidence unchanged."""
         mock_client = AsyncMock()
@@ -294,9 +520,11 @@ class TestCalibration:
 class TestSolarProductionModel:
 
     def test_predict_3d_hit(self) -> None:
-        """3D bin is the top level and is used when populated."""
+        """3D bin is the top level and is used when well-populated (≥4)."""
         model = SolarProductionModel(total_kwp=13.5)
         # rad_b=20 (500 W/m²), cloud_b=2 (20%), alt_b=9 (45°)
+        model.add_sample(20, 2, 9, 5.0)
+        model.add_sample(20, 2, 9, 5.5)
         model.add_sample(20, 2, 9, 5.0)
         model.add_sample(20, 2, 9, 5.5)
         model.build()
@@ -304,8 +532,75 @@ class TestSolarProductionModel:
         assert result == pytest.approx(5.25, abs=0.1)
         assert model.hit_level_counts["3d"] == 1
 
+    def test_3d_bin_below_min_support_falls_back_to_2d(self) -> None:
+        """A 3D bin with <4 samples isn't published — its samples still
+        contribute to the 2D level, which serves the prediction (as
+        "2d_sparse": 3 samples is below the 2D trust threshold too)."""
+        model = SolarProductionModel(total_kwp=13.5)
+        model.add_sample(20, 2, 9, 5.0)
+        model.add_sample(20, 2, 9, 5.5)
+        model.add_sample(20, 2, 9, 5.0)  # only 3 samples → below support
+        model.build()
+        assert (20, 2, 9) not in model.median_3d
+        result = model.predict(ghi=500, cloud_cover=20, sun_altitude=45)
+        assert result == pytest.approx(5.0, abs=0.1)
+        assert model.hit_level_counts["3d"] == 0
+        assert model.hit_level_counts["2d_sparse"] == 1
+
+    def test_predict_with_level_below_horizon(self) -> None:
+        """Sun below the horizon reports the veto level; GHI=0 with the sun
+        UP reports the distinct non-veto "no_radiation" level, so the
+        consensus can tell a genuine night zero from a missing/zero
+        radiation entry at a sunny hour."""
+        model = SolarProductionModel(total_kwp=13.5)
+        # Sun down → genuine zero, regardless of GHI.
+        assert model.predict_with_level(ghi=500, sun_altitude=0) == (
+            0.0, "below_horizon"
+        )
+        assert model.predict_with_level(ghi=0, sun_altitude=0) == (
+            0.0, "below_horizon"
+        )
+        # GHI=0 but sun up (default altitude 45°) → no_radiation, not a veto.
+        assert model.predict_with_level(ghi=0) == (0.0, "no_radiation")
+
+    def test_2d_trust_level_depends_on_sample_count(self) -> None:
+        """A 2D bin is published from a single sample, but only reports the
+        consensus-trusted "2d" level at ≥ MIN_2D_TRUST_SAMPLES; sparser hits
+        report "2d_sparse" with the SAME value."""
+        sparse = SolarProductionModel(total_kwp=13.5)
+        sparse.add_sample(20, 2, 9, 5.0)  # 1 sample
+        sparse.build()
+        # Query altitude bucket 6 → misses 3D, hits 2D (20, 2).
+        val, level = sparse.predict_with_level(
+            ghi=500, cloud_cover=20, sun_altitude=30
+        )
+        assert val == pytest.approx(5.0, abs=0.1)
+        assert level == "2d_sparse"
+        assert sparse.hit_level_counts["2d_sparse"] == 1
+        assert sparse.hit_level_counts["2d"] == 0
+
+        supported = SolarProductionModel(total_kwp=13.5)
+        for kwh in (5.0, 5.5, 5.0, 5.5):  # ≥ MIN_2D_TRUST_SAMPLES, spread
+            supported.add_sample(20, 2, 9, kwh)
+        supported.build()
+        val, level = supported.predict_with_level(
+            ghi=500, cloud_cover=20, sun_altitude=30
+        )
+        assert val == pytest.approx(5.25, abs=0.1)
+        assert level == "2d"
+        assert supported.hit_level_counts["2d"] == 1
+
+    def test_hit_level_counts_reset(self) -> None:
+        """reset_hit_level_counts zeroes all counters."""
+        model = SolarProductionModel(total_kwp=13.5)
+        model.hit_level_counts["3d"] = 7
+        model.hit_level_counts["global"] = 3
+        model.reset_hit_level_counts()
+        assert all(v == 0 for v in model.hit_level_counts.values())
+
     def test_predict_2d_fallback(self) -> None:
-        """Falls back to 2D when 3D bin is empty for the queried altitude."""
+        """Falls back to 2D when 3D bin is empty for the queried altitude
+        (a single-sample bin still serves the value, as "2d_sparse")."""
         model = SolarProductionModel(total_kwp=13.5)
         # Only populate altitude bucket 9 (45°)
         model.add_sample(20, 2, 9, 5.0)
@@ -313,7 +608,7 @@ class TestSolarProductionModel:
         # Query altitude 30° (bucket 6) — misses 3D, hits 2D
         result = model.predict(ghi=500, cloud_cover=20, sun_altitude=30)
         assert result > 0
-        assert model.hit_level_counts["2d"] == 1
+        assert model.hit_level_counts["2d_sparse"] == 1
 
     def test_predict_interpolation_fallback(self) -> None:
         """Falls back to interpolation when 2D exact is empty."""
@@ -350,6 +645,29 @@ class TestSolarProductionModel:
         assert not hasattr(model, "median_5d")
         assert not hasattr(model, "bins_4d")
         assert not hasattr(model, "median_4d")
+
+
+class TestPredictFromModelTelemetry:
+
+    def test_hit_level_counts_reset_per_run(self, forecast) -> None:
+        """Each predict_from_model run starts from zeroed counters so the
+        telemetry shows the live prediction mix, not history since build."""
+        model = SolarProductionModel(total_kwp=13.5)
+        model.build()
+        # Inflated by a previous run / pass-2 curtailment probing
+        model.hit_level_counts["3d"] = 99
+        forecast._production_model = model
+
+        result = forecast.predict_from_model([
+            {"time": "2026-06-12T12:00:00", "shortwave_radiation": 500,
+             "cloudcover": 20, "temperature_2m": 20},
+        ])
+
+        # Counters reflect only this run (1 prediction, empty model → global)
+        assert model.hit_level_counts["3d"] == 0
+        assert sum(model.hit_level_counts.values()) == 1
+        # The per-hour level is recorded for consensus gating
+        assert result["2026-06-12"].hourly_levels[12] == "global"
 
 
 class TestConsensusFloatEquality:
@@ -462,6 +780,35 @@ class TestReliableForecast:
         forecast._consensus = {}
         assert forecast.has_reliable_forecast() is False
 
+    def test_stale_only_consensus_unreliable(self, forecast) -> None:
+        """A consensus holding ONLY past-dated entries (never evicted) must
+        not report a reliable forecast for today."""
+        from datetime import timedelta
+        yesterday = date.today() - timedelta(days=1)
+        forecast._consensus = {
+            yesterday.strftime("%Y-%m-%d"): DailyForecast(
+                date=yesterday, total_kwh=25.0,
+                hourly={10: 3.0, 12: 7.0}, source="consensus",
+            )
+        }
+        assert forecast.has_reliable_forecast() is False
+
+    def test_stale_entry_plus_current_entry_reliable(self, forecast) -> None:
+        """A stale entry alongside a healthy today entry doesn't break it."""
+        from datetime import timedelta
+        today = date.today()
+        yesterday = today - timedelta(days=1)
+        forecast._consensus = {
+            yesterday.strftime("%Y-%m-%d"): DailyForecast(
+                date=yesterday, total_kwh=0.1, hourly={}, source="consensus",
+            ),
+            today.strftime("%Y-%m-%d"): DailyForecast(
+                date=today, total_kwh=25.0,
+                hourly={10: 3.0, 12: 7.0}, source="consensus",
+            ),
+        }
+        assert forecast.has_reliable_forecast() is True
+
 
 class TestConsensusPersistence:
 
@@ -528,6 +875,61 @@ class TestConsensusPersistence:
         assert 0.8 < forecast.confidence < 1.0
 
 
+class TestFluxTimeSrc:
+    """All aggregateWindow pipelines must label windows by their START.
+
+    The Flux default (timeSrc:"_stop") stamps [08:00,09:00) as 09:00,
+    shifting every hour-keyed pipeline (training, calibration) by +1h."""
+
+    @pytest.mark.asyncio
+    async def test_training_queries_use_start_timesrc(self, forecast) -> None:
+        queries: list = []
+
+        solar_rec = MagicMock()
+        solar_rec.get_time.return_value = datetime(2026, 5, 1, 12)
+        solar_rec.get_value.return_value = 1000.0
+        solar_table = MagicMock()
+        solar_table.records = [solar_rec]
+
+        async def _q(q: str):
+            queries.append(q)
+            # Return one solar record so the function proceeds past the
+            # solar check and issues the weather queries too.
+            return [solar_table] if "InputPower" in q else []
+
+        client = AsyncMock()
+        client.query = AsyncMock(side_effect=_q)
+        settings = MagicMock()
+        settings.influxdb.bucket_solar = "solar"
+        settings.influxdb.bucket_weather = "weather_forecast"
+
+        ok = await forecast.build_production_model(client, settings)
+        assert ok is False  # no weather data — but queries were issued
+
+        agg_queries = [q for q in queries if "aggregateWindow" in q]
+        # solar + SOC + load + 6 weather fields
+        assert len(agg_queries) >= 9
+        for q in agg_queries:
+            assert 'timeSrc: "_start"' in q
+
+    @pytest.mark.asyncio
+    async def test_daily_calibration_query_uses_start_timesrc(self, forecast) -> None:
+        queries: list = []
+
+        async def _q(q: str):
+            queries.append(q)
+            return []
+
+        client = AsyncMock()
+        client.query = AsyncMock(side_effect=_q)
+        await forecast.calibrate_from_actuals(client, "solar", days=7)
+
+        daily = [q for q in queries if "aggregateWindow(every: 1d" in q]
+        assert daily, "expected the daily-actuals aggregateWindow query"
+        for q in daily:
+            assert 'timeSrc: "_start"' in q
+
+
 class TestIntradayCalibration:
     """Live actual-vs-forecast scaling that the controller applies to the
     rest of today's solar forecast before passing it to the optimizer."""
@@ -584,6 +986,29 @@ class TestIntradayCalibration:
         client = AsyncMock()
         client.query = AsyncMock(side_effect=_query)
         return client
+
+    @pytest.mark.asyncio
+    async def test_intraday_queries_use_start_timesrc(self, forecast) -> None:
+        """The intraday actuals/SOC/load queries label windows by start."""
+        today = self._make_forecast_with_today(
+            forecast, {h: 3.0 for h in range(6, 18)},
+        )
+        queries: list = []
+        inner = self._mock_query({6: 1500, 7: 1500, 8: 1500}, today)
+
+        async def _q(q: str):
+            queries.append(q)
+            return await inner.query(q)
+
+        client = AsyncMock()
+        client.query = AsyncMock(side_effect=_q)
+        await forecast.compute_intraday_calibration(
+            client, "solar", current_hour=9, target_date=today,
+        )
+        agg_queries = [q for q in queries if "aggregateWindow" in q]
+        assert agg_queries, "expected aggregateWindow queries"
+        for q in agg_queries:
+            assert 'timeSrc: "_start"' in q
 
     @pytest.mark.asyncio
     async def test_curtailed_hours_excluded_from_calibration(self, forecast) -> None:
@@ -776,3 +1201,126 @@ class TestIntradayCalibration:
             client, "solar", current_hour=7, target_date=today,
         )
         assert ratio is None  # forecast sum < min_forecast_kwh
+
+
+class TestZeroProductionCoverage:
+    """A zero/near-zero (<NEAR_ZERO_WATTS) training sample is only legitimate
+    (snow cover, standby) when RECORDED inverter state covers that hour.
+    Hours predating state recording default to "on", but that convention must
+    not vouch for (near-)zeros: historic manual-off/bypass hours — including
+    ones with a 5-50 W telemetry blip — would inject false ~0 kWh samples
+    into high-GHI bins and drag the medians down. Real positive samples keep
+    the default-on behaviour."""
+
+    ZERO_DT = datetime(2026, 7, 1, 12)
+    POSITIVE_SAMPLES = 30 * 8  # 30 June days x hours 9-16
+
+    def _client(
+        self, inverter_records: list, probe_watts: float = 0.0,
+        probe_ghi: float = 500.0,
+    ):
+        solar_records = []
+        ghi_records = []
+
+        def _rec(dt, value):
+            r = MagicMock()
+            r.get_time.return_value = dt
+            r.get_value.return_value = value
+            return r
+
+        for day in range(1, 31):
+            for hour in range(9, 17):
+                dt = datetime(2026, 6, day, hour)
+                solar_records.append(_rec(dt, 3000.0))
+                ghi_records.append(_rec(dt, 500.0))
+        # The probe: a zero/near-zero hour WITH radiation, daytime.
+        solar_records.append(_rec(self.ZERO_DT, probe_watts))
+        ghi_records.append(_rec(self.ZERO_DT, probe_ghi))
+
+        def _table(recs):
+            t = MagicMock()
+            t.records = recs
+            return t
+
+        async def _q(q: str):
+            if '"InputPower"' in q:
+                return [_table(solar_records)]
+            if "shortwave_radiation" in q:
+                return [_table(ghi_records)]
+            if "inverter_on" in q:
+                return [_table(inverter_records)] if inverter_records else []
+            return []  # SOC, load, export, other weather fields
+
+        client = AsyncMock()
+        client.query = AsyncMock(side_effect=_q)
+        return client
+
+    async def _build(
+        self, solar_arrays, inverter_records, probe_watts: float = 0.0,
+        probe_ghi: float = 500.0,
+    ):
+        forecast = SolarForecast(
+            arrays=solar_arrays, latitude=49.0, longitude=14.5,
+            confidence=0.7, logger=MagicMock(),
+        )
+        settings = MagicMock()
+        settings.influxdb.bucket_solar = "solar"
+        settings.influxdb.bucket_weather = "weather_forecast"
+        ok = await forecast.build_production_model(
+            self._client(
+                inverter_records, probe_watts=probe_watts, probe_ghi=probe_ghi
+            ),
+            settings,
+        )
+        assert ok is True
+        return forecast._production_model
+
+    def _always_on_record(self):
+        on_record = MagicMock()
+        # Predates every training hour → carry-forward covers them all as ON.
+        on_record.get_time.return_value = datetime(2026, 5, 1, 0, 0)
+        on_record.get_value.return_value = 1
+        return on_record
+
+    @pytest.mark.asyncio
+    async def test_zero_hour_without_state_coverage_excluded(self, solar_arrays) -> None:
+        """No inverter_state records at all → the 0 W hour has no coverage
+        and must NOT enter the training set; positives still train."""
+        model = await self._build(solar_arrays, [])
+        assert model.data_points == self.POSITIVE_SAMPLES
+
+    @pytest.mark.asyncio
+    async def test_zero_hour_with_state_coverage_included(self, solar_arrays) -> None:
+        """The SAME 0 W hour, but recorded state says the inverter was ON
+        the whole time → a real snow/standby observation, kept."""
+        model = await self._build(solar_arrays, [self._always_on_record()])
+        assert model.data_points == self.POSITIVE_SAMPLES + 1
+
+    @pytest.mark.asyncio
+    async def test_near_zero_hour_without_state_coverage_excluded(self, solar_arrays) -> None:
+        """A 30 W hour (telemetry blip during an otherwise-off hour) is a
+        near-zero, not real production — without recorded state coverage it
+        must be excluded exactly like an exact 0 W sample."""
+        model = await self._build(solar_arrays, [], probe_watts=30.0)
+        assert model.data_points == self.POSITIVE_SAMPLES
+
+    @pytest.mark.asyncio
+    async def test_near_zero_hour_with_state_coverage_included(self, solar_arrays) -> None:
+        """The SAME 30 W hour with recorded ON state is a legitimate
+        observation (snow/standby with sensor noise) and is kept."""
+        model = await self._build(
+            solar_arrays, [self._always_on_record()], probe_watts=30.0
+        )
+        assert model.data_points == self.POSITIVE_SAMPLES + 1
+
+    @pytest.mark.asyncio
+    async def test_low_ghi_near_zero_trains_without_coverage(self, solar_arrays) -> None:
+        """A 30 W hour at LOW radiation (GHI 80 <= NEAR_ZERO_HIGH_GHI) is
+        normal dawn/dusk/deep-overcast output — it must stay trainable even
+        WITHOUT inverter-state coverage. Requiring coverage there would
+        wholesale-drop every dim hour predating state recording and bias the
+        lowest radiation bins high."""
+        model = await self._build(
+            solar_arrays, [], probe_watts=30.0, probe_ghi=80.0
+        )
+        assert model.data_points == self.POSITIVE_SAMPLES + 1

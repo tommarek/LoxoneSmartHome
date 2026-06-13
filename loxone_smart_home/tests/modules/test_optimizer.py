@@ -132,7 +132,12 @@ class TestOptimizerBasic:
 
         summary = optimizer.summarize(decisions)
         assert summary["total_blocks"] == 24
-        assert summary["charge_blocks"] + summary["discharge_blocks"] + summary["hold_blocks"] == 24
+        # hold_idle is the battery-passive preserve variant of hold (greedy
+        # retention holds on deficit blocks emit it since the SPH hold fix).
+        assert (
+            summary["charge_blocks"] + summary["discharge_blocks"]
+            + summary["hold_blocks"] + summary["hold_idle_blocks"]
+        ) == 24
 
 
 class TestOptimizerSolar:
@@ -263,11 +268,6 @@ class TestOptimizer15Min:
             current_soc=50.0,
         )
         assert len(decisions) == 2
-
-    def test_night_reserve_defaults(self, optimizer) -> None:
-        """Verify _night_reserve_kwh defaults to 5.0 without calling calibrate."""
-        assert optimizer._night_reserve_kwh == 5.0
-        assert optimizer._night_reserve_updated is None
 
     def test_backward_pass_prefers_better_blocks(self, optimizer) -> None:
         """6 CZK block before 10 CZK block with limited battery — should
@@ -705,21 +705,26 @@ class TestSelfConsumptionHold:
         net of wear at 3.0 is +1.12. Pre-fix code valued future SC at +3.12
         and would hold; post-fix correctly prefers discharge.
         """
-        # Hour 8: peak (4.0 CZK), zero consumption (covered by solar).
+        # Hour 8: peak (4.0 CZK), consumption covered by solar (no deficit).
         # Hour 9: cheap (0.5 CZK) — recharge bait.
         # Hours 10–31: moderate (3.0 CZK), real consumption — only here is SC valuable.
         prices = [4.0] * 1 + [0.5] * 1 + [3.0] * 22
         blocks = make_15min_blocks(prices, start_hour=8)
 
-        # Solar exactly cancels consumption at hour 8 (no SC need there);
-        # full consumption from hour 10 onward.
+        # Solar exactly cancels consumption at hours 8-9 (no SC need there);
+        # full consumption from hour 10 onward. NOTE: an explicit 0.0
+        # consumption would trigger the engine's base-load fallback (the value
+        # model and the SOC simulation both serve learned base load on
+        # zero-forecast blocks), so the "no deficit at the peak" premise is
+        # expressed as solar == consumption instead.
         consumption = {h: 1.0 for h in range(24)}
-        consumption[8] = 0.0   # peak block: no consumption → not a future-SC contributor
-        consumption[9] = 0.0
+        consumption[8] = 0.4
+        consumption[9] = 0.4
+        solar = {8: 0.4, 9: 0.4}
 
         charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
-            solar_hourly={},
+            solar_hourly=solar,
             consumption_hourly=consumption,
             distribution_func=const_dist(0.12),
             battery_capacity_kwh=10.0,
@@ -741,29 +746,39 @@ class TestSelfConsumptionHold:
         self, optimizer: BatteryOptimizer
     ) -> None:
         """When there's no future consumption (all solar-covered),
-        hold value should not prevent profitable discharge."""
-        # Expensive blocks with zero consumption
-        prices = [0.5] * 4 + [8.0] * 4
+        hold value should not prevent profitable discharge.
+
+        TEST CHANGE (iteration 2): starts at 100% SOC (nothing to solar-bank,
+        so the hold scoring is isolated to retention) and adds a cheap tail
+        AFTER the peak (the discharge gate requires a profitable future
+        recharge: dv = sell_rev - recharge_cost > 0; in the original shape
+        the only cheap blocks preceded the peak, so dv was always negative
+        and the assertion survived purely via the `len(charge) > 0` arm — an
+        artifact of the old median-import charge gate, which the
+        forward-looking gate correctly refuses with no in-horizon deficit."""
+        # Solar-covered hours 0-7, expensive 8.0 peak at 4-7, cheap tail 8-11
+        prices = [0.5] * 4 + [8.0] * 4 + [0.5] * 4
         blocks = make_15min_blocks(prices, start_hour=0)
 
         charge, discharge, _sp, decisions = optimizer.optimize(
             blocks=blocks,
-            solar_hourly={h: 5.0 for h in range(8)},  # Solar covers everything
-            consumption_hourly={h: 0.5 for h in range(8)},
+            solar_hourly={h: 5.0 for h in range(8)},  # Solar covers hours 0-7
+            consumption_hourly={h: 0.5 for h in range(12)},
             distribution_func=lambda h: 0.5,
             battery_capacity_kwh=10.0,
-            current_soc=80.0,
+            current_soc=100.0,
             min_soc=20.0,
             sell_fee_czk=0.5,
             battery_amortisation_czk=2.0,
         )
 
-        # With solar covering all consumption, no self-consumption need
-        # Battery should discharge at 8.0 CZK if profitable
-        # discharge_profit = 8.0 - 0.5 - 0.5 - 2.0 - recharge > 0
-        # This should still work
-        assert len(discharge) > 0 or len(charge) > 0, (
-            "Optimizer should still make active decisions when solar covers consumption"
+        # With solar covering all peak-hour consumption there is no
+        # self-consumption need at the peak — the hold/retention value must
+        # not block the profitable discharge:
+        # sell_rev = 8.0 - 0.5 - 2.0 = 5.5, recharge = (0.5+0.5)/0.85 ≈ 1.18.
+        assert len(discharge) > 0, (
+            "Hold value must not block profitable discharge when solar covers "
+            "all consumption and the battery is full"
         )
 
 
@@ -1031,8 +1046,9 @@ class TestSellProduction:
         assert charge & sell_prod == set(), "charge and sell_production overlap"
         assert discharge & sell_prod == set(), "discharge and sell_production overlap"
 
-        # Per-block actions are mutually exclusive
-        valid_actions = {"charge", "discharge", "hold", "sell_production"}
+        # Per-block actions are mutually exclusive. hold_idle is the greedy
+        # battery-passive preserve (retention hold on a deficit block).
+        valid_actions = {"charge", "discharge", "hold", "hold_idle", "sell_production"}
         for d in decisions:
             assert d.action in valid_actions, f"Unknown action: {d.action}"
 
@@ -1129,6 +1145,401 @@ class TestSellProduction:
         assert tomorrow_10
         assert all(d.solar_kwh == 0.0 for d in today_10)
         assert all(d.solar_kwh == 1.25 for d in tomorrow_10)
+
+
+class TestExportAmortisationPassTwo:
+    """battery_amortisation_export_czk must survive into the Pass-2 re-run.
+
+    Regression: the Pass-2 _single_pass call omitted amort_export, so it
+    defaulted back to the shared wear cost and a prohibitive export-wear
+    override was silently dropped whenever Pass 2 fired.
+    """
+
+    def test_pass2_keeps_export_wear_override(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # Hour 0: very cheap + solar sized so charge+banking lands the battery
+        # at ~99.1% after three blocks → the fourth hour-0 charge block is
+        # "wasted" (ΔSOC < 1%), which forces Pass 2 to redistribute it onto a
+        # cheap hour-3 hold block. Hours 1-2: 5.0 CZK — with base amortisation
+        # 0 a discharge there is profitable (sell_rev = 4.5, recharge ≈ 1.06)
+        # and DOES fire when the override is absent (verified). The OLD Pass-2
+        # dropped the override, so its re-run scheduled exactly those
+        # discharges. With the 50 CZK export-wear override sell_rev is deeply
+        # negative, so the final plan must contain NO grid-export discharge.
+        blocks = make_15min_blocks([0.3, 5.0, 5.0, 0.4], start_hour=0)
+        _, discharge, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={0: 5.6},  # tops the battery just before hour-0 ends
+            consumption_hourly={h: 1.0 for h in range(4)},
+            distribution_func=const_dist(0.5),
+            battery_capacity_kwh=10.0,
+            current_soc=50.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=0.0,
+            battery_amortisation_export_czk=50.0,
+        )
+
+        # The scenario must actually exercise Pass 2 (wasted hour-0 charge
+        # blocks redistributed), otherwise this test proves nothing.
+        pass2_ran = any(
+            "Pass 2" in str(call)
+            for call in optimizer.logger.info.call_args_list
+        )
+        assert pass2_ran, "scenario must force a Pass-2 charge redistribution"
+
+        assert discharge == set(), (
+            "export-wear override (50 CZK/kWh) must gate off all grid-export "
+            "discharges in the FINAL (Pass-2) plan too; got discharges at "
+            f"{sorted(ts.strftime('%H:%M') for ts in discharge)}"
+        )
+        assert all(d.action != "discharge" for d in decisions)
+
+
+class TestBelowFloorLiveSoc:
+    """A below-min_soc telemetry SOC must not be clamped UP (phantom energy)."""
+
+    def test_below_min_soc_is_preserved_and_not_discharged(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # All-expensive prices: the optimizer would love to discharge, but the
+        # battery is BELOW the floor — there is no usable energy. The old
+        # two-sided clamp lifted 10% → 20% and credited 1 kWh out of thin air.
+        prices = [10.0] * 24
+        blocks = make_blocks(prices)
+
+        _, discharge, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            battery_capacity_kwh=10.0,
+            current_soc=10.0,   # below the 20% floor (real telemetry case)
+            min_soc=20.0,
+        )
+
+        assert decisions[0].soc_before == 10.0, (
+            "live below-floor SOC must be preserved, not clamped up to min_soc"
+        )
+        assert discharge == set(), "no usable energy below the floor"
+        # Nothing can draw the battery further down, and with no charge blocks
+        # (flat 10 CZK day) nothing raises it either — no phantom credit.
+        for d in decisions:
+            assert d.soc_after <= 10.0 + 1e-6
+
+    def test_above_max_soc_still_clamped_down(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # The high-side clamp must survive (documented real condition:
+        # telemetry 100% while max_soc=90).
+        blocks = make_blocks([2.0] * 24)
+        _, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            current_soc=100.0,
+            max_soc=90.0,
+        )
+        assert decisions[0].soc_before == 90.0
+
+
+class TestTerminalSocValue:
+    """Leftover SOC at horizon end is worth the MILP-style terminal value, so
+    the greedy engine must not dump the battery into a marginal end-of-horizon
+    price bump before tomorrow's DAM prices arrive."""
+
+    def test_no_end_of_horizon_battery_dump(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # Horizon 10:00-23:45. Late-night 1.0 blocks set the terminal-value
+        # cap (min import 2.0 → cap 2.0/0.85 ≈ 2.35; median SC = 3.5+1-2 =
+        # 2.5 → terminal ≈ 2.33). The 4.5 spike's GROSS sell value is
+        # 4.5-0.5-2.0 = 2.0 CZK/kWh — below the 2.33 CZK/kWh a retained kWh
+        # is worth tomorrow, so selling does NOT beat retaining and the
+        # battery must not be dumped into the marginal end-of-horizon bump.
+        # (A higher spike whose gross sell value clears the terminal value
+        # AND has a profitable in-horizon recharge is legitimate arbitrage —
+        # see test_mid_horizon_arbitrage_with_cheap_recharge_discharges.)
+        prices = [3.5] * 8 + [4.5] * 2 + [3.5] * 2 + [1.0] * 2
+        blocks = make_15min_blocks(prices, start_hour=10)
+
+        _, discharge, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 0.1 for h in range(24)},
+            distribution_func=const_dist(1.0),
+            battery_capacity_kwh=10.0,
+            current_soc=90.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        spike_discharges = [
+            d for d in decisions
+            if d.action == "discharge" and abs(d.price_czk - 4.5) < 0.01
+        ]
+        assert spike_discharges == [], (
+            "marginal end-of-horizon discharge (gross sell 2.0 < terminal "
+            "2.33) must not dump the battery before tomorrow's prices arrive; "
+            f"got {len(spike_discharges)} spike discharges"
+        )
+        # The retained energy survives to the end of the horizon.
+        assert decisions[-1].soc_after >= 70.0, (
+            f"battery should end the horizon well above min, got "
+            f"{decisions[-1].soc_after:.1f}%"
+        )
+
+    def test_mid_horizon_arbitrage_with_cheap_recharge_discharges(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """A profitable mid-horizon discharge with a genuine cheap recharge
+        scheduled AFTER it must actually discharge.
+
+        Regression for the terminal-value FLOOR on future_max_discharge_value:
+        that array holds NET arbitrage profits (sell_rev - recharge_cost; the
+        battery ends refilled), but the floor injected the GROSS value of a
+        retained kWh and the 0.8 is_worthwhile gate applied it at EVERY block.
+        Here the 5.5 spike's dv = sell_rev(3.0) - recharge(2.35) = 0.65 > 0,
+        gross sell 3.0 > terminal 2.33, and the 1.0 CZK recharge follows the
+        spike — discharging pockets dv AND preserves the terminal energy,
+        strictly better than holding. The old floor rejected it
+        (0.65 < 0.8 × 2.33)."""
+        # Spike at hours 6-7, cheap recharge at hours 12-13, moderate rest.
+        prices = [3.5] * 6 + [5.5] * 2 + [3.5] * 4 + [1.0] * 2 + [3.5] * 10
+        blocks = make_15min_blocks(prices, start_hour=0)
+
+        _, discharge, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 0.1 for h in range(24)},
+            distribution_func=const_dist(1.0),
+            battery_capacity_kwh=10.0,
+            current_soc=90.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        spike_discharges = [
+            d for d in decisions
+            if d.action == "discharge" and abs(d.price_czk - 5.5) < 0.01
+        ]
+        assert spike_discharges, (
+            "profitable mid-horizon arbitrage (dv=0.65>0, gross sell 3.0 > "
+            "terminal 2.33, cheap 1.0 recharge after the spike) must "
+            "discharge; the terminal floor on future_max_discharge_value "
+            "blocked it. Actions at the spike: "
+            f"{[(f'{d.timestamp:%H:%M}', d.action) for d in decisions if abs(d.price_czk - 5.5) < 0.01]}"
+        )
+        # The cheap recharge after the spike is actually used.
+        assert any(
+            d.action == "charge" and abs(d.price_czk - 1.0) < 0.01
+            for d in decisions
+        ), "the 1.0 CZK blocks after the spike should recharge the battery"
+
+    def test_terminal_value_zero_on_negative_price_days(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # With a negative-price valley the cheapest import is ≤ 0, the
+        # MILP-mirrored cap drives the terminal value to 0 and a genuinely
+        # profitable evening discharge must still fire (no over-holding).
+        prices = (
+            [-1.0] * 6 + [2.0] * 6 + [1.0] * 6 + [8.0] * 6
+            + [-1.0] * 6 + [2.0] * 18
+        )
+        blocks = make_blocks(prices)
+        _, discharge, _sp, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={},
+            distribution_func=const_dist(1.0),
+            current_soc=50.0,
+        )
+        assert len({t.hour for t in discharge} & set(range(18, 24))) > 0
+
+
+class TestGreedyHoldIdle:
+    """Retention holds on deficit blocks emit hold_idle (battery passive) so
+    the SPH doesn't actuate load_first and drain the energy being retained."""
+
+    def test_retention_hold_with_deficit_becomes_hold_idle(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        # Cheap night (charges), moderate midday, expensive evening with real
+        # consumption: the midday holds retain the battery for the evening —
+        # on the SPH a plain hold (load_first) would drain it into the midday
+        # deficit, so those blocks must be hold_idle and preserve SOC.
+        prices = [1.0] * 6 + [3.0] * 6 + [6.0] * 6
+        blocks = make_15min_blocks(prices, start_hour=0)
+        consumption = {h: 1.0 for h in range(18)}
+
+        _, discharge, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=consumption,
+            distribution_func=const_dist(0.5),
+            battery_capacity_kwh=10.0,
+            current_soc=40.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        midday = [d for d in decisions if 6 <= d.timestamp.hour < 12]
+        idle = [d for d in midday if d.action == "hold_idle"]
+        assert idle, (
+            "midday retention holds with a consumption deficit must be "
+            f"hold_idle, got actions {[d.action for d in midday]}"
+        )
+        # hold_idle is battery-passive: SOC carries over unchanged.
+        for d in idle:
+            assert d.soc_after == d.soc_before, (
+                f"hold_idle at {d.timestamp:%H:%M} must not move SOC: "
+                f"{d.soc_before} → {d.soc_after}"
+            )
+        # And the retention actually works: the battery reaches the expensive
+        # evening with at least as much charge as it had entering midday.
+        soc_at_6 = next(d.soc_before for d in decisions if d.timestamp.hour == 6)
+        soc_at_12 = next(d.soc_before for d in decisions if d.timestamp.hour == 12)
+        assert soc_at_12 >= soc_at_6 - 1e-6
+
+    def test_peak_blocks_self_consume_when_cheaper_tail_follows(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """A peak FOLLOWED by a cheaper tail (the rolling-horizon shape).
+
+        Regression: gating the hold_idle remap on the INCLUSIVE future-SC
+        array (which counts block i itself as "future") idled the battery
+        straight through its own peak — there was always "a peak ahead", so
+        the energy was never spent. Peak deficit blocks must self-consume
+        (plain hold); only the genuinely-cheaper pre-peak blocks may idle.
+        """
+        # 24h of 15-min blocks: [1]*24 + [3]*24 + [6]*16 + [2]*32 blocks.
+        prices = [1.0] * 6 + [3.0] * 6 + [6.0] * 4 + [2.0] * 8
+        blocks = make_15min_blocks(prices, start_hour=0)
+        consumption = {h: 1.0 for h in range(24)}
+
+        _, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly=consumption,
+            distribution_func=const_dist(1.0),
+            battery_capacity_kwh=10.0,
+            current_soc=90.0,  # battery charged
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+
+        peak = [d for d in decisions if 12 <= d.timestamp.hour < 16]
+        deficit_peak = [d for d in peak if d.consumption_kwh > d.solar_kwh]
+        assert deficit_peak, "peak must have deficit blocks in this scenario"
+        assert all(d.action != "hold_idle" for d in deficit_peak), (
+            "expensive-peak deficit blocks must self-consume, not idle: "
+            f"{[(f'{d.timestamp:%H:%M}', d.action) for d in deficit_peak]}"
+        )
+        # The stored energy is actually SPENT during the peak.
+        soc_peak_start = next(
+            d.soc_before for d in decisions if d.timestamp.hour == 12
+        )
+        soc_peak_end = next(
+            d.soc_after for d in decisions
+            if d.timestamp.hour == 15 and d.timestamp.minute == 45
+        )
+        assert soc_peak_end < soc_peak_start, (
+            f"battery must drain over the peak: {soc_peak_start} → {soc_peak_end}"
+        )
+        # Pre-peak cheaper blocks still retain (idle) for the peak.
+        pre_peak = [d for d in decisions if d.timestamp.hour < 12]
+        assert any(d.action == "hold_idle" for d in pre_peak), (
+            "cheaper pre-peak deficit blocks should idle to retain energy: "
+            f"{[(f'{d.timestamp:%H:%M}', d.action) for d in pre_peak]}"
+        )
+
+    def test_two_peaks_with_energy_for_both_self_consume_today(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Energy-aware remap (quantity gate): a strictly-better future peak
+        must NOT idle the current peak when the battery holds enough energy
+        for BOTH.
+
+        Regression: the remap was quantity-blind — whenever ANY strictly-
+        better future deficit block existed, the current block idled. 32h
+        horizon, today's peak 6.0, tomorrow's 6.2, SOC 100% (≈8 kWh usable
+        vs ≈4.3 kWh per peak): today's peak went entirely hold_idle and the
+        whole peak was imported from grid at ~7 CZK/kWh despite ample stored
+        energy. With the gate (idle only while usable_kwh <= strictly-better
+        future need / leg_eta) today's peak self-consumes; only once the
+        remaining energy is just enough for tomorrow's better peak may late
+        blocks idle."""
+        # 32h from 12:00: moderate, today's 6.0 peak (17-20), cheap tail +
+        # night, moderate, tomorrow's 6.2 peak (truncated horizon end).
+        hourly = [3.0] * 5 + [6.0] * 4 + [2.0] * 3 + [1.0] * 6 \
+            + [3.0] * 10 + [6.2] * 4
+        blocks = make_15min_blocks(hourly, start_hour=12)
+        assert len(blocks) == 128  # ~32h rolling horizon
+
+        _, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(1.0),
+            battery_capacity_kwh=10.0,
+            current_soc=100.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+            # export wear high enough that the peaks aren't grid-export
+            # arbitrage — this test isolates hold vs hold_idle.
+            battery_amortisation_export_czk=5.0,
+        )
+
+        today_peak = [d for d in decisions if abs(d.price_czk - 6.0) < 0.01]
+        assert today_peak, "scenario must contain today's 6.0 peak"
+        # Today's peak must NOT be entirely idled — the battery has energy
+        # for both peaks, so it self-consumes (plain hold) through the peak.
+        holds = [d for d in today_peak if d.action == "hold"]
+        assert len(holds) > len(today_peak) // 2, (
+            "today's peak must predominantly self-consume when the battery "
+            "holds enough for today AND tomorrow; got actions "
+            f"{[(f'{d.timestamp:%H:%M}', d.action) for d in today_peak]}"
+        )
+        # The first peak blocks (most usable energy) must self-consume.
+        assert today_peak[0].action == "hold"
+        # And the stored energy is actually SPENT across today's peak.
+        assert today_peak[-1].soc_after < today_peak[0].soc_before - 10.0, (
+            f"battery must drain over today's peak: "
+            f"{today_peak[0].soc_before} → {today_peak[-1].soc_after}"
+        )
+        # Tomorrow's strictly-better peak still gets served from battery.
+        tomorrow_peak = [d for d in decisions if abs(d.price_czk - 6.2) < 0.01]
+        assert any(d.soc_after < d.soc_before for d in tomorrow_peak), (
+            "tomorrow's peak should also self-consume from the battery"
+        )
+
+    def test_hold_idle_never_lands_in_action_sets(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        prices = [1.0] * 6 + [3.0] * 6 + [6.0] * 6
+        blocks = make_15min_blocks(prices, start_hour=0)
+        charge, discharge, sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(18)},
+            distribution_func=const_dist(0.5),
+            battery_capacity_kwh=10.0,
+            current_soc=40.0,
+            min_soc=20.0,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        idle_ts = {d.timestamp for d in decisions if d.action == "hold_idle"}
+        assert not (idle_ts & charge)
+        assert not (idle_ts & discharge)
+        assert not (idle_ts & sp)
 
 
 # ---------------------------------------------------------------------------
@@ -1256,3 +1667,351 @@ def test_adaptive_rate_uses_grid_side_power_not_raw_soc():
     # Charge input = ΔSOC/η: 2.0/0.9 = 2.22 kWh / 0.25h = 8.9 kW → 91%.
     c = _charge_dec(base, 40.0, 60.0)
     assert compute_charge_power_rates([c], 10.0, 9.8, action="charge", efficiency=0.9)[base] == 91
+
+
+class TestBaseLoadProfileLocalKeying:
+    """The base-load profile is consumed with LOCAL (hour, weekend) keys, so
+    build_base_load_profile / update_profile_with_yesterday must convert
+    InfluxDB's UTC record times to local time before extracting hour/weekday,
+    AND use start-labeled aggregateWindow (the Flux default stop-labeling
+    shifts hour keys +1h; in CEST the two bugs no longer cancel)."""
+
+    @staticmethod
+    def _rec(dt, value):
+        from unittest.mock import MagicMock
+        r = MagicMock()
+        r.get_time.return_value = dt
+        r.get_value.return_value = value
+        return r
+
+    @staticmethod
+    def _client(heating_records, ev_records, load_records, captured=None):
+        from unittest.mock import AsyncMock, MagicMock
+
+        def _table(recs):
+            t = MagicMock()
+            t.records = recs
+            return t
+
+        async def _q(q):
+            if captured is not None:
+                captured.append(q)
+            if "heating" in q:
+                return [_table(heating_records)] if heating_records else []
+            if "ev_charging" in q:
+                return [_table(ev_records)] if ev_records else []
+            return [_table(load_records)] if load_records else []
+
+        client = MagicMock()
+        client.query = AsyncMock(side_effect=_q)
+        return client
+
+    @pytest.mark.asyncio
+    async def test_build_keys_by_local_hour(self, optimizer) -> None:
+        """A start-labeled 10:00 UTC record in June (CEST, UTC+2) is the
+        12:00 LOCAL hour — the profile slot must be 12, not 10."""
+        from datetime import timezone
+        # Wednesday 2026-06-10 10:00 UTC == 12:00 Europe/Prague (CEST)
+        load = [self._rec(datetime(2026, 6, 10, 10, 0, tzinfo=timezone.utc), 1500.0)]
+        client = self._client([], [], load)
+
+        profile = await optimizer.build_base_load_profile(client, "solar", "loxone")
+
+        assert profile.profile == {(12, False): pytest.approx(1.5)}
+
+    @pytest.mark.asyncio
+    async def test_build_weekend_classified_on_local_day(self, optimizer) -> None:
+        """Friday 22:00 UTC is Saturday 00:00 local (CEST) — must land in
+        the WEEKEND hour-0 slot, not Friday hour 22."""
+        from datetime import timezone
+        # 2026-06-12 is a Friday; 22:00 UTC -> 2026-06-13 (Sat) 00:00 CEST
+        load = [self._rec(datetime(2026, 6, 12, 22, 0, tzinfo=timezone.utc), 800.0)]
+        client = self._client([], [], load)
+
+        profile = await optimizer.build_base_load_profile(client, "solar", "loxone")
+
+        assert profile.profile == {(0, True): pytest.approx(0.8)}
+
+    @pytest.mark.asyncio
+    async def test_build_heating_exclusion_keys_match_load_keys(self, optimizer) -> None:
+        """Heating/EV exclusion keys are converted the same way as load keys,
+        so a heating hour still excludes the matching load record."""
+        from datetime import timezone
+        ts = datetime(2026, 6, 10, 10, 0, tzinfo=timezone.utc)
+        heating = [self._rec(ts, 1)]
+        load = [
+            self._rec(ts, 5000.0),  # heating hour — must be excluded
+            self._rec(datetime(2026, 6, 10, 11, 0, tzinfo=timezone.utc), 1000.0),
+        ]
+        client = self._client(heating, [], load)
+
+        profile = await optimizer.build_base_load_profile(client, "solar", "loxone")
+
+        # Only the non-heating hour remains, at its LOCAL hour 13.
+        assert profile.profile == {(13, False): pytest.approx(1.0)}
+
+    @pytest.mark.asyncio
+    async def test_build_queries_use_start_labeled_windows(self, optimizer) -> None:
+        captured: list = []
+        client = self._client([], [], [], captured=captured)
+
+        await optimizer.build_base_load_profile(client, "solar", "loxone")
+
+        agg = [q for q in captured if "aggregateWindow" in q]
+        assert len(agg) == 3  # heating + EV + load
+        for q in agg:
+            assert 'timeSrc: "_start"' in q
+
+    @pytest.mark.asyncio
+    async def test_build_explicit_local_tz_param_respected(self, optimizer) -> None:
+        """An explicitly-passed tz overrides the Europe/Prague default."""
+        import zoneinfo
+        from datetime import timezone
+        load = [self._rec(datetime(2026, 6, 10, 10, 0, tzinfo=timezone.utc), 1500.0)]
+        client = self._client([], [], load)
+
+        profile = await optimizer.build_base_load_profile(
+            client, "solar", "loxone", local_tz=zoneinfo.ZoneInfo("UTC")
+        )
+
+        assert profile.profile == {(10, False): pytest.approx(1.5)}
+
+    @pytest.mark.asyncio
+    async def test_yesterday_update_keys_by_local_hour(self, optimizer) -> None:
+        from datetime import timezone
+        # Seed the slot the local-keyed record should update.
+        optimizer._base_load_profile.profile[(12, False)] = 2.0
+        load = [self._rec(datetime(2026, 6, 10, 10, 0, tzinfo=timezone.utc), 1000.0)]
+        captured: list = []
+        client = self._client([], [], load, captured=captured)
+
+        await optimizer.update_profile_with_yesterday(client, "solar", "loxone")
+
+        # EMA at the LOCAL hour-12 slot: 0.9*2.0 + 0.1*1.0
+        assert optimizer._base_load_profile.profile[(12, False)] == pytest.approx(1.9)
+        # The UTC hour-10 slot must NOT have been touched/created.
+        assert (10, False) not in optimizer._base_load_profile.profile
+        # And the windows are start-labeled.
+        agg = [q for q in captured if "aggregateWindow" in q]
+        assert len(agg) == 3
+        for q in agg:
+            assert 'timeSrc: "_start"' in q
+
+
+class TestDistributionAwareChargeGate:
+    """Charge-gate economics, iteration 2 (forward-looking, wear-aware).
+
+    Iteration 1 made the gate distribution-aware but valued a charged kWh at
+    the horizon's MEDIAN import cost. That breaks whenever cheap blocks are
+    the horizon MAJORITY (negative/windy days, cheap-NT bands): the median
+    sits in the cheap mode, cheap*efficiency < cheap → zero candidates, and
+    the `spot < 0` fallback was dead because the actuation gate used the
+    same algebra. Iteration 2 values the charge FORWARD-LOOKING against the
+    best future deficit self-consumption value (future_sc_value, per
+    delivered kWh, amortisation-adjusted, terminal-floored):
+
+        charge profitable  ⇔  (p + dist) < future_sc_value[i] * efficiency
+
+    BEHAVIOUR CHANGE (deliberate): future_sc_value subtracts
+    battery_amortisation_czk, so the gate is now WEAR-CONSISTENT — a cycle
+    that is cash-positive but wear-negative (full-cost spread smaller than
+    the wear cost) no longer charges. The "still charges" controls below
+    therefore use wear-PROFITABLE parameters, and the wear-marginal case is
+    pinned as a no-charge test of its own.
+    """
+
+    @staticmethod
+    def _low_spread_prices(day_spot: float = 1.2) -> list:
+        """Two days: spot 0.8 overnight (00-07), `day_spot` daytime (08-23)."""
+        day = [0.8] * 8 + [day_spot] * 16
+        return day * 2
+
+    def test_no_grid_charge_when_distribution_eats_the_spread(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """dist 2.5: night full cost 3.3 vs best future SC value
+        (1.2 + 2.5 - 2.0 amort) * 0.85 = 1.445 — every charged kWh loses
+        money, so NO grid charge may be scheduled."""
+        blocks = make_15min_blocks(self._low_spread_prices())
+        charge, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(2.5),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert charge == set(), (
+            "spot-only break-even scheduled loss-making night charging: "
+            f"{sorted(t.hour for t in charge)}"
+        )
+        assert all(d.action != "charge" for d in decisions)
+
+    def test_grid_charge_still_selected_with_low_distribution(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Wear-PROFITABLE control: night 0.8 / day 4.0 at dist 0.5 — night
+        full cost 1.3 < (4.0 + 0.5 - 2.0 amort) * 0.85 = 2.125, so nightly
+        charging must still happen (the fix must not over-tighten the gate).
+
+        TEST CHANGE (iteration 2): the original control used day spot 1.2,
+        which is cash-positive (1.3 < 1.7 * 0.85... barely) but wear-NEGATIVE
+        with amort 2.0 — under the wear-consistent gate it correctly stops
+        charging (pinned in test_wear_negative_spread_does_not_charge below).
+        The control's PURPOSE (guard against over-tightening) is preserved
+        with a wear-profitable day price."""
+        blocks = make_15min_blocks(self._low_spread_prices(day_spot=4.0))
+        charge, _, _sp, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(0.5),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert len(charge) > 0, "profitable night charging must survive the fix"
+        assert all(t.hour < 8 for t in charge), (
+            f"charging must stay in the cheap night hours: "
+            f"{sorted({t.hour for t in charge})}"
+        )
+
+    def test_wear_negative_spread_does_not_charge(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """WEAR-CONSISTENCY (new, intended behaviour of the iteration-2 gate):
+        a cycle that is cash-positive but wear-negative must NOT charge.
+
+        Night 0.8 / day 1.2 at dist 0.5, amort 2.0: importing at 1.3 to
+        displace a 1.7 import is cash-positive after round-trip losses
+        (1.7 * 0.85 = 1.445 > 1.3) — the OLD wear-blind gate cycled nightly
+        for ~0.12 CZK/kWh cash margin while wearing the battery 2.0 CZK per
+        delivered kWh, a net value destruction of ~1.6 CZK/kWh. The new gate
+        values the charge at the amort-adjusted SC value
+        ((1.2 + 0.5 - 2.0) < 0 → floored terminal value) and refuses."""
+        blocks = make_15min_blocks(self._low_spread_prices(day_spot=1.2))
+        charge, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(0.5),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert charge == set(), (
+            "cash-positive but wear-negative cycling must not charge: "
+            f"{sorted({t.hour for t in charge})}"
+        )
+        assert all(d.action != "charge" for d in decisions)
+
+    def test_cheap_majority_negative_day_still_charges_before_peak(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """S1-shaped cheap-majority regression: spot -0.5 for 20h, 4.0 for
+        the 17-20 evening peak, dist 2.0, amort 2.0.
+
+        The iteration-1 median gate never charged here: the median import
+        cost sits in the cheap mode (1.5), threshold 1.5 * 0.85 = 1.275 <
+        1.5 → zero candidates, and the `spot < 0` fallback was vetoed by the
+        algebraically-identical actuation gate — so the battery idled while
+        the peak imported at 6.0 CZK/kWh (greedy/MILP parity broken; the
+        MILP charges the same windows). Forward-looking gate: 1.5 <
+        (4.0 + 2.0 - 2.0) * 0.85 = 3.4 → charges ahead of the peak."""
+        day = [-0.5 if not (17 <= h <= 20) else 4.0 for h in range(24)]
+        blocks = make_15min_blocks(day * 2)
+        charge, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(2.0),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert len(charge) > 0, (
+            "cheap-majority horizon must still charge ahead of the peak "
+            "(median-based gate regression)"
+        )
+        # Charging lands in the cheap hours, never inside the expensive peak.
+        assert all(not (17 <= t.hour <= 20) for t in charge), (
+            f"charging must avoid the 17-20 peak: {sorted({t.hour for t in charge})}"
+        )
+        # And the stored energy is actually used: day-1 peak deficit blocks
+        # are served from the battery (SOC drops across the peak).
+        day1_peak = [
+            d for d in decisions
+            if d.timestamp.hour == 20 and d.timestamp.day == blocks[0][0].day
+        ]
+        day1_prepeak = [
+            d for d in decisions
+            if d.timestamp.hour == 17 and d.timestamp.day == blocks[0][0].day
+        ]
+        assert day1_peak[-1].soc_after < day1_prepeak[0].soc_before, (
+            "the peak must drain the battery charged from the cheap majority"
+        )
+
+    def test_negative_spot_candidate_vetoed_when_full_cost_unprofitable(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """The `p < 0` candidate fallback must still pass the actuation-side
+        charge_value gate. Spot -0.05 with dist 2.5 costs 2.45/kWh while the
+        best future deficit SC value (0.3 + 2.5 - 2.0 amort = 0.8) is only
+        worth 0.8 * 0.85 = 0.68 per grid kWh after round-trip losses —
+        charge_value is negative, so the scheduled block must NOT actuate as
+        a charge."""
+        prices = [-0.05] * 12 + [0.3] * 12
+        blocks = make_blocks(prices)
+        charge, _, _sp, decisions = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(2.5),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert charge == set(), (
+            "negative-spot blocks with loss-making FULL cost must not charge: "
+            f"{sorted(t.hour for t in charge)}"
+        )
+        assert all(d.action != "charge" for d in decisions)
+
+    def test_paid_to_charge_still_charges_despite_high_distribution(
+        self, optimizer: BatteryOptimizer
+    ) -> None:
+        """Deep negatives must keep charging even at high distribution: spot
+        -5.0 with dist 2.5 has NEGATIVE full cost (-2.5) — the gate must not
+        veto free money."""
+        prices = [-5.0] * 6 + [1.2] * 18
+        blocks = make_blocks(prices)
+        charge, _, _sp, _ = optimizer.optimize(
+            blocks=blocks,
+            solar_hourly={},
+            consumption_hourly={h: 1.0 for h in range(24)},
+            distribution_func=const_dist(2.5),
+            battery_capacity_kwh=10.0,
+            current_soc=20.0,
+            min_soc=20.0,
+            efficiency=0.85,
+            sell_fee_czk=0.5,
+            battery_amortisation_czk=2.0,
+        )
+        assert len(charge) > 0, "negative full-cost blocks must still charge"
+        assert all(t.hour < 6 for t in charge)

@@ -7,6 +7,7 @@ from modules.growatt.deferrable_loads import (
     DeferrableLoad,
     DeferrableLoadSchedule,
     DeferrableLoadScheduler,
+    filter_to_current_window_instance,
 )
 
 
@@ -193,3 +194,127 @@ def test_savings_is_naive_minus_expected():
         load_name="ev", naive_cost_czk=10.0, expected_cost_czk=6.0
     )
     assert sched.savings_czk == 4.0
+
+
+# --- Multi-day horizon: only the FIRST window instance is schedulable -------
+
+
+def make_horizon(start: datetime, hours: int) -> List[datetime]:
+    """A contiguous 15-min block grid spanning `hours` hours."""
+    return [start + timedelta(minutes=15 * i) for i in range(hours * 4)]
+
+
+def overnight_load(**kw) -> DeferrableLoad:
+    defaults = dict(
+        name="ev", energy_required_kwh=1.0, power_kw=2.0,  # 2 blocks
+        earliest_start=time(22, 0), latest_end=time(6, 0),
+        interruptible=True,
+    )
+    defaults.update(kw)
+    return DeferrableLoad(**defaults)
+
+
+def daytime_load(**kw) -> DeferrableLoad:
+    defaults = dict(
+        name="boiler", energy_required_kwh=1.0, power_kw=2.0,  # 2 blocks
+        earliest_start=time(6, 0), latest_end=time(22, 0),
+        interruptible=True,
+    )
+    defaults.update(kw)
+    return DeferrableLoad(**defaults)
+
+
+def test_filter_keeps_only_first_overnight_instance():
+    # 32h horizon from 20:00 Jun 1 → 04:00 Jun 3: contains TWO instances of a
+    # 22:00→06:00 window (Jun 1 22:00→Jun 2 06:00 and Jun 2 22:00→horizon end).
+    horizon = make_horizon(datetime(2025, 6, 1, 20, 0), 32)
+    kept = filter_to_current_window_instance(horizon, overnight_load())
+    assert kept, "first instance must yield candidates"
+    assert kept[0] == datetime(2025, 6, 1, 22, 0)
+    assert kept[-1] == datetime(2025, 6, 2, 5, 45)
+    # Nothing from the second night.
+    assert all(ts < datetime(2025, 6, 2, 6, 0) for ts in kept)
+
+
+def test_filter_keeps_only_first_daytime_instance():
+    # 32h horizon from 04:00 Jun 1 → 12:00 Jun 2: contains TWO instances of a
+    # 06:00→22:00 window (Jun 1 06:00→22:00 and Jun 2 06:00→12:00).
+    horizon = make_horizon(datetime(2025, 6, 1, 4, 0), 32)
+    kept = filter_to_current_window_instance(horizon, daytime_load())
+    assert kept[0] == datetime(2025, 6, 1, 6, 0)
+    assert kept[-1] == datetime(2025, 6, 1, 21, 45)
+    assert all(ts < datetime(2025, 6, 1, 22, 0) for ts in kept)
+
+
+def test_filter_now_already_inside_window():
+    # Horizon starts at 23:00, already inside the 22:00→06:00 window — the
+    # current (partial) instance is used, not skipped.
+    horizon = make_horizon(datetime(2025, 6, 1, 23, 0), 32)
+    kept = filter_to_current_window_instance(horizon, overnight_load())
+    assert kept[0] == datetime(2025, 6, 1, 23, 0)
+    assert kept[-1] == datetime(2025, 6, 2, 5, 45)
+
+
+def test_filter_now_inside_after_midnight_tail():
+    # Horizon starts at 03:00 — inside the after-midnight tail of 22:00→06:00.
+    # The current instance closes at 06:00 the SAME day.
+    horizon = make_horizon(datetime(2025, 6, 2, 3, 0), 32)
+    kept = filter_to_current_window_instance(horizon, overnight_load())
+    assert kept[0] == datetime(2025, 6, 2, 3, 0)
+    assert kept[-1] == datetime(2025, 6, 2, 5, 45)
+    assert all(ts < datetime(2025, 6, 2, 6, 0) for ts in kept)
+
+
+def test_filter_full_day_window_closes_at_2359():
+    # 00:00→23:59 "full-day" window: the 23:45→23:59 gap contains no block
+    # start, but the instance must still close at 23:59 (not leak into
+    # tomorrow).
+    load = daytime_load(earliest_start=time(0, 0), latest_end=time(23, 59))
+    horizon = make_horizon(datetime(2025, 6, 1, 0, 0), 32)
+    kept = filter_to_current_window_instance(horizon, load)
+    assert kept[-1] == datetime(2025, 6, 1, 23, 45)  # 23:45 < 23:59 → in-window
+    assert all(ts < datetime(2025, 6, 1, 23, 59) for ts in kept)
+
+
+def test_filter_no_blocks_in_window():
+    # Horizon entirely outside the window → empty.
+    load = overnight_load()
+    horizon = make_horizon(datetime(2025, 6, 1, 8, 0), 8)  # 08:00-16:00
+    assert filter_to_current_window_instance(horizon, load) == []
+
+
+def test_scheduler_does_not_place_blocks_in_second_overnight_instance():
+    # 32h horizon with two 22:00→06:00 instances; the SECOND night is much
+    # cheaper, tempting the scheduler past the current cycle's deadline.
+    base = datetime(2025, 6, 1, 20, 0)
+    blocks = []
+    for i in range(32 * 4):
+        ts = base + timedelta(minutes=15 * i)
+        in_window = ts.hour >= 22 or ts.hour < 6
+        second_night = ts >= datetime(2025, 6, 2, 12, 0)
+        price = 0.1 if (in_window and second_night) else (2.0 if in_window else 9.0)
+        blocks.append((ts, price))
+    load = overnight_load(energy_required_kwh=2.0)  # 4 blocks
+    sched = DeferrableLoadScheduler().schedule(load, blocks, flat_dist)
+    deadline = datetime(2025, 6, 2, 6, 0)
+    assert sched.scheduled_blocks == 4
+    assert sched.block_datetimes, "schedule must carry datetimes"
+    assert all(ts < deadline for ts in sched.block_datetimes)
+
+
+def test_schedule_all_respects_first_daytime_instance():
+    # Two 06:00→22:00 instances in a 32h horizon; tomorrow morning is cheaper.
+    base = datetime(2025, 6, 1, 4, 0)
+    blocks = []
+    for i in range(32 * 4):
+        ts = base + timedelta(minutes=15 * i)
+        in_window = 6 <= ts.hour < 22
+        tomorrow = ts.date() > base.date()
+        price = 0.1 if (in_window and tomorrow) else (2.0 if in_window else 9.0)
+        blocks.append((ts, price))
+    load = daytime_load(energy_required_kwh=2.0)  # 4 blocks
+    schedules = DeferrableLoadScheduler().schedule_all([load], blocks, flat_dist)
+    assert len(schedules) == 1
+    deadline = datetime(2025, 6, 1, 22, 0)
+    assert schedules[0].scheduled_blocks == 4
+    assert all(ts < deadline for ts in schedules[0].block_datetimes)

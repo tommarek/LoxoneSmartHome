@@ -84,6 +84,56 @@ class DeferrableLoad:
         return t >= self.earliest_start or t < self.latest_end
 
 
+def filter_to_current_window_instance(
+    block_timestamps: List[datetime], load: "DeferrableLoad"
+) -> List[datetime]:
+    """Restrict candidate blocks to the FIRST instance of the load's window.
+
+    ``DeferrableLoad.in_window`` tests time-of-day only, but callers pass a
+    multi-day (~32h) price horizon, so a 22:00→06:00 window also matches
+    tomorrow night and a scheduler would happily place blocks past the current
+    cycle's deadline (energy silently undelivered — the next cycle's rollover
+    hides the shortfall). This helper walks *block_timestamps* (assumed sorted
+    ascending) and keeps in-window blocks only up to and including the first
+    window-instance close, i.e. it stops once an in-window run ends after
+    having started.
+
+    Handles: "now" already inside the window, windows crossing midnight, and
+    horizons that start out-of-window (blocks before the window opens are
+    skipped, not treated as a close). Shared by the greedy scheduler and the
+    MILP co-optimizer so both engines agree on the deadline.
+
+    Returns the kept timestamps in chronological order ([] when no block of
+    the horizon falls inside the window's first instance).
+    """
+    kept: List[datetime] = []
+    close: Optional[datetime] = None  # wall-clock end of the first instance
+    for ts in block_timestamps:
+        if not load.in_window(ts.time()):
+            if close is not None:
+                break  # the in-window run ended → first instance is closed
+            continue  # horizon starts out-of-window — keep scanning
+        if close is None:
+            # First in-window block: compute the wall-clock close of THIS
+            # window instance so the deadline holds even across grid gaps
+            # (e.g. a 00:00→23:59 "full-day" window whose out-of-window
+            # minute contains no block start).
+            if load.earliest_start <= load.latest_end:
+                close = datetime.combine(ts.date(), load.latest_end, tzinfo=ts.tzinfo)
+            elif ts.time() >= load.earliest_start:
+                # Wrapping window entered before midnight → closes tomorrow.
+                close = datetime.combine(
+                    ts.date() + timedelta(days=1), load.latest_end, tzinfo=ts.tzinfo
+                )
+            else:
+                # Wrapping window entered in its after-midnight tail.
+                close = datetime.combine(ts.date(), load.latest_end, tzinfo=ts.tzinfo)
+        if ts >= close:
+            break  # next window instance — past the current deadline
+        kept.append(ts)
+    return kept
+
+
 @dataclass
 class DeferrableLoadSchedule:
     """Output of the planner: which 15-min blocks each load should run in."""
@@ -145,10 +195,18 @@ class DeferrableLoadScheduler:
             return DeferrableLoadSchedule(load_name=load.name)
 
         # Filter to blocks within the allowed local-time window (DeferrableLoad
-        # handles midnight-wrapping windows, e.g. an EV charged 22:00→06:00).
+        # handles midnight-wrapping windows, e.g. an EV charged 22:00→06:00),
+        # restricted to the FIRST window instance in the horizon — the price
+        # horizon spans ~32h, so without this a 22:00→06:00 window would also
+        # match tomorrow night and blocks could land past the current deadline.
+        allowed = set(
+            filter_to_current_window_instance(
+                [ts for ts, _ in price_blocks], load
+            )
+        )
         candidates: List[Tuple[int, datetime, float]] = []  # (idx, ts, cost_per_kwh)
         for idx, (ts, spot) in enumerate(price_blocks):
-            if not load.in_window(ts.time()):
+            if ts not in allowed:
                 continue
             # Cost per kWh delivered = spot + distribution. Sell fee NA.
             cost_per_kwh = spot + distribution_func(ts.hour)

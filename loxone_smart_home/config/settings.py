@@ -654,15 +654,44 @@ class GrowattConfig(BaseSettings):
                     )
             # Optional time windows default to a full day in the controller, but
             # if present they must be parseable by time.fromisoformat (HH:MM).
+            window_times = {}
             for key in ("earliest_start", "latest_end"):
                 if key in entry:
                     try:
-                        _time.fromisoformat(entry[key])
+                        window_times[key] = _time.fromisoformat(entry[key])
                     except (ValueError, TypeError):
                         raise ValueError(
                             f"deferrable_loads_json entry {name!r}: '{key}' must be "
                             f"an HH:MM time string (got {entry[key]!r})"
                         )
+            # A zero-width window (earliest_start == latest_end) passes time
+            # parsing but in_window() is then always False — the load would
+            # silently never be scheduled. Reject it loudly instead. Compare
+            # AFTER applying the controller's defaults for missing keys
+            # (00:00 / 23:59), so a single-key entry like
+            # {"latest_end": "00:00"} is caught too.
+            eff_start = window_times.get(
+                "earliest_start", _time.fromisoformat("00:00")
+            )
+            eff_end = window_times.get(
+                "latest_end", _time.fromisoformat("23:59")
+            )
+            # Width in minutes, mod 24h for midnight-wrapping windows. A
+            # window narrower than one 15-min block can contain no block
+            # start — same silent never-schedules failure as zero width.
+            start_min = eff_start.hour * 60 + eff_start.minute
+            end_min = eff_end.hour * 60 + eff_end.minute
+            width_min = (end_min - start_min) % (24 * 60)
+            if width_min < 15:
+                raise ValueError(
+                    f"deferrable_loads_json entry {name!r}: the effective "
+                    f"window ({eff_start.strftime('%H:%M')} → "
+                    f"{eff_end.strftime('%H:%M')}, after applying defaults "
+                    f"for missing keys) is zero-width or narrower than one "
+                    f"15-minute block — the load would (almost) never be "
+                    f"scheduled. For a ~full-day window use earliest_start "
+                    f"'00:00' and latest_end '23:59'."
+                )
             # A load we can switch ON but not OFF would be energised at its
             # window start and then left running forever (the controller's stop
             # path has no command to send). Reject it here so the whole feature

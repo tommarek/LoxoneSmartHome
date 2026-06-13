@@ -531,6 +531,58 @@ def test_surplus_solar_can_sell_at_mid_soc():
     )
 
 
+def test_sell_production_blocks_do_not_bank_solar():
+    """is_sp blocks are actuated battery-passive (grid-first @ stop_soc=live
+    SOC), so the plan must not bank solar into the battery there — a planned
+    SOC rise on a sell_production block would never happen on the hardware.
+    Guards the `solar_to_batt <= charge_max * (1 - is_sp)` constraint.
+
+    Scenario engineered so banking SATURATES mid-window (1.8 kWh headroom vs
+    4×1.0 kWh surplus blocks) with a high-value evening making banked energy
+    worth more than exporting: without the constraint the solver provably
+    mixes is_sp + solar_to_batt on the same block (verified: pre-fix plans
+    show sell_production blocks with SOC rising up to ~7%)."""
+    prices = [3.0] * 4 + [6.0] * 20
+    blocks = make_blocks(prices, start_hour=10)
+    opt = MILPBatteryOptimizer()
+    _, _, sp, decisions = opt.optimize(
+        blocks=blocks,
+        solar_hourly={10: 4.5},                       # 1.0 kWh surplus/block
+        consumption_hourly={h: 0.5 for h in range(24)},
+        distribution_func=flat_dist(0.5),
+        current_soc=82.0, min_soc=20.0, max_soc=100.0,  # 1.8 kWh headroom
+        charge_rate_kw=5.0, discharge_rate_kw=5.0, discharge_power_pct=100.0,
+        sell_fee_czk=0.5, battery_amortisation_czk=2.0,
+    )
+    sp_dec = [d for d in decisions if d.action == "sell_production"]
+    assert sp_dec, "scenario must produce sell_production blocks"
+    for d in sp_dec:
+        # Tolerance covers ACTION_EPS-scale solver noise (5e-3 kWh ≈ 0.05%).
+        assert d.soc_after <= d.soc_before + 0.06, (
+            f"sell_production at {d.timestamp:%H:%M} banked solar: "
+            f"SOC {d.soc_before:.2f} → {d.soc_after:.2f}"
+        )
+
+
+def test_time_limit_incumbent_detection():
+    """_has_feasible_incumbent accepts a CBC time-limit incumbent (sol_status
+    LpSolutionIntegerFeasible) and rejects everything else / odd objects."""
+    import pulp
+
+    class FakeProb:
+        sol_status = pulp.constants.LpSolutionIntegerFeasible
+
+    class FakeProbNoStatus:
+        pass
+
+    class FakeProbOptimal:
+        sol_status = pulp.constants.LpSolutionOptimal
+
+    assert MILPBatteryOptimizer._has_feasible_incumbent(FakeProb())
+    assert not MILPBatteryOptimizer._has_feasible_incumbent(FakeProbNoStatus())
+    assert not MILPBatteryOptimizer._has_feasible_incumbent(FakeProbOptimal())
+
+
 def test_milp_discharge_rate_independent_of_discharge_power_pct():
     """Regression guard for the '4x too slow discharge' fix (commit 7f2f31a):
     the MILP discharge energy is discharge_rate_kw*0.25 per block and the energy

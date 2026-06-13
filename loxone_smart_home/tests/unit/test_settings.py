@@ -179,8 +179,69 @@ class TestDeferrableLoadsJsonValidator:
             '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, "earliest_start": "25:00"}]',  # bad time
             # mqtt_topic_on without mqtt_topic_off — cannot be turned off
             '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, "mqtt_topic_on": "ev/on"}]',
+            # zero-width window — in_window() would always be False
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"earliest_start": "08:00", "latest_end": "08:00"}]',
         ],
     )
     def test_malformed_entries_raise(self, raw: str) -> None:
         with pytest.raises(ValidationError):
+            GrowattConfig(deferrable_loads_json=raw)
+
+    def test_zero_width_window_error_suggests_full_day(self) -> None:
+        # earliest_start == latest_end never schedules (in_window always
+        # False); the error must say so and point at the 00:00→23:59 idiom.
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"earliest_start": "08:00", "latest_end": "08:00"}]'
+        )
+        with pytest.raises(ValidationError, match="zero-width"):
+            GrowattConfig(deferrable_loads_json=raw)
+
+    def test_zero_width_window_via_default_is_rejected(self) -> None:
+        # A single-key entry must be checked against the controller's
+        # defaults (00:00 / 23:59): {"latest_end": "00:00"} defaults
+        # earliest_start to 00:00 → zero-width → silently never schedules.
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"latest_end": "00:00"}]'
+        )
+        with pytest.raises(ValidationError, match="zero-width"):
+            GrowattConfig(deferrable_loads_json=raw)
+
+    def test_full_day_window_is_valid(self) -> None:
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"earliest_start": "00:00", "latest_end": "23:59"}]'
+        )
+        config = GrowattConfig(deferrable_loads_json=raw)
+        assert "ev" in config.deferrable_loads_json
+
+    def test_midnight_wrap_window_is_valid(self) -> None:
+        # 22:00 -> 06:00 wraps midnight; the mod-24h width (480 min) must
+        # not be misread as negative/zero by the width check.
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"earliest_start": "22:00", "latest_end": "06:00"}]'
+        )
+        config = GrowattConfig(deferrable_loads_json=raw)
+        assert "ev" in config.deferrable_loads_json
+
+    def test_exactly_one_block_window_is_valid(self) -> None:
+        # 15 minutes = exactly one block; schedulable, must pass.
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 0.1, "power_kw": 1, '
+            '"earliest_start": "10:00", "latest_end": "10:15"}]'
+        )
+        config = GrowattConfig(deferrable_loads_json=raw)
+        assert "ev" in config.deferrable_loads_json
+
+    def test_sub_block_window_is_rejected(self) -> None:
+        # 9-minute window (23:50 -> default 23:59) can contain no block
+        # start unless grid-aligned — same silent never-schedules class.
+        raw = (
+            '[{"name": "ev", "energy_required_kwh": 1, "power_kw": 1, '
+            '"earliest_start": "23:50"}]'
+        )
+        with pytest.raises(ValidationError, match="15-minute block"):
             GrowattConfig(deferrable_loads_json=raw)

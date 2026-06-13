@@ -10,7 +10,7 @@ import logging
 import math
 import statistics
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
@@ -86,6 +86,10 @@ class DailyForecast:
     total_kwh: float
     hourly: Dict[int, float] = field(default_factory=dict)  # hour -> kWh
     source: str = "unknown"
+    # Model forecasts only: hour -> bin level that produced the value
+    # ("below_horizon"/"no_radiation"/"3d"/"2d"/"2d_sparse"/"interpolate"/
+    # "global"); consensus uses it to gate per-hour trust in the model.
+    hourly_levels: Dict[int, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -107,10 +111,16 @@ class SolarProductionModel:
     # 2D bins: (rad, cloud) -> [kwh] (fallback — always includes cloud!)
     bins_2d: Dict[Tuple[int, int], List[float]] = field(default_factory=dict)
     median_2d: Dict[Tuple[int, int], float] = field(default_factory=dict)
+    # Per-published-2D-bin sample counts: a 2D bin is published from a single
+    # sample, but the consensus must only TRUST it (level "2d") when it has
+    # ≥ MIN_2D_TRUST_SAMPLES; sparser hits report "2d_sparse" (same value).
+    samples_2d: Dict[Tuple[int, int], int] = field(default_factory=dict)
     global_median: float = 0.0
     # Observability: which bin level is actually used
     hit_level_counts: Dict[str, int] = field(
-        default_factory=lambda: {"3d": 0, "2d": 0, "interpolate": 0, "global": 0}
+        default_factory=lambda: {
+            "3d": 0, "2d": 0, "2d_sparse": 0, "interpolate": 0, "global": 0,
+        }
     )
     # Metadata
     total_kwp: float = 13.5
@@ -191,16 +201,35 @@ class SolarProductionModel:
                 bins[key] = []
             bins[key].append(kwh)
 
+    # Minimum samples before a 3D bin is published. Sparser bins fall
+    # through to the 2D level (where the same samples still contribute),
+    # so hit_level_counts keeps meaning "well-supported bin used".
+    MIN_3D_SAMPLES = 4
+    # Minimum samples before a 2D hit is reported as the consensus-trusted
+    # "2d" level. 2D bins are still PUBLISHED (and predicted from) at a
+    # single sample, but a 1-sample bin (e.g. one anomalous near-zero hour)
+    # must not override the average of the other sources — sparser hits
+    # report "2d_sparse", which the consensus treats like "interpolate".
+    MIN_2D_TRUST_SAMPLES = MIN_3D_SAMPLES
+
     def build(self) -> None:
-        """Compute median for all bin levels."""
-        for bins, median_dict in [
-            (self.bins_3d, self.median_3d), (self.bins_2d, self.median_2d),
+        """Compute median for all bin levels.
+
+        3D bins need at least MIN_3D_SAMPLES samples to be published;
+        their data always contributes to the 2D fallback regardless.
+        2D sample counts are recorded so prediction can report whether a
+        2D hit is well-supported ("2d") or single/few-sample ("2d_sparse").
+        """
+        for bins, median_dict, min_samples in [
+            (self.bins_3d, self.median_3d, self.MIN_3D_SAMPLES),
+            (self.bins_2d, self.median_2d, 1),
         ]:
             median_dict.clear()
             for key, values in bins.items():
-                if values:
+                if len(values) >= min_samples:
                     med = self._compute_quantile(values)
                     median_dict[key] = med
+        self.samples_2d = {key: len(values) for key, values in self.bins_2d.items()}
 
         all_medians = [v for v in self.median_2d.values() if v > 0]
         self.global_median = statistics.median(all_medians) if all_medians else 0.0
@@ -245,17 +274,41 @@ class SolarProductionModel:
             return lower_cval if lower_cval is not None else upper_cval
         return None
 
-    def predict(
+    def reset_hit_level_counts(self) -> None:
+        """Zero the per-level hit counters.
+
+        Called at the start of each live prediction run so the counts
+        reflect THAT run's bin mix — previously they accumulated forever
+        (and the pass-2 curtailment probing inflated them before the model
+        ever served a real forecast).
+        """
+        for key in self.hit_level_counts:
+            self.hit_level_counts[key] = 0
+
+    def predict_with_level(
         self, ghi: float,
         sun_azimuth: float = 180, sun_altitude: float = 45,
         cloud_cover: float = 50, temperature: float = 15,
-    ) -> float:
-        """Predict kWh production. Cloud cover is ALWAYS used.
+    ) -> Tuple[float, str]:
+        """Predict kWh production and report which level produced the value.
 
-        Fallback: 3D (rad, cloud, alt) → 2D (rad, cloud) → interpolate → global.
+        Levels: "below_horizon" (genuine zero — sun below the horizon, the
+        only level the consensus zero-veto honours), "no_radiation" (GHI<=0
+        while the sun is UP — usually a missing/zero radiation entry, NOT a
+        veto: other sources may rightly be positive), else the fallback
+        chain "3d" → "2d" ("2d_sparse" when the bin has fewer than
+        MIN_2D_TRUST_SAMPLES samples) → "interpolate" → "global". Consensus
+        uses the level to decide how far to trust the model for an hour.
+        Cloud cover is ALWAYS used.
         """
-        if ghi <= 0 or sun_altitude <= 0:
-            return 0.0
+        if sun_altitude <= 0:
+            return 0.0, "below_horizon"
+        if ghi <= 0:
+            # Sun is up but the forecast carries no radiation for the hour —
+            # report a distinct level so the consensus does NOT veto other
+            # sources' positive PV with this zero (it falls through to the
+            # normal divergence gating instead).
+            return 0.0, "no_radiation"
 
         rad_b = self.radiation_to_bucket(ghi)
         cloud_b = self.cloud_to_bucket(cloud_cover)
@@ -271,28 +324,56 @@ class SolarProductionModel:
         k = (rad_b, cloud_b, alt_b)
         if k in self.median_3d:
             self.hit_level_counts["3d"] += 1
-            return _cap(self.median_3d[k])
+            return _cap(self.median_3d[k]), "3d"
 
-        # 2D exact (rad, cloud)
+        # 2D exact (rad, cloud). The VALUE is served either way; the LEVEL
+        # only reads "2d" (consensus-trusted) when the bin has enough
+        # samples — a single-sample bin reports "2d_sparse" so it cannot
+        # override the other sources on divergence.
         k = (rad_b, cloud_b)
         if k in self.median_2d:
-            self.hit_level_counts["2d"] += 1
-            return _cap(self.median_2d[k])
+            if self.samples_2d.get(k, 0) >= self.MIN_2D_TRUST_SAMPLES:
+                self.hit_level_counts["2d"] += 1
+                return _cap(self.median_2d[k]), "2d"
+            self.hit_level_counts["2d_sparse"] += 1
+            return _cap(self.median_2d[k]), "2d_sparse"
 
         # 2D interpolation — find nearest on radiation/cloud axes
         interp = self._interpolate_2d(rad_b, cloud_b)
         if interp is not None:
             self.hit_level_counts["interpolate"] += 1
-            return _cap(interp)
+            return _cap(interp), "interpolate"
 
         self.hit_level_counts["global"] += 1
-        return _cap(self.global_median)
+        return _cap(self.global_median), "global"
+
+    def predict(
+        self, ghi: float,
+        sun_azimuth: float = 180, sun_altitude: float = 45,
+        cloud_cover: float = 50, temperature: float = 15,
+    ) -> float:
+        """Predict kWh production (value only — see predict_with_level)."""
+        return self.predict_with_level(
+            ghi, sun_azimuth=sun_azimuth, sun_altitude=sun_altitude,
+            cloud_cover=cloud_cover, temperature=temperature,
+        )[0]
 
 
 class SolarForecast:
     """Solar production forecast combining learned model, API, and weather data."""
 
     FORECAST_SOLAR_URL = "https://api.forecast.solar/estimate"
+
+    # Training samples below this hourly mean (W) are treated like zeros for
+    # the inverter-state-coverage rule: a 5-50 W "production" hour is almost
+    # always an off/bypass hour with a telemetry blip, not real generation,
+    # and must not ride the missing→on default into high-GHI bins.
+    NEAR_ZERO_WATTS = 50.0
+    # ...but only at meaningful radiation: below this GHI (W/m²), a <50 W
+    # hour is the NORMAL dawn/dusk/deep-overcast output, and requiring state
+    # coverage would wholesale-drop every such sample predating inverter-
+    # state recording, biasing the lowest radiation bins high.
+    NEAR_ZERO_HIGH_GHI = 100.0
 
     def __init__(
         self,
@@ -553,25 +634,27 @@ class SolarForecast:
                     return t.astimezone(local_tz)
                 return t
 
-            # Query hourly solar production
+            # Query hourly solar production. timeSrc:"_start" — the default
+            # "_stop" stamps the [08:00,09:00) window at 09:00, shifting every
+            # hour key (and the sun position derived from it) by +1h.
             solar_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             # Query hourly SOC and load (for curtailment detection)
             soc_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "SOC")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             load_query = f'''
 from(bucket: "{settings.influxdb.bucket_solar}")
   |> range(start: -730d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             # Raw export_enabled and inverter_on state-change records from
             # controller-persisted state. We carry the last value forward
@@ -674,7 +757,7 @@ from(bucket: "{weather_bucket}")
   |> filter(fn: (r) => r._measurement == "weather_forecast")
   |> filter(fn: (r) => r._field == "{field_name}")
   |> filter(fn: (r) => r.type == "hour")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
                     result = await influxdb_client.query(q)
                     if result:
@@ -710,11 +793,13 @@ from(bucket: "{weather_bucket}")
                     )
                 return cloud_total_by_hour.get(hour_key, 50.0)
 
-            # Helper to add a data point to all bin levels
-            def _add_to_model(m: SolarProductionModel, hour_key: str, kwh: float) -> None:
+            # Helper to add a data point to all bin levels. Returns True when
+            # the sample actually landed in the bins (it declines on missing
+            # radiation / sun below horizon) so callers can count real samples.
+            def _add_to_model(m: SolarProductionModel, hour_key: str, kwh: float) -> bool:
                 ghi = ghi_by_hour.get(hour_key, 0)
                 if ghi <= 0:
-                    return
+                    return False
                 parts = hour_key.split("-")
                 year, month, day, hour = int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])
 
@@ -723,25 +808,56 @@ from(bucket: "{weather_bucket}")
                 azimuth, altitude = _sun_position(self.latitude, year, month, day, hour)
 
                 if altitude <= 0:
-                    return  # Sun below horizon
+                    return False  # Sun below horizon
 
                 rad_b = SolarProductionModel.radiation_to_bucket(ghi)
                 cloud_b = SolarProductionModel.cloud_to_bucket(cloud)
                 alt_b = SolarProductionModel.altitude_to_bucket(altitude)
 
                 m.add_sample(rad_b, cloud_b, alt_b, kwh)
+                return True
 
-            # PASS 1: Build rough model from all matched data
+            # PASS 1: Build rough model from all matched data. The recorded-
+            # state filters (export disabled / inverter off — filters 1a/1b
+            # below) apply here too: otherwise pass 1 trains on censored hours
+            # and the pass-2 `expected` baseline is biased low. Zero and
+            # near-zero (<NEAR_ZERO_WATTS) hours are KEPT when there was
+            # radiation and RECORDED state says the inverter was on (snow
+            # cover, standby — real observations); only negative readings
+            # are noise. (Near-)zeros from hours WITHOUT state coverage are
+            # dropped (see below); the default-on convention must not vouch
+            # for them.
             total_kwp = sum(a.kwp for a in self.arrays)
             model = SolarProductionModel(total_kwp=total_kwp)
             matched = 0
             for hour_key, watts in solar_by_hour.items():
-                if hour_key not in ghi_by_hour or watts <= 0:
+                if hour_key not in ghi_by_hour or watts < 0:
                     continue
                 if ghi_by_hour[hour_key] <= 0:
                     continue
-                _add_to_model(model, hour_key, watts / 1000.0)
-                matched += 1
+                if export_by_hour.get(hour_key, 1) == 0:
+                    continue
+                if inverter_on_by_hour.get(hour_key, 1) == 0:
+                    continue
+                # A zero/near-zero sample (< NEAR_ZERO_WATTS — a telemetry
+                # blip during an otherwise-off hour reads 5-50 W, not exactly
+                # 0) at HIGH GHI is only trustworthy when recorded inverter
+                # state actually COVERS the hour. The missing→on default
+                # exists for hours predating state recording, and those
+                # include manual-off/bypass periods: their (near-)zeros would
+                # land in high-GHI bins and drag the medians down. Low-GHI
+                # near-zeros (normal dawn/dusk output) stay trainable without
+                # coverage — dropping them wholesale would bias the lowest
+                # radiation bins high. Real positive production keeps the
+                # default-on convention.
+                if (
+                    watts < self.NEAR_ZERO_WATTS
+                    and ghi_by_hour[hour_key] > self.NEAR_ZERO_HIGH_GHI
+                    and hour_key not in inverter_on_by_hour
+                ):
+                    continue
+                if _add_to_model(model, hour_key, watts / 1000.0):
+                    matched += 1
 
             if matched < 100:
                 self.logger.warning(f"Only {matched} matched hours, need 100+")
@@ -756,11 +872,22 @@ from(bucket: "{weather_bucket}")
                 total_kwp=total_kwp, quantile=self.model_quantile
             )
             curtailed = 0
+            added = 0
             for hour_key, watts in solar_by_hour.items():
-                if hour_key not in ghi_by_hour or watts <= 0:
+                if hour_key not in ghi_by_hour or watts < 0:
                     continue
                 ghi = ghi_by_hour[hour_key]
                 if ghi <= 0:
+                    continue
+                # Same (near-)zero-coverage rule as pass 1: a <NEAR_ZERO_WATTS
+                # hour at high GHI with no recorded inverter state (predates
+                # state recording) is not a legitimate snow/standby
+                # observation — skip it. Low-GHI near-zeros stay trainable.
+                if (
+                    watts < self.NEAR_ZERO_WATTS
+                    and ghi > self.NEAR_ZERO_HIGH_GHI
+                    and hour_key not in inverter_on_by_hour
+                ):
                     continue
 
                 kwh = watts / 1000.0
@@ -806,9 +933,13 @@ from(bucket: "{weather_bucket}")
                     curtailed += 1
                     continue
 
-                _add_to_model(model2, hour_key, kwh)
+                if _add_to_model(model2, hour_key, kwh):
+                    added += 1
 
-            model2.data_points = matched - curtailed
+            # Count what actually landed in the bins — `matched - curtailed`
+            # over-counted (curtailed includes hours pass 1 never matched, and
+            # _add_to_model can still decline on sun-below-horizon).
+            model2.data_points = added
             model2.curtailed_filtered = curtailed
 
             earliest = min(solar_by_hour.keys())
@@ -845,7 +976,12 @@ from(bucket: "{weather_bucket}")
         if not self._production_model:
             return {}
 
+        # Telemetry: zero the per-level counters so they reflect THIS
+        # prediction run's bin mix, not everything since the model was built.
+        self._production_model.reset_hit_level_counts()
+
         daily_hourly: Dict[str, Dict[int, float]] = {}
+        daily_levels: Dict[str, Dict[int, str]] = {}
 
         for entry in weather_hourly:
             time_str = entry.get("time", "")
@@ -866,7 +1002,7 @@ from(bucket: "{weather_bucket}")
 
             azimuth, altitude = _sun_position(self.latitude, dt.year, dt.month, dt.day, hour)
 
-            predicted_kwh = self._production_model.predict(
+            predicted_kwh, level = self._production_model.predict_with_level(
                 ghi,
                 sun_azimuth=azimuth,
                 sun_altitude=altitude,
@@ -876,7 +1012,9 @@ from(bucket: "{weather_bucket}")
 
             if date_str not in daily_hourly:
                 daily_hourly[date_str] = {}
+                daily_levels[date_str] = {}
             daily_hourly[date_str][hour] = predicted_kwh
+            daily_levels[date_str][hour] = level
 
         result: Dict[str, DailyForecast] = {}
         for date_str, hourly in daily_hourly.items():
@@ -886,6 +1024,7 @@ from(bucket: "{weather_bucket}")
                 total_kwh=total,
                 hourly=hourly,
                 source="model",
+                hourly_levels=daily_levels.get(date_str, {}),
             )
 
         if result:
@@ -1043,12 +1182,18 @@ from(bucket: "{weather_bucket}")
                     all_hours |= set(s.hourly.keys())
 
                 for hour in all_hours:
-                    # Only trust a model 0 when the hour is genuinely PRESENT in
-                    # the model (sun below horizon). A MISSING hour (e.g. a dropped
-                    # weather entry) must NOT be conflated with a real zero — fall
-                    # through to averaging the other sources instead of discarding
-                    # their positive PV.
-                    if hour in model.hourly and model.hourly[hour] <= 0:
+                    model_level = model.hourly_levels.get(hour, "")
+                    # Only veto with a model 0 when the model says the zero is
+                    # GENUINE (sun below the horizon). A MISSING hour (e.g. a
+                    # dropped weather entry), a GHI=0-with-sun-up hour
+                    # ("no_radiation" — often just a missing radiation entry)
+                    # or a zero out of a sparse bin must NOT discard the other
+                    # sources' positive PV — fall through to normal handling,
+                    # where a 0 model value diverges from positive others
+                    # (divergence denominator (model+others)/2 > 0) and the
+                    # hour resolves to avg_others.
+                    if (hour in model.hourly and model.hourly[hour] <= 0
+                            and model_level == "below_horizon"):
                         hourly[hour] = 0
                         continue
                     model_val = model.hourly.get(hour, 0)
@@ -1069,11 +1214,18 @@ from(bucket: "{weather_bucket}")
                             # Agreement: average all sources
                             all_vals = [model_val] + other_vals
                             hourly[hour] = sum(all_vals) / len(all_vals)
-                        elif model_val >= avg_others:
-                            # Model predicts more: trust it (real installation data)
+                        elif model_val > 0 and model_level in ("3d", "2d"):
+                            # Divergent, but the value comes from a well-
+                            # supported bin (real installation data, ≥
+                            # MIN_2D_TRUST_SAMPLES samples — "2d_sparse" does
+                            # NOT qualify): trust the model in BOTH directions.
+                            # (Taking whichever was HIGHER here was a
+                            # structural over-forecast bias.)
                             hourly[hour] = model_val
                         else:
-                            # Model predicts much less: sparse bin, use other sources
+                            # Sparse bin (2d_sparse/interpolate/global/unknown
+                            # level) or a non-horizon zero: weak support, use
+                            # the others
                             hourly[hour] = avg_others
 
                 total = sum(hourly.values())
@@ -1116,6 +1268,7 @@ from(bucket: "{weather_bucket}")
         influxdb_client: Any,
         bucket: str,
         days: int = 30,
+        local_tz: Any = None,
     ) -> None:
         """Auto-tune confidence factor by comparing past forecasts with actual production.
 
@@ -1127,16 +1280,19 @@ from(bucket: "{weather_bucket}")
             influxdb_client: Async InfluxDB client
             bucket: Solar InfluxDB bucket name
             days: Number of past days to compare (default 30)
+            local_tz: Local timezone for keying window-start timestamps onto
+                the local calendar day (forecasts are local-day keyed)
         """
         try:
             # Get actual daily production using TodayGenerateEnergy (inverter's own
             # daily total). Exclude today (-1d stop) to avoid comparing a partial
-            # day's actual against a full day's forecast.
+            # day's actual against a full day's forecast. timeSrc:"_start" so each
+            # window is stamped with the day it covers, not the next day.
             query = f'''
 from(bucket: "{bucket}")
   |> range(start: -{days}d, stop: -1d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "TodayGenerateEnergy")
-  |> aggregateWindow(every: 1d, fn: max, createEmpty: false)
+  |> aggregateWindow(every: 1d, fn: max, createEmpty: false, timeSrc: "_start")
   |> filter(fn: (r) => r._value > 1)
 '''
             result = await influxdb_client.query(query)
@@ -1147,14 +1303,39 @@ from(bucket: "{bucket}")
             # Daily production totals (already in kWh from inverter)
             # Use max() in case of multiple entries per day
             actual_by_day: Dict[str, float] = {}
+            window_start_by_day: Dict[str, datetime] = {}
             for table in result:
                 for record in table.records:
-                    day = record.get_time().strftime("%Y-%m-%d")
+                    t_raw = record.get_time()
+                    t = t_raw
+                    # Window-start timestamps are UTC; key on the LOCAL date
+                    # so the day label matches the local-day forecasts.
+                    if local_tz is not None and getattr(t, "tzinfo", None) is not None:
+                        t = t.astimezone(local_tz)
+                    day = t.strftime("%Y-%m-%d")
                     val = record.get_value()
                     if not isinstance(val, (int, float)):
                         continue  # skip None/empty aggregate (would crash max cmp)
                     if day not in actual_by_day or val > actual_by_day[day]:
                         actual_by_day[day] = val
+                    prev = window_start_by_day.get(day)
+                    if prev is None or t_raw > prev:
+                        window_start_by_day[day] = t_raw
+
+            # Windows are stamped at their START; day windows align to day
+            # boundaries but the -1d range stop almost never does, so the
+            # FINAL window is usually a truncated partial day. A window is
+            # complete only when the full day fits before the stop — drop the
+            # rest so the recency weighting below (newest day weighs most)
+            # never anchors on a partial day's total.
+            for day, t0 in window_start_by_day.items():
+                now_ref = (
+                    datetime.now(timezone.utc)
+                    if getattr(t0, "tzinfo", None) is not None
+                    else datetime.now()
+                )
+                if t0 + timedelta(days=1) > now_ref - timedelta(days=1):
+                    actual_by_day.pop(day, None)
 
             if not actual_by_day:
                 return
@@ -1254,12 +1435,14 @@ from(bucket: "{bucket}")
         from datetime import date as _date
         today = _date.today()
         total_kwp = sum(a.kwp for a in self.arrays)
+        has_current = False
         for forecast in self._consensus.values():
             # Skip stale past-dated entries that were never evicted from the
             # consensus pool — a yesterday forecast must not gate today's
             # reliability decision.
             if forecast.date < today:
                 continue
+            has_current = True
             day_of_year = forecast.date.timetuple().tm_yday
             if 91 <= day_of_year <= 273:  # April-September
                 min_kwh = total_kwp * 0.3
@@ -1268,7 +1451,9 @@ from(bucket: "{bucket}")
             if total_kwp > 5 and forecast.total_kwh < min_kwh:
                 return False
 
-        return True
+        # Only stale past-dated entries → nothing covering today/tomorrow to
+        # base decisions on; that is NOT a reliable forecast.
+        return has_current
 
     # --- Public interface ---
 
@@ -1398,7 +1583,7 @@ from(bucket: "{bucket}")
 from(bucket: "{bucket}")
   |> range(start: -{lookback_hours + 1}h)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "{field}")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             result = await influxdb_client.query(q)
             if result:
@@ -1526,7 +1711,7 @@ from(bucket: "{bucket}")
 from(bucket: "{bucket}")
   |> range(start: -{lookback_hours + 1}h)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "InputPower")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
             result = await influxdb_client.query(q)
             actual_by_hour: Dict[int, float] = {}

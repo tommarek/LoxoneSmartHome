@@ -46,7 +46,9 @@ except Exception:
 # v2: training/prediction now bucket InfluxDB UTC timestamps into local time.
 # v3: inverter_on carry-forward also converts change records to local (was
 #     comparing local hour-keys against UTC change timestamps).
-ML_MODEL_SCHEMA_VERSION = 3
+# v4: hourly aggregates are start-labeled (timeSrc: "_start") — the default
+#     stop-labeling shifted every hour key +1h; lags extended to 48h/168h.
+ML_MODEL_SCHEMA_VERSION = 4
 
 
 class MLConsumptionForecast:
@@ -57,6 +59,12 @@ class MLConsumptionForecast:
         self._forecaster = None
         self._last_train_time: Optional[datetime] = None
         self._last_train_index_end: Optional[datetime] = None
+        # Set on EVERY build attempt (success or failure). The controller
+        # polls needs_rebuild() every minute, so a failing build (cold start,
+        # InfluxDB outage) must back off instead of re-running heavy 365-day
+        # queries on every poll.
+        self._last_build_attempt: Optional[datetime] = None
+        self.failed_build_backoff_seconds: int = 3600
         self._exog_cols: List[str] = []
         self._schema_version: int = 0
         # The (forecaster, training-end) pair read by predict_hourly, which runs
@@ -83,6 +91,8 @@ class MLConsumptionForecast:
         training-end cannot meaningfully "skip ahead" many days, so it must be
         refreshed often to keep the prediction horizon close to now.
         """
+        if self._failed_attempt_recently():
+            return False
         if self._forecaster is None or self._last_train_time is None:
             return True
         if self._schema_version != ML_MODEL_SCHEMA_VERSION:
@@ -90,17 +100,42 @@ class MLConsumptionForecast:
         age = (datetime.now() - self._last_train_time).total_seconds()
         return age > max_age_days * 86400
 
+    def _failed_attempt_recently(self) -> bool:
+        """True if the last build attempt failed within the backoff window."""
+        if self._last_build_attempt is None:
+            return False
+        if (
+            self._last_train_time is not None
+            and self._last_train_time >= self._last_build_attempt
+        ):
+            return False  # last attempt succeeded — normal cadence applies
+        age = (datetime.now() - self._last_build_attempt).total_seconds()
+        return age < self.failed_build_backoff_seconds
+
     @staticmethod
     def _build_exog(timestamps, temps_lookup: Dict[str, float]):
-        """Build the exogenous feature dataframe aligned to `timestamps`."""
+        """Build the exogenous feature dataframe aligned to `timestamps`.
+
+        Hours missing from `temps_lookup` fall back to the mean of the
+        available training temperatures. NOTE: over a full training year
+        that mean is ≈10°C in CZ anyway — this mainly avoids a hardcoded
+        constant; the real per-hour improvement is in the PREDICTION path,
+        which uses the nearest available hour's temperature
+        (_fallback_temperature). 10°C is used only when no temperatures are
+        available at all.
+        """
         import pandas as pd  # type: ignore
+        if temps_lookup:
+            default_temp = sum(temps_lookup.values()) / len(temps_lookup)
+        else:
+            default_temp = 10.0
         rows = []
         for ts in timestamps:
             key = ts.strftime("%Y-%m-%d-%H")
             rows.append({
                 "hour": ts.hour,
                 "weekday": ts.weekday(),
-                "temp": temps_lookup.get(key, 10.0),
+                "temp": temps_lookup.get(key, default_temp),
             })
         return pd.DataFrame(rows, index=timestamps)
 
@@ -115,16 +150,20 @@ class MLConsumptionForecast:
         difference (1-2h) and the consumption peak lands in the wrong block.
         """
         self._local_tz = local_tz
+        # Record the attempt up front so needs_rebuild() can back off if this
+        # attempt fails (missing deps, query error, too little data, ...).
+        self._last_build_attempt = datetime.now()
         if not SKFORECAST_AVAILABLE:
             self.logger.info(
                 "skforecast not installed — ML consumption forecaster disabled"
             )
             return False
 
-        # Quantile to forecast: 0.5 = median (RandomForest, the default). A
-        # higher value forecasts an upper bound on demand (quantile gradient
-        # boosting) so the optimizer keeps a larger reserve. Read defensively
-        # so a missing/old settings object just yields the median behaviour.
+        # Quantile to forecast: 0.5 = the default RandomForest, which predicts
+        # the conditional MEAN (not a true median). A higher value forecasts
+        # an upper bound on demand (quantile gradient boosting) so the
+        # optimizer keeps a larger reserve. Read defensively so a missing/old
+        # settings object just yields the default (mean) behaviour.
         try:
             quantile = float(
                 getattr(
@@ -148,13 +187,13 @@ class MLConsumptionForecast:
 from(bucket: "{bucket_solar}")
   |> range(start: -365d)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "INVPowerToLocalLoad")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
         temperature_query = f'''
 from(bucket: "{bucket_loxone}")
   |> range(start: -365d)
   |> filter(fn: (r) => r._measurement == "temperature" and r._field == "temperature_outside")
-  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false)
+  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")
 '''
         inverter_on_query = f'''
 from(bucket: "{bucket_solar}")
@@ -238,14 +277,64 @@ from(bucket: "{bucket_solar}")
         # Reindex to hourly and forward-fill small gaps; bail if too gappy.
         y_series = y_series.sort_index()
         y_full = y_series.asfreq("1h")
+        # Gap policy, measured on the RAW hourly series before any filling
+        # (measuring after a partial interpolate under-reports the true
+        # outage length): bridging a contiguous gap >24h would fabricate
+        # training data (paired with default temps), but declining outright
+        # would disable the ML engine for up to a YEAR after a single long
+        # outage anywhere in the 365-day window (temp-sensor outage,
+        # inverter-off stretch, vacation — common events), retried hourly
+        # with the heavy 365-day queries. Instead, TRUNCATE to the
+        # contiguous data AFTER the most recent >24h gap and train on that;
+        # decline only if too little remains. Small gaps (≤24h) on the
+        # surviving series are interpolated; short ragged edges (which
+        # interpolation can't reach) get bounded ffill/bfill.
+        min_train_hours = 24 * 14  # same floor as the clean-hours check
+        na_mask = y_full.isna()
+        if na_mask.any():
+            # Contiguous NaN runs: id -> length in hours.
+            run_ids = (~na_mask).cumsum()[na_mask]
+            run_lengths = run_ids.value_counts()
+            long_runs = run_lengths[run_lengths > 24]
+            if not long_runs.empty:
+                # End (last NaN hour) of the MOST RECENT >24h gap; keep only
+                # the contiguous data after it.
+                gap_end = run_ids[run_ids.isin(long_runs.index)].index.max()
+                kept = y_full.index > gap_end
+                dropped = int((~kept).sum())
+                y_full = y_full[kept]
+                if len(y_full) < min_train_hours:
+                    self.logger.info(
+                        f"ML training: only {len(y_full)}h of contiguous "
+                        f"data after the most recent >24h gap (ends "
+                        f"{gap_end}) — need ≥{min_train_hours}h, declining"
+                    )
+                    return False
+                self.logger.info(
+                    f"ML training: {len(long_runs)} contiguous gap(s) >24h "
+                    f"(longest {int(run_lengths.max())}h) — truncated "
+                    f"{dropped}h ending {gap_end}, training on the "
+                    f"{len(y_full)}h after it"
+                )
         if y_full.isna().mean() > 0.3:
             self.logger.info(
                 f"ML training: too many gaps ({y_full.isna().mean():.0%}) "
                 f"in hourly series — skipping"
             )
             return False
-        # Interpolate the small remaining gaps.
-        y_full = y_full.interpolate(limit=6).ffill().bfill()
+        na_mask = y_full.isna()
+        if na_mask.any():
+            y_full = y_full.interpolate(limit=24)
+            # Bounded fills for the series edges (leading NaNs can't be
+            # interpolated forward).
+            y_full = y_full.ffill(limit=3).bfill(limit=3)
+            if y_full.isna().any():
+                self.logger.info(
+                    "ML training: NaNs remain after bounded gap-filling "
+                    "(unfillable series edge) — declining (recursive "
+                    "forecaster needs a regular series)"
+                )
+                return False
 
         exog = self._build_exog(y_full.index, temp_by_hour)
 
@@ -261,13 +350,16 @@ from(bucket: "{bucket_solar}")
                 regressor = RandomForestRegressor(
                     n_estimators=60, max_depth=10, n_jobs=-1, random_state=0
                 )
+            # Lags: the full last day, plus the same hour 2 days and 1 week
+            # back — lags=24 alone cannot see last week's pattern.
+            lags = list(range(1, 25)) + [48, 168]
             # skforecast renamed the first constructor arg from `regressor`
             # (<=0.13) to `estimator` (>=0.14). Support both so the module
             # works across the version range pinned in requirements.
             try:
-                fc = ForecasterRecursive(estimator=regressor, lags=24)
+                fc = ForecasterRecursive(estimator=regressor, lags=lags)
             except TypeError:
-                fc = ForecasterRecursive(regressor=regressor, lags=24)
+                fc = ForecasterRecursive(regressor=regressor, lags=lags)
             fc.fit(y=y_full, exog=exog)
             return fc
 
@@ -291,11 +383,12 @@ from(bucket: "{bucket_solar}")
         self._predict_state = (forecaster, self._last_train_index_end)
         model_kind = (
             f"quantile GBR (α={quantile:.2f})" if quantile > 0.5
-            else "median RandomForest"
+            else "mean RandomForest"
         )
         self.logger.info(
             f"ML consumption model trained: {len(y_full)} hours, "
-            f"lags=24, {len(self._exog_cols)} exog features, {model_kind}"
+            f"lags=1-24,48,168, {len(self._exog_cols)} exog features, "
+            f"{model_kind}"
         )
         return True
 
@@ -352,9 +445,14 @@ from(bucket: "{bucket_solar}")
                 )
                 return {}
             idx = pd.date_range(start=start, periods=need_steps, freq="1h")
+            # Missing forecast hours fall back to the nearest available
+            # hour's temperature (10°C only when no temps exist at all).
+            from .consumption_forecast import _fallback_temperature
             temps_lookup = {
                 f"{t.year:04d}-{t.month:02d}-{t.day:02d}-{t.hour:02d}":
-                    forecast_temps.get(t.hour, 10.0)
+                    forecast_temps.get(
+                        t.hour, _fallback_temperature(forecast_temps, t.hour)
+                    )
                 for t in idx
             }
             exog = self._build_exog(idx, temps_lookup)

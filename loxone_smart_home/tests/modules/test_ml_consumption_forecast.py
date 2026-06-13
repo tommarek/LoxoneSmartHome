@@ -64,6 +64,33 @@ class FakeInfluxClient:
         return []
 
 
+class GappyInfluxClient(FakeInfluxClient):
+    """FakeInfluxClient with an outage hole in the middle.
+
+    The hole spans GAP_HOURS from GAP_START. The gap policy measures
+    contiguous NaN runs on the RAW hourly series (before any filling):
+    a >24h gap TRUNCATES training to the contiguous data after the most
+    recent such gap (declining only when <336h remain); ≤24h is bridged
+    by interpolate(limit=24).
+    """
+
+    GAP_START_HOURS = 24 * 10
+    GAP_HOURS = 24 * 4
+
+    async def query(self, q):
+        tables = await super().query(q)
+        if "inverter_state" in q or not tables:
+            return tables
+        start = datetime(2026, 1, 1, 0, 0, 0)
+        gap_lo = start + timedelta(hours=self.GAP_START_HOURS)
+        gap_hi = gap_lo + timedelta(hours=self.GAP_HOURS)
+        recs = [
+            r for r in tables[0].records
+            if not (gap_lo <= r.get_time() < gap_hi)
+        ]
+        return [FakeTable(recs)]
+
+
 def make_settings():
     return SimpleNamespace(
         influxdb=SimpleNamespace(bucket_solar="solar", bucket_loxone="loxone")
@@ -171,3 +198,157 @@ def test_needs_rebuild_default_one_day():
     m = MLConsumptionForecast()
     # Untrained → always rebuild.
     assert m.needs_rebuild() is True
+
+
+@pytest.mark.asyncio
+async def test_queries_use_start_labeled_windows(monkeypatch):
+    """aggregateWindow must be start-labeled (timeSrc: "_start").
+
+    The Flux default stamps each window with its STOP time, shifting every
+    hour key +1h and delaying the whole predicted load profile.
+    """
+    pytest.importorskip("pandas")
+    import modules.growatt.ml_consumption_forecast as mod
+    # Force past the availability gate so the queries are actually issued;
+    # the empty results bail out long before skforecast is touched.
+    monkeypatch.setattr(mod, "SKFORECAST_AVAILABLE", True)
+
+    captured = []
+
+    class RecordingClient:
+        async def query(self, q):
+            captured.append(q)
+            return []
+
+    m = MLConsumptionForecast()
+    ok = await m.build_model(RecordingClient(), make_settings())
+    assert ok is False  # no data — but the queries were issued
+
+    agg_queries = [q for q in captured if "aggregateWindow" in q]
+    assert len(agg_queries) == 2  # consumption + temperature
+    for q in agg_queries:
+        assert 'timeSrc: "_start"' in q
+
+
+@pytest.mark.asyncio
+async def test_needs_rebuild_backoff_after_failed_build():
+    """A failed training attempt must not be retried on every poll."""
+    m = MLConsumptionForecast()
+    # Fails regardless of environment: without skforecast at the availability
+    # gate, with skforecast at the 2-week-minimum data check.
+    ok = await m.build_model(FakeInfluxClient(days=3), make_settings())
+    assert ok is False
+
+    # Within the backoff window: no retry, despite being untrained.
+    assert m.needs_rebuild() is False
+
+    # After the window expires the rebuild is wanted again.
+    m._last_build_attempt = datetime.now() - timedelta(
+        seconds=m.failed_build_backoff_seconds + 1
+    )
+    assert m.needs_rebuild() is True
+
+
+def test_needs_rebuild_success_cadence_unchanged():
+    """A SUCCESSFUL build keeps the existing 1-day retrain cadence."""
+    m = MLConsumptionForecast()
+    # Simulate a successful build: attempt recorded, then training completed.
+    m._forecaster = object()
+    m._schema_version = ML_MODEL_SCHEMA_VERSION
+    m._last_build_attempt = datetime.now() - timedelta(seconds=10)
+    m._last_train_time = datetime.now()
+    assert m.needs_rebuild() is False
+
+    # Two days later it retrains (backoff must not mask a stale success).
+    m._last_build_attempt = datetime.now() - timedelta(days=2)
+    m._last_train_time = datetime.now() - timedelta(days=2, seconds=-10)
+    assert m.needs_rebuild() is True
+
+
+@pytest.mark.skipif(not SKFORECAST_AVAILABLE, reason="skforecast not installed")
+@pytest.mark.asyncio
+async def test_build_truncates_at_long_gap_and_trains():
+    """A >24h contiguous RAW gap no longer declines outright — it truncates
+    to the contiguous data AFTER the gap and trains on that.
+
+    Declining outright disabled the ML engine for up to a year after a
+    single long outage anywhere in the 365-day window. With the gap at day
+    10 of 30 (4-day hole), 16 days (384h ≥ 336h) survive after it.
+    """
+    from unittest.mock import MagicMock
+    logger = MagicMock()
+    m = MLConsumptionForecast(logger=logger)
+    ok = await m.build_model(GappyInfluxClient(days=30), make_settings())
+    assert ok is True
+    assert m.is_trained is True
+    # The truncation is logged (what was dropped, what remains).
+    assert any(
+        "truncated" in str(c.args[0])
+        for c in logger.info.call_args_list
+    )
+    # Training end is the last hour of the synthetic series (Jan 30 23:00 —
+    # 30 days of hourly data starting Jan 1 00:00).
+    assert m._last_train_index_end == datetime(2026, 1, 30, 23, 0, 0)
+
+
+class ThirtyHourGapClient(GappyInfluxClient):
+    """30h gap "months ago": plenty of contiguous data remains after it."""
+    GAP_HOURS = 30
+    GAP_START_HOURS = 24 * 5  # post-gap: 30d*24 - 150h = 570h ≥ 336h
+
+
+class RecentThirtyHourGapClient(GappyInfluxClient):
+    """30h gap ending ~5 days before the end of the window: only 120h of
+    contiguous data survive after it — below the 336h minimum."""
+    GAP_HOURS = 30
+    GAP_START_HOURS = 30 * 24 - 30 - 24 * 5  # gap ends 5 days before end
+
+
+@pytest.mark.skipif(not SKFORECAST_AVAILABLE, reason="skforecast not installed")
+@pytest.mark.asyncio
+async def test_build_trains_on_data_after_old_30h_gap():
+    """A 30h gap months back must NOT disable the engine — training uses
+    the post-gap contiguous data (≥336h remain)."""
+    m = MLConsumptionForecast()
+    ok = await m.build_model(ThirtyHourGapClient(days=30), make_settings())
+    assert ok is True
+    assert m.is_trained is True
+
+
+@pytest.mark.asyncio
+async def test_build_declines_on_recent_30h_gap(monkeypatch):
+    """A 30h gap 5 days ago leaves only 120h of post-gap data (<336h) —
+    truncation can't help, training declines.
+
+    Also pins the raw-measurement semantics: the 30h outage must be
+    DETECTED as a long gap on the RAW series (a partial interpolate first
+    would under-report it as 24h).
+    """
+    pytest.importorskip("pandas")
+    import modules.growatt.ml_consumption_forecast as mod
+    # The decline happens before any skforecast use; force past the
+    # availability gate so the gap logic is exercised even without it.
+    monkeypatch.setattr(mod, "SKFORECAST_AVAILABLE", True)
+
+    m = MLConsumptionForecast()
+    ok = await m.build_model(RecentThirtyHourGapClient(days=30), make_settings())
+    assert ok is False
+    assert m.is_trained is False
+
+
+class ModerateGapClient(GappyInfluxClient):
+    GAP_HOURS = 20
+
+
+@pytest.mark.skipif(not SKFORECAST_AVAILABLE, reason="skforecast not installed")
+@pytest.mark.asyncio
+async def test_build_trains_through_moderate_gap():
+    """Gaps ≤24h are bridged (interpolate(limit=24)) and train fine.
+
+    The old interpolate(limit=6) + ffill/bfill(limit=3) could only bridge
+    12h, so 13-24h gaps declined with a misleading message.
+    """
+    m = MLConsumptionForecast()
+    ok = await m.build_model(ModerateGapClient(days=30), make_settings())
+    assert ok is True
+    assert m.is_trained is True

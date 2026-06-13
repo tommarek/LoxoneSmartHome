@@ -36,7 +36,9 @@ and house load — and we maximise net cash. Modelling every flow explicitly
                                 - (batt_to_load + batt_to_grid)/η_dis
     power:  grid_charge + solar_to_batt <= charge_max
             batt_to_load + batt_to_grid <= discharge_max * (1 - is_charge)
-    reserve: soc[i+1] >= effective_min_soc[i]
+    reserve: soc[i+1] >= effective_min_soc[i] - reserve_short[i]   (SOFT —
+            penalised at RESERVE_SHORTFALL_FLOOR, which is deliberately 0;
+            the only HARD battery floor is min_soc via the soc var bounds)
 
   Objective (maximise):
     + solar_to_grid * (spot - fee)               solar export (no dist, no wear)
@@ -133,12 +135,12 @@ MIN_GRID_DISCHARGE_FRACTION = 0.5
 # incident). So this is 0: the only hard battery floor is min_soc (the soc var
 # lower bound); the reserve is the model's economic decision, not a heuristic.
 #
-# IMPORTANT: keep this 0 until the reserve-floor loss convention is unified with
-# the MILP SOC dynamics. The shared _compute_reserve_soc_per_block helper models
-# losses with the FULL round-trip efficiency, while MILP SOC continuity uses the
-# sqrt-split per-leg eta — so eff_min_kwh and the soc it constrains use different
-# conventions. That mismatch is inert only because this penalty is 0; making it
-# nonzero would apply a (~sqrt-scale) mis-scaled soft floor.
+# NOTE: the loss conventions ARE now unified — the shared
+# _compute_reserve_soc_per_block helper and the greedy SOC simulation both use
+# the sqrt-split per-leg eta, the same convention as the MILP SOC continuity,
+# so eff_min_kwh and the soc it constrains finally agree. Keep this 0 anyway:
+# the per-block double-counting/snowball incident rationale above stands
+# regardless of the (now consistent) scaling.
 RESERVE_SHORTFALL_FLOOR = 0.0
 
 
@@ -201,6 +203,29 @@ class MILPBatteryOptimizer:
 
     def summarize(self, decisions: List[BlockDecision]) -> Dict:
         return self._helper.summarize(decisions)
+
+    @staticmethod
+    def _has_feasible_incumbent(prob: Any) -> bool:
+        """True when a non-Optimal solve still left a usable solution loaded.
+
+        A CBC time-limit incumbent comes back with sol_status
+        LpSolutionIntegerFeasible (and the variable values ARE loaded), but
+        LpStatus can read "Not Solved" depending on the sol-file wording.
+        Attribute access is guarded so pulp versions without these constants
+        simply take the strict greedy-fallback path.
+        """
+        try:
+            sol_status = getattr(prob, "sol_status", None)
+            feasible = getattr(
+                pulp.constants, "LpSolutionIntegerFeasible", None
+            )
+            return (
+                sol_status is not None
+                and feasible is not None
+                and sol_status == feasible
+            )
+        except Exception:
+            return False
 
     def _greedy_fallback(self, blocks, solar_hourly, consumption_hourly,
                          distribution_func, battery_capacity_kwh, current_soc,
@@ -342,7 +367,15 @@ class MILPBatteryOptimizer:
         # pinning soc[0]. Telemetry can report e.g. 100% while max_soc=90;
         # an out-of-bounds start makes soc[0] == start_battery_kwh infeasible
         # against the soc variable bounds, silently forcing greedy fallback
-        # every tick.
+        # every tick. A below-floor reading is clamped UP here (relaxing the
+        # soc[0] bound risks infeasibility) — warn, because the plan then
+        # credits energy the battery doesn't actually hold until it recovers.
+        if current_soc < min_soc:
+            self.logger.warning(
+                f"Live SOC {current_soc:.1f}% is below min_soc {min_soc:.1f}% — "
+                f"clamping soc[0] up to keep the LP feasible; the plan may "
+                f"briefly credit unavailable energy until the SOC recovers"
+            )
         current_soc = max(min_soc, min(max_soc, current_soc))
 
         n = len(blocks)
@@ -363,7 +396,9 @@ class MILPBatteryOptimizer:
 
         # Split the round-trip efficiency symmetrically across the two legs so
         # both charging and discharging incur loss (eta_chg * eta_dis ==
-        # efficiency). The greedy engine applies all loss on the charge leg;
+        # efficiency). The greedy engine's SOC simulation and the shared
+        # reserve helper use the SAME sqrt-split per-leg convention, so both
+        # engines' SOC trajectories and reserve floors are scaled identically;
         # sqrt-splitting is closer to real inverter behaviour and makes the
         # cost of a charge→discharge cycle independent of which leg you price.
         eta = max(1e-3, efficiency) ** 0.5
@@ -489,6 +524,12 @@ class MILPBatteryOptimizer:
             # can't bank self-consumption value the hardware won't realise (the
             # deficit is served from grid there) — keeps plan and actuation aligned.
             prob += batt_to_load[i] <= batt_out_max * (1 - is_sp[i])
+            # Battery-passive also means no CHARGING: with stop_soc pinned to the
+            # live SOC the inverter won't bank surplus solar either, so a planned
+            # solar_to_batt on an is_sp block would promise an SOC rise the
+            # hardware never delivers. Forbid it — the solver must pick export
+            # (is_sp) OR banking per block, never both.
+            prob += solar_to_batt[i] <= charge_max * (1 - is_sp[i])
 
             # SOC continuity: charge legs gain energy at η_chg; discharge legs
             # deplete the battery at 1/η_dis (wear is priced in the objective).
@@ -653,9 +694,19 @@ class MILPBatteryOptimizer:
                 deferrable_loads, sell_production_min_soc_margin,
                 battery_amortisation_export_czk=battery_amortisation_export_czk,
             )
-        if status_str != "Optimal":
-            # Infeasible / Unbounded / Undefined / timed-out without an optimum:
-            # delegate to greedy so the controller still gets a usable plan.
+        if status_str != "Optimal" and self._has_feasible_incumbent(prob):
+            # CBC hit the time limit but left an integer-feasible incumbent
+            # (variable values ARE loaded in that case). Depending on the
+            # sol-file wording PuLP reports this as "Not Solved" — a good 10s
+            # solution we should use, not discard. Accept it with a note.
+            self.logger.warning(
+                f"MILP solver hit the time limit with status {status_str} — "
+                f"using the integer-feasible incumbent (not proven optimal)"
+            )
+        elif status_str != "Optimal":
+            # Infeasible / Unbounded / Undefined / timed-out without an
+            # incumbent: delegate to greedy so the controller still gets a
+            # usable plan.
             self.logger.warning(
                 f"MILP solver returned status {status_str} — "
                 f"falling back to greedy engine"
@@ -794,8 +845,16 @@ class MILPBatteryOptimizer:
             if block_energy <= 0 or requested <= 0:
                 continue
 
-            # In-window block indices (uses the load's own midnight-aware test).
-            win = [i for i in range(n) if load.in_window(blocks[i][0].time())]
+            # In-window block indices, clamped to the FIRST window instance:
+            # the price horizon spans ~32h, so a time-of-day test alone also
+            # matches tomorrow's window and the solver would place blocks past
+            # the current cycle's deadline (energy silently never delivered —
+            # the cycle rollover resets accounting).
+            from .deferrable_loads import filter_to_current_window_instance
+            allowed = set(
+                filter_to_current_window_instance([b[0] for b in blocks], load)
+            )
+            win = [i for i in range(n) if blocks[i][0] in allowed]
             if not win:
                 meta.append({
                     "load": load, "requested": requested, "scheduled": 0,
