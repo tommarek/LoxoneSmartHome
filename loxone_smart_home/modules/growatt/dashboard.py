@@ -180,10 +180,9 @@ async def api_status(request: web.Request) -> web.Response:
     current_distribution_czk = 0.0
     if current_block:
         from .decision_engine import GrowattDecisionEngine
-        # Use the shared factory (live config) rather than re-hardcoding
-        # charge/discharge thresholds — only the distribution + low_tariff_hours
-        # fields feed _get_distribution_tariff, but a single source avoids stale
-        # inline literals a future reader could mistake for live config.
+        # Use the shared factory (live config). Only the distribution +
+        # low_tariff_hours fields feed _get_distribution_tariff, but keeping a
+        # single source keeps the thresholds in sync with live config.
         _th = _make_price_thresholds(ctrl)
         current_distribution_czk = GrowattDecisionEngine._get_distribution_tariff(
             int(current_block[0].split(":")[0]), _th
@@ -383,10 +382,9 @@ def _build_price_rows(
     whether ``is_current`` can be True — so both call this single builder.
     """
     from .decision_engine import GrowattDecisionEngine
-    # Reuse the shared factory (reads the live config) rather than re-hardcoding
-    # charge/discharge thresholds; only the distribution + low_tariff_hours
-    # fields feed _get_distribution_tariff below, but keeping a single source
-    # avoids a future reader trusting stale inline literals as live config.
+    # Reuse the shared factory (reads the live config). Only the distribution +
+    # low_tariff_hours fields feed _get_distribution_tariff below, but keeping a
+    # single source keeps the thresholds in sync with live config.
     thresholds = _make_price_thresholds(ctrl)
     rows = []
     for (start, end), price_czk in sorted(price_items):
@@ -791,16 +789,16 @@ async def _today_grid_economics(ctrl) -> Optional[GridEconomicsResult]:
     Integrates the inverter's cumulative energy meters (EnergyToUserToday /
     EnergyToGridToday) differenced per 15-min block against THAT block's real
     price — import pays spot+distribution, export earns spot-sell_fee (no
-    distribution). This is the meter-accurate cost; the daily-average estimate it
-    replaces multiplied total kWh by the day's average spot, which badly mis-
-    prices energy bought/sold in cheap or negative windows (could even flip the
-    sign). Returns a GridEconomicsResult or None on any failure (caller falls
-    back to the rough estimate). import_cost can be NEGATIVE when you were net
-    paid to import (negative spot beating distribution).
+    distribution). This is the meter-accurate cost: pricing per block correctly
+    values energy bought/sold in cheap or negative windows (a daily-average price
+    would mis-price these and could even flip the sign). Returns a
+    GridEconomicsResult or None on any failure (caller falls back to the rough
+    estimate). import_cost can be NEGATIVE when you were net paid to import
+    (negative spot beating distribution).
 
     Blocks whose price key doesn't match exactly are priced via the nearest
     available block (then day-average) and COUNTED in dropped_blocks/dropped_kwh
-    — never silently dropped, which previously made import cost read too low.
+    so their energy still contributes to the import cost.
     """
     if not getattr(ctrl, "influxdb_client", None) or not ctrl._current_prices:
         return None
@@ -893,8 +891,9 @@ async def _today_grid_economics(ctrl) -> Optional[GridEconomicsResult]:
         # today is counted. Drop the stop-label artifact at exactly 00:00 (the
         # 23:45-00:00 window's fn:last carries YESTERDAY's pre-reset cumulative,
         # mislabeled today 00:00) — otherwise the opening delta is negative and
-        # skipped. Only when tz is available (mixing naive/aware would break the
-        # sort); without tz we keep the old behaviour (tiny opening undercount).
+        # skipped. Only applied when tz is available (mixing naive/aware would
+        # break the sort); without tz the opening block is left unseeded (tiny
+        # opening undercount).
         if tz is None or not points:
             return sorted(points)
         midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1499,8 +1498,8 @@ async def _build_economics(ctrl, opt, include_periods: bool = False) -> Dict[str
     """Consolidated today-economics dict shared by /api/economics and /api/insights.
 
     All four numbers computed from meters/actuals (never net_value scores), each
-    tagged with a source/accuracy flag. The legacy keys plan_value_czk and
-    arbitrage_czk are retained as None for the old frontend during migration.
+    tagged with a source/accuracy flag. The keys plan_value_czk and
+    arbitrage_czk are kept as None for frontend compatibility.
     """
     econ: Dict[str, Any] = {}
     acc: Dict[str, str] = {}
@@ -1525,7 +1524,7 @@ async def _build_economics(ctrl, opt, include_periods: bool = False) -> Dict[str
         acc["net_cost"] = "meter_integrated"
         econ["estimated"] = False
     else:
-        # Rough daily-average fallback (legacy behaviour) when integration fails.
+        # Rough daily-average fallback when meter integration fails.
         tel = _get_live_telemetry()
         export_kwh = tel.get("EnergyToGridToday", 0) or 0
         import_kwh = tel.get("EnergyToUserToday", 0) or 0
@@ -1583,12 +1582,11 @@ async def _build_economics(ctrl, opt, include_periods: bool = False) -> Dict[str
     if eg is not None:
         acc["expected_daily_gain"] = "plan_projection"
 
-    # --- Deprecated legacy fields for the old frontend ---
-    # plan_value_czk summed net_value, which historically mixed CZK and CZK/kWh
-    # units across engines (dimensionally wrong) — kept null. arbitrage_czk used to
-    # price free solar as if grid-bought; it is now ALIASED to the new meter-
-    # accurate batt_net_arbitrage_czk (or None when that's unavailable) so the old
-    # frontend, which reads arbitrage_czk only as a fallback, gets a correct value.
+    # --- Compatibility fields for the frontend ---
+    # plan_value_czk is kept null: summing net_value mixes CZK and CZK/kWh units
+    # across engines (dimensionally wrong). arbitrage_czk is ALIASED to the
+    # meter-accurate batt_net_arbitrage_czk (or None when unavailable) so the
+    # frontend, which reads arbitrage_czk as a fallback, gets a correct value.
     econ["plan_value_czk"] = None
     econ["arbitrage_czk"] = econ.get("batt_net_arbitrage_czk")
 
@@ -1725,8 +1723,8 @@ async def api_insights(request: web.Request) -> web.Response:
 
     # ---- Economics (today) — consolidated, meter/actuals-based, source-flagged.
     #      Shared with /api/economics via _build_economics so the two never
-    #      diverge. Old keys (plan_value_czk/arbitrage_czk) kept null for the
-    #      legacy frontend during migration. ----
+    #      diverge. Compatibility keys (plan_value_czk/arbitrage_czk) per
+    #      _build_economics. ----
     out["economics"] = await _build_economics(ctrl, opt)
 
     # ---- Data freshness ----
@@ -3735,8 +3733,7 @@ function renderHomeMoney(ec) {
   // Battery net arbitrage (grid-charge cost vs discharge value, solar free).
   const arb = (ec.batt_net_arbitrage_czk != null) ? ec.batt_net_arbitrage_czk : ec.arbitrage_czk;
   set('moneyArb', arb == null ? '--' : (arb >= 0 ? '+' : '') + arb.toFixed(1));
-  // Saved today = actual vs no-battery baseline (replaces the old, dimensionally
-  // wrong sum-of-net_value "optimizer value").
+  // Saved today = actual vs no-battery baseline.
   const saved = (ec.saved_today_czk != null) ? ec.saved_today_czk : ec.plan_value_czk;
   const planEl = document.getElementById('moneyPlan');
   if (planEl) {

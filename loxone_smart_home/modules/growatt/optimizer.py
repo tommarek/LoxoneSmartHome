@@ -3,10 +3,9 @@
 Home to the pieces the MILP optimizer (`milp_optimizer.py`) and the controller
 both rely on: the base-load profile (training + daily EMA update), the dynamic
 per-block reserve-SOC floor, the `BlockDecision` type, inverter power-rate
-sizing, decision summarisation, and the shared sell-production constants. The
-greedy dispatch engine that used to live here was removed when the system went
-MILP-only (see git history); `BatteryOptimizer` now exposes only that shared
-infrastructure.
+sizing, decision summarisation, and the shared sell-production constants.
+`BatteryOptimizer` exposes only this shared infrastructure; dispatch itself is
+done by the MILP optimizer.
 """
 
 import bisect
@@ -79,7 +78,7 @@ def compute_charge_power_rates(
     # and the reserve helper (_compute_reserve_soc_per_block). Using the FULL
     # round-trip value here would under-estimate grid-side discharge energy
     # (dsoc*0.85 vs dsoc*0.92) and size the discharge powerRate too low, risking
-    # not fully draining a short high-price spike the adaptive feature exists for.
+    # not fully draining a short high-price spike the adaptive rate exists for.
     eta = max(1e-3, efficiency) ** 0.5
 
     def _grid_kwh(d: BlockDecision) -> float:
@@ -159,8 +158,8 @@ SELL_PRODUCTION_MARGIN_CZK = 0.3
 # Hardware reality (SPH grid-first): pure solar export with the battery passive
 # is only physical when the battery is near FULL — below this margin the inverter
 # banks surplus solar instead. Mirrors milp_optimizer.SP_MIN_SOC_MARGIN_PCT so
-# the greedy fallback's plan/SOC projection matches the hardware (and the
-# controller's sell_production→battery_hold actuation remap) at mid-SOC.
+# the plan/SOC projection matches the hardware (and the controller's
+# sell_production→battery_hold actuation remap) at mid-SOC.
 SP_MIN_SOC_MARGIN_PCT = 2.0
 
 # Minimum forecast solar excess (kWh per 15-min block) required to trigger
@@ -242,11 +241,6 @@ class BatteryOptimizer:
     controller: base-load profile training/update, the dynamic per-block
     reserve-SOC floor (`_compute_reserve_soc_per_block`), and decision
     summarisation. The MILP holds one of these as `self._helper`.
-
-    (Historically this also held a greedy dispatch engine; the system is now
-    MILP-only and that engine was removed — see git history. The class name is
-    kept so the MILP's `self._helper = BatteryOptimizer(...)` and the
-    controller/dashboard imports stay unchanged.)
     """
 
     def __init__(self, logger: Optional[logging.Logger] = None):
@@ -482,8 +476,8 @@ from(bucket: "{solar_bucket}")
 
         # Per-leg loss factor: `efficiency` is ROUND-TRIP, so each physical
         # conversion leg (charge OR discharge) costs sqrt(efficiency) — the
-        # same convention as the MILP SOC continuity and the greedy SOC
-        # simulation, so the reserve floor and the SOC it constrains agree.
+        # same convention as the MILP SOC continuity, so the reserve floor and
+        # the SOC it constrains agree.
         leg_eta = max(1e-3, efficiency) ** 0.5
 
         sorted_prices = sorted(prices)
@@ -547,13 +541,13 @@ from(bucket: "{solar_bucket}")
                 peak_reserve_kwh = max(peak_reserve_kwh, running_kwh)
 
                 # A cheap-ish grid block before the recharge gives ONE top-up
-                # opportunity. Only note it here — crediting a fresh full charge
-                # block per cheap block (the old behaviour) over-credited
-                # incoming on price-flat nights, zeroing the reserve and letting
+                # opportunity, noted here as a single flag. Crediting a fresh
+                # full charge block per cheap block would over-credit incoming
+                # energy on price-flat nights, zeroing the reserve and letting
                 # discharge drain the battery with nothing left for base load.
                 # bisect_left on the pre-sorted prices counts strictly-cheaper
-                # blocks in O(log n) — identical to the old O(n) rescan but
-                # without rescanning all prices for every (block_idx, j) pair.
+                # blocks in O(log n) without rescanning all prices for every
+                # (block_idx, j) pair.
                 price_rank = bisect.bisect_left(sorted_prices, prices[j]) / n if n > 0 else 0.5
                 if price_rank < 0.35:
                     has_cheap_topup = True
@@ -588,9 +582,8 @@ from(bucket: "{solar_bucket}")
         charge_blocks = [d for d in decisions if d.action == "charge"]
         discharge_blocks = [d for d in decisions if d.action == "discharge"]
         hold_blocks = [d for d in decisions if d.action == "hold"]
-        # Battery-hold (preserve): grid serves the house, battery idle. Both
-        # engines emit this — the MILP for grid-serves-load blocks with usable
-        # battery, the greedy for retention holds with a consumption deficit.
+        # Battery-hold (preserve): grid serves the house, battery idle. The MILP
+        # emits this for grid-serves-load blocks with usable battery.
         hold_idle_blocks = [d for d in decisions if d.action == "hold_idle"]
         sell_production_blocks = [d for d in decisions if d.action == "sell_production"]
 

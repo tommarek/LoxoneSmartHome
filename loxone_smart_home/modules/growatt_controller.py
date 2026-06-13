@@ -309,11 +309,11 @@ class GrowattController(BaseModule):
         self._forecast_temps_by_date: Dict[Any, Dict[int, float]] = {}
         self._forecast_temps_fetched_at: Optional[datetime] = None
 
-        # When the solar production model was last (re)built / attempted. The
-        # build used to be once-per-process; with UI/deploy-driven restarts a
-        # container can run for weeks, so the periodic loop rebuilds it weekly
-        # — and retries hourly while there is no model at all (failed startup
-        # build, e.g. InfluxDB unreachable right after a restart).
+        # When the solar production model was last (re)built / attempted. A
+        # container can run for weeks across UI/deploy-driven restarts, so the
+        # periodic loop rebuilds the model weekly — and retries hourly while
+        # there is no model at all (failed startup build, e.g. InfluxDB
+        # unreachable right after a restart).
         self._solar_model_built_at: Optional[datetime] = None
         # Initialized to NOW (not None): the periodic loop starts BEFORE the
         # Phase-3 startup build task is assigned to _models_task, so a slow
@@ -794,7 +794,7 @@ class GrowattController(BaseModule):
                     self._mode_manager.get_battery_first_slots()
                     if hasattr(self, '_mode_manager') else {}
                 ),
-                "grid_first": {}  # No longer tracking grid-first slots
+                "grid_first": {}  # Grid-first slots are not tracked
             }
 
         state = {}
@@ -2093,8 +2093,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         IMPORTANT: ev_charging is written ON CHANGE (e.g. once when charging
         starts), so it ages out of the 30-min window during a long charge — the
         continuously-updated ev_charging_power is the reliable signal. It is in
-        kW, so it must be converted to W before comparing to the W threshold
-        (the bug that let the battery discharge into the car mid-charge).
+        kW, so it must be converted to W before comparing to the W threshold,
+        otherwise the battery would discharge into the car mid-charge.
         Returns power in kW.
         """
         if not self.influxdb_client:
@@ -2434,8 +2434,8 @@ from(bucket: "{bucket}")
                     f"📊 Fetched {len(prices_15min)} price blocks for {target_date}"
                 )
 
-                # NEW: Use cross-day optimal scheduling
-                # This will find globally cheapest blocks across today+tomorrow window
+                # Use cross-day optimal scheduling: find the globally cheapest
+                # blocks across the today+tomorrow window
                 await self._calculate_cross_day_optimal_schedule(
                     suppress_print=suppress_schedule_print,
                     force_table=force_table_display
@@ -2480,8 +2480,6 @@ from(bucket: "{bucket}")
         Args:
             suppress_print: If True, skip printing schedule (used during startup)
             force_table: If True, always show full table regardless of log level
-
-        This replaces the old separate-day approach with true global optimization.
         """
         # Get combined price window with absolute timestamps
         window = self._get_combined_price_window()
@@ -2506,8 +2504,8 @@ from(bucket: "{bucket}")
             # NOTE: a stored kWh's true avoided cost is the price at DISCHARGE
             # (typically the evening VT peak), not the window median, so this is
             # INTENTIONALLY CONSERVATIVE — it charges fewer blocks when the window
-            # contains a pronounced peak. This is the legacy rule-based block-count
-            # heuristic (dynamic_charge_blocks defaults OFF; dispatch is MILP-only),
+            # contains a pronounced peak. This block-count heuristic
+            # (dynamic_charge_blocks defaults OFF; dispatch is MILP-only) is
             # kept deliberately cautious about grid charging.
             sorted_p = sorted(all_prices)
             median_price = sorted_p[len(sorted_p) // 2] if sorted_p else 2.0
@@ -2760,14 +2758,14 @@ from(bucket: "{bucket}")
                 h, dist_thresholds
             )
 
-            # Deferrable loads. Two strategies depending on the engine:
-            #  - MILP CO-OPTIMIZES them: each load becomes a decision variable
-            #    placed where total cost is lowest (incl. PV surplus & battery
-            #    state). We hand the specs to optimize() and read the chosen
-            #    placement back off the optimizer after the solve.
-            #  - The greedy engine can't co-optimize, so we pre-schedule each
-            #    into its cheapest in-window blocks and ADD the per-block draw to
-            #    consumption_hourly so the battery at least plans around it.
+            # Deferrable loads. The MILP optimizer CO-OPTIMIZES them: each load
+            # becomes a decision variable placed where total cost is lowest
+            # (incl. PV surplus & battery state). We hand the specs to optimize()
+            # and read the chosen placement back off the optimizer after the
+            # solve. An optimizer that can't co-optimize (CO_OPTIMIZES_DEFERRABLE
+            # false) gets each load pre-scheduled into its cheapest in-window
+            # blocks, with the per-block draw ADDED to consumption_hourly so the
+            # battery at least plans around it.
             co_opt_deferrable = getattr(
                 self._optimizer, "CO_OPTIMIZES_DEFERRABLE", False
             )
@@ -2850,11 +2848,10 @@ from(bucket: "{bucket}")
                     self.logger.warning(f"Deferrable scheduling failed: {e}")
                     self._deferrable_schedules = []
 
-            # Run the optimizer off the event loop. The greedy engine is fast,
-            # but the MILP engine shells out to CBC (a blocking subprocess that
-            # can run up to its solve time-limit); either way a 96-block solve
-            # is pure CPU work that must not freeze MQTT handling or the 15-min
-            # decision cadence.
+            # Run the optimizer off the event loop. The MILP engine shells out
+            # to CBC (a blocking subprocess that can run up to its solve
+            # time-limit); a 96-block solve is pure CPU work that must not freeze
+            # MQTT handling or the 15-min decision cadence.
             opt_kwargs: Dict[str, Any] = dict(
                 blocks=price_blocks_czk,
                 solar_hourly=solar_hourly,
@@ -2889,8 +2886,8 @@ from(bucket: "{bucket}")
                 sell_fee_czk=self.config.sell_fee_czk,
                 battery_amortisation_czk=self.config.battery_amortisation_czk,
                 # Optional export-only wear penalty (None → shared base cost).
-                # Both engines accept it; raises the arbitrage hurdle without
-                # touching battery→house self-consumption economics.
+                # Raises the arbitrage hurdle without touching battery→house
+                # self-consumption economics.
                 battery_amortisation_export_czk=getattr(
                     self.config, "battery_amortisation_export_czk", None
                 ),
@@ -2906,17 +2903,16 @@ from(bucket: "{bucket}")
                     - self.config.inverter_off_price_hysteresis_czk
                 ),
             )
-            # MILP-only knobs (the greedy engine doesn't accept these kwargs).
-            # co_opt_deferrable is the MILP marker (only MILP sets
-            # CO_OPTIMIZES_DEFERRABLE), so gate MILP-only kwargs on it.
+            # MILP-only knobs. co_opt_deferrable is the MILP marker (only MILP
+            # sets CO_OPTIMIZES_DEFERRABLE), so gate MILP-only kwargs on it.
             if co_opt_deferrable:
                 opt_kwargs["switch_penalty_czk"] = getattr(
                     self.config, "milp_switch_penalty_czk", 0.0
                 )
                 if deferrable_for_milp:
                     opt_kwargs["deferrable_loads"] = deferrable_for_milp
-            # Keep BOTH engines' sell_production SOC gate in sync with the
-            # controller's actuation remap (greedy + MILP both accept this).
+            # Keep the optimizer's sell_production SOC gate in sync with the
+            # controller's actuation remap.
             opt_kwargs["sell_production_min_soc_margin"] = getattr(
                 self.config, "sell_production_min_soc_margin", 2.0
             )
@@ -2931,11 +2927,9 @@ from(bucket: "{bucket}")
             hold_idle_times = {
                 d.timestamp for d in decisions if d.action == "hold_idle"
             }
-            # Per-leg SOC-loss factor to convert each engine's ΔSOC to grid-side
-            # energy. BOTH engines now share the sqrt-split convention (the
-            # greedy SOC simulation and the shared reserve helper were unified
-            # with the MILP's per-leg eta), so the conversion no longer depends
-            # on which engine produced the decisions.
+            # Per-leg SOC-loss factor to convert the optimizer's ΔSOC to
+            # grid-side energy, using the sqrt-split per-leg efficiency
+            # convention shared by the MILP and the reserve helper.
             _leg_eta = self.config.battery_efficiency ** 0.5
             # Adaptive charge rate: per-charge-window inverter powerRate% so the
             # hardware charges at the gentlest rate that still fills each window.
@@ -3011,17 +3005,15 @@ from(bucket: "{bucket}")
                 f"(avg charge: {summary['avg_charge_price']:.2f}, "
                 f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
             )
-            # Discharge threshold for the log line below (charge threshold was
-            # dead — removed).
+            # Discharge threshold for the log line below.
             effective_discharge_threshold = min(
                 (b.price_czk for b in decisions if b.action == "discharge"),
                 default=discharge_threshold_czk,
             )
         else:
             # Optimizer disabled (optimizer_enabled=False) — no scheduling.
-            # The old rule-based scheduler was removed with the MILP-only
-            # cleanup; "disabled" now means hold (the decision_engine's safety
-            # gates — battery protection, export, inverter-off — still apply).
+            # "Disabled" means hold: the decision_engine's safety gates
+            # (battery protection, export, inverter-off) still apply.
             charge_times = set()
             discharge_times = set()
             sell_production_times = set()
@@ -3194,12 +3186,12 @@ from(bucket: "{bucket}")
                         )
 
         # === STEP 3: Calculate pre-discharge charging ===
-        # ONLY for the rule-based engine. When the optimizer is active it already
-        # plans charge-before-discharge inside its energy-flow model (charge_times
-        # above), so a separate heuristic here just produces phantom charge blocks
-        # that the optimizer-driven decision engine never actuates (the chart then
-        # shows "pre-discharge charging" the inverter never enters). Let the
-        # optimizer be the single source of truth for charging.
+        # ONLY when the optimizer is disabled. When the optimizer is active it
+        # already plans charge-before-discharge inside its energy-flow model
+        # (charge_times above), so a separate heuristic here would just produce
+        # phantom charge blocks the decision engine never actuates (the chart
+        # would then show "pre-discharge charging" the inverter never enters).
+        # The optimizer is the single source of truth for charging.
         pre_discharge_blocks: List[Tuple[datetime, datetime, float]] = []
 
         if discharge_blocks and not self._optimizer:
@@ -3600,8 +3592,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     f"✅ Successfully fetched {len(prices)} price blocks for {tomorrow_date}"
                 )
 
-                # NEW: Recalculate cross-day optimal schedule with tomorrow's data
-                # This will find globally optimal blocks across remaining today + full tomorrow
+                # Recalculate cross-day optimal schedule with tomorrow's data:
+                # globally optimal blocks across remaining today + full tomorrow
                 await self._calculate_cross_day_optimal_schedule(force_table=True)
 
                 # Trigger re-evaluation with the updated schedule
@@ -3684,8 +3676,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 # Check defer flag - override charging if tomorrow cheaper.
                 # Never override a MANUAL override (Priority 1): a user-requested
                 # charge must win over the auto defer-to-tomorrow heuristic.
-                # (_defer_charging_to_tomorrow is the legacy flag, currently never
-                # set True, but guard the precedence regardless.)
+                # (_defer_charging_to_tomorrow is never set True in practice, but
+                # guard the precedence regardless.)
                 if (
                     not context.manual_override_active
                     and self._defer_charging_to_tomorrow
@@ -3967,7 +3959,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 self._hold_blocks_today.copy() if self._optimizer else set()
             ),
             # When the optimizer drives, its charge blocks (in cheapest_blocks)
-            # are actuated without the rule-based summer price gate.
+            # are actuated without the summer price gate.
             optimizer_active=bool(self._optimizer),
             # Solar schedule
             sunrise=sunrise,
@@ -4049,13 +4041,14 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # On the SPH, stop_soc is the level the inverter MAINTAINS in BOTH modes:
         # it charges UP to stop_soc (from GRID too, even with ac_charge off — the
         # ac_charge flag does NOT prevent battery_first grid-charging) and
-        # discharges DOWN to it. So stop_soc=max_soc made battery_hold grid-charge
-        # the battery toward 100% at the spot price (confirmed from telemetry:
-        # ChargePower>0 while importing from grid during a hold). Pinning to the
-        # live SOC removes the charge headroom → no grid charge; any surplus solar
-        # exports instead of being banked (export is price-gated below). Banking
-        # surplus solar during a hold is NOT achievable on this inverter without
-        # also grid-charging, so we prefer "export surplus, never grid-charge".
+        # discharges DOWN to it. With stop_soc=max_soc battery_hold would
+        # grid-charge the battery toward 100% at the spot price (confirmed from
+        # telemetry: ChargePower>0 while importing from grid during a hold).
+        # Pinning to the live SOC removes the charge headroom → no grid charge;
+        # any surplus solar exports instead of being banked (export is
+        # price-gated below). Banking surplus solar during a hold is NOT
+        # achievable on this inverter without also grid-charging, so we prefer
+        # "export surplus, never grid-charge".
         if mode in ("sell_production", "battery_hold", "high_load_protected"):
             # FLOOR, not round: rounding a live SOC of e.g. 50.6 UP to 51 would
             # leave ~0.4% of charge headroom, and on this SPH battery_first
@@ -4624,10 +4617,10 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             self.logger.warning(f"Solar forecast refresh failed: {e}")
 
                 # Rebuild the solar production model weekly. It trains on a
-                # 730-day window that previously only refreshed on container
-                # restart — with restarts now UI/deploy-driven the model could
-                # silently age for weeks. While there is NO model at all
-                # (startup build failed/declined), retry hourly instead —
+                # 730-day window; since restarts are UI/deploy-driven a
+                # container can run for weeks, so the model must refresh on a
+                # timer rather than only at startup. While there is NO model at
+                # all (startup build failed/declined), retry hourly instead —
                 # otherwise the controller would run modelless forever.
                 solar_rebuild_due = False
                 if self._solar_forecast and (
@@ -4791,8 +4784,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             pass
                         self._price_fetch_task = None
 
-                    # NEW: Apply cross-day schedule transition at midnight
-                    # What was "tomorrow" is now "today"
+                    # Apply the cross-day schedule transition at midnight:
+                    # what was "tomorrow" is now "today".
 
                     # Move next-day prices to current prices
                     if self._next_day_prices_fetched and self._next_day_prices:
@@ -4810,7 +4803,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                         self._next_day_prices_date = None
                         self._next_day_prices_fetched = False
 
-                        # NEW: Shift queued tomorrow schedules to today
+                        # Shift queued tomorrow schedules to today
                         self.logger.info(
                             "🔄 Applying queued tomorrow's schedule as today's schedule"
                         )
@@ -4856,7 +4849,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                             | self._pre_discharge_blocks_today
                         )
 
-                        # Clear old defer flag (replaced by cross-day logic)
+                        # Clear the defer flag (superseded by cross-day logic)
                         self._defer_charging_to_tomorrow = False
                         self._tomorrow_cheaper_by = None
 
@@ -4930,8 +4923,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                         self._defer_charging_to_tomorrow = False
                         self._tomorrow_cheaper_by = None
 
-                        # CRITICAL FIX: Fetch TODAY's prices immediately
-                        # This ensures control logic uses correct prices
+                        # Fetch TODAY's prices immediately so control logic uses
+                        # the correct prices.
                         await self._fetch_prices()
 
                         self.logger.info(

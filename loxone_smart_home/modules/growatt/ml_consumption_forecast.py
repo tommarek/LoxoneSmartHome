@@ -42,12 +42,13 @@ except Exception:
         SKFORECAST_AVAILABLE = False
 
 
-# Bumped if the feature set or training logic changes incompatibly.
-# v2: training/prediction now bucket InfluxDB UTC timestamps into local time.
-# v3: inverter_on carry-forward also converts change records to local (was
-#     comparing local hour-keys against UTC change timestamps).
-# v4: hourly aggregates are start-labeled (timeSrc: "_start") — the default
-#     stop-labeling shifted every hour key +1h; lags extended to 48h/168h.
+# Bumped if the feature set or training logic changes incompatibly, so a
+# version mismatch forces a retrain. Current schema:
+# - training and prediction bucket InfluxDB UTC timestamps into local time
+#   (including the inverter_on carry-forward change records);
+# - hourly aggregates are start-labeled (timeSrc: "_start") so hour keys are
+#   not shifted +1h by Flux's default stop-labeling;
+# - lags cover 48h/168h in addition to the last day.
 ML_MODEL_SCHEMA_VERSION = 4
 
 

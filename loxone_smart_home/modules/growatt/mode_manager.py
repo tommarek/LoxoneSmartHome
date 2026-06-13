@@ -72,10 +72,10 @@ class ModeManager:
     ) -> tuple[str, str]:
         """Ensure start time is in future for inverter scheduling."""
         # Forward preserve_duration BY KEYWORD: the adapter signature is
-        # (start, stop, min_future_minutes=1, preserve_duration=False, ...), so
-        # passing it positionally bound the bool to min_future_minutes and left
-        # the adapter's preserve_duration at False — silently dropping the slot-
-        # duration-preservation intent when a start time is bumped to the future.
+        # (start, stop, min_future_minutes=1, preserve_duration=False, ...), so a
+        # positional bool would bind to min_future_minutes and leave the adapter's
+        # preserve_duration at False, dropping the slot-duration-preservation
+        # intent when a start time is bumped to the future.
         return self._adapter._ensure_future_start(
             start_hour, stop_hour,
             preserve_duration=preserve_duration,
@@ -290,11 +290,11 @@ class ModeManager:
             )
 
         if adjusted_start == adjusted_stop:
-            # Defensive: the caller (_ensure_future_start) now prevents collapse
-            # by snapping the start back a minute, so this should be unreachable.
-            # Treat it as a benign no-op (return True) rather than a hard failure
-            # — raising would roll back the WHOLE state apply (export, inverter-on)
-            # for a transient near-boundary timing edge.
+            # Defensive: _ensure_future_start prevents collapse by snapping the
+            # start back a minute, so this should be unreachable. Treat it as a
+            # benign no-op (return True) rather than a hard failure — failing here
+            # would roll back the WHOLE state apply (export, inverter-on) for a
+            # transient near-boundary timing edge.
             self.logger.warning(
                 f"Battery-first window collapsed ({adjusted_start}=={adjusted_stop}); "
                 "skipping actuation (benign no-op)."
@@ -307,9 +307,9 @@ class ModeManager:
         sig = ("battery_first", adjusted_start, adjusted_stop, stop_soc, power_rate)
         # force_power_rate must bypass this signature short-circuit: the same sig
         # (e.g. 100%) can be stored from a previous battery_first while the
-        # inverter's actual powerRate was since clobbered by a grid_first
-        # discharge (separate _last_applied key). Skipping here would leave that
-        # stale rate in place — the exact stale-powerRate bug force was added for.
+        # inverter's actual powerRate has since been clobbered by a grid_first
+        # discharge (a separate _last_applied key). Skipping here would leave that
+        # stale rate in place.
         if self._last_applied.get("battery_first") == sig and not force_power_rate:
             self.logger.debug(
                 f"Battery-first {adjusted_start}-{adjusted_stop} already applied, skipping"
@@ -335,11 +335,10 @@ class ModeManager:
             )
             return False
 
-        # Always send stopSOC (matching set_grid_first). The previous `!= 90`
-        # skip assumed the inverter's resting default is 90% with no tracking of
-        # the actual hardware value — if a prior charge cycle left stopSOC at
-        # 100, a later stop_soc=90 would be silently skipped and the battery
-        # would charge past the intended target.
+        # Always send stopSOC (matching set_grid_first). The actual hardware
+        # value isn't tracked, so a conditional skip could leave a stale stopSOC
+        # in place — e.g. a prior cycle leaving it at 100 while the caller wants
+        # 90 — charging the battery past the intended target.
         stopsoc_topic = "energy/solar/command/batteryfirst/set/stopsoc"
         stopsoc_payload = {"value": stop_soc}
         self.logger.debug(f"Setting battery-first stopSOC to {stop_soc}%")
@@ -354,10 +353,10 @@ class ModeManager:
             return False
         await asyncio.sleep(self.config.command_delay)
 
-        # Send powerRate when it's non-default (100) OR when the caller forces it
-        # (adaptive charging needs the exact rate written even at 100%, because
-        # the inverter otherwise keeps a stale rate from a previous grid-first
-        # discharge — the latent bug that pinned all "100%" charging at 25%).
+        # Send powerRate when it's non-default (100) OR when the caller forces it.
+        # Adaptive charging needs the exact rate written even at 100%, because the
+        # inverter otherwise keeps a stale rate from a previous grid-first
+        # discharge.
         if power_rate != 100 or force_power_rate:
             powerrate_topic = "energy/solar/command/batteryfirst/set/powerrate"
             powerrate_payload = {"value": power_rate}
@@ -639,10 +638,10 @@ class ModeManager:
             )
 
         if adjusted_start == adjusted_stop:
-            # Defensive: the caller now prevents collapse by snapping the start
-            # back a minute, so this should be unreachable. Benign no-op (return
-            # True) rather than a hard failure that would roll back the whole
-            # state apply for a transient near-boundary timing edge.
+            # Defensive: the caller prevents collapse by snapping the start back a
+            # minute, so this should be unreachable. Benign no-op (return True)
+            # rather than a hard failure that would roll back the whole state
+            # apply for a transient near-boundary timing edge.
             self.logger.warning(
                 f"Grid-first window collapsed ({adjusted_start}=={adjusted_stop}); "
                 "skipping actuation (benign no-op)."
@@ -839,9 +838,10 @@ class ModeManager:
             return True
 
         # Disable the previous mode to achieve load-first. Capture the disable
-        # results and abort on failure — otherwise the old battery_first/grid_first
-        # slot stays ENABLED while we report success, desyncing tracked vs hardware
-        # (mirrors set_battery_first/set_grid_first's ensure_exclusive hardening).
+        # results and abort on failure — otherwise the prior battery_first/
+        # grid_first slot stays ENABLED while we report success, desyncing tracked
+        # state vs hardware (as ensure_exclusive guards in set_battery_first/
+        # set_grid_first).
         disable_ok = True
         if previous_mode is None:
             # Startup or unknown state - full reset for safety

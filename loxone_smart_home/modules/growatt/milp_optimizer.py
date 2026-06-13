@@ -6,8 +6,8 @@ decisions)`. Shares base-load profiling and the reserve-SOC floor with the
 controller via the `BatteryOptimizer` helper in `optimizer.py`.
 
 Why bother:
-- True global optimum (greedy can pick a small early gain that locks out a
-  much bigger later gain).
+- True global optimum (a per-block greedy choice can pick a small early gain
+  that locks out a much bigger later gain).
 - Cleanly expresses constraints (SOC bounds, power limits, reserve floor,
   sell-production minimum excess) instead of hand-coded gates.
 - More stable schedule across re-evaluations.
@@ -38,8 +38,8 @@ and house load — and we maximise net cash. Modelling every flow explicitly
     power:  grid_charge + solar_to_batt <= charge_max
             batt_to_load + batt_to_grid <= discharge_max * (1 - is_charge)
     reserve: soc[i+1] >= effective_min_soc[i] - reserve_short[i]   (SOFT —
-            penalised at RESERVE_SHORTFALL_FLOOR, which is deliberately 0;
-            the only HARD battery floor is min_soc via the soc var bounds)
+            penalised at RESERVE_SHORTFALL_FLOOR, which is 0; the only HARD
+            battery floor is min_soc via the soc var bounds)
 
   Objective (maximise):
     + solar_to_grid * (spot - fee)               solar export (no dist, no wear)
@@ -52,9 +52,8 @@ and house load — and we maximise net cash. Modelling every flow explicitly
 
   Why this is correct for the Czech market:
     - Serving load from the battery removes a grid_to_load term worth
-      (spot+dist); net of amort wear that is (spot+dist-amort) — exactly the
-      greedy engine's self_consumption_value. So self-consumption is valued
-      WITHOUT an explicit reward term.
+      (spot+dist); net of amort wear that is (spot+dist-amort). So
+      self-consumption is valued WITHOUT an explicit reward term.
     - Battery export nets to (spot-dist-fee-amort) = sell_revenue.
     - Distribution is paid on BOTH import and export (it appears in import
       cost and is subtracted from export revenue).
@@ -118,30 +117,27 @@ SP_MIN_SOC_MARGIN_PCT = 2.0
 
 # A grid-EXPORT (discharge-to-grid) block must move at least this fraction of
 # the grid-first power rate. The controller actuates discharge as on/off at a
-# fixed powerRate, so without a floor the solver scatters many trivial sub-rate
-# exports that the inverter would each run at full power (the shadow-run
-# defect). A floor keeps every export block "meaningful" (≥half rate) so
-# set-based actuation is faithful, while still allowing a partial final block
-# so the solver never has to BUY grid power just to top up for a full export.
+# fixed powerRate, so without a floor the solver could scatter many trivial
+# sub-rate exports that the inverter would each run at full power. A floor keeps
+# every export block "meaningful" (≥half rate) so set-based actuation is
+# faithful, while still allowing a partial final block so the solver never has
+# to BUY grid power just to top up for a full export.
 MIN_GRID_DISCHARGE_FRACTION = 0.5
 
-# Per-block reserve-shortfall penalty (CZK per kWh). The overnight reserve is
-# now EMERGENT from the objective itself: the objective already prices every
-# future grid import, so the solver naturally keeps charge whenever importing
-# later would be expensive, and sells/discharges when that is more profitable —
-# which is exactly the right economics. A non-zero per-block penalty on top
-# DOUBLE-COUNTS and, because the reserve floor can sit above SOC for many
-# consecutive blocks, its per-block accumulation snowballs into "grid-charge at
-# the evening PEAK to satisfy the reserve" — a guaranteed loss (the live
-# incident). So this is 0: the only hard battery floor is min_soc (the soc var
-# lower bound); the reserve is the model's economic decision, not a heuristic.
+# Per-block reserve-shortfall penalty (CZK per kWh). This is 0 because the
+# overnight reserve is EMERGENT from the objective itself: the objective already
+# prices every future grid import, so the solver naturally keeps charge whenever
+# importing later would be expensive, and sells/discharges when that is more
+# profitable — exactly the right economics. A non-zero per-block penalty on top
+# would DOUBLE-COUNT, and because the reserve floor can sit above SOC for many
+# consecutive blocks, its per-block accumulation would snowball into
+# "grid-charge at the evening PEAK to satisfy the reserve" — a guaranteed loss.
+# The only hard battery floor is min_soc (the soc var lower bound); the reserve
+# is the model's economic decision, not a heuristic.
 #
-# NOTE: the loss conventions ARE now unified — the shared
-# _compute_reserve_soc_per_block helper and the greedy SOC simulation both use
-# the sqrt-split per-leg eta, the same convention as the MILP SOC continuity,
-# so eff_min_kwh and the soc it constrains finally agree. Keep this 0 anyway:
-# the per-block double-counting/snowball incident rationale above stands
-# regardless of the (now consistent) scaling.
+# The shared _compute_reserve_soc_per_block helper uses the same sqrt-split
+# per-leg eta as the MILP SOC continuity, so eff_min_kwh and the soc it
+# constrains agree.
 RESERVE_SHORTFALL_FLOOR = 0.0
 
 
@@ -162,17 +158,15 @@ class MILPBatteryOptimizer:
 
     # The controller checks this to decide whether to hand deferrable loads
     # to the optimizer (co-optimize) or pre-schedule them and overlay the
-    # result onto the consumption forecast (greedy can't co-optimize).
+    # result onto the consumption forecast. The MILP co-optimizes.
     CO_OPTIMIZES_DEFERRABLE = True
 
     def __init__(self, logger: Optional[logging.Logger] = None):
         self.logger = logger or logging.getLogger(__name__)
-        # Re-use the greedy optimizer's reserve-SOC + bin-state helpers so
-        # behaviour is consistent across engines.
+        # Re-use the shared reserve-SOC + base-load helpers.
         from .optimizer import BatteryOptimizer
-        # BatteryOptimizer is now the shared infrastructure helper (base-load
-        # profile, reserve-SOC, summarize) — the greedy dispatch engine it once
-        # held was removed when the system went MILP-only.
+        # BatteryOptimizer is the shared infrastructure helper (base-load
+        # profile, reserve-SOC, summarize).
         self._helper = BatteryOptimizer(logger=self.logger)
         self._last_decisions: List[BlockDecision] = []
         # How _last_decisions was produced: 'milp' (a real solve) or 'fallback'
@@ -216,7 +210,7 @@ class MILPBatteryOptimizer:
         LpSolutionIntegerFeasible (and the variable values ARE loaded), but
         LpStatus can read "Not Solved" depending on the sol-file wording.
         Attribute access is guarded so pulp versions without these constants
-        simply take the strict greedy-fallback path.
+        simply take the strict safe-fallback path.
         """
         try:
             sol_status = getattr(prob, "sol_status", None)
@@ -377,8 +371,8 @@ class MILPBatteryOptimizer:
         charge_rate_kw: float = 2.5,
         discharge_rate_kw: float = 2.5,
         # Accepted for engine-signature parity but IGNORED by the MILP energy
-        # model: batt_to_grid_max = discharge_rate_kw*0.25 (the '4x too slow'
-        # fix, commit 7f2f31a). Guarded by test_milp_discharge_rate_independent…
+        # model: batt_to_grid_max = discharge_rate_kw*0.25. Guarded by
+        # test_milp_discharge_rate_independent…
         discharge_power_pct: float = 25.0,
         efficiency: float = 0.85,
         sell_fee_czk: float = 0.5,
@@ -421,7 +415,7 @@ class MILPBatteryOptimizer:
         # Clamp the live SOC into the configured [min, max] window before
         # pinning soc[0]. Telemetry can report e.g. 100% while max_soc=90;
         # an out-of-bounds start makes soc[0] == start_battery_kwh infeasible
-        # against the soc variable bounds, silently forcing greedy fallback
+        # against the soc variable bounds, silently forcing the safe fallback
         # every tick. A below-floor reading is clamped UP here (relaxing the
         # soc[0] bound risks infeasibility) — warn, because the plan then
         # credits energy the battery doesn't actually hold until it recovers.
@@ -437,9 +431,10 @@ class MILPBatteryOptimizer:
         charge_max = charge_rate_kw * 0.25
         # discharge_rate_kw is the ACTUAL grid-discharge power at the configured
         # discharge_power_rate (~2.5 kW at 25% on this inverter), confirmed from
-        # telemetry. Both house self-consumption and grid export run at that rate
-        # — do NOT throttle grid export by discharge_power_pct again (that
-        # double-counted the power rate and modelled grid discharge 4x too slow).
+        # telemetry. Both house self-consumption and grid export run at that rate,
+        # so grid export is NOT additionally throttled by discharge_power_pct
+        # (that would double-count the power rate and model grid discharge 4x too
+        # slow).
         batt_out_max = discharge_rate_kw * 0.25
         batt_to_grid_max = batt_out_max
         max_battery_kwh = battery_capacity_kwh * max_soc / 100.0
@@ -451,11 +446,11 @@ class MILPBatteryOptimizer:
 
         # Split the round-trip efficiency symmetrically across the two legs so
         # both charging and discharging incur loss (eta_chg * eta_dis ==
-        # efficiency). The greedy engine's SOC simulation and the shared
-        # reserve helper use the SAME sqrt-split per-leg convention, so both
-        # engines' SOC trajectories and reserve floors are scaled identically;
-        # sqrt-splitting is closer to real inverter behaviour and makes the
-        # cost of a charge→discharge cycle independent of which leg you price.
+        # efficiency). The shared reserve helper uses the SAME sqrt-split per-leg
+        # convention, so SOC trajectories and reserve floors are scaled
+        # identically; sqrt-splitting is closer to real inverter behaviour and
+        # makes the cost of a charge→discharge cycle independent of which leg you
+        # price.
         eta = max(1e-3, efficiency) ** 0.5
 
         # Per-block price coefficients.
@@ -463,12 +458,11 @@ class MILPBatteryOptimizer:
         dists = [distribution_func(ts.hour) for ts, _ in blocks]
         # Grid export gross (battery wear charged separately). Export pays NO
         # distribution — only the sell fee (FVE buyback = spot − fee). Distribution
-        # applies to IMPORT only. (Was spot − dist − fee, which under-valued export
-        # by the whole distribution tariff and made it hoard/curtail sellable solar.)
+        # applies to IMPORT only.
         export_now = [prices[i] - sell_fee_czk for i in range(n)]
         # Wear cost charged on battery→GRID export. Defaults to the shared wear
         # cost; an explicit export override raises the arbitrage hurdle without
-        # touching battery→house self-consumption. Unset → identical to before.
+        # touching battery→house self-consumption. Unset → uses the shared wear cost.
         amort_export = (
             battery_amortisation_czk
             if battery_amortisation_export_czk is None
@@ -487,11 +481,10 @@ class MILPBatteryOptimizer:
             s = _forecast_value(solar_hourly, ts) / 4.0
             c = _forecast_value(consumption_hourly, ts) / 4.0
             if c <= 0:
-                # Mirror the greedy engine AND the shared reserve helper: a
-                # missing/zero consumption entry falls back to the learned
-                # base-load profile, so the MILP load balance never sees 0 house
-                # load where the reserve floor (eff_min_kwh) assumed real base
-                # load — an intra-MILP + cross-engine inconsistency otherwise.
+                # Mirror the shared reserve helper: a missing/zero consumption
+                # entry falls back to the learned base-load profile, so the MILP
+                # load balance never sees 0 house load where the reserve floor
+                # (eff_min_kwh) assumed real base load — an inconsistency otherwise.
                 c = self._helper._base_load_profile.get(
                     ts.hour, ts.weekday() >= 5
                 ) / 4.0
@@ -499,8 +492,7 @@ class MILPBatteryOptimizer:
             consumption_block.append(c)
             solar_excess.append(max(0.0, s - c))
 
-        # Per-block effective minimum SOC (reserve), reused from the greedy
-        # helper so both engines protect the same overnight energy.
+        # Per-block effective minimum SOC (reserve), from the shared helper.
         effective_min_socs = self._helper._compute_reserve_soc_per_block(
             blocks, prices, solar_hourly, battery_capacity_kwh,
             min_soc, max_soc, charge_max, efficiency,
@@ -687,14 +679,14 @@ class MILPBatteryOptimizer:
             max(0.0, sc_values[len(sc_values) // 2]) if sc_values else 0.0
         )
         min_charge_cost = min(import_cost) if import_cost else 0.0
-        # Cap uses the ROUND-TRIP efficiency on purpose (not the per-leg `eta`):
-        # the break-even for "charge cheap now, use later" is the full
-        # charge→store→discharge cycle. Don't "fix" this to `eta`. Apply the cap
-        # ALWAYS (not only when min_charge_cost > 0): on a deeply-negative-price
-        # day min(import_cost) can be ≤ 0 while the median stays positive, and the
-        # max(0.0, …) floor then correctly drives terminal value to 0 — otherwise
-        # the cap is skipped and SOC-hoarding (grid-charge to inflate end SOC)
-        # gets rewarded exactly when it shouldn't.
+        # Cap uses the ROUND-TRIP efficiency (not the per-leg `eta`) because the
+        # break-even for "charge cheap now, use later" is the full
+        # charge→store→discharge cycle. The cap applies ALWAYS (not only when
+        # min_charge_cost > 0): on a deeply-negative-price day min(import_cost)
+        # can be ≤ 0 while the median stays positive, and the max(0.0, …) floor
+        # then correctly drives terminal value to 0 — otherwise the cap would be
+        # skipped and SOC-hoarding (grid-charge to inflate end SOC) rewarded
+        # exactly when it shouldn't be.
         terminal_value_per_kwh = max(0.0, min(
             terminal_value_per_kwh, min_charge_cost / max(1e-3, efficiency)
         ))
@@ -934,7 +926,7 @@ class MILPBatteryOptimizer:
                     # No contiguous slot fits in the window — fall back to
                     # interruptible (scattered) scheduling. Warn, because the
                     # actuation layer will run this nominally non-interruptible
-                    # load in pieces (mirrors the greedy scheduler's warning).
+                    # load in pieces.
                     self.logger.warning(
                         f"Deferrable load {load.name!r} non-interruptible but no "
                         f"contiguous {nb_eff}-block run fits its window — "

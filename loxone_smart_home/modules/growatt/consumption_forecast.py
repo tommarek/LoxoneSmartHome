@@ -225,13 +225,12 @@ def _fallback_temperature(forecast_temps: Dict[int, float], hour: int) -> float:
 # Bumped when the build_model logic changes in a way that invalidates
 # previously cached models (e.g., new training-data filters). On version
 # mismatch the controller forces a fresh rebuild, even if the cached
-# model is younger than rebuild_interval_days.
-# v5: hourly aggregates are start-labeled (timeSrc: "_start") — the default
-#     stop-labeling shifted every hour key +1h — and bins now need
-#     MIN_BIN_SAMPLES samples to enter medians.
-# v6: sparse (below-MIN_BIN_SAMPLES) bins feed the hourly/global fallbacks
-#     again (v5 dropped them entirely, leaving young installs with empty
-#     fallbacks), and a build with zero trusted bins is declined.
+# model is younger than rebuild_interval_days. Current schema:
+# - hourly aggregates are start-labeled (timeSrc: "_start") so hour keys are
+#   not shifted +1h by Flux's default stop-labeling;
+# - a bin needs MIN_BIN_SAMPLES samples to enter medians, but sparse bins
+#   still feed the hourly/global fallbacks (so young installs aren't left
+#   with empty fallbacks), and a build with zero trusted bins is declined.
 MODEL_SCHEMA_VERSION = 6
 
 # Upper bound for a "real household" hourly consumption sample (kWh).
@@ -314,7 +313,7 @@ class ConsumptionForecast:
                 # wall-clock so the (temp, hour, weekend) bins are keyed by the
                 # same local hours predict_hourly is queried with. Without it
                 # the consumption peak lands 1-2h off and weekend/weekday can
-                # misclassify near midnight. Mirrors the ML model's _to_local.
+                # misclassify near midnight. Matches the ML model's _to_local.
                 if local_tz is not None and getattr(t, "tzinfo", None) is not None:
                     t = t.astimezone(local_tz)
                 return t

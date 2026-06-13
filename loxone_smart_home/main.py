@@ -49,11 +49,11 @@ class LoxoneSmartHome:
         self.growatt_controller: Optional[GrowattController] = None
         self.ote_collector: Optional[OTEPriceCollector] = None
 
-        # Web Service (new monitoring dashboard - runs in separate process)
+        # Web Service (monitoring dashboard - runs in separate process)
         self.web_service = None
         self.web_service_task: Optional[asyncio.Task[None]] = None
 
-        # API server (legacy, will be replaced by web service)
+        # Legacy aiohttp API server (used only when the web service is disabled)
         self.api_app: Optional[web.Application] = None
         self.api_runner: Optional[web.AppRunner] = None
         self.api_site: Optional[web.TCPSite] = None
@@ -216,7 +216,7 @@ class LoxoneSmartHome:
             self.modules.append(task)
             logger.info("OTE Price Collector started")
 
-        # Start Web Service (replaces old API server)
+        # Start Web Service
         if self.settings.web_service.enabled:
             await self.start_web_service()
             logger.info(f"Web monitoring service started on port {self.settings.web_service.port}")

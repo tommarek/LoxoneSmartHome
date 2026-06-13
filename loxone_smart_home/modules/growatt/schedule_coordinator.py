@@ -1,7 +1,7 @@
 """Schedule coordination: price logging and schedule state management.
 
-Extracted from GrowattController to reduce its complexity.
-Handles schedule block tracking, price table formatting, and schedule logging.
+Owns schedule block tracking, price table formatting, and schedule logging,
+keeping that concern out of GrowattController.
 """
 
 import logging
@@ -23,7 +23,7 @@ class ScheduleCoordinator:
         self.logger = logger
         self._log_level = log_level
 
-        # Schedule state (moved from controller)
+        # Schedule state
         self.cheapest_charging_blocks_today: Set[Tuple[str, str]] = set()
         self.cheapest_charging_blocks_tomorrow: Set[Tuple[str, str]] = set()
         self.pre_discharge_blocks_today: Set[Tuple[str, str]] = set()

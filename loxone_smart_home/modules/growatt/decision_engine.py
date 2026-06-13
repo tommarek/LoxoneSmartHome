@@ -97,28 +97,26 @@ class DecisionContext:
     is_optimizer_sell_production_scheduled: bool = False
     # Optimizer-scheduled battery-hold blocks: preserve the battery (no discharge),
     # serve the house from grid. Actuated as the battery_hold mode so the hardware
-    # matches the optimizer's "hold" plan instead of draining via load_first.
+    # matches the optimizer's "hold" plan rather than draining via load_first.
     optimizer_hold_blocks: Set[Tuple[str, str]] = field(default_factory=set)
     is_optimizer_hold_scheduled: bool = False
-    # True when the MILP/greedy optimizer is the active scheduling engine. When
-    # set, the optimizer's per-block charge decisions (cheapest_blocks) are the
-    # single source of truth: the model owns charge economics (including price),
-    # so the rule-based summer charge gate does NOT apply. The optimizer is kept
-    # correct (it never grid-charges at peak for the reserve) by the price-aware
-    # reserve penalty in the MILP — not by a seasonal heuristic.
+    # True when the MILP optimizer is the active scheduling engine. When set, the
+    # optimizer's per-block charge decisions (cheapest_blocks) are the single
+    # source of truth: the model owns charge economics (including price), so the
+    # rule-based summer charge gate does NOT apply. The model is kept from
+    # grid-charging at peak for the reserve by the price-aware reserve penalty in
+    # the MILP, not by a seasonal heuristic.
     optimizer_active: bool = False
 
     def __post_init__(self) -> None:
         """Derive additional context after initialization."""
         # CHARGE authority:
         #  - Optimizer active → the model owns charge economics (incl. price):
-        #    actuate exactly its scheduled charge set. The MILP no longer
-        #    grid-charges at a bad price (its reserve is objective-driven, not a
-        #    penalty that snowballed into peak charging), so no seasonal gate is
-        #    needed — the model decides.
-        #  - Optimizer inactive (legacy fallback) → apply the rule-based summer
-        #    gate (only grid-charge at/below summer_charge_price_max, default 0)
-        #    / cheapest-blocks logic.
+        #    actuate exactly its scheduled charge set. Its reserve is
+        #    objective-driven, so no seasonal gate is needed — the model decides.
+        #  - Optimizer inactive (rule-based fallback) → apply the summer gate
+        #    (only grid-charge at/below summer_charge_price_max, default 0) /
+        #    cheapest-blocks logic.
         if self.optimizer_active:
             self.is_battery_charging_scheduled = bool(
                 self.current_block_key
@@ -203,10 +201,10 @@ MODE_DEFINITIONS = {
         "description": "High load protection - prevent battery discharge",
         # load_first DISCHARGES the battery to cover a load deficit (it ignores
         # stop_soc as a discharge floor on the SPH), so it does NOT protect the
-        # battery when a big load like an EV pulls more than solar — the battery
-        # drained into the car. Use battery_first like battery_hold: the battery
-        # is passive (grid+solar serve the load, no discharge). stop_soc is
-        # pinned to the LIVE SOC in the controller so it also won't grid-charge.
+        # battery when a big load like an EV pulls more than solar — it would
+        # drain into the car. Use battery_first like battery_hold: the battery is
+        # passive (grid+solar serve the load, no discharge). stop_soc is pinned to
+        # the LIVE SOC in the controller so it also won't grid-charge.
         "inverter_mode": "battery_first",
         "stop_soc": "max_soc",  # overridden to live SOC in _build_desired_state
         "ac_charge": False
@@ -242,9 +240,9 @@ MODE_DEFINITIONS = {
         # house is served from grid) — the "hold". stop_soc is pinned to the LIVE
         # SOC in the controller (_build_desired_state), NOT max_soc: on the SPH,
         # battery_first charges UP to stop_soc from the GRID even with ac_charge
-        # off (the flag does not gate grid-charging), so max_soc made the hold
-        # silently grid-charge to 100% at the spot price. With stop_soc=live SOC
-        # there's no charge headroom → no grid charge, no discharge; surplus solar
+        # off (the flag does not gate grid-charging), so max_soc would make the
+        # hold grid-charge to 100% at the spot price. With stop_soc=live SOC there
+        # is no charge headroom → no grid charge, no discharge; surplus solar
         # exports rather than being banked (banking can't be done here without
         # also grid-charging). max_soc below is just the resolver default — the
         # live-SOC pin overrides it.
@@ -621,9 +619,9 @@ class GrowattDecisionEngine:
         # FALLBACK ONLY: when the optimizer is the active engine it owns the
         # discharge schedule (Priority 4A) — it reserves the battery for the
         # highest-value blocks and protects the overnight reserve. This simple
-        # price-threshold path would otherwise discharge EXTRA blocks the
-        # optimizer deliberately left as "hold", so the chart (optimizer schedule)
-        # would show the inverter idle while it actually exports to grid.
+        # price-threshold path must defer to it, otherwise it would discharge
+        # EXTRA blocks the optimizer deliberately left as "hold", diverging from
+        # the displayed optimizer schedule.
         if context.optimizer_active:
             return False
 
@@ -666,8 +664,8 @@ class GrowattDecisionEngine:
         current_dist = self._get_distribution_tariff(current_hour, context.price_thresholds)
         # Cost to recharge 1 kWh at the cheapest future block: its spot price PLUS
         # that block's own distribution tariff (import pays distribution), all over
-        # round-trip efficiency. Omitting the recharge block's tariff understated
-        # the recharge cost and let discharge fire below true break-even.
+        # round-trip efficiency. The recharge block's tariff must be included or
+        # the recharge cost is understated and discharge fires below break-even.
         try:
             recharge_hour = int(cheapest_block_key[0].split(":")[0])
         except (ValueError, IndexError, AttributeError, TypeError):

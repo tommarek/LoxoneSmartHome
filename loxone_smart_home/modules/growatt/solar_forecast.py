@@ -128,10 +128,10 @@ class SolarProductionModel:
     curtailed_filtered: int = 0
     date_range: str = ""
     built_at: Optional[datetime] = None
-    # Per-bin estimator quantile. 0.5 = median (default; unchanged behaviour).
-    # Higher (e.g. 0.7) recovers PV *potential* when curtailment thins out a
-    # bin's high-end clean samples — the surviving samples skew low because the
-    # sunniest hours are the ones most likely to have been curtailed.
+    # Per-bin estimator quantile. 0.5 = median. Higher (e.g. 0.7) recovers PV
+    # *potential* when curtailment thins out a bin's high-end clean samples —
+    # the surviving samples skew low because the sunniest hours are the ones
+    # most likely to have been curtailed.
     quantile: float = 0.5
 
     @staticmethod
@@ -153,8 +153,8 @@ class SolarProductionModel:
         """Per-bin estimate at `self.quantile`, after IQR outlier removal.
 
         `quantile=0.5` reproduces the median exactly (linear interpolation at
-        0.5 == median for both odd and even n), so the default is behaviour-
-        preserving; a higher quantile lifts the estimate toward potential.
+        0.5 == median for both odd and even n); a higher quantile lifts the
+        estimate toward potential.
         """
         if not values:
             return 0.0
@@ -281,9 +281,8 @@ class SolarProductionModel:
         """Zero the per-level hit counters.
 
         Called at the start of each live prediction run so the counts
-        reflect THAT run's bin mix — previously they accumulated forever
-        (and the pass-2 curtailment probing inflated them before the model
-        ever served a real forecast).
+        reflect THAT run's bin mix rather than accumulating across runs
+        (including the pass-2 curtailment probing during training).
         """
         for key in self.hit_level_counts:
             self.hit_level_counts[key] = 0
@@ -485,8 +484,8 @@ class SolarForecast:
                             # So the naive date/hour below IS the local grid, no
                             # conversion needed (cf. OpenMeteo timezone=auto and
                             # Solcast's explicit tz conversion). If forecast.solar
-                            # ever changed its default to UTC this would shift by
-                            # the local offset; that contract is assumed here.
+                            # returned UTC instead this would shift by the local
+                            # offset; that contract is assumed here.
                             dt = datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S")
                             date_str = dt.strftime("%Y-%m-%d")
                             hour = dt.hour
@@ -640,7 +639,7 @@ class SolarForecast:
                 bucket on the same local clock — otherwise the sun-altitude
                 bucket learned at a UTC hour is applied at a different physical
                 instant, shifting the whole production curve by the UTC offset.
-                Mirrors the consumption/ML forecasters' ``_to_local`` fix.
+                Mirrors the consumption/ML forecasters' ``_to_local``.
 
         Returns:
             True if model was built successfully
@@ -786,7 +785,7 @@ from(bucket: "{weather_bucket}")
                     if result:
                         # Average across any duplicate series landing in the
                         # same local hour (consistent with the `mean`
-                        # aggregateWindow above) — taking max biased cloud/
+                        # aggregateWindow above). Taking max would bias cloud/
                         # radiation toward the most extreme contributing record.
                         sums: Dict[str, float] = {}
                         counts: Dict[str, int] = {}
@@ -966,9 +965,9 @@ from(bucket: "{weather_bucket}")
                 if _add_to_model(model2, hour_key, kwh):
                     added += 1
 
-            # Count what actually landed in the bins — `matched - curtailed`
-            # over-counted (curtailed includes hours pass 1 never matched, and
-            # _add_to_model can still decline on sun-below-horizon).
+            # Count what actually landed in the bins. `matched - curtailed`
+            # would over-count: curtailed includes hours pass 1 never matched,
+            # and _add_to_model can still decline on sun-below-horizon.
             model2.data_points = added
             model2.curtailed_filtered = curtailed
 
@@ -1251,8 +1250,8 @@ from(bucket: "{weather_bucket}")
                             # supported bin (real installation data, ≥
                             # MIN_2D_TRUST_SAMPLES samples — "2d_sparse" does
                             # NOT qualify): trust the model in BOTH directions.
-                            # (Taking whichever was HIGHER here was a
-                            # structural over-forecast bias.)
+                            # Taking whichever source was HIGHER here would be a
+                            # structural over-forecast bias.
                             hourly[hour] = model_val
                         else:
                             # Sparse bin (2d_sparse/interpolate/global/unknown
@@ -1273,7 +1272,7 @@ from(bucket: "{weather_bucket}")
                     source=source,
                 )
             elif len(sources) >= 2:
-                # No model, but multiple other sources — original consensus logic
+                # No model, but multiple other sources — plain averaging consensus
                 hourly = {}
                 all_hours = set()
                 for s in sources:
