@@ -58,6 +58,9 @@ def test_build_price_rows_basic_economics_and_status():
     assert charging_row["day"] == "today"
     # Planned inverter powerRate is surfaced per row (None when no projection).
     assert "projected_power_rate" in charging_row
+    # Export-view price = spot - sell_fee (no distribution, no wear); the
+    # Import/Export chart toggle plots this in the Export view.
+    assert charging_row["sell_czk"] == round(3.0 - 0.5, 2)
 
 
 def test_build_price_rows_inverter_off_only_when_not_charging():
@@ -180,6 +183,18 @@ def test_dashboard_html_has_tab_app_shell():
     assert html.count("</section>") == 4
     # showTab nav JS present.
     assert "function showTab(" in html
+
+
+def test_dashboard_html_has_import_export_toggle():
+    html = dashboard.DASHBOARD_HTML
+    # Segmented toggle present on both charts, wired to setPriceView, view-aware
+    # bar values via viewVals, and persisted/re-rendered without a refetch.
+    assert html.count('class="viewtog"') >= 2  # home + prices charts
+    assert "data-view=\"import\"" in html and "data-view=\"export\"" in html
+    assert "function setPriceView(" in html
+    assert "function viewVals(" in html
+    assert "function renderCharts(" in html
+    assert "p.sell_czk" in html  # export view plots spot - sell_fee
 
 
 def test_dashboard_html_has_pwa_head_and_scroll_chart():
@@ -470,6 +485,72 @@ def test_plan_savings_zero_when_actual_matches_baseline():
     savings, n = dashboard._plan_savings_from_flows(ctrl, blocks)
     assert n == 1
     assert savings == pytest.approx(0.0, abs=0.01)
+
+
+def test_expected_snapshot_persist_and_read(tmp_path):
+    # Persisting the optimizer's expected daily gain must survive "restarts"
+    # (re-reading the file) and the period reader sums only the in-window days.
+    from datetime import date, timedelta
+    ctrl = SimpleNamespace(
+        config=_econ_config(),
+        _economics_snapshots_path=str(tmp_path / "economics_snapshots.json"),
+    )
+    today = date.today()
+    dashboard.persist_expected_snapshot(ctrl, today.strftime("%Y-%m-%d"), 5.0)
+    dashboard.persist_expected_snapshot(
+        ctrl, (today - timedelta(days=2)).strftime("%Y-%m-%d"), 3.0)
+    dashboard.persist_expected_snapshot(
+        ctrl, (today - timedelta(days=20)).strftime("%Y-%m-%d"), 9.0)
+    # 7-day window: today + 2-days-ago = 8.0 over 2 days; 20-days-ago excluded.
+    s7, n7 = dashboard._read_expected_snapshots(ctrl, 7, None)
+    assert (s7, n7) == (8.0, 2)
+    # 30-day window: all three.
+    s30, n30 = dashboard._read_expected_snapshots(ctrl, 30, None)
+    assert (s30, n30) == (17.0, 3)
+
+
+@pytest.mark.asyncio
+async def test_period_economics_reconstructs_real_vs_baseline(tmp_path):
+    # One day, hours 9 and 10, with grid import meters + PV/load power + OTE
+    # prices → real net cost and a no-battery baseline are reconstructed.
+    from datetime import datetime as _dt
+    today = _dt.now().date()
+
+    def at(h):
+        return _dt(today.year, today.month, today.day, h, 0)
+
+    recs = [
+        # cumulative import meter: +1 kWh in hour 9, +1 kWh in hour 10
+        _FieldRecord(at(9), "EnergyToUserToday", 1.0),
+        _FieldRecord(at(10), "EnergyToUserToday", 2.0),
+        # PV/load power (W) — hour 9: load 1000 > pv 0 (deficit); hour 10 same
+        _FieldRecord(at(9), "INVPowerToLocalLoad", 1000.0),
+        _FieldRecord(at(10), "INVPowerToLocalLoad", 1000.0),
+    ]
+    prices = [_FieldRecord(at(9), "price_czk_kwh", 3.0),
+              _FieldRecord(at(10), "price_czk_kwh", 3.0)]
+
+    class _MultiInflux:
+        async def query(self, q):
+            if "ote_prices" in q or "electricity_prices" in q:
+                return [_FakeTable(prices)]
+            return [_FakeTable(recs)]
+
+    ctrl = SimpleNamespace(
+        influxdb_client=_MultiInflux(),
+        settings=SimpleNamespace(influxdb=SimpleNamespace(bucket_solar="solar")),
+        config=_econ_config(),
+        _period_econ_cache={},
+        _economics_snapshots_path=str(tmp_path / "s.json"),
+    )
+    res = await dashboard._period_economics(ctrl, 7)
+    assert res is not None and res["source"] == "reconstructed"
+    # hour 9 import delta = 1 kWh (hour 10 delta=1). Both NT (9,10): hour 10 is
+    # VT under D57d, hour 9 NT — net cost is positive with positive prices.
+    assert res["net_cost_czk"] > 0
+    assert res["import_cost_czk"] > 0
+    # No expected snapshots yet → expected series empty.
+    assert res["expected_saved_czk"] is None
 
 
 @pytest.mark.asyncio

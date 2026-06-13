@@ -1827,6 +1827,32 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         except Exception as e:
             self.logger.warning(f"Periodic solar model rebuild failed: {e}")
 
+    async def _maybe_snapshot_expected_gain(self, now) -> None:
+        """Once per day, record the optimizer's expected full-day gain so the
+        dashboard's weekly/monthly stats can show predicted-vs-realized savings.
+
+        Captured at the first eval of each local day that has a plan — early, so
+        it reflects the morning full-day projection (realized-so-far + remaining
+        plan). Persisted to economics_snapshots.json on the config_state volume
+        so the prediction history survives container restarts.
+        """
+        today = now.date()
+        if getattr(self, "_expected_snapshot_date", None) == today:
+            return
+        opt = getattr(self, "_optimizer", None)
+        if not opt or not getattr(opt, "_last_decisions", None):
+            return  # no plan yet — try again next tick
+        from modules.growatt import dashboard as _dash
+        econ = await _dash._build_economics(self, opt)
+        eg = econ.get("expected_daily_gain_czk")
+        if eg is None:
+            return
+        _dash.persist_expected_snapshot(self, today.strftime("%Y-%m-%d"), eg)
+        self._expected_snapshot_date = today
+        self.logger.info(
+            f"📈 Recorded optimizer expected gain for {today}: {eg:+.1f} CZK"
+        )
+
     async def _build_models_background(self) -> None:
         """Build ML models in background without blocking controller operation.
 
@@ -4840,6 +4866,15 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     self._models_task.add_done_callback(
                         self._make_task_guard("solar_model_rebuild", None)
                     )
+
+                # Snapshot the optimizer's expected daily gain once per day so
+                # the weekly/monthly stats can show predicted-vs-realized. The
+                # snapshot is persisted (survives restarts) like the Solcast
+                # quota. Best-effort — never disrupt dispatch.
+                try:
+                    await self._maybe_snapshot_expected_gain(now)
+                except Exception as e:
+                    self.logger.debug(f"Expected-gain snapshot failed: {e}")
 
                 # Rebuild consumption model if needed (weekly)
                 if self._consumption_forecast and self._consumption_forecast.needs_rebuild():

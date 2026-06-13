@@ -435,6 +435,9 @@ def _build_price_rows(
             "day": day,
             "czk_kwh": czk,
             "buy_czk": round(czk + dist, 2),  # real all-in import price
+            # Export REVENUE price (spot − sell fee, no distribution, no wear) —
+            # the "Export" chart view plots this; can be negative.
+            "sell_czk": round(czk - sell_fee, 2),
             "net_sell_czk": net_sell,
             "distribution_czk": round(dist, 2),
             "is_charging": is_charging,
@@ -1120,7 +1123,280 @@ def _plan_savings_from_flows(ctrl, blocks: Dict[str, Dict[str, float]]
     return round(savings, 1), counted
 
 
-async def _build_economics(ctrl, opt) -> Dict[str, Any]:
+async def _period_economics(ctrl, days: int) -> Optional[Dict[str, Any]]:
+    """Reconstruct real vs no-battery economics over the last `days` days.
+
+    Fully retroactive — no stored state needed: it differences the daily-reset
+    cumulative meters (EnergyToUserToday/EnergyToGridToday) per HOUR against that
+    hour's historical OTE price (ote_prices bucket, native hourly granularity) +
+    config distribution, and prices a no-battery baseline from the hourly PV/load
+    power. Returns summed import_cost, export_revenue, net_cost, baseline_cost and
+    saved (baseline − actual) over the window. Cached ~30 min per `days` on the
+    controller (heavy: 3 InfluxDB queries). None on failure.
+    """
+    if not getattr(ctrl, "influxdb_client", None):
+        return None
+    cache = getattr(ctrl, "_period_econ_cache", {}) or {}
+    hit = cache.get(days)
+    if hit and (datetime.now() - hit[0]).total_seconds() < 1800:
+        return hit[1]
+
+    from .decision_engine import GrowattDecisionEngine
+    import zoneinfo
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Prague")
+    except Exception:
+        tz = None
+    th = _make_price_thresholds(ctrl)
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    bucket = ctrl.settings.influxdb.bucket_solar
+    rng = f"-{days}d"
+
+    def _local(t):
+        if tz is not None and getattr(t, "tzinfo", None) is not None:
+            t = t.astimezone(tz)
+        return t.replace(tzinfo=None) if getattr(t, "tzinfo", None) else t
+
+    # Query A: cumulative grid meters, hourly last (start-labeled so the hour key
+    # is the hour the energy accrued in).
+    meters_flux = (
+        f'from(bucket: "{bucket}")\n  |> range(start: {rng})\n'
+        '  |> filter(fn: (r) => r._measurement == "solar" and '
+        '(r._field == "EnergyToUserToday" or r._field == "EnergyToGridToday"))\n'
+        '  |> aggregateWindow(every: 1h, fn: last, createEmpty: false, timeSrc: "_start")\n'
+    )
+    # Query B: PV/load power, hourly mean → baseline.
+    power_flux = (
+        f'from(bucket: "{bucket}")\n  |> range(start: {rng})\n'
+        '  |> filter(fn: (r) => r._measurement == "solar" and '
+        '(r._field == "PV1InputPower" or r._field == "PV2InputPower" or '
+        'r._field == "INVPowerToLocalLoad"))\n'
+        '  |> aggregateWindow(every: 1h, fn: mean, createEmpty: false, timeSrc: "_start")\n'
+    )
+    # Query C: historical OTE prices (native hourly), CZK/kWh.
+    ote_bucket = "ote_prices"
+    price_flux = (
+        f'from(bucket: "{ote_bucket}")\n  |> range(start: {rng})\n'
+        '  |> filter(fn: (r) => r._measurement == "electricity_prices" and '
+        'r._field == "price_czk_kwh")\n'
+    )
+    try:
+        meters_r = await ctrl.influxdb_client.query(meters_flux)
+        power_r = await ctrl.influxdb_client.query(power_flux)
+        price_r = await ctrl.influxdb_client.query(price_flux)
+    except Exception:
+        return None
+
+    # price[(date, hour)] = CZK/kWh
+    price_map: Dict[tuple, float] = {}
+    for table in price_r:
+        for rec in table.records:
+            t = _local(rec.get_time())
+            v = rec.get_value()
+            if v is not None:
+                price_map[(t.date(), t.hour)] = float(v)
+    if not price_map:
+        return None
+
+    # meters[(date,hour)][field] = cumulative kWh ; power[(date,hour)][field] = W
+    meters: Dict[tuple, Dict[str, float]] = {}
+    for table in meters_r:
+        for rec in table.records:
+            t = _local(rec.get_time())
+            f, v = rec.get_field(), rec.get_value()
+            if v is not None:
+                meters.setdefault((t.date(), t.hour), {})[f] = float(v)
+    power: Dict[tuple, Dict[str, float]] = {}
+    for table in power_r:
+        for rec in table.records:
+            t = _local(rec.get_time())
+            f, v = rec.get_field(), rec.get_value()
+            if v is not None:
+                power.setdefault((t.date(), t.hour), {})[f] = float(v)
+
+    import_cost = export_rev = baseline_cost = saved = 0.0
+    days_seen = set()
+    # Per day, difference the cumulative meters across its 24 hours.
+    by_day: Dict[Any, list] = {}
+    for (d, h) in meters:
+        by_day.setdefault(d, []).append(h)
+    for d, hours in by_day.items():
+        prev = {"EnergyToUserToday": 0.0, "EnergyToGridToday": 0.0}
+        for h in sorted(hours):
+            m = meters.get((d, h), {})
+            price = price_map.get((d, h))
+            if price is None:
+                # keep meter continuity but skip unpriceable hour
+                for fld in prev:
+                    if fld in m:
+                        prev[fld] = m[fld]
+                continue
+            dist = GrowattDecisionEngine._get_distribution_tariff(h, th)
+            buy = price + dist
+            sell = max(0.0, price - sell_fee)
+            imp = m.get("EnergyToUserToday")
+            exp = m.get("EnergyToGridToday")
+            d_imp = max(0.0, imp - prev["EnergyToUserToday"]) if imp is not None else 0.0
+            d_exp = max(0.0, exp - prev["EnergyToGridToday"]) if exp is not None else 0.0
+            if imp is not None:
+                prev["EnergyToUserToday"] = imp
+            if exp is not None:
+                prev["EnergyToGridToday"] = exp
+            import_cost += d_imp * buy
+            export_rev += d_exp * sell
+            actual_cost = d_imp * buy - d_exp * sell
+            # No-battery baseline from hourly PV/load power (kWh for the hour).
+            pw = power.get((d, h), {})
+            pv = max(0.0, pw.get("PV1InputPower", 0.0) + pw.get("PV2InputPower", 0.0)) / 1000.0
+            load = max(0.0, pw.get("INVPowerToLocalLoad", 0.0)) / 1000.0
+            net_solar = pv - load
+            base = (-net_solar) * buy if net_solar < 0 else (-net_solar) * sell
+            baseline_cost += base
+            saved += base - actual_cost
+            days_seen.add(d)
+
+    result = {
+        "days": days,
+        "days_counted": len(days_seen),
+        "import_cost_czk": round(import_cost, 1),
+        "export_revenue_czk": round(export_rev, 1),
+        "net_cost_czk": round(import_cost - export_rev, 1),
+        "baseline_cost_czk": round(baseline_cost, 1),
+        "saved_czk": round(saved, 1),
+        "source": "reconstructed",
+    }
+    # Optimizer-EXPECTED series (accrues forward) from persisted daily snapshots.
+    exp_sum, exp_days = _read_expected_snapshots(ctrl, days, tz)
+    result["expected_saved_czk"] = exp_sum
+    result["expected_days_counted"] = exp_days
+
+    cache[days] = (datetime.now(), result)
+    setattr(ctrl, "_period_econ_cache", cache)
+    return result
+
+
+def _expected_snapshots_path(ctrl):
+    """Path to the persisted optimizer-prediction snapshots, on the same
+    config_state volume as Solcast's quota — so predictions survive restarts."""
+    import os
+    override = getattr(ctrl, "_economics_snapshots_path", None)
+    if override:
+        return pathlib.Path(override)
+    base = os.environ.get(
+        "CONFIG_OVERRIDES_PATH", "/app/config_state/config_overrides.json")
+    return pathlib.Path(base).parent / "economics_snapshots.json"
+
+
+def _load_expected_snapshots(ctrl) -> Dict[str, float]:
+    """Load {date_str: expected_gain_czk} from disk (tolerant of missing/corrupt)."""
+    try:
+        p = _expected_snapshots_path(ctrl)
+        if not p.exists():
+            return {}
+        data = json.loads(p.read_text())
+        return {k: float(v) for k, v in data.items() if v is not None}
+    except Exception:
+        return {}
+
+
+def persist_expected_snapshot(ctrl, date_str: str, expected_czk: float) -> None:
+    """Record one day's optimizer-expected gain, pruning to ~40 days. Persisted
+    so the prediction history survives container restarts (called once/day by
+    the controller). Best-effort: a read-only FS must not break dispatch."""
+    try:
+        snaps = _load_expected_snapshots(ctrl)
+        snaps[date_str] = round(float(expected_czk), 2)
+        # Keep the most recent ~40 entries (lexicographic = chronological for ISO).
+        for old in sorted(snaps)[:-40]:
+            snaps.pop(old, None)
+        p = _expected_snapshots_path(ctrl)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".tmp")
+        tmp.write_text(json.dumps(snaps, indent=2))
+        tmp.replace(p)
+    except Exception:
+        pass
+
+
+def _read_expected_snapshots(ctrl, days, tz):
+    """Sum persisted daily optimizer-expected gains over the last `days`.
+
+    The expected series only accrues from when snapshots began, so this is
+    partial until ~`days` days have elapsed. Returns (sum_czk|None, days_counted)."""
+    snaps = _load_expected_snapshots(ctrl)
+    if not snaps:
+        return None, 0
+    from datetime import timedelta, date as _date
+    now = datetime.now(tz) if tz else datetime.now()
+    today = (now.replace(tzinfo=None) if getattr(now, "tzinfo", None) else now).date()
+    cutoff = today - timedelta(days=days)
+    vals = []
+    for ds, v in snaps.items():
+        try:
+            d = _date.fromisoformat(ds)
+        except ValueError:
+            continue
+        if d > cutoff and v is not None:
+            vals.append(v)
+    if not vals:
+        return None, 0
+    return round(sum(vals), 1), len(vals)
+
+
+def _expected_daily_gain(ctrl, opt, saved_today_czk) -> Optional[float]:
+    """Optimizer's expected full-day gain vs a no-battery baseline (CZK).
+
+    = realized-so-far (saved_today, from actuals) + the sum over today's still-
+    FUTURE plan blocks of (baseline cost − plan cost). Per block, from the
+    BlockDecision projection (no InfluxDB):
+      baseline (no battery): net = consumption − solar; cost = net·buy (import)
+                             or net·sell (export, net<0).
+      plan (with battery):   battery_delta = cap·(soc_after − soc_before)/100;
+                             net' = (consumption − solar) + battery_delta;
+                             cost = net'·buy or net'·sell.
+    Approximate (ignores round-trip losses on the SOC delta), but consistent in
+    spirit with the actuals-based saved_today so the two are comparable.
+    """
+    decisions = getattr(opt, "_last_decisions", []) if opt else []
+    if not decisions or saved_today_czk is None:
+        return None
+    import zoneinfo
+    from datetime import timedelta
+    try:
+        tz = zoneinfo.ZoneInfo("Europe/Prague")
+    except Exception:
+        tz = None
+    now = datetime.now(tz) if tz else datetime.now()
+
+    def _to_local_naive(t):
+        if tz is not None and getattr(t, "tzinfo", None) is not None:
+            t = t.astimezone(tz)
+        return t.replace(tzinfo=None)
+
+    now_n = _to_local_naive(now)
+    today = now_n.date()
+    sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
+    cap = getattr(ctrl.config, "battery_capacity", 10.0)
+    remaining = 0.0
+    for d in decisions:
+        ts = _to_local_naive(d.timestamp)
+        if ts.date() != today:
+            continue
+        # Skip blocks already elapsed — they're in saved_today via actuals.
+        if ts + timedelta(minutes=15) <= now_n:
+            continue
+        buy = d.price_czk + d.distribution_czk
+        sell = d.price_czk - sell_fee
+        base_net = d.consumption_kwh - d.solar_kwh
+        base_cost = base_net * (buy if base_net >= 0 else sell)
+        batt_delta = cap * (d.soc_after - d.soc_before) / 100.0
+        plan_net = base_net + batt_delta
+        plan_cost = plan_net * (buy if plan_net >= 0 else sell)
+        remaining += base_cost - plan_cost
+    return round(saved_today_czk + remaining, 1)
+
+
+async def _build_economics(ctrl, opt, include_periods: bool = False) -> Dict[str, Any]:
     """Consolidated today-economics dict shared by /api/economics and /api/insights.
 
     All four numbers computed from meters/actuals (never net_value scores), each
@@ -1199,12 +1475,34 @@ async def _build_economics(ctrl, opt) -> Dict[str, Any]:
         econ["saved_today_czk"] = None
         econ["plan_savings_source"] = "unavailable"
 
+    # --- Optimizer's EXPECTED full-day gain (realized-so-far + projected rest) ---
+    # The plan only covers from now to the horizon end, so the full-day
+    # expectation is what the battery has already saved today (actuals) plus
+    # what the remaining plan blocks project to save vs the no-battery baseline.
+    eg = _expected_daily_gain(ctrl, opt, econ.get("saved_today_czk"))
+    econ["expected_daily_gain_czk"] = eg
+    if eg is not None:
+        acc["expected_daily_gain"] = "plan_projection"
+
     # --- Deprecated legacy fields (kept null for the old frontend) ---
     # plan_value_czk summed net_value, which mixes CZK (MILP) and CZK/kWh
     # (greedy) — dimensionally wrong; arbitrage_czk priced free solar as if
     # grid-bought. Both replaced by saved_today_czk / batt_net_arbitrage_czk.
     econ["plan_value_czk"] = None
     econ["arbitrage_czk"] = econ.get("batt_net_arbitrage_czk")
+
+    # --- Weekly / monthly real-vs-optimizer summary (heavy; only on demand) ---
+    # Computed for /api/economics, NOT the 30s /api/insights poll. Each period:
+    # real net cost, no-battery baseline, saved (real), and the optimizer's
+    # persisted expected-saved (accrues forward).
+    if include_periods:
+        periods: Dict[str, Any] = {}
+        for label, n in (("week", 7), ("month", 30)):
+            try:
+                periods[label] = await _period_economics(ctrl, n)
+            except Exception:
+                periods[label] = None
+        econ["periods"] = periods
 
     econ["_accuracy"] = acc
     return econ
@@ -1217,7 +1515,7 @@ async def api_economics(request: web.Request) -> web.Response:
         return web.json_response({"economics": {}, "error": "no controller"})
     opt = getattr(ctrl, "_optimizer", None)
     try:
-        econ = await _build_economics(ctrl, opt)
+        econ = await _build_economics(ctrl, opt, include_periods=True)
     except Exception as e:
         return web.json_response({"economics": {}, "error": str(e)})
     return web.json_response({
@@ -2573,6 +2871,16 @@ html { scroll-behavior: smooth; }
 .soc-fill { transition: width .5s cubic-bezier(.22,.61,.36,1), background .3s; }
 
 /* Compact Home "Today" chart: 96 bars fit the width (flex), no scroll. */
+/* Import/Export price-view segmented toggle (above both charts). */
+.viewtog-wrap { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.viewtog {
+  appearance: none; border: 0; background: transparent; color: var(--muted);
+  font: inherit; font-size: 12px; font-weight: 600; padding: 4px 12px;
+  cursor: pointer; min-height: 28px;
+}
+.viewtog + .viewtog { border-left: 1px solid var(--border); }
+.viewtog.active { background: var(--accent); color: #fff; }
+.viewtog:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .home-chart { position: relative; height: 134px; margin-top: 10px; }
 .home-chart .price-chart { height: 134px; margin-top: 0; gap: 0; }
 .home-chart .price-bar { flex: 1 1 0; min-width: 0; width: auto; }
@@ -2589,6 +2897,12 @@ html { scroll-behavior: smooth; }
 .money-val { font-size: 16px; font-weight: 800; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .money-lbl { font-size: 10px; color: var(--muted); margin-top: 2px; }
 @media (max-width: 430px) { .money-grid { grid-template-columns: 1fr 1fr; } }
+/* Weekly/monthly money table */
+.period-tbl { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+.period-tbl th { text-align: right; font-size: 11px; color: var(--muted); font-weight: 600; padding: 3px 0; }
+.period-tbl th:first-child { text-align: left; }
+.period-tbl td { text-align: right; padding: 5px 0; border-top: 1px solid var(--border); font-variant-numeric: tabular-nums; font-weight: 700; }
+.period-tbl td.pl { text-align: left; font-weight: 400; color: var(--text); font-size: 12px; }
 </style>
 </head>
 <body>
@@ -2642,9 +2956,15 @@ html { scroll-behavior: smooth; }
   <div id="highLoadBanner" class="hl-banner" style="display:none"></div>
   <!-- Today overview: compact full-day price + SOC, no horizontal scroll -->
   <div class="card" style="margin-bottom:12px">
-    <div style="display:flex;justify-content:space-between;align-items:baseline;gap:8px;flex-wrap:wrap">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
       <h2 style="margin:0">Today</h2>
-      <div id="homeNow" style="font-size:12px;color:var(--muted)">--</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="viewtog-wrap" role="group" aria-label="Price view">
+          <button class="viewtog active" data-view="import" onclick="setPriceView('import')">Import</button>
+          <button class="viewtog" data-view="export" onclick="setPriceView('export')">Export</button>
+        </div>
+        <div id="homeNow" style="font-size:12px;color:var(--muted)">--</div>
+      </div>
     </div>
     <div id="homeChartNoData" style="color:var(--muted);text-align:center;padding:24px;display:none">Loading…</div>
     <div class="home-chart" id="homeChartWrap">
@@ -2669,7 +2989,7 @@ html { scroll-behavior: smooth; }
       <div class="money-item"><div class="money-val" id="moneyArb" style="color:var(--accent)">--</div><div class="money-lbl">Battery · net</div></div>
       <div class="money-item"><div class="money-val" id="moneyPlan">--</div><div class="money-lbl">Saved today</div></div>
     </div>
-    <div class="stat-label" style="margin-top:8px;font-size:11px;opacity:.65" id="moneyNote">Net = earned − spent · estimated from today&#39;s totals × prices</div>
+    <div class="stat-label" style="margin-top:8px;font-size:11px;opacity:.65" id="moneyNote">Net = earned − spent · meter-accurate, priced per 15-min block</div>
   </div>
 
   <!-- Energy Today -->
@@ -2801,12 +3121,26 @@ html { scroll-behavior: smooth; }
     <div class="card">
       <h2>💰 Economics (today)</h2>
       <div style="font-size:13px;line-height:1.9">
-        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Saved today (vs no battery)</span><span id="econPlan" style="font-weight:700">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Saved today (so far)</span><span id="econPlan" style="font-weight:700">--</span></div>
+        <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Expected today (full day)</span><span id="econExpected" style="font-weight:700">--</span></div>
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Import cost</span><span id="econImport">--</span></div>
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Export revenue</span><span id="econExport">--</span></div>
         <div class="stat" style="display:flex;justify-content:space-between"><span class="stat-label">Battery arbitrage (net)</span><span id="econArbitrage">--</span></div>
-        <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="econNote">meter/actuals-based</div>
+        <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="econNote">saved = realized vs no-battery · expected = realized + remaining plan</div>
       </div>
+    </div>
+    <div class="card">
+      <h2>📅 Weekly / Monthly money</h2>
+      <table class="period-tbl">
+        <thead><tr><th></th><th>7 days</th><th>30 days</th></tr></thead>
+        <tbody>
+          <tr><td class="pl">Saved <span style="opacity:.6">(real vs no battery)</span></td><td id="pkSavedW">--</td><td id="pkSavedM">--</td></tr>
+          <tr><td class="pl">Optimizer predicted</td><td id="pkExpW">--</td><td id="pkExpM">--</td></tr>
+          <tr><td class="pl">Net grid cost</td><td id="pkNetW">--</td><td id="pkNetM">--</td></tr>
+          <tr><td class="pl">No-battery baseline</td><td id="pkBaseW">--</td><td id="pkBaseM">--</td></tr>
+        </tbody>
+      </table>
+      <div class="stat-label" style="margin-top:6px;font-size:11px;opacity:.7" id="periodNote">real reconstructed from meters + OTE prices · predicted accrues daily</div>
     </div>
     <div class="card">
       <h2>🎯 Forecast Accuracy</h2>
@@ -2842,10 +3176,17 @@ html { scroll-behavior: smooth; }
   <section class="tab-page" id="tab-chart">
   <!-- Price Chart -->
   <div class="card" style="margin-bottom:12px">
-    <h2 id="priceChartTitle">Today's Prices &amp; Battery SOC</h2>
-    <div style="font-size:11px;color:var(--muted);margin-bottom:2px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
+      <h2 id="priceChartTitle" style="margin:0">Today's Prices &amp; Battery SOC</h2>
+      <div class="viewtog-wrap" role="group" aria-label="Price view">
+        <button class="viewtog active" data-view="import" onclick="setPriceView('import')">Import</button>
+        <button class="viewtog" data-view="export" onclick="setPriceView('export')">Export</button>
+      </div>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin:4px 0 2px">
       &#128202; Drag sideways to scroll &middot; tap a bar for details &middot;
-      <b style="color:var(--accent)">NOW</b> line splits done vs planned
+      <b style="color:var(--accent)">NOW</b> line splits done vs planned &middot;
+      <span id="viewHint">bars = all-in import price (spot + distribution)</span>
     </div>
     <!-- Overlay lines: one swatch per metric; solid = actual, dashed = forecast -->
     <div class="soc-legend">
@@ -3152,14 +3493,28 @@ function homeBarClass(p) {
   else if (p.is_inverter_off) cls = 'inverter-off';
   return cls;
 }
-// Vertical scale for a price chart on a ZERO line: how far the all-in price
-// reaches ABOVE 0 (cost, incl. the fee floor) and BELOW 0 (net paid). The 0
-// line is then placed maxNeg/range up from the bottom so negatives drop below.
+// Per-block value for the active chart view:
+//   import → all-in BUY price (spot + distribution), with the distribution as a
+//            fee floor (the minimum you pay even at zero/negative spot).
+//   export → EXPORT REVENUE (spot − sell fee), no distribution → no fee floor.
+// Returns {allin, fee}; both priceScale and barInner read this, so flipping the
+// view switches every chart at once.
+function viewVals(p) {
+  if (priceView === 'export') {
+    const sell = (p.sell_czk != null) ? p.sell_czk : (p.czk_kwh - 0.5);
+    return { allin: sell, fee: 0 };
+  }
+  const fee = p.distribution_czk || 0;
+  const allin = (p.buy_czk != null) ? p.buy_czk : (p.czk_kwh + fee);
+  return { allin, fee };
+}
+// Vertical scale for a price chart on a ZERO line: how far the value reaches
+// ABOVE 0 and BELOW 0 (for the active view). The 0 line is placed maxNeg/range
+// up from the bottom so negatives drop below.
 function priceScale(prices) {
   let maxPos = 0.001, maxNeg = 0;
   prices.forEach(p => {
-    const spot = p.czk_kwh, fee = p.distribution_czk || 0;
-    const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
+    const { allin, fee } = viewVals(p);
     maxPos = Math.max(maxPos, fee, allin > 0 ? allin : 0);  // fee floor always shown
     if (allin < 0) maxNeg = Math.max(maxNeg, -allin);
   });
@@ -3175,8 +3530,7 @@ function priceScale(prices) {
 //            value you're paid). fee stays above 0, net drops below: the total
 //            span (fee top -> net bottom) == the gross negative spot.
 function barInner(p, sc) {
-  const spot = p.czk_kwh, fee = p.distribution_czk || 0;
-  const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
+  const { allin, fee } = viewVals(p);
   const range = sc.range, zero = sc.zero;
   let s = '';
   if (allin >= 0) {
@@ -3313,23 +3667,41 @@ async function fetchPrices() {
     const allPrices = [...todayPrices, ...tomorrowPrices];
     priceData = allPrices;  // unified array for tooltip lookups across both charts
 
-    document.getElementById('priceChartTitle').textContent =
-      data.has_tomorrow ? 'Today + Tomorrow Prices & Battery SOC' : "Today's Prices & Battery SOC";
+    lastChartData = {
+      todayPrices, tomorrowPrices, timeline: projData.timeline || [],
+      hasTomorrow: !!data.has_tomorrow,
+    };
+    renderCharts();
+  } catch (e) { console.error('fetchPrices error:', e); }
+}
 
-    // Shared zero-line scale so today + tomorrow charts are comparable
-    // (same 0-line position and units across both days).
-    const maxAbs = priceScale(allPrices);
+// Render every chart from the cached data for the ACTIVE price view. Split out
+// of fetchPrices so the Import/Export toggle re-renders instantly without a
+// network round-trip.
+function renderCharts() {
+  if (!lastChartData) return;
+  const { todayPrices, tomorrowPrices, timeline, hasTomorrow } = lastChartData;
+  const allPrices = [...todayPrices, ...tomorrowPrices];
 
-    const timeline = projData.timeline || [];
-    renderHomeChart(todayPrices, timeline);  // compact Home overview
-    const eMaxToday = energyScaleMax(todayPrices, timeline, true);
-    renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
-    renderEnergyLine(todayPrices, timeline, 'priceChartToday', 'consLineToday', true, 'consumption_kwh', consActuals, '#38bdf8', eMaxToday);
-    renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true, eMaxToday);
-    renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday', true);
+  const titleEl = document.getElementById('priceChartTitle');
+  if (titleEl) titleEl.textContent =
+    (hasTomorrow ? 'Today + Tomorrow ' : "Today's ")
+    + (priceView === 'export' ? 'Export revenue & Battery SOC' : 'Prices & Battery SOC');
 
-    const tomorrowWrap = document.getElementById('priceChartTomorrowWrap');
-    if (data.has_tomorrow && tomorrowPrices.length) {
+  // Shared zero-line scale so today + tomorrow charts are comparable
+  // (same 0-line position and units across both days, for the active view).
+  const maxAbs = priceScale(allPrices);
+
+  renderHomeChart(todayPrices, timeline);  // compact Home overview
+  const eMaxToday = energyScaleMax(todayPrices, timeline, true);
+  renderPriceChart(todayPrices, 'priceChartToday', 0, maxAbs);
+  renderEnergyLine(todayPrices, timeline, 'priceChartToday', 'consLineToday', true, 'consumption_kwh', consActuals, '#38bdf8', eMaxToday);
+  renderSolarLine(todayPrices, timeline, 'priceChartToday', 'solarLineToday', true, eMaxToday);
+  renderSocLine(todayPrices, timeline, 'priceChartToday', 'socLineToday', true);
+
+  const tomorrowWrap = document.getElementById('priceChartTomorrowWrap');
+  if (tomorrowWrap) {
+    if (hasTomorrow && tomorrowPrices.length) {
       tomorrowWrap.style.display = '';
       const eMaxTomorrow = energyScaleMax(tomorrowPrices, timeline, false);
       renderPriceChart(tomorrowPrices, 'priceChartTomorrow', todayPrices.length, maxAbs);
@@ -3339,7 +3711,21 @@ async function fetchPrices() {
     } else {
       tomorrowWrap.style.display = 'none';
     }
-  } catch (e) { console.error('fetchPrices error:', e); }
+  }
+}
+
+// Flip the Import/Export price view: persist, sync the toggle buttons, re-render.
+function setPriceView(v) {
+  priceView = (v === 'export') ? 'export' : 'import';
+  try { localStorage.setItem('priceView', priceView); } catch (e) {}
+  document.querySelectorAll('.viewtog').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.view === priceView);
+  });
+  const hint = document.getElementById('viewHint');
+  if (hint) hint.textContent = priceView === 'export'
+    ? 'bars = export revenue (spot − sell fee)'
+    : 'bars = all-in import price (spot + distribution)';
+  renderCharts();
 }
 
 function renderSocLine(prices, timeline, chartId, svgId, isToday) {
@@ -3604,9 +3990,37 @@ let priceData = [];
 let solarActuals = {};  // "HH:00" -> actual solar kWh (today only)
 let socActuals = {};    // "HH:MM" -> actual battery SOC% (today, elapsed blocks)
 let consActuals = {};   // "HH:00" -> actual household load kWh (today only)
+// Chart price view: 'import' (buy = spot+distribution) | 'export' (spot−sell_fee).
+let priceView = (function(){ try { return localStorage.getItem('priceView') || 'import'; } catch(e){ return 'import'; } })();
+let lastChartData = null;  // {todayPrices, tomorrowPrices, timeline, hasTomorrow} for instant re-render on toggle
 
 function fmtCzk(v) {
   return (v == null) ? '--' : (v >= 0 ? '+' : '') + v.toFixed(1) + ' CZK';
+}
+
+// Weekly/monthly money — from /api/economics (heavier; polled slowly, not in
+// the 30s insights loop). Reconstructed real vs no-battery + persisted
+// optimizer prediction.
+async function fetchEconomics() {
+  let d;
+  try { d = await (await fetch('/api/economics')).json(); }
+  catch (e) { return; }
+  const periods = (d && d.economics && d.economics.periods) || {};
+  const fill = (p, sav, exp, net, base) => {
+    const set = (id, v, signed) => {
+      const e = document.getElementById(id); if (!e) return;
+      if (v == null) { e.textContent = '--'; e.style.color = 'var(--muted)'; return; }
+      e.textContent = (signed && v >= 0 ? '+' : '') + v.toFixed(1);
+      if (signed) e.style.color = v >= 0 ? 'var(--green)' : 'var(--red)';
+    };
+    const w = periods[p] || {};
+    set(sav, w.saved_czk, true);
+    set(exp, w.expected_saved_czk, true);
+    set(net, w.net_cost_czk, false);
+    set(base, w.baseline_cost_czk, false);
+  };
+  fill('week', 'pkSavedW', 'pkExpW', 'pkNetW', 'pkBaseW');
+  fill('month', 'pkSavedM', 'pkExpM', 'pkNetM', 'pkBaseM');
 }
 
 async function fetchInsights() {
@@ -3623,6 +4037,12 @@ async function fetchInsights() {
   if (planEl) {
     planEl.textContent = fmtCzk(saved);
     planEl.style.color = (saved || 0) >= 0 ? 'var(--green)' : 'var(--red)';
+  }
+  const expEl = document.getElementById('econExpected');
+  if (expEl) {
+    const eg = ec.expected_daily_gain_czk;
+    expEl.textContent = fmtCzk(eg);
+    expEl.style.color = (eg == null) ? 'var(--muted)' : (eg >= 0 ? 'var(--green)' : 'var(--red)');
   }
   setText('econExport', fmtCzk(ec.export_revenue_czk));
   setText('econImport', ec.import_cost_czk == null ? '--' :
@@ -3689,13 +4109,25 @@ async function fetchInsights() {
     }
   }
 
-  // --- Alerts strip ---
+  // --- Alerts strip: actionable, persistent problems only. Transient
+  // post-restart conditions (ML still retraining → binned; diagnostic /get
+  // reads failing; tiny-denominator morning solar error) must NOT alarm. ---
   const alerts = [];
   if (en.optimizer_fellback) alerts.push('Optimizer fell back to ' + en.optimizer + ' (PuLP/solver issue)');
-  if (en.consumption_fellback) alerts.push('ML consumption unavailable — using binned model');
-  if (Object.keys(cmds).some(k => !cmds[k].success)) alerts.push('A control command failed — check logs');
+  // ML fallback is shown in Engines & Sources; not an alert (it self-resolves
+  // a minute after a restart once the ML model retrains).
+  // Only a failed CONTROL command (/set) matters — /get reads fail transiently
+  // at startup and recover on the next poll.
+  if (Object.keys(cmds).some(k => k.indexOf('/set') !== -1 && !cmds[k].success))
+    alerts.push('A control command failed — check logs');
   if (fr.prices_age_s != null && fr.prices_age_s > 7200) alerts.push('Prices are stale (' + Math.round(fr.prices_age_s / 3600) + 'h old)');
-  if (ac.solar_error_pct != null && Math.abs(ac.solar_error_pct) > 40) alerts.push('Solar forecast off by ' + ac.solar_error_pct + '% today');
+  // Only alert when solar UNDER-delivers vs forecast (actual << forecast) —
+  // that's what mis-sizes the plan's reserves against you. Over-performance is
+  // good news, not a warning. Gate on a meaningful absolute forecast (≥3 kWh so
+  // far) so a tiny morning 0.1-vs-0.2 kWh miss can't trip it.
+  if (ac.solar_error_pct != null && ac.solar_error_pct < -40
+      && ac.solar_forecast_kwh_so_far != null && ac.solar_forecast_kwh_so_far >= 3)
+    alerts.push('Solar underdelivering: ' + Math.abs(ac.solar_error_pct) + '% below forecast today');
   const strip = document.getElementById('alertsStrip');
   if (strip) {
     strip.innerHTML = alerts.length
@@ -4187,16 +4619,21 @@ document.getElementById('refreshBtn').addEventListener('click', refreshAll);
   }
 })();
 
+// Sync the Import/Export toggle buttons + hint to the persisted view (no
+// re-render yet — lastChartData is null until the first fetchPrices).
+setPriceView(priceView);
 fetchStatus();
 fetchLive();
 fetchPrices();
 fetchInsights();
+fetchEconomics();
 fetchLogs();
 connectSSE();
 setInterval(fetchStatus, 5000);
 setInterval(fetchLive, 3000);
 setInterval(fetchPrices, 60000);
 setInterval(fetchInsights, 30000);
+setInterval(fetchEconomics, 300000);  // weekly/monthly: heavy, refresh every 5 min
 </script>
 </body>
 </html>

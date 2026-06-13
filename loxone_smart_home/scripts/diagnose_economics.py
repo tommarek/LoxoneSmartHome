@@ -29,6 +29,7 @@ async def main() -> None:
     cfg = settings.growatt          # GrowattConfig (distribution tariff, etc.)
     bucket = "solar"                # CLAUDE.md: inverter telemetry bucket
     client = AsyncInfluxDBClient(settings)
+    await client.start()            # initialize the connection pool
 
     tz = zoneinfo.ZoneInfo("Europe/Prague")
     now = datetime.now(tz)
