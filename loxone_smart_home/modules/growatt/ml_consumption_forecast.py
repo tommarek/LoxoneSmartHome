@@ -230,7 +230,13 @@ from(bucket: "{bucket_solar}")
                 v = record.get_value()
                 if isinstance(v, (int, float)) and v > 0:
                     cons_by_hour[key] = float(v) / 1000.0  # kWh
-                    cons_ts[key] = t
+                    # Floor to the hour: this timestamp becomes the training
+                    # series index, and asfreq("1h") needs it ON the hour. The
+                    # raw record time is NOT aligned (the first -365d window is
+                    # labelled at the non-aligned range start, e.g. :51:09), and
+                    # a single off-hour anchor makes asfreq miss every real
+                    # point → a fabricated >24h gap → ML wrongly declines.
+                    cons_ts[key] = t.replace(minute=0, second=0, microsecond=0)
 
         temp_by_hour: Dict[str, float] = {}
         for table in temperature_result:
@@ -276,6 +282,10 @@ from(bucket: "{bucket_solar}")
         # skforecast needs a regular frequency for recursive forecasting.
         # Reindex to hourly and forward-fill small gaps; bail if too gappy.
         y_series = y_series.sort_index()
+        # Hour-floored index can in principle collide (e.g. a partial first
+        # window flooring onto an existing hour); keep the last so asfreq's
+        # unique-index requirement holds.
+        y_series = y_series[~y_series.index.duplicated(keep="last")]
         y_full = y_series.asfreq("1h")
         # Gap policy, measured on the RAW hourly series before any filling
         # (measuring after a partial interpolate under-reports the true

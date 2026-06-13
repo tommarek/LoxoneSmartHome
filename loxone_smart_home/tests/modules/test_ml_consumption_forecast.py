@@ -336,6 +336,38 @@ async def test_build_declines_on_recent_30h_gap(monkeypatch):
     assert m.is_trained is False
 
 
+class MisalignedFirstWindowClient(FakeInfluxClient):
+    """Mimics Flux's real labelling: the FIRST window of a range(start:-365d)
+    is partial and labelled at the non-hour-aligned range start (e.g. :51:09),
+    while every later window is on the hour. The oldest series index is then
+    off-hour, which used to anchor asfreq("1h") off the grid → every real point
+    missed its slot → a fabricated >24h gap → ML wrongly declined. Flooring the
+    index to the hour fixes it."""
+
+    async def query(self, q):
+        tables = await super().query(q)
+        if "inverter_state" in q or not tables:
+            return tables
+        recs = tables[0].records
+        if recs:
+            # Shift the first record off the hour by 51m09.629938s.
+            t0 = recs[0].get_time().replace(minute=51, second=9, microsecond=629938)
+            recs[0] = FakeRecord(t0, recs[0].get_value())
+        return [FakeTable(recs)]
+
+
+@pytest.mark.skipif(not SKFORECAST_AVAILABLE, reason="skforecast not installed")
+@pytest.mark.asyncio
+async def test_build_trains_despite_offhour_first_window():
+    """Regression: a non-hour-aligned first timestamp (Flux partial range-start
+    window) must not manufacture a spurious >24h gap — index is hour-floored, so
+    asfreq aligns and training succeeds on the full window."""
+    m = MLConsumptionForecast()
+    ok = await m.build_model(MisalignedFirstWindowClient(days=21), make_settings())
+    assert ok is True
+    assert m.is_trained is True
+
+
 class ModerateGapClient(GappyInfluxClient):
     GAP_HOURS = 20
 
