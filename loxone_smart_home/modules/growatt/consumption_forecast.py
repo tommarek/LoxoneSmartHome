@@ -12,6 +12,24 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 
+def _linear_quantile(sorted_vals: List[float], p: float) -> float:
+    """Linear-interpolated quantile `p` (0..1) of an already-sorted list.
+
+    Used for IQR quartiles: the raw index form ``sorted_vals[3*n//4]`` puts q3
+    at the MAX element for a minimum-size bin (n=4), so the upper fence never
+    removes anything for exactly the sparse, noisy bins that need it most.
+    """
+    if not sorted_vals:
+        return 0.0
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    idx = p * (len(sorted_vals) - 1)
+    lo = int(idx)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = idx - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
 @dataclass
 class ConsumptionModel:
     """Binned consumption lookup model.
@@ -56,12 +74,11 @@ class ConsumptionModel:
         all_bin_medians: List[float] = []
 
         for key, values in self.bins.items():
-            # IQR outlier removal
+            # IQR outlier removal (interpolated quartiles, not raw order
+            # statistics — see _linear_quantile for why this matters at n=4).
             sorted_vals = sorted(values)
-            q1_idx = len(sorted_vals) // 4
-            q3_idx = 3 * len(sorted_vals) // 4
-            q1 = sorted_vals[q1_idx]
-            q3 = sorted_vals[q3_idx]
+            q1 = _linear_quantile(sorted_vals, 0.25)
+            q3 = _linear_quantile(sorted_vals, 0.75)
             iqr = q3 - q1
             lower = q1 - 1.5 * iqr
             upper = q3 + 1.5 * iqr

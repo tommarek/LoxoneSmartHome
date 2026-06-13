@@ -33,8 +33,8 @@ class PriceThresholds:
     summer_charge_price_max: float = 0.0  # Max CZK/kWh to charge in summer (0 = only negative)
     # Defaults mirror GrowattConfig (config/settings.py) so a default-constructed
     # PriceThresholds computes the real D57d schedule, not a placeholder.
-    distribution_tariff_high: float = 0.913  # High tariff distribution cost CZK/kWh
-    distribution_tariff_low: float = 0.116  # Low tariff distribution cost CZK/kWh
+    distribution_tariff_high: float = 0.919  # High tariff distribution cost CZK/kWh
+    distribution_tariff_low: float = 0.281  # Low tariff distribution cost CZK/kWh
     low_tariff_hours: str = "0-10,11-12,13-14,15-17,18-24"  # Hour ranges for low tariff
 
 
@@ -596,7 +596,7 @@ class GrowattDecisionEngine:
             relays = details["heating_relays"]
             parts.append(f"Heating: {', '.join(relays)}")
         if details.get("ev_charging"):
-            parts.append(f"EV charging: {details['ev_power']:.0f}W")
+            parts.append(f"EV charging: {details['ev_power']:.1f}kW")  # ev_power is kW
         detail = " + ".join(parts) if parts else "High loads active"
         return f"{detail} — no discharge ({ctx.max_soc:.0f}% stop SOC)"
 
@@ -642,7 +642,13 @@ class GrowattDecisionEngine:
         # Prices are already in CZK/kWh (converted at storage time)
         current_price_czk = context.current_price
 
-        # Find the absolute cheapest 15-minute block price
+        # Find the cheapest 15-minute block price. This is used as the recharge-
+        # cost BASIS — a proxy for the price at which the discharged energy will be
+        # replaced. The day's cheapest block (even an already-elapsed overnight
+        # trough) is the right proxy because recharge happens at the RECURRING
+        # daily trough (e.g. tomorrow ~03:00 at ~the same price); restricting to
+        # forward-today blocks would, at the evening peak, leave only expensive
+        # blocks and wrongly suppress legitimate peak discharge.
         if not context.prices_15min:
             return False
 
@@ -714,27 +720,6 @@ class GrowattDecisionEngine:
         changed = self._last_mode != new_mode
         self._last_mode = new_mode
         return changed
-
-    def _validate_price_data(self, hourly_prices: Dict[Tuple[str, str], float]) -> bool:
-        """Validate price data integrity.
-
-        Args:
-            hourly_prices: Hour price mapping to validate
-
-        Returns:
-            True if data is valid
-        """
-        if not hourly_prices:
-            return False
-
-        # Check for reasonable price range in CZK/kWh
-        # Czech OTE market regularly goes negative; 2022 energy crisis saw ~25 CZK/kWh spikes
-        for price in hourly_prices.values():
-            if not -12.5 <= price <= 250:
-                self.logger.warning(f"Suspicious price detected: {price} CZK/kWh")
-                return False
-
-        return True
 
     def calculate_price_ranking(
         self,

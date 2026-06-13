@@ -238,13 +238,19 @@ class MILPBatteryOptimizer:
         """Minimal SAFE schedule when the MILP can't solve (PuLP missing,
         infeasible, or timed-out without an incumbent).
 
-        Two tiers, both conservative — never discharge, never export:
+        Two tiers:
           1. Reuse the last good plan if its blocks still cover the current
-             horizon (what the controller most recently acted on).
-          2. Otherwise hold every block and grid-charge only the cheapest
-             blocks needed to lift SOC to the highest reserve floor in the
-             horizon (overnight protection), using the SAME reserve helper and
-             per-leg sqrt-eta convention as the MILP.
+             horizon (what the controller most recently acted on). This REPLAYS
+             that recently-vetted MILP plan verbatim, so it MAY include the
+             discharge/sell_production blocks it had — replaying the last optimal
+             plan through a brief solver hiccup is better than forcing a hold,
+             and the decision_engine export/discharge gates still apply on top.
+          2. Otherwise the strictly-conservative tier — hold every block and
+             grid-charge only the cheapest blocks needed to lift SOC to the
+             highest reserve floor in the horizon (overnight protection), never
+             discharging or exporting, using the SAME reserve helper and per-leg
+             sqrt-eta convention as the MILP. Charge candidates are restricted to
+             blocks at/before the reserve deadline (see below).
 
         Deferrable loads are NOT co-optimised on a degraded tick (schedules
         cleared). Returns the engine-standard 4-tuple. The decision_engine's
@@ -301,8 +307,20 @@ class MILPBatteryOptimizer:
         )
         import_cost = [prices[i] + distribution_func(blocks[i][0].hour)
                        for i in range(len(blocks))]
+        # Restrict charge candidates to blocks AT OR BEFORE the highest reserve
+        # floor. The globally-cheapest blocks across a ~32h horizon are often
+        # tomorrow midday (cheap/negative spot), AFTER tonight's reserve is
+        # needed — charging there would NOT lift SOC in time to meet the overnight
+        # floor that target_soc was derived from. Pick the cheapest among the
+        # pre-deadline blocks instead.
+        if effective_min_socs:
+            peak_idx = max(range(len(effective_min_socs)),
+                           key=lambda i: effective_min_socs[i])
+        else:
+            peak_idx = len(blocks) - 1
+        candidates = list(range(peak_idx + 1))
         charge_idx = set(
-            sorted(range(len(blocks)), key=lambda i: import_cost[i])[:n_charge]
+            sorted(candidates, key=lambda i: import_cost[i])[:n_charge]
         )
 
         charge_times: Set[datetime] = set()
@@ -314,8 +332,15 @@ class MILPBatteryOptimizer:
             if i in charge_idx and battery_kwh < max_battery_kwh - 1e-9:
                 action = "charge"
                 charge_times.add(ts)
+                prev_kwh = battery_kwh
                 battery_kwh = min(max_battery_kwh, battery_kwh + per_block_stored)
-                net_value = -charge_max * import_cost[i]
+                # Scale the cost by the energy ACTUALLY added: when the final
+                # block is clipped at max SOC it stores less than a full block,
+                # so charging the full nominal charge_max would overstate the
+                # reported cost (net_value feeds dashboards, not dispatch).
+                frac = ((battery_kwh - prev_kwh) / per_block_stored
+                        if per_block_stored > 1e-9 else 1.0)
+                net_value = -charge_max * import_cost[i] * frac
             else:
                 action = "hold"
                 net_value = 0.0
@@ -780,7 +805,13 @@ class MILPBatteryOptimizer:
             elif val(is_disch[i]) > 0.5 and bg > ACTION_EPS:
                 action = "discharge"
                 discharge_times.add(ts)
+                # The solver may also route battery→load on the same block
+                # (is_batt_chg=0 permits both batt_to_load and batt_to_grid), so
+                # credit that self-consumption (avoided import net of wear) too —
+                # otherwise net_value understates a mixed discharge+self block.
                 net_value = bg * sell_revenue[i]
+                if bl > ACTION_EPS:
+                    net_value += bl * (import_cost[i] - battery_amortisation_czk)
             elif val(is_sp[i]) > 0.5 and sg > ACTION_EPS:
                 # A block the solver explicitly put into sell-production mode.
                 action = "sell_production"
@@ -820,7 +851,12 @@ class MILPBatteryOptimizer:
                 price_czk=price,
                 distribution_czk=dists[i],
                 solar_kwh=solar_block[i],
-                consumption_kwh=consumption_block[i],
+                # Include the deferrable draw the solver actually balanced (load
+                # balance is `... == c + deferrable_draw[i]`), so the reported
+                # consumption matches the measured INVPowerToLocalLoad the chart
+                # plots against and the economics base_net — otherwise blocks with
+                # a scheduled EV/boiler load under-report total house draw.
+                consumption_kwh=consumption_block[i] + val(deferrable_draw[i]),
                 soc_before=(soc_v[i] / battery_capacity_kwh) * 100.0,
                 soc_after=(soc_v[i + 1] / battery_capacity_kwh) * 100.0,
                 net_value=net_value,

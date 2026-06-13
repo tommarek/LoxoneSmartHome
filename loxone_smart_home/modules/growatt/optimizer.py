@@ -75,7 +75,12 @@ def compute_charge_power_rates(
     rates: Dict[datetime, int] = {}
     window: List[BlockDecision] = []
 
-    eta = max(1e-3, efficiency)
+    # Per-leg efficiency (sqrt of round-trip), matching the MILP SOC continuity
+    # and the reserve helper (_compute_reserve_soc_per_block). Using the FULL
+    # round-trip value here would under-estimate grid-side discharge energy
+    # (dsoc*0.85 vs dsoc*0.92) and size the discharge powerRate too low, risking
+    # not fully draining a short high-price spike the adaptive feature exists for.
+    eta = max(1e-3, efficiency) ** 0.5
 
     def _grid_kwh(d: BlockDecision) -> float:
         """GRID-side power the inverter's powerRate actually governs for this
@@ -506,20 +511,27 @@ from(bucket: "{solar_bucket}")
             # horizon excludes the recharge block itself (it refills mid-block),
             # so when the very next block is already a recharge the reserve is
             # 0 — intended: the upcoming block tops the battery back up.
-            recharge_j = next_recharge_idx[min(block_idx + 1, n - 1)] if block_idx + 1 < n else n
+            recharge_j = next_recharge_idx[block_idx + 1] if block_idx + 1 < n else n
             window_end = recharge_j if recharge_j < n else n
 
             # Net energy the battery must hold to cover consumption until the
             # next recharge. Work in per-BLOCK units over the SAME
             # [block_idx+1, window_end) horizon for load, solar and grid credit
             # so they can't disagree. Per block, solar first offsets the
-            # concurrent base load; only the deficit must come from the battery
-            # (drawn at the discharge-leg loss → /leg_eta) and only the surplus
-            # charges it (at the charge-leg loss → *leg_eta). This avoids the old
-            # double-count where full solar was credited as incoming charge while
-            # the full load was still booked into the reserve.
-            gross_reserve_kwh = 0.0
-            incoming_kwh = 0.0
+            # concurrent base load; only the deficit draws the battery (at the
+            # discharge-leg loss → /leg_eta) and only the surplus charges it (at
+            # the charge-leg loss → *leg_eta).
+            #
+            # Accumulate a RUNNING cumulative draw and take its PEAK, rather than
+            # netting all surplus against all deficit. Netting is order-blind: a
+            # solar surplus LATE in the window would otherwise cancel a base-load
+            # deficit that occurs EARLIER, which is physically impossible if the
+            # battery is already drained before the surplus arrives. The running-
+            # peak respects time order — a surplus only helps deficits that come
+            # AFTER it (it reduces `running`), never an earlier one (the peak is
+            # already locked in).
+            running_kwh = 0.0
+            peak_reserve_kwh = 0.0
             has_cheap_topup = False
             for j in range(block_idx + 1, window_end):
                 ts_j = blocks[j][0]
@@ -529,9 +541,10 @@ from(bucket: "{solar_bucket}")
                 solar_block = max(0.0, _forecast_value(solar_hourly, ts_j) / 4.0)
                 net = base_block - solar_block
                 if net > 0:
-                    gross_reserve_kwh += net / leg_eta
+                    running_kwh += net / leg_eta
                 else:
-                    incoming_kwh += (-net) * leg_eta
+                    running_kwh -= (-net) * leg_eta
+                peak_reserve_kwh = max(peak_reserve_kwh, running_kwh)
 
                 # A cheap-ish grid block before the recharge gives ONE top-up
                 # opportunity. Only note it here — crediting a fresh full charge
@@ -545,10 +558,10 @@ from(bucket: "{solar_bucket}")
                 if price_rank < 0.35:
                     has_cheap_topup = True
 
+            reserve_kwh = peak_reserve_kwh
             if has_cheap_topup:
-                incoming_kwh += kwh_per_block * leg_eta
-
-            reserve_kwh = max(0, gross_reserve_kwh - incoming_kwh)
+                reserve_kwh -= kwh_per_block * leg_eta
+            reserve_kwh = max(0, reserve_kwh)
             reserve_kwh = min(reserve_kwh, max_reserve)
             effective_min_socs[block_idx] = min(
                 max_soc - 5,

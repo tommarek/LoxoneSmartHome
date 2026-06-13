@@ -145,19 +145,9 @@ class SolarProductionModel:
         return min(10, max(0, int(cloud_pct / 10)))
 
     @staticmethod
-    def azimuth_to_bucket(azimuth_deg: float) -> int:
-        """Sun azimuth → bucket (15° steps, 0-23)."""
-        return int((azimuth_deg % 360) / 15)
-
-    @staticmethod
     def altitude_to_bucket(altitude_deg: float) -> int:
         """Sun altitude → bucket (5° steps, 0-18)."""
         return min(18, max(0, int(altitude_deg / 5)))
-
-    @staticmethod
-    def temp_to_bucket(temp_c: float) -> int:
-        """Temperature → bucket (5°C steps)."""
-        return min(12, max(0, int((temp_c + 20) / 5)))
 
     def _compute_quantile(self, values: List[float]) -> float:
         """Per-bin estimate at `self.quantile`, after IQR outlier removal.
@@ -171,8 +161,13 @@ class SolarProductionModel:
         if len(values) < 3:
             return statistics.median(values)
         sorted_vals = sorted(values)
-        q1 = sorted_vals[len(sorted_vals) // 4]
-        q3 = sorted_vals[3 * len(sorted_vals) // 4]
+        # Interpolated quartiles, NOT raw order statistics. With the index form
+        # sorted_vals[3*n//4], a minimum bin (n=4) puts q3 at the MAX element and
+        # q1 at the second-smallest, so q3+1.5*iqr sits above every sample and the
+        # upper fence removes nothing for exactly the sparse, noisy bins that need
+        # it most. Linear interpolation gives true 25th/75th percentiles.
+        q1 = self._linear_quantile(sorted_vals, 0.25)
+        q3 = self._linear_quantile(sorted_vals, 0.75)
         iqr = q3 - q1
         filtered = sorted(
             v for v in values if (q1 - 1.5 * iqr) <= v <= (q3 + 1.5 * iqr)
@@ -184,12 +179,20 @@ class SolarProductionModel:
             return filtered[0]
         if q >= 1:
             return filtered[-1]
-        # Linear-interpolated quantile.
-        idx = q * (len(filtered) - 1)
+        return self._linear_quantile(filtered, q)
+
+    @staticmethod
+    def _linear_quantile(sorted_vals: List[float], p: float) -> float:
+        """Linear-interpolated quantile `p` (0..1) of an already-sorted list."""
+        if not sorted_vals:
+            return 0.0
+        if len(sorted_vals) == 1:
+            return sorted_vals[0]
+        idx = p * (len(sorted_vals) - 1)
         lo = int(idx)
-        hi = min(lo + 1, len(filtered) - 1)
+        hi = min(lo + 1, len(sorted_vals) - 1)
         frac = idx - lo
-        return filtered[lo] * (1 - frac) + filtered[hi] * frac
+        return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
 
     def add_sample(self, rad_b: int, cloud_b: int, alt_b: int,
                    kwh: float) -> None:
@@ -445,6 +448,7 @@ class SolarForecast:
             Dict mapping date string (YYYY-MM-DD) to DailyForecast
         """
         combined_hourly: Dict[str, Dict[int, float]] = {}  # date_str -> {hour -> wh}
+        arrays_succeeded = 0
 
         async with aiohttp.ClientSession() as session:
             for array in self.arrays:
@@ -493,6 +497,7 @@ class SolarForecast:
                                 combined_hourly[date_str].get(hour, 0) + wh
                             )
 
+                    arrays_succeeded += 1
                     self.logger.info(
                         f"Fetched forecast.solar for {array.name} "
                         f"({array.kwp} kWp, az={array.azimuth}°, tilt={array.declination}°)"
@@ -515,13 +520,26 @@ class SolarForecast:
                 source="api",
             )
 
+        all_arrays_ok = arrays_succeeded == len(self.arrays)
+        if result and not all_arrays_ok and self._api_forecast:
+            # A PARTIAL fetch (e.g. 429 after the first of N arrays) under-counts
+            # every day it touched — the un-fetched arrays' production is missing.
+            # Do NOT overwrite a previously-cached FULL forecast with it; keep the
+            # last good one and return that. (First run with no prior cache falls
+            # through below and caches the partial as the best available.)
+            self.logger.warning(
+                f"forecast.solar partial fetch ({arrays_succeeded}/"
+                f"{len(self.arrays)} arrays) — keeping previous cached forecast"
+            )
+            return self._api_forecast
+
         if result:
             self._api_forecast = result
             self._last_api_update = datetime.now()
             total_all = sum(f.total_kwh for f in result.values())
             self.logger.info(
-                f"Solar API forecast updated: {len(result)} days, "
-                f"total {total_all:.1f} kWh across {len(self.arrays)} arrays"
+                f"Solar API forecast updated: {len(result)} days, total "
+                f"{total_all:.1f} kWh ({arrays_succeeded}/{len(self.arrays)} arrays)"
             )
 
         return result
@@ -566,21 +584,26 @@ class SolarForecast:
 
                     weather_data = {"hourly": []}
                     for i, t in enumerate(times):
-                        # Compute effective cloud cover from layers
+                        # OpenMeteo can return an explicit JSON null for any hourly
+                        # value; coerce EVERY layer with `or 0` (not just cloud_low)
+                        # — _effective_cloud_cover does `0.5*cloud_mid/100`, so a
+                        # None mid/high layer raises TypeError and the outer except
+                        # would discard the ENTIRE radiation forecast. Mirrors the
+                        # controller's inline fetch.
                         if cloud_low and i < len(cloud_low):
                             eff_cloud = _effective_cloud_cover(
                                 cloud_low[i] or 0,
-                                cloud_mid[i] if cloud_mid and i < len(cloud_mid) else 0,
-                                cloud_high[i] if cloud_high and i < len(cloud_high) else 0,
+                                (cloud_mid[i] or 0) if cloud_mid and i < len(cloud_mid) else 0,
+                                (cloud_high[i] or 0) if cloud_high and i < len(cloud_high) else 0,
                             )
                         else:
-                            eff_cloud = cloud_total[i] if cloud_total and i < len(cloud_total) else 50
+                            eff_cloud = (cloud_total[i] or 0) if cloud_total and i < len(cloud_total) else 50
 
                         weather_data["hourly"].append({
                             "time": t,
-                            "shortwave_radiation": radiation[i] if i < len(radiation) else 0,
+                            "shortwave_radiation": (radiation[i] if i < len(radiation) else 0) or 0,
                             "cloudcover": eff_cloud,
-                            "temperature_2m": temperatures[i] if i < len(temperatures) else 15,
+                            "temperature_2m": (temperatures[i] if i < len(temperatures) else 15),
                         })
 
                     result = self.calculate_from_weather(weather_data)
@@ -769,8 +792,15 @@ from(bucket: "{weather_bucket}")
                         counts: Dict[str, int] = {}
                         for table in result:
                             for record in table.records:
+                                # SKIP non-numeric values (matching the sibling
+                                # parse loops above) rather than `or 0`-coercing
+                                # them: folding a None cloudcover reading in as 0
+                                # would count it as CLEAR SKY, pulling the hour's
+                                # mean toward clear and over-predicting production.
+                                val = record.get_value()
+                                if not isinstance(val, (int, float)):
+                                    continue
                                 key = _to_local(record.get_time()).strftime("%Y-%m-%d-%H")
-                                val = record.get_value() or 0
                                 sums[key] = sums.get(key, 0.0) + val
                                 counts[key] = counts.get(key, 0) + 1
                         for key, total in sums.items():
@@ -1060,7 +1090,9 @@ from(bucket: "{weather_bucket}")
 
         for entry in hourly_data:
             time_str = entry.get("time", "")
-            ghi = entry.get("shortwave_radiation", 0)  # W/m² Global Horizontal Irradiance
+            # `or 0` (not just the .get default): an explicit JSON null leaves the
+            # key present with value None, which `None <= 0` would TypeError on.
+            ghi = entry.get("shortwave_radiation") or 0  # W/m² GHI
 
             if not time_str or ghi <= 0:
                 continue
@@ -1230,11 +1262,15 @@ from(bucket: "{weather_bucket}")
 
                 total = sum(hourly.values())
                 source_names = [s.source for s in sources]
+                # Append the non-model sources only when there are any, else the
+                # label is a malformed "model+" with a dangling plus.
+                extras = [s for s in source_names if s != "model"]
+                source = "model" + ("+" + "+".join(extras) if extras else "")
                 result[date_str] = DailyForecast(
                     date=datetime.strptime(date_str, "%Y-%m-%d").date(),
                     total_kwh=total,
                     hourly=hourly,
-                    source="model+" + "+".join(s for s in source_names if s != "model"),
+                    source=source,
                 )
             elif len(sources) >= 2:
                 # No model, but multiple other sources — original consensus logic
@@ -1398,7 +1434,8 @@ from(bucket: "{bucket}")
                 return
 
             # Weighted average: recent days count more
-            # Last day weight=days, first day weight=1
+            # weight = i+1 over chronologically-sorted ratios → newest day weight
+            # = len(ratios) (filtered usable pairs, generally < days), oldest = 1
             weighted_sum = 0.0
             weight_total = 0.0
             for i, ratio in enumerate(ratios):
@@ -1607,16 +1644,24 @@ from(bucket: "{bucket}")
     ) -> Dict[int, int]:
         """Carry-forward an inverter_state on/off field to today's hours.
 
-        State is recorded only on change, so we read the last 24h of records
+        State is recorded only on change, so we read a wide window of records
         and, for each completed hour h of today, take the most recent value
         at/before the END of that hour. Missing → 1 (enabled/on), matching the
         training-filter convention.
+
+        The window is -7d, NOT -24h: if a curtailment (export/inverter switched
+        off) started more than a day ago and hasn't changed since, a 24h window
+        returns zero records and every hour wrongly defaults to 1 (on), so a
+        genuinely censored morning leaks into intraday calibration and scales the
+        potential forecast down to censored output. A week reaches back past any
+        realistic continuous off-state (these flags are price-gated and toggle
+        most days); the query is cheap since state is written only on change.
         """
         out: Dict[int, int] = {}
         try:
             q = f'''
 from(bucket: "{bucket}")
-  |> range(start: -24h)
+  |> range(start: -7d)
   |> filter(fn: (r) => r._measurement == "inverter_state" and r._field == "{field}")
   |> sort(columns: ["_time"])
 '''
@@ -1632,18 +1677,32 @@ from(bucket: "{bucket}")
                         if isinstance(v, (int, float)):
                             records.append((t, int(round(float(v)))))
             records.sort(key=lambda r: r[0])
+            # Single forward-pointer sweep over the sorted change-records (NOT a
+            # full rescan per hour, which was O(hours×records)): both hours and
+            # records are monotonically increasing, so carry `idx`/`last` forward.
+            # Per hour, take the MIN of the entering state and any state changes
+            # WITHIN the hour — mirroring _carry_forward_hourly so a partially-
+            # disabled (mid-hour OFF) hour counts as disabled/censored, instead of
+            # the end-of-hour value letting an OFF→ON transition hour slip through
+            # as fully enabled.
+            idx = 0
+            last = 1  # state entering the current hour (1 = ON/enabled default)
             for h in range(current_hour):
-                # End of hour h, local. Build a naive comparison via the record
-                # timestamps (already local). Last record at/before this wins.
-                last = 1
-                for t, v in records:
-                    if t.date() < target_date or (
-                        t.date() == target_date and t.hour <= h
-                    ):
-                        last = v
-                    else:
+                hour_min = last
+                while idx < len(records):
+                    t, v = records[idx]
+                    if not (t.date() < target_date or (
+                            t.date() == target_date and t.hour <= h)):
                         break
-                out[h] = last
+                    if t.date() == target_date and t.hour == h:
+                        # change WITHIN hour h → fold into the hour's min
+                        hour_min = min(hour_min, v)
+                    else:
+                        # change before hour h (earlier day/hour) → re-base entering
+                        hour_min = v
+                    last = v  # post-change state carries to the next hour
+                    idx += 1
+                out[h] = hour_min
         except Exception as e:
             self.logger.debug(f"_state_by_hour_today({field}) failed: {e}")
         return out

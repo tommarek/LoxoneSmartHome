@@ -71,8 +71,15 @@ class ModeManager:
         immediate_activation: bool = False
     ) -> tuple[str, str]:
         """Ensure start time is in future for inverter scheduling."""
+        # Forward preserve_duration BY KEYWORD: the adapter signature is
+        # (start, stop, min_future_minutes=1, preserve_duration=False, ...), so
+        # passing it positionally bound the bool to min_future_minutes and left
+        # the adapter's preserve_duration at False — silently dropping the slot-
+        # duration-preservation intent when a start time is bumped to the future.
         return self._adapter._ensure_future_start(
-            start_hour, stop_hour, preserve_duration, immediate_activation=immediate_activation
+            start_hour, stop_hour,
+            preserve_duration=preserve_duration,
+            immediate_activation=immediate_activation,
         )
 
     async def _wait_for_command_result(self, command_path: str) -> Optional[Dict[str, Any]]:

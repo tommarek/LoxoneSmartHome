@@ -3,7 +3,7 @@
 import json
 from datetime import datetime, time, timedelta
 from typing import Any, Dict
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -102,10 +102,14 @@ async def test_deferrable_load_actuation_serializes_payload_and_tracks_block(
     await growatt_controller._apply_deferrable_load_schedule(block)
     await growatt_controller._apply_deferrable_load_schedule(block.replace(minute=1))
 
-    mock_mqtt_client.publish.assert_awaited_once_with(
-        "ev/on", json.dumps({"enabled": True})
-    )
+    # First tick turns the load ON; the second tick (same block, load already
+    # active) RE-ISSUES the ON command idempotently so a dropped publish self-
+    # heals — every publish targets the ON topic with the ON payload.
+    on_call = call("ev/on", json.dumps({"enabled": True}))
+    assert mock_mqtt_client.publish.await_count == 2
+    mock_mqtt_client.publish.assert_has_awaits([on_call, on_call])
     assert growatt_controller._deferrable_active == {"ev"}
+    # The block is still credited exactly ONCE despite the re-issue.
     assert growatt_controller._deferrable_completed_blocks == {("ev", block)}
 
 

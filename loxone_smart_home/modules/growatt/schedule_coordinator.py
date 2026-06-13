@@ -6,7 +6,7 @@ Handles schedule block tracking, price table formatting, and schedule logging.
 
 import logging
 from datetime import date as date_type
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List, Optional, Set, Tuple
 
 from .types import GrowattLogLevel
@@ -219,9 +219,16 @@ class ScheduleCoordinator:
         self.logger.info("\U0001f4ca COMPREHENSIVE PRICE TABLE (entire available window)")
         self.logger.info("=" * 70)
 
-        # Group blocks by date
+        # Group blocks by date. Restrict "tomorrow" to EXACTLY tomorrow's date,
+        # not `> today`: the ~32h horizon can cross a SECOND midnight and pull in
+        # a few day-after-tomorrow blocks, which log_price_table_for_date would
+        # then collapse onto tomorrow's table (block_dict is keyed by HH:MM only,
+        # so a shared quarter-hour slot from the later date overwrites tomorrow's
+        # — a wrong displayed price/marker). Those far blocks are beyond the
+        # two-day display window anyway.
+        tomorrow = today + timedelta(days=1)
         today_blocks = [(s, e, p) for s, e, p in window if s.date() == today]
-        tomorrow_blocks = [(s, e, p) for s, e, p in window if s.date() > today]
+        tomorrow_blocks = [(s, e, p) for s, e, p in window if s.date() == tomorrow]
 
         # Display today's prices (if any remaining)
         if today_blocks:

@@ -58,7 +58,9 @@ class LoxoneSmartHome:
         self.api_runner: Optional[web.AppRunner] = None
         self.api_site: Optional[web.TCPSite] = None
 
-        # Monitoring dashboard runner (port 5555) — tracked for cleanup
+        # Controller-backed dashboard API runner (internal port 5556,
+        # DASHBOARD_API_PORT) — tracked for cleanup. The public pages on 5555 are
+        # served by the separate loxone_web container (run_web_apps.py).
         self.dashboard_runner: Optional[web.AppRunner] = None
 
         # Shutdown event
@@ -255,7 +257,7 @@ class LoxoneSmartHome:
         else:
             await self.stop_api_server()
 
-        # Stop monitoring dashboard (port 5555)
+        # Stop controller-backed dashboard API (internal port 5556)
         if self.dashboard_runner:
             await self.dashboard_runner.cleanup()
             self.dashboard_runner = None

@@ -404,9 +404,13 @@ async def get_prices(request: web.Request) -> web.Response:
         )
 
     try:
-        # Get current time and price for current hour
+        # Current price for the current 15-MIN block. _current_prices is keyed by
+        # 15-min blocks ('HH:00'/'HH:15'/'HH:30'/'HH:45'); matching '%H:00' would
+        # return the hour's first-quarter price for any wall-clock minute >= 15.
+        # Floor the minute to the nearest 15 to look up the actual current block.
         now = controller._get_local_now()
-        current_hour = now.strftime("%H:00")
+        block_min = (now.minute // 15) * 15
+        current_block_start = f"{now.hour:02d}:{block_min:02d}"
 
         # Prices in _current_prices are already CZK/kWh (converted at storage time)
         eur_czk_rate = controller._eur_czk_rate or 25.0
@@ -414,7 +418,7 @@ async def get_prices(request: web.Request) -> web.Response:
         # Find current price
         current_price_czk = None
         for (start, _), price in controller._current_prices.items():
-            if start == current_hour:
+            if start == current_block_start:
                 current_price_czk = price
                 break
 

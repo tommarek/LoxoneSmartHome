@@ -121,6 +121,23 @@ class TestWeatherConfig:
 class TestGrowattConfig:
     """Test the GrowattConfig class."""
 
+    def test_low_tariff_hours_validation(self) -> None:
+        """low_tariff_hours must parse and contain at least one range."""
+        # Valid multi-range value passes through unchanged.
+        cfg = GrowattConfig(low_tariff_hours="0-10,15-17")
+        assert cfg.low_tariff_hours == "0-10,15-17"
+
+        # An empty / all-whitespace value would silently bill every import hour
+        # at the high VT tariff — must be rejected, not accepted.
+        with pytest.raises(ValidationError):
+            GrowattConfig(low_tariff_hours="")
+        with pytest.raises(ValidationError):
+            GrowattConfig(low_tariff_hours="  ,  ")
+
+        # Malformed ranges still raise.
+        with pytest.raises(ValidationError):
+            GrowattConfig(low_tariff_hours="10-5")  # start >= end
+
     def test_soc_validation(self) -> None:
         """Test state of charge validation."""
         # Valid SOC values

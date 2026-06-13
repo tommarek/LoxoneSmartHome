@@ -590,7 +590,6 @@ class GrowattController(BaseModule):
     def _format_price_summary(
         self,
         blocks: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float,
     ) -> str:
         """Format a compact price summary. Delegates to ScheduleCoordinator."""
         return self._schedule.format_price_summary(blocks)
@@ -601,7 +600,6 @@ class GrowattController(BaseModule):
         charging_tomorrow: List[Tuple[datetime, datetime, float]],
         discharge_today: List[Tuple[datetime, datetime, float]],
         discharge_tomorrow: List[Tuple[datetime, datetime, float]],
-        eur_czk_rate: float,
     ) -> None:
         """Log compact schedule summary. Delegates to ScheduleCoordinator."""
         self._schedule.log_compact_schedule(
@@ -1055,7 +1053,7 @@ class GrowattController(BaseModule):
         return ScheduleCoordinator.group_consecutive_blocks(blocks)
 
     async def _log_cross_day_price_table(
-        self, window: List[Tuple[datetime, datetime, float]], eur_czk_rate: float,
+        self, window: List[Tuple[datetime, datetime, float]],
         force_display: bool = False
     ) -> None:
         """Log cross-day price table. Delegates to ScheduleCoordinator."""
@@ -1076,7 +1074,6 @@ class GrowattController(BaseModule):
         self,
         blocks: List[Tuple[datetime, datetime, float]],
         date: date_type,
-        eur_czk_rate: float,
         charging_blocks: Set[Tuple[str, str]],
         pre_discharge_blocks: Set[Tuple[str, str]],
         discharge_blocks: Set[Tuple[str, str]],
@@ -1089,12 +1086,17 @@ class GrowattController(BaseModule):
 
     async def _get_eur_czk_rate(self) -> float:
         """Get EUR to CZK exchange rate from Czech National Bank."""
-        # Check cache first (refresh once per day)
+        # Check cache first. A successfully parsed rate is cached for 24h; a
+        # FALLBACK (CNB unreachable / unparseable) is cached only ~10 min so a
+        # transient outage — e.g. CNB unreachable right after a NAS restart while
+        # the network settles — is retried within minutes instead of pinning the
+        # flat 25.0 rate (and skewing every CZK/kWh conversion) for a full day.
         now = self._get_local_now()
+        ttl = 600 if getattr(self, "_eur_czk_rate_is_fallback", False) else 86400
         if (
             self._eur_czk_rate is not None
             and self._eur_czk_rate_updated is not None
-            and (now - self._eur_czk_rate_updated).total_seconds() < 86400  # 24 hours
+            and (now - self._eur_czk_rate_updated).total_seconds() < ttl
         ):
             return self._eur_czk_rate
 
@@ -1114,9 +1116,11 @@ class GrowattController(BaseModule):
                         fallback = float(
                             self._optional_config.get("eur_czk_rate", 25.0)
                         )
-                        # Cache the fallback to avoid repeated API calls
+                        # Cache the fallback briefly (see TTL above) to avoid
+                        # hammering CNB while still retrying within minutes.
                         self._eur_czk_rate = fallback
                         self._eur_czk_rate_updated = now
+                        self._eur_czk_rate_is_fallback = True
                         return fallback
 
                     # Read raw bytes and try different encodings
@@ -1140,9 +1144,10 @@ class GrowattController(BaseModule):
                         if rate <= 0:
                             raise ValueError(f"Invalid EUR/CZK rate from CNB: {rate}")
 
-                        # Cache the rate
+                        # Cache the parsed rate for the full 24h.
                         self._eur_czk_rate = rate
                         self._eur_czk_rate_updated = now
+                        self._eur_czk_rate_is_fallback = False
 
                         self.logger.info(f"Updated EUR/CZK exchange rate: {rate:.3f}")
                         return rate
@@ -1150,18 +1155,20 @@ class GrowattController(BaseModule):
             self.logger.warning("EUR not found in CNB exchange rate data")
             # Return default fallback (25 CZK per EUR is typical)
             fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
-            # Cache the fallback to avoid repeated API calls
+            # Cache the fallback briefly (short TTL) so we retry soon.
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
+            self._eur_czk_rate_is_fallback = True
             return fallback
 
         except Exception as e:
             self.logger.error(f"Error fetching EUR/CZK exchange rate: {e}")
             # Return default fallback (25 CZK per EUR is typical)
             fallback = float(self._optional_config.get("eur_czk_rate", 25.0))
-            # Cache the fallback to avoid repeated API calls on errors
+            # Cache the fallback briefly (short TTL) so we retry soon.
             self._eur_czk_rate = fallback
             self._eur_czk_rate_updated = now
+            self._eur_czk_rate_is_fallback = True
             return fallback
 
     async def _get_inverter_time(self) -> Optional[datetime]:
@@ -1589,90 +1596,6 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
             merged.update(self._forecast_temps_by_date.get(target_date, {}))
         return merged
 
-    async def _log_price_table(
-        self, prices_15min: Dict[Tuple[str, str], float], date: str, eur_czk_rate: float
-    ) -> None:
-        """Log 15-minute interval prices in a compact table format."""
-        # Use provided rate for consistency
-
-        self.logger.info(f"Energy prices for {date} (15-minute intervals):")
-
-        # If we have 96 blocks, show in compact 4-column format (one per quarter-hour)
-        if len(prices_15min) >= 90:
-            # Sort blocks by time
-            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
-
-            self.logger.info("┌─────────┬──────────┬──────────┬──────────┬──────────┐")
-            self.logger.info("│  Hour   │  :00-:15 │  :15-:30 │  :30-:45 │  :45-:00 │")
-            self.logger.info("├─────────┼──────────┼──────────┼──────────┼──────────┤")
-
-            # Process 4 blocks at a time (one hour)
-            for hour in range(24):
-                hour_blocks = sorted_blocks[hour * 4:(hour + 1) * 4]
-                if len(hour_blocks) < 4:
-                    break
-
-                # Get prices for each 15-minute block in CZK/kWh
-                prices = []
-                for (start, end), price_czk in hour_blocks:
-                    # Mark blocks: 🔋=regular charge, 🔌=pre-discharge charge, ⚡=discharge
-                    if (hasattr(self, '_pre_discharge_blocks') and
-                            (start, end) in self._pre_discharge_blocks):
-                        prices.append(f"{price_czk:5.2f}🔌")
-                    elif (start, end) in self._cheapest_charging_blocks:
-                        prices.append(f"{price_czk:5.2f}🔋")
-                    elif (hasattr(self, '_discharge_periods') and
-                          (start, end) in self._discharge_periods):
-                        prices.append(f"{price_czk:5.2f}⚡")
-                    else:
-                        prices.append(f"{price_czk:6.2f} ")
-
-                # Pad if we don't have all 4 blocks
-                while len(prices) < 4:
-                    prices.append("   -   ")
-
-                self.logger.info(
-                    f"│ {hour:02d}:00   │ {prices[0]} │ {prices[1]} │ {prices[2]} │ {prices[3]} │"
-                )
-
-            self.logger.info("└─────────┴──────────┴──────────┴──────────┴──────────┘")
-
-            # Show legend
-            legend_items = []
-            if self._cheapest_charging_blocks:
-                legend_items.append("🔋=Charge")
-            if hasattr(self, '_pre_discharge_blocks') and self._pre_discharge_blocks:
-                legend_items.append("🔌=Pre-discharge")
-            if hasattr(self, '_discharge_periods') and self._discharge_periods:
-                legend_items.append("⚡=Discharge")
-            if legend_items:
-                self.logger.info(f"Legend: {', '.join(legend_items)}")
-
-            # Show summary statistics
-            all_prices = list(prices_15min.values())
-            min_price = min(all_prices)
-            max_price = max(all_prices)
-            avg_price = sum(all_prices) / len(all_prices)
-
-            self.logger.info(
-                f"Summary: Min={min_price:.3f} CZK/kWh, Max={max_price:.3f} CZK/kWh, "
-                f"Avg={avg_price:.3f} CZK/kWh"
-            )
-        else:
-            # Fallback for fewer blocks - show as list
-            self.logger.info("┌──────────────┬──────────────┐")
-            self.logger.info("│   Period     │   CZK/kWh    │")
-            self.logger.info("├──────────────┼──────────────┤")
-
-            sorted_blocks = sorted(prices_15min.items(), key=lambda x: x[0][0])
-            for (start, end), price_czk_kwh in sorted_blocks:
-                period = f"{start}-{end}"
-                self.logger.info(
-                    f"│ {period:12s} │   {price_czk_kwh:7.3f}    │"
-                )
-
-            self.logger.info("└──────────────┴──────────────┘")
-
     async def start(self) -> None:
         """Start the Growatt controller.
 
@@ -1746,12 +1669,16 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # Poll EV charging from InfluxDB (high-load protection — EV isn't in the
         # MQTT cache). Heating stays event-driven via _on_home_status.
         self._high_load_poll_task = asyncio.create_task(self._high_load_poll_loop())
-        # Supervise it: if it ever dies with an exception (outside its own
-        # per-iteration try/except), log loudly and restart — otherwise the
-        # controller would silently stop evaluating while the process still
-        # looks healthy.
+        # Supervise BOTH long-lived loops: if either dies with an exception
+        # (outside its own per-iteration try/except), log loudly and restart —
+        # otherwise the controller would silently stop evaluating, or stop polling
+        # EV high-load state (degrading discharge protection), while the process
+        # still looks healthy.
         self._periodic_check_task.add_done_callback(
             self._make_task_guard("periodic_evaluation", self._periodic_evaluation_loop)
+        )
+        self._high_load_poll_task.add_done_callback(
+            self._make_task_guard("high_load_poll", self._high_load_poll_loop)
         )
 
         # Perform initial evaluation (mode decision with available data)
@@ -1788,8 +1715,12 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 self.logger.warning(f"Restarting background task '{name}'")
                 new_task = asyncio.create_task(restart())
                 new_task.add_done_callback(self._make_task_guard(name, restart))
+                # Re-point the strong reference so stop() can still cancel the
+                # restarted task (the event loop only holds a weak ref).
                 if name == "periodic_evaluation":
                     self._periodic_check_task = new_task
+                elif name == "high_load_poll":
+                    self._high_load_poll_task = new_task
         return _cb
 
     async def _rebuild_solar_model_background(self) -> None:
@@ -1827,10 +1758,19 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         today = now.date()
         if getattr(self, "_expected_snapshot_date", None) == today:
             return
+        from modules.growatt import dashboard as _dash
+        today_str = today.strftime("%Y-%m-%d")
+        # _expected_snapshot_date is in-memory only, so a mid-day RESTART would
+        # otherwise re-enter here and overwrite today's snapshot with a recompute
+        # off a truncated (rest-of-day) plan horizon — losing the stable morning
+        # full-day projection. If today's snapshot is already persisted, adopt it
+        # and skip: the first capture of the day stands.
+        if today_str in _dash._load_expected_snapshots(self):
+            self._expected_snapshot_date = today
+            return
         opt = getattr(self, "_optimizer", None)
         if not opt or not getattr(opt, "_last_decisions", None):
             return  # no plan yet — try again next tick
-        from modules.growatt import dashboard as _dash
         econ = await _dash._build_economics(self, opt)
         eg = econ.get("expected_daily_gain_czk")
         if eg is None:
@@ -2130,7 +2070,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         if active:
             parts = []
             if ev_active:
-                parts.append(f"EV: {self._ev_high_load_power:.0f}W")
+                # _ev_high_load_power is in kW (see _query_ev_charging_from_influx)
+                parts.append(f"EV: {self._ev_high_load_power:.1f}kW")
             if heating_active:
                 parts.append(f"Heating: {len(heating_relays)} relay(s)")
             self.logger.info(f"⚡ High loads ACTIVE ({', '.join(parts)}) — protecting battery")
@@ -2551,7 +2492,6 @@ from(bucket: "{bucket}")
 
         now = self._get_local_now()
         today = now.date()
-        rate = self._eur_czk_rate or 25.0
 
         # === STEP 1: Use shared scheduling logic to find optimal blocks ===
         discharge_threshold_czk = self.config.discharge_price_min
@@ -2562,7 +2502,13 @@ from(bucket: "{bucket}")
         # Determine charge block count (dynamic or fixed)
         if self.config.dynamic_charge_blocks:
             all_prices = [price for _, price in price_blocks_czk]
-            # Average self-consumption value: median price + average distribution tariff
+            # Self-consumption value basis = median spot + average distribution.
+            # NOTE: a stored kWh's true avoided cost is the price at DISCHARGE
+            # (typically the evening VT peak), not the window median, so this is
+            # INTENTIONALLY CONSERVATIVE — it charges fewer blocks when the window
+            # contains a pronounced peak. This is the legacy rule-based block-count
+            # heuristic (dynamic_charge_blocks defaults OFF; dispatch is MILP-only),
+            # kept deliberately cautious about grid charging.
             sorted_p = sorted(all_prices)
             median_price = sorted_p[len(sorted_p) // 2] if sorted_p else 2.0
             avg_dist = (
@@ -3105,7 +3051,7 @@ from(bucket: "{bucket}")
             if charging_today or charging_tomorrow:
                 self.logger.info("📊 Charging Schedule:")
                 if charging_today:
-                    price_summary = self._format_price_summary(charging_today, rate)
+                    price_summary = self._format_price_summary(charging_today)
                     self.logger.info(f"  Today: {price_summary}")
                     for start_dt, end_dt, price_czk in charging_today:
                         self.logger.info(
@@ -3113,7 +3059,7 @@ from(bucket: "{bucket}")
                             f"{price_czk:.3f} CZK/kWh"
                         )
                 if charging_tomorrow:
-                    price_summary = self._format_price_summary(charging_tomorrow, rate)
+                    price_summary = self._format_price_summary(charging_tomorrow)
                     self.logger.info(f"  Tomorrow: {price_summary}")
                     for start_dt, end_dt, price_czk in charging_tomorrow:
                         self.logger.info(
@@ -3203,10 +3149,10 @@ from(bucket: "{bucket}")
                 f"threshold: {effective_discharge_threshold:.2f} CZK/kWh"
             )
             if discharge_today:
-                price_summary = self._format_price_summary(discharge_today, rate)
+                price_summary = self._format_price_summary(discharge_today)
                 self.logger.info(f"  Discharge today: {price_summary}")
             if discharge_tomorrow:
-                price_summary = self._format_price_summary(discharge_tomorrow, rate)
+                price_summary = self._format_price_summary(discharge_tomorrow)
                 self.logger.info(f"  Discharge tomorrow: {price_summary}")
 
             # VERBOSE level - full details
@@ -3397,7 +3343,7 @@ from(bucket: "{bucket}")
 
         if not suppress_print or force_table:
             # Display comprehensive cross-day price table
-            await self._log_cross_day_price_table(window, rate, force_display=force_table)
+            await self._log_cross_day_price_table(window, force_display=force_table)
 
             if not suppress_print:
                 discharge_count = len(self._discharge_periods_today)
@@ -3563,43 +3509,6 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         except Exception as e:
             self.logger.error(f"Failed to store schedule to InfluxDB: {e}", exc_info=True)
 
-    def _calculate_discharge_periods(
-        self,
-        prices: Dict[Tuple[str, str], float],
-        rate: float
-    ) -> List[Tuple[str, str, float]]:
-        """Calculate periods when battery discharge would be profitable.
-
-        Args:
-            prices: Dictionary of 15-minute price blocks
-            rate: EUR to CZK conversion rate
-
-        Returns:
-            List of tuples (start_time, end_time, price_czk) for discharge periods
-        """
-        if not prices:
-            return []
-
-        discharge_periods = []
-
-        # Get thresholds from config
-        discharge_min_czk = self.config.discharge_price_min
-        profit_margin = self.config.discharge_profit_margin
-
-        # Find cheapest block price (already CZK/kWh)
-        cheapest_price_czk = min(prices.values())
-
-        # Calculate effective threshold
-        required_by_margin = cheapest_price_czk * profit_margin
-        effective_threshold_czk = max(discharge_min_czk, required_by_margin)
-
-        # Find all periods above threshold
-        for (start, end), price_czk in sorted(prices.items()):
-            if price_czk >= effective_threshold_czk:
-                discharge_periods.append((start, end, price_czk))
-
-        return discharge_periods
-
     def get_schedule_table_data(self) -> Dict[str, Any]:
         """Get schedule table data for web API display.
 
@@ -3647,149 +3556,6 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             "prices_fetched": bool(self._current_prices),
             "next_day_prices_fetched": self._next_day_prices_fetched,
         }
-
-    async def _log_price_analysis(
-        self,
-        prices: Dict[Tuple[str, str], float],
-        date: str,
-        charging_schedule: List[Tuple[str, str, float]],
-        charge_blocks: int,
-        pre_discharge_schedule: Optional[List[Tuple[str, str, float]]] = None,
-        peak_to_precharge_map: Optional[Dict[str, List[Tuple[str, str, float]]]] = None
-    ) -> None:
-        """Log comprehensive price analysis including table and charging schedule.
-
-        Args:
-            prices: Dictionary of 15-minute price blocks
-            date: Date string for the prices
-            charging_schedule: List of cheapest charging blocks
-            charge_blocks: Number of blocks configured for charging
-            pre_discharge_schedule: Optional list of pre-discharge charging blocks
-            peak_to_precharge_map: Optional mapping of peaks to their pre-charge blocks
-        """
-        # Ensure we have exchange rate
-        if not self._eur_czk_rate:
-            self._eur_czk_rate = await self._get_eur_czk_rate()
-
-        rate = self._eur_czk_rate or 25.0
-
-        # Calculate discharge periods
-        discharge_periods = self._calculate_discharge_periods(prices, rate)
-
-        # Store discharge periods for price table display
-        self._discharge_periods = set(
-            (period[0], period[1]) for period in discharge_periods
-        )
-
-        # Log price table (will now show discharge periods too)
-        await self._log_price_table(prices, date, rate)
-
-        if charging_schedule:
-            # Calculate average price for charging blocks
-            avg_price = sum(block[2] for block in charging_schedule) / len(charging_schedule)
-            avg_czk = avg_price  # Already CZK/kWh
-            charge_duration_hours = charge_blocks * 0.25  # 15 minutes = 0.25 hours
-
-            # Log charging schedule
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"🔋 CHARGING SCHEDULE "
-                f"({charge_blocks} blocks = {charge_duration_hours:.1f} hours)"
-            )
-            self.logger.info(f"   Average price: {avg_czk:.3f} CZK/kWh")
-            self.logger.info("   Charging blocks:")
-
-            for start, end, price_czk in charging_schedule:
-                self.logger.info(
-                    f"     {start}-{end}: {price_czk:.3f} CZK/kWh"
-                )
-
-            # Calculate savings vs peak
-            all_prices = list(prices.values())
-            max_price = max(all_prices) if all_prices else avg_price
-            savings_pct = (
-                ((max_price - avg_price) / max_price * 100)
-                if max_price > 0 else 0
-            )
-            self.logger.info(f"   Savings vs peak: {savings_pct:.0f}%")
-            self.logger.info("=" * 50)
-
-        # Log discharge schedule if there are discharge periods
-        if discharge_periods:
-            # Calculate average price for discharge blocks
-            avg_discharge_price = sum(p[2] for p in discharge_periods) / len(discharge_periods)
-            avg_discharge_czk = avg_discharge_price  # Already CZK/kWh
-            discharge_duration_hours = len(discharge_periods) * 0.25
-
-            # Get cheapest price for profit calculation
-            cheapest_price_czk = min(prices.values())  # Already CZK/kWh
-
-            # Calculate profit margin
-            profit_margin = avg_discharge_czk / cheapest_price_czk if cheapest_price_czk > 0 else 0
-
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"⚡ DISCHARGE SCHEDULE "
-                f"({len(discharge_periods)} blocks = {discharge_duration_hours:.1f} hours)"
-            )
-            self.logger.info(f"   Average price: {avg_discharge_czk:.3f} CZK/kWh")
-            self.logger.info(f"   Cheapest block: {cheapest_price_czk:.3f} CZK/kWh")
-            self.logger.info(f"   Profit margin: {profit_margin:.1f}x")
-            self.logger.info(
-                f"   Discharge threshold: {self.config.discharge_price_min:.2f} CZK/kWh"
-            )
-            self.logger.info("   Discharge blocks:")
-
-            # Group consecutive blocks for cleaner display
-            grouped_periods = []
-            current_group = [discharge_periods[0]]
-
-            for i in range(1, len(discharge_periods)):
-                prev_end = current_group[-1][1]
-                curr_start = discharge_periods[i][0]
-
-                # Check if consecutive (end time of prev equals start time of current)
-                if prev_end == curr_start:
-                    current_group.append(discharge_periods[i])
-                else:
-                    # Start new group
-                    grouped_periods.append(current_group)
-                    current_group = [discharge_periods[i]]
-
-            # Add the last group
-            grouped_periods.append(current_group)
-
-            # Display grouped periods
-            for group in grouped_periods:
-                start = group[0][0]
-                end = group[-1][1]
-                avg_group_price = sum(p[2] for p in group) / len(group)
-                avg_group_czk = avg_group_price  # Already CZK/kWh
-                if len(group) > 1:
-                    self.logger.info(
-                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh "
-                        f"(avg of {len(group)} blocks)"
-                    )
-                else:
-                    self.logger.info(
-                        f"     {start}-{end}: {avg_group_czk:.3f} CZK/kWh"
-                    )
-
-            self.logger.info("=" * 50)
-
-        # Log pre-discharge preparation schedule if available
-        if pre_discharge_schedule and peak_to_precharge_map:
-            # Calculate totals
-            total_unique_blocks = len(self._combined_charging_blocks)
-            total_hours = total_unique_blocks * 0.25
-            pre_discharge_count = len(self._pre_discharge_blocks)
-
-            self.logger.info("=" * 50)
-            self.logger.info(
-                f"🔌 PRE-DISCHARGE: {pre_discharge_count} blocks added "
-                f"(total charging: {total_unique_blocks} blocks = {total_hours:.1f}h)"
-            )
-            self.logger.info("=" * 50)
 
     async def _on_price_update(self) -> None:
         """Handle new price data availability."""
@@ -3948,8 +3714,9 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
 
                 # Re-derive and (re)apply the desired hardware state EVERY
                 # evaluation. The decided mode STRING can be unchanged while the
-                # resolved hardware state still differs — e.g. sell_production
-                # resolves to battery_hold once live SOC crosses the margin, or an
+                # resolved hardware state still differs — e.g. the passive-hold
+                # modes (sell_production / battery_hold / high_load_protected) pin
+                # stop_soc to the LIVE SOC, which drifts between ticks, or an
                 # adaptive per-window powerRate changes mid-mode. Gating on the
                 # mode string alone would skip those reactuations until the next
                 # 15-min decide(). has_mode_changed() is kept (it advances the
@@ -3970,9 +3737,11 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     new_mode, params=mode_params, reason=reason,
                     explanation=explanation, context=context,
                 )
-                # Report the EFFECTIVE (actuated) mode, not the pre-remap decision
-                # — e.g. a mid-SOC sell_production actuates as battery_hold, and
-                # operational_mode must match the inverter_mode written alongside.
+                # Report the EFFECTIVE (built) mode. This normally echoes the
+                # decided mode; it differs only when _build_desired_state remaps
+                # an unknown mode to "regular". (sell_production etc. are NOT mode-
+                # swapped — they stay their own mode with stop_soc pinned to live
+                # SOC.) operational_mode must match the state written alongside.
                 self._current_mode = getattr(self, "_last_built_mode", new_mode)
                 if applied:
                     await self._write_inverter_state_point(source="mode_change")
@@ -4204,8 +3973,28 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             sunrise=sunrise,
             sunset=sunset,
             is_summer_mode=(await self._get_season_mode() == "summer"),
-            discharge_power_pct=float(self.config.discharge_power_rate),
+            discharge_power_pct=self._current_discharge_power_pct(),
         )
+
+    def _current_discharge_power_pct(self) -> float:
+        """The discharge powerRate% the inverter will ACTUALLY use this block.
+
+        Mirrors _build_desired_state: when adaptive_discharge_rate is on and a
+        per-block rate is planned for the current block, that rate is actuated;
+        otherwise the static config rate. Surfacing it here keeps the decision-
+        engine discharge explanations honest (they'd otherwise always report the
+        config rate, e.g. "25% power" while the inverter runs at 100%).
+        """
+        if (getattr(self.config, "adaptive_discharge_rate", False)
+                and self._discharge_power_rate_by_ts):
+            now = self._get_local_now()
+            cur_ts = now.replace(
+                minute=(now.minute // 15) * 15, second=0, microsecond=0
+            )
+            drate = self._discharge_power_rate_by_ts.get(cur_ts)
+            if drate is not None:
+                return float(drate)
+        return float(self.config.discharge_power_rate)
 
     async def _build_desired_state(
         self, mode: str, params: Optional[Dict[str, Any]] = None,
@@ -4268,7 +4057,14 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # surplus solar during a hold is NOT achievable on this inverter without
         # also grid-charging, so we prefer "export surplus, never grid-charge".
         if mode in ("sell_production", "battery_hold", "high_load_protected"):
-            stop_soc = int(round(max(
+            # FLOOR, not round: rounding a live SOC of e.g. 50.6 UP to 51 would
+            # leave ~0.4% of charge headroom, and on this SPH battery_first
+            # charges UP TO stop_soc from the grid even with ac_charge off — i.e.
+            # a rounded-up pin lets the inverter pull a little grid power into the
+            # battery during a hold, the exact thing these modes prevent. Floor
+            # guarantees stop_soc <= live SOC (no discharge risk: battery_first
+            # serves the house from grid, it does not discharge below stop_soc).
+            stop_soc = int(math.floor(max(
                 self.config.min_soc, min(self.config.max_soc, self._battery_soc)
             )))
 
@@ -4407,9 +4203,10 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except Exception as e:
                 self.logger.debug(f"Could not seed inverter_on from price gate: {e}")
 
-        # Stash the EFFECTIVE mode (after any sell_production→battery_hold remap)
-        # so the caller can report the actuated mode as operational_mode, not the
-        # pre-remap decision string (which would contradict inverter_mode).
+        # Stash the EFFECTIVE built mode so the caller reports the actuated mode
+        # as operational_mode. This echoes the decided `mode` except where it was
+        # remapped above (an unknown mode → "regular"). The passive-hold modes are
+        # NOT swapped — they keep their name and go passive via the stop_soc pin.
         self._last_built_mode = mode
 
         return InverterState(
@@ -4693,6 +4490,7 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             if current_block_start in sched.block_datetimes:
                 desired_active.add(sched.load_name)
 
+        already_active = set(self._deferrable_active)  # active BEFORE this cycle
         to_start = desired_active - self._deferrable_active
         to_stop = self._deferrable_active - desired_active
 
@@ -4736,7 +4534,21 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         # newly-credited block so a mid-cycle restart does not re-schedule
         # already-delivered energy (which would double-import from grid).
         if mqtt_live:
-            for load_name in desired_active & self._deferrable_active:
+            for load_name in sorted(desired_active & self._deferrable_active):
+                # RE-ISSUE ON each cycle for loads that were ALREADY active in a
+                # prior cycle (not the ones just started above — those published
+                # moments ago). A publish only enqueues; if the broker connection
+                # drops within the publish TTL the message is dropped, and
+                # `to_start` (desired − active) would NOT re-fire it because the
+                # load is already in _deferrable_active. Re-sending value:1 is
+                # idempotent and makes the credit below honest — the command keeps
+                # getting retried until the block ends, so a single dropped publish
+                # self-heals on the next tick.
+                load = loads_by_name.get(load_name)
+                if (load_name in already_active and load and load.mqtt_topic_on
+                        and not simulate and self.mqtt_client):
+                    payload = _payload(load.payload_on, {"value": 1})
+                    await self.mqtt_client.publish(load.mqtt_topic_on, payload)
                 key = (load_name, current_block_start)
                 if key not in self._deferrable_completed_blocks:
                     self._deferrable_completed_blocks.add(key)
@@ -4962,172 +4774,170 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                 # phase drifts and can skip the 00:00 tick entirely; an exact
                 # equality check would then miss the rollover and leave
                 # yesterday's prices/schedule active for the whole day.
-                if last_midnight_check != now.date():
-                    current_midnight = now.date()
-                    if last_midnight_check != current_midnight:
-                        last_midnight_check = current_midnight
-                        self.logger.info("🕛 Midnight - new day starting...")
+                current_midnight = now.date()
+                if last_midnight_check != current_midnight:
+                    last_midnight_check = current_midnight
+                    self.logger.info("🕛 Midnight - new day starting...")
 
-                        # Cancel any ongoing fetch task (if exists)
-                        if self._price_fetch_task and not self._price_fetch_task.done():
-                            self.logger.debug(
-                                "Cancelling previous price fetch task (midnight rollover)"
-                            )
-                            self._price_fetch_task.cancel()
-                            try:
-                                await self._price_fetch_task
-                            except asyncio.CancelledError:
-                                pass
-                            self._price_fetch_task = None
+                    # Cancel any ongoing fetch task (if exists)
+                    if self._price_fetch_task and not self._price_fetch_task.done():
+                        self.logger.debug(
+                            "Cancelling previous price fetch task (midnight rollover)"
+                        )
+                        self._price_fetch_task.cancel()
+                        try:
+                            await self._price_fetch_task
+                        except asyncio.CancelledError:
+                            pass
+                        self._price_fetch_task = None
 
-                        # NEW: Apply cross-day schedule transition at midnight
+                    # NEW: Apply cross-day schedule transition at midnight
+                    # What was "tomorrow" is now "today"
+
+                    # Move next-day prices to current prices
+                    if self._next_day_prices_fetched and self._next_day_prices:
+                        self._current_prices = self._next_day_prices
+                        self._prices_date = self._next_day_prices_date
+                        self._prices_updated = now
+
+                        self.logger.info(
+                            f"✅ Activated next-day prices for {self._prices_date} "
+                            f"({len(self._current_prices)} blocks)"
+                        )
+
+                        # Clear next-day storage
+                        self._next_day_prices = {}
+                        self._next_day_prices_date = None
+                        self._next_day_prices_fetched = False
+
+                        # NEW: Shift queued tomorrow schedules to today
+                        self.logger.info(
+                            "🔄 Applying queued tomorrow's schedule as today's schedule"
+                        )
+
                         # What was "tomorrow" is now "today"
+                        self._cheapest_charging_blocks_today = (
+                            self._cheapest_charging_blocks_tomorrow.copy()
+                        )
+                        self._pre_discharge_blocks_today = (
+                            self._pre_discharge_blocks_tomorrow.copy()
+                        )
+                        self._discharge_periods_today = (
+                            self._discharge_periods_tomorrow.copy()
+                        )
+                        self._sell_production_blocks_today = (
+                            self._sell_production_blocks_tomorrow.copy()
+                        )
+                        self._hold_blocks_today = (
+                            self._hold_blocks_tomorrow.copy()
+                        )
 
-                        # Move next-day prices to current prices
-                        if self._next_day_prices_fetched and self._next_day_prices:
-                            self._current_prices = self._next_day_prices
-                            self._prices_date = self._next_day_prices_date
-                            self._prices_updated = now
+                        # Clear tomorrow's schedules
+                        self._cheapest_charging_blocks_tomorrow = set()
+                        self._pre_discharge_blocks_tomorrow = set()
+                        self._discharge_periods_tomorrow = set()
+                        self._sell_production_blocks_tomorrow = set()
+                        self._hold_blocks_tomorrow = set()
 
-                            self.logger.info(
-                                f"✅ Activated next-day prices for {self._prices_date} "
-                                f"({len(self._current_prices)} blocks)"
-                            )
+                        # Clear queues
+                        self._queued_tomorrow_charging = []
+                        self._queued_tomorrow_pre_discharge = []
+                        self._queued_tomorrow_discharge = []
 
-                            # Clear next-day storage
-                            self._next_day_prices = {}
-                            self._next_day_prices_date = None
-                            self._next_day_prices_fetched = False
+                        # Update backward-compatible sets
+                        self._cheapest_charging_blocks = (
+                            self._cheapest_charging_blocks_today.copy()
+                        )
+                        self._pre_discharge_blocks = (
+                            self._pre_discharge_blocks_today.copy()
+                        )
+                        self._combined_charging_blocks = (
+                            self._cheapest_charging_blocks_today
+                            | self._pre_discharge_blocks_today
+                        )
 
-                            # NEW: Shift queued tomorrow schedules to today
-                            self.logger.info(
-                                "🔄 Applying queued tomorrow's schedule as today's schedule"
-                            )
+                        # Clear old defer flag (replaced by cross-day logic)
+                        self._defer_charging_to_tomorrow = False
+                        self._tomorrow_cheaper_by = None
 
-                            # What was "tomorrow" is now "today"
-                            self._cheapest_charging_blocks_today = (
-                                self._cheapest_charging_blocks_tomorrow.copy()
-                            )
-                            self._pre_discharge_blocks_today = (
-                                self._pre_discharge_blocks_tomorrow.copy()
-                            )
-                            self._discharge_periods_today = (
-                                self._discharge_periods_tomorrow.copy()
-                            )
-                            self._sell_production_blocks_today = (
-                                self._sell_production_blocks_tomorrow.copy()
-                            )
-                            self._hold_blocks_today = (
-                                self._hold_blocks_tomorrow.copy()
-                            )
+                        self.logger.info(
+                            f"✅ Schedule shift complete: "
+                            f"{len(self._combined_charging_blocks)} charging blocks "
+                            f"active today"
+                        )
 
-                            # Clear tomorrow's schedules
-                            self._cheapest_charging_blocks_tomorrow = set()
-                            self._pre_discharge_blocks_tomorrow = set()
-                            self._discharge_periods_tomorrow = set()
-                            self._sell_production_blocks_tomorrow = set()
-                            self._hold_blocks_tomorrow = set()
+                        # Print full schedule table for the new day
+                        window = self._get_combined_price_window()
+                        if window:
+                            await self._log_cross_day_price_table(window, force_display=True)
 
-                            # Clear queues
-                            self._queued_tomorrow_charging = []
-                            self._queued_tomorrow_pre_discharge = []
-                            self._queued_tomorrow_discharge = []
+                        # Recalculate schedule with today's prices (optimizer needs this)
+                        if self._current_prices:
+                            await self._calculate_cross_day_optimal_schedule()
 
-                            # Update backward-compatible sets
-                            self._cheapest_charging_blocks = (
-                                self._cheapest_charging_blocks_today.copy()
-                            )
-                            self._pre_discharge_blocks = (
-                                self._pre_discharge_blocks_today.copy()
-                            )
-                            self._combined_charging_blocks = (
-                                self._cheapest_charging_blocks_today
-                                | self._pre_discharge_blocks_today
-                            )
+                        # Trigger re-evaluation with recalculated schedule
+                        await self._on_price_update()
 
-                            # Clear old defer flag (replaced by cross-day logic)
-                            self._defer_charging_to_tomorrow = False
-                            self._tomorrow_cheaper_by = None
+                        # Daily solar calibration: recalibrate from yesterday's actuals
+                        if self._solar_forecast:
+                            try:
+                                await self._solar_forecast.calibrate_from_actuals(
+                                    self.influxdb_client,
+                                    self.settings.influxdb.bucket_solar,
+                                    local_tz=self._local_tz,
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"Daily solar calibration failed: {e}")
 
-                            self.logger.info(
-                                f"✅ Schedule shift complete: "
-                                f"{len(self._combined_charging_blocks)} charging blocks "
-                                f"active today"
-                            )
+                        # Daily base load profile update with yesterday's data
+                        if self._optimizer:
+                            try:
+                                await self._optimizer.update_profile_with_yesterday(
+                                    self.influxdb_client,
+                                    self.settings.influxdb.bucket_solar,
+                                    self.settings.influxdb.bucket_loxone,
+                                )
+                            except Exception as e:
+                                self.logger.warning(f"Base load profile update failed: {e}")
 
-                            # Print full schedule table for the new day
-                            window = self._get_combined_price_window()
-                            if window:
-                                rate = self._eur_czk_rate or 25.0
-                                await self._log_cross_day_price_table(window, rate, force_display=True)
+                        # Start background fetch for NEW next day's prices (non-blocking)
+                        # This task will retry indefinitely with smart time-based backoff
+                        self._price_fetch_task = asyncio.create_task(
+                            self._fetch_next_day_prices_task()
+                        )
+                        self.logger.info(
+                            "🔄 Started background fetch for next day's prices "
+                            "(will retry with smart backoff until successful)"
+                        )
+                    else:
+                        # No next-day prices available - CRITICAL: Fetch TODAY's prices!
+                        current_date = self._get_local_date_string(days_ahead=0)
 
-                            # Recalculate schedule with today's prices (optimizer needs this)
-                            if self._current_prices:
-                                await self._calculate_cross_day_optimal_schedule()
+                        self.logger.warning(
+                            "⚠️  Next-day prices not available at midnight! "
+                            "This should not happen if pre-fetch worked correctly."
+                        )
+                        self.logger.info(
+                            f"📊 Fetching prices for TODAY ({current_date}) immediately..."
+                        )
 
-                            # Trigger re-evaluation with recalculated schedule
-                            await self._on_price_update()
+                        # Reset the fetch flag for the new day
+                        self._next_day_prices_fetched = False
+                        self._next_day_prices = {}
+                        self._next_day_prices_date = None
 
-                            # Daily solar calibration: recalibrate from yesterday's actuals
-                            if self._solar_forecast:
-                                try:
-                                    await self._solar_forecast.calibrate_from_actuals(
-                                        self.influxdb_client,
-                                        self.settings.influxdb.bucket_solar,
-                                        local_tz=self._local_tz,
-                                    )
-                                except Exception as e:
-                                    self.logger.warning(f"Daily solar calibration failed: {e}")
+                        # Clear defer flag (new day, new decisions)
+                        self._defer_charging_to_tomorrow = False
+                        self._tomorrow_cheaper_by = None
 
-                            # Daily base load profile update with yesterday's data
-                            if self._optimizer:
-                                try:
-                                    await self._optimizer.update_profile_with_yesterday(
-                                        self.influxdb_client,
-                                        self.settings.influxdb.bucket_solar,
-                                        self.settings.influxdb.bucket_loxone,
-                                    )
-                                except Exception as e:
-                                    self.logger.warning(f"Base load profile update failed: {e}")
+                        # CRITICAL FIX: Fetch TODAY's prices immediately
+                        # This ensures control logic uses correct prices
+                        await self._fetch_prices()
 
-                            # Start background fetch for NEW next day's prices (non-blocking)
-                            # This task will retry indefinitely with smart time-based backoff
-                            self._price_fetch_task = asyncio.create_task(
-                                self._fetch_next_day_prices_task()
-                            )
-                            self.logger.info(
-                                "🔄 Started background fetch for next day's prices "
-                                "(will retry with smart backoff until successful)"
-                            )
-                        else:
-                            # No next-day prices available - CRITICAL: Fetch TODAY's prices!
-                            current_date = self._get_local_date_string(days_ahead=0)
-
-                            self.logger.warning(
-                                "⚠️  Next-day prices not available at midnight! "
-                                "This should not happen if pre-fetch worked correctly."
-                            )
-                            self.logger.info(
-                                f"📊 Fetching prices for TODAY ({current_date}) immediately..."
-                            )
-
-                            # Reset the fetch flag for the new day
-                            self._next_day_prices_fetched = False
-                            self._next_day_prices = {}
-                            self._next_day_prices_date = None
-
-                            # Clear defer flag (new day, new decisions)
-                            self._defer_charging_to_tomorrow = False
-                            self._tomorrow_cheaper_by = None
-
-                            # CRITICAL FIX: Fetch TODAY's prices immediately
-                            # This ensures control logic uses correct prices
-                            await self._fetch_prices()
-
-                            self.logger.info(
-                                f"⏰ Next-day prices will be fetched at "
-                                f"{self.config.price_fetch_hour}:00 when OTE publishes them"
-                            )
+                        self.logger.info(
+                            f"⏰ Next-day prices will be fetched at "
+                            f"{self.config.price_fetch_hour}:00 when OTE publishes them"
+                        )
 
                 # Check for 15-minute block change (price changes every 15 minutes)
                 current_block = (now.hour, now.minute // 15)

@@ -405,18 +405,21 @@ async def test_grid_economics_counts_dropped_not_silent():
 
 @pytest.mark.asyncio
 async def test_grid_economics_skips_midnight_reset():
-    # A negative delta (cumulative meter reset at midnight) is skipped and is
-    # NOT counted as a fallback-priced "dropped" block.
+    # The point stop-labeled at today 00:00 holds YESTERDAY's pre-reset cumulative
+    # (8.0). It is dropped as the artifact and a synthetic 0.0 baseline is seeded,
+    # so today's energy differences from 0 — the opening block IS counted and the
+    # reset is absorbed (not double-counted, not a fallback-priced "dropped" block).
     recs = [
-        _FieldRecord(_today_at(0, 0), "EnergyToUserToday", 8.0),
-        _FieldRecord(_today_at(0, 15), "EnergyToUserToday", 0.5),  # reset → de<0
+        _FieldRecord(_today_at(0, 0), "EnergyToUserToday", 8.0),   # yesterday's value @ 00:00 label
+        _FieldRecord(_today_at(0, 15), "EnergyToUserToday", 0.5),  # today: opening block, +0.5
         _FieldRecord(_today_at(0, 30), "EnergyToUserToday", 1.0),  # +0.5
     ]
-    ctrl = _econ_ctrl(recs, prices={("00:15", "00:30"): 2.0})
+    prices = {("00:00", "00:15"): 2.0, ("00:15", "00:30"): 2.0}
+    ctrl = _econ_ctrl(recs, prices=prices)
     res = await dashboard._today_grid_economics(ctrl)
     assert res is not None
-    assert res.import_kwh == 0.5          # only the +0.5 block counted
-    assert res.dropped_blocks == 0        # reset is not a "dropped" block
+    assert res.import_kwh == 1.0          # opening 0.5 + 0.5, full day counted
+    assert res.dropped_blocks == 0        # both blocks priced; reset absorbed
 
 
 @pytest.mark.asyncio
@@ -551,6 +554,52 @@ async def test_period_economics_reconstructs_real_vs_baseline(tmp_path):
     assert res["import_cost_czk"] > 0
     # No expected snapshots yet → expected series empty.
     assert res["expected_saved_czk"] is None
+
+
+@pytest.mark.asyncio
+async def test_period_economics_per_field_gap_not_dumped(tmp_path):
+    # Per-field contiguity: import is contiguous (h9,10,11) but the EXPORT meter
+    # is MISSING at hour 10 while present at 9 and 11. A single shared cursor
+    # would (because import kept it contiguous) difference export h11 against h9,
+    # dumping two hours of export into one hour. With per-field tracking, the
+    # export delta at h11 spans a gap and must NOT be counted.
+    from datetime import datetime as _dt
+    today = _dt.now().date()
+
+    def at(h):
+        return _dt(today.year, today.month, today.day, h, 0)
+
+    recs = [
+        # import meter contiguous over hours 9,10,11 → +1 at h10, +1 at h11
+        _FieldRecord(at(9), "EnergyToUserToday", 1.0),
+        _FieldRecord(at(10), "EnergyToUserToday", 2.0),
+        _FieldRecord(at(11), "EnergyToUserToday", 3.0),
+        # export meter present only at h9 and h11 (h10 dropped out)
+        _FieldRecord(at(9), "EnergyToGridToday", 0.0),
+        _FieldRecord(at(11), "EnergyToGridToday", 4.0),
+    ]
+    prices = [_FieldRecord(at(h), "price_czk_kwh", 3.0) for h in (9, 10, 11)]
+
+    class _MultiInflux:
+        async def query(self, q):
+            if "ote_prices" in q or "electricity_prices" in q:
+                return [_FakeTable(prices)]
+            return [_FakeTable(recs)]
+
+    ctrl = SimpleNamespace(
+        influxdb_client=_MultiInflux(),
+        settings=SimpleNamespace(influxdb=SimpleNamespace(bucket_solar="solar")),
+        config=_econ_config(),
+        _period_econ_cache={},
+        _economics_snapshots_path=str(tmp_path / "s.json"),
+    )
+    res = await dashboard._period_economics(ctrl, 7)
+    assert res is not None
+    # Import counted normally (2 kWh over the two contiguous deltas).
+    assert res["import_cost_czk"] > 0
+    # The export pair spans the h10 gap → not differenced → zero revenue, NOT the
+    # 4 kWh a shared-cursor would have wrongly dumped at h11.
+    assert res["export_revenue_czk"] == 0.0
 
 
 @pytest.mark.asyncio

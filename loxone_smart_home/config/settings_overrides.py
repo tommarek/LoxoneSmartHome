@@ -34,6 +34,8 @@ from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, get_args, get_origin
 
+from pydantic_core import PydanticUndefined
+
 logger = logging.getLogger("GROWATT.settings")
 
 # Location of the persisted overrides file. Lives under a dedicated state dir
@@ -268,11 +270,23 @@ def build_settings_schema(config: Any) -> List[Dict[str, Any]]:
                 "hot": spec.hot,
                 "type": _python_type_name(info.annotation),
                 "value": value,
-                "default": info.default if info.default is not None else None,
+                # A required field (declared without a default) has
+                # info.default == PydanticUndefined in Pydantic v2 — NOT None and
+                # NOT JSON-serializable, so it would break the whole schema's
+                # serialization (and the /settings page) rather than this one
+                # field. Map it to None explicitly.
+                "default": None if info.default is PydanticUndefined
+                           else info.default,
+                # gt/lt are EXCLUSIVE bounds; flag them so the UI doesn't present
+                # e.g. gt=0 as an inclusive min=0 (a value the validator rejects).
                 "min": _constraint(meta, "ge") if _constraint(meta, "ge") is not None
                        else _constraint(meta, "gt"),
                 "max": _constraint(meta, "le") if _constraint(meta, "le") is not None
                        else _constraint(meta, "lt"),
+                "exclusive_min": _constraint(meta, "ge") is None
+                                 and _constraint(meta, "gt") is not None,
+                "exclusive_max": _constraint(meta, "le") is None
+                                 and _constraint(meta, "lt") is not None,
                 "choices": spec.choices,
                 "help": spec.help or (info.description or ""),
             })

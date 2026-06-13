@@ -741,6 +741,7 @@ class GrowattConfig(BaseSettings):
         a feature flag), so a malformed value should fail at startup rather
         than raise mid-decision.
         """
+        n_ranges = 0
         for part in v.split(","):
             part = part.strip()
             if not part:
@@ -756,6 +757,15 @@ class GrowattConfig(BaseSettings):
                 raise ValueError(
                     f"low_tariff_hours range {part!r} must satisfy 0<=start<end<=24"
                 )
+            n_ranges += 1
+        # Require at least one range. An all-empty value parses as "no NT hours",
+        # which silently bills EVERY import hour at the high VT tariff — a quiet
+        # economic mis-config. Reject it (e.g. when a user clears the field in the
+        # settings UI) instead of letting it validate.
+        if n_ranges == 0:
+            raise ValueError(
+                "low_tariff_hours must contain at least one 'start-end' range"
+            )
         return v
 
     @field_validator("max_charge_blocks")
@@ -769,6 +779,34 @@ class GrowattConfig(BaseSettings):
         """
         if "min_charge_blocks" in info.data and v < info.data["min_charge_blocks"]:
             raise ValueError("max_charge_blocks must be >= min_charge_blocks")
+        return v
+
+    @field_validator("battery_discharge_max_kw")
+    @classmethod
+    def validate_discharge_rate_consistency(cls, v: float, info: Any) -> float:
+        """Keep battery_discharge_rate_kw consistent with discharge_power_rate.
+
+        battery_discharge_rate_kw (the kW the OPTIMIZER uses to size per-block
+        discharge energy) and discharge_power_rate (the % the inverter is
+        ACTUALLY actuated at, against this hardware max) feed two independent
+        paths. Both are live-editable in the settings UI, so editing one without
+        the other silently mis-sizes the MILP discharge plan vs. real actuation.
+        The implied discharge power is battery_discharge_max_kw * rate/100; flag
+        a gross divergence (>50%) so a desync fails fast instead of degrading the
+        plan. (The default 2.5 kW vs 9.8 kW * 25% = 2.45 kW is well within band.)
+        Validated here, on the later-defined field, so the other two are present.
+        """
+        rate_pct = info.data.get("discharge_power_rate")
+        rate_kw = info.data.get("battery_discharge_rate_kw")
+        if rate_pct and rate_kw and v > 0:
+            implied_kw = v * rate_pct / 100.0
+            if implied_kw > 0 and not (0.5 <= rate_kw / implied_kw <= 1.5):
+                raise ValueError(
+                    f"battery_discharge_rate_kw ({rate_kw} kW) is inconsistent "
+                    f"with discharge_power_rate ({rate_pct}%) of "
+                    f"battery_discharge_max_kw ({v} kW) = {implied_kw:.2f} kW "
+                    "implied. Set battery_discharge_rate_kw near the implied kW."
+                )
         return v
 
 

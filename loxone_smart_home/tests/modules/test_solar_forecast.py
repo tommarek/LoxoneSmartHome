@@ -94,6 +94,20 @@ class TestWeatherCalculation:
         result = forecast.calculate_from_weather({"hourly": []})
         assert result == {}
 
+    def test_null_radiation_does_not_crash(self, forecast) -> None:
+        # OpenMeteo can return an explicit JSON null for shortwave_radiation; the
+        # key is present with value None, so `None <= 0` would TypeError and
+        # discard the whole forecast. The null hour must be skipped, not crash.
+        weather_data = {
+            "hourly": [
+                {"time": "2026-04-11T03:00:00", "shortwave_radiation": None},
+                {"time": "2026-04-11T12:00:00", "shortwave_radiation": 600},
+            ]
+        }
+        result = forecast.calculate_from_weather(weather_data)
+        day = result["2026-04-11"]
+        assert len(day.hourly) == 1 and 12 in day.hourly
+
 
 class TestConsensus:
 

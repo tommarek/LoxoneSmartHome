@@ -274,7 +274,7 @@ class SolcastForecast:
 
         timeout = aiohttp.ClientTimeout(total=15)
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            for rid in self.rooftop_ids:
+            for idx, rid in enumerate(self.rooftop_ids):
                 # Budget already reserved atomically above (self._req_count +=
                 # n_sites), so do NOT increment per-site here (double-count).
                 url = f"{self.BASE_URL}/{rid}/forecasts"
@@ -286,7 +286,15 @@ class SolcastForecast:
                             body = await resp.text()
                             if resp.status in (401, 403):
                                 # Bad key — permanent for the whole account.
+                                # Refund the sites AFTER this one: the batch
+                                # reserved n_sites up front, but we bail here
+                                # without ever sending their requests, so they
+                                # never touched Solcast's ledger. (This site
+                                # DID get a response, so it stays counted.)
                                 self._auth_failed = True
+                                self._req_count = max(
+                                    0, self._req_count - (n_sites - (idx + 1))
+                                )
                                 self._save_quota_state()
                                 self.logger.error(
                                     f"Solcast auth failed ({resp.status}) for "

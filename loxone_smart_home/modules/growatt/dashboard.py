@@ -179,16 +179,12 @@ async def api_status(request: web.Request) -> web.Response:
     # show the REAL all-in price you pay to buy = spot + distribution.
     current_distribution_czk = 0.0
     if current_block:
-        from .decision_engine import GrowattDecisionEngine, PriceThresholds
-        _th = PriceThresholds(
-            charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
-            discharge_profit_margin=4.0, battery_efficiency=0.85,
-            distribution_tariff_high=ctrl.config.distribution_tariff_high,
-            distribution_tariff_low=ctrl.config.distribution_tariff_low,
-            low_tariff_hours=getattr(
-                ctrl.config, "low_tariff_hours", "0-10,11-12,13-14,15-17,18-24"
-            ),
-        )
+        from .decision_engine import GrowattDecisionEngine
+        # Use the shared factory (live config) rather than re-hardcoding
+        # charge/discharge thresholds — only the distribution + low_tariff_hours
+        # fields feed _get_distribution_tariff, but a single source avoids stale
+        # inline literals a future reader could mistake for live config.
+        _th = _make_price_thresholds(ctrl)
         current_distribution_czk = GrowattDecisionEngine._get_distribution_tariff(
             int(current_block[0].split(":")[0]), _th
         )
@@ -386,16 +382,12 @@ def _build_price_rows(
     price dict, the per-action block-sets, the soc_lookup day prefix, and
     whether ``is_current`` can be True — so both call this single builder.
     """
-    from .decision_engine import GrowattDecisionEngine, PriceThresholds
-    thresholds = PriceThresholds(
-        charge_price_max=1.5, export_price_min=1.0, discharge_price_min=5.0,
-        discharge_profit_margin=4.0, battery_efficiency=0.85,
-        distribution_tariff_high=ctrl.config.distribution_tariff_high,
-        distribution_tariff_low=ctrl.config.distribution_tariff_low,
-        low_tariff_hours=getattr(
-            ctrl.config, 'low_tariff_hours', '0-10,11-12,13-14,15-17,18-24'
-        ),
-    )
+    from .decision_engine import GrowattDecisionEngine
+    # Reuse the shared factory (reads the live config) rather than re-hardcoding
+    # charge/discharge thresholds; only the distribution + low_tariff_hours
+    # fields feed _get_distribution_tariff below, but keeping a single source
+    # avoids a future reader trusting stale inline literals as live config.
+    thresholds = _make_price_thresholds(ctrl)
     rows = []
     for (start, end), price_czk in sorted(price_items):
         is_current = cur_block is not None and (start, end) == cur_block
@@ -644,7 +636,7 @@ async def _today_local_actuals(
 from(bucket: "{bucket}")
   |> range(start: -24h)
   |> filter(fn: (r) => r._measurement == "solar" and r._field == "{field}")
-  |> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false)
+  |> aggregateWindow(every: {every}, fn: {agg_fn}, createEmpty: false, timeSrc: "_start")
 '''
         r = await ctrl.influxdb_client.query(q)
         out: Dict[str, float] = {}
@@ -818,7 +810,17 @@ async def _today_grid_economics(ctrl) -> Optional[GridEconomicsResult]:
     bucket = ctrl.settings.influxdb.bucket_solar
     flux = (
         f'from(bucket: "{bucket}")\n'
-        '  |> range(start: -18h)\n'
+        # -28h (not -18h): the meters are CUMULATIVE with a midnight reset, and
+        # integrate() never counts points[0] (baseline only). After ~18:00 local
+        # a -18h window starts AFTER today's 00:00, so the dropped baseline holds
+        # the whole 00:00→window-start cumulative energy and today's early-morning
+        # import/export silently vanishes from the total as the evening wears on.
+        # -28h always reaches back past the previous midnight reset; combined with
+        # the synthetic (midnight, 0.0) baseline seeded below, today's full day
+        # counts including the opening 00:00 block. (Without the seed the first
+        # today reading would difference off yesterday's large pre-reset value —
+        # de<0, skipped — dropping the opening block.)
+        '  |> range(start: -28h)\n'
         '  |> filter(fn: (r) => r._measurement == "solar" and '
         '(r._field == "EnergyToUserToday" or r._field == "EnergyToGridToday"))\n'
         # fn:last STOP-labels each window: t1 is the EXCLUSIVE window end (=start
@@ -886,10 +888,29 @@ async def _today_grid_economics(ctrl) -> Optional[GridEconomicsResult]:
                 cost += de * max(0.0, spot - sell_fee)
         return round(cost, 1), round(energy, 3), dropped_blocks, round(dropped_kwh, 3)
 
+    def _seed_open_block(points):
+        # Seed a synthetic (today-midnight, 0.0) so the FIRST elapsed block of
+        # today is counted. Drop the stop-label artifact at exactly 00:00 (the
+        # 23:45-00:00 window's fn:last carries YESTERDAY's pre-reset cumulative,
+        # mislabeled today 00:00) — otherwise the opening delta is negative and
+        # skipped. Only when tz is available (mixing naive/aware would break the
+        # sort); without tz we keep the old behaviour (tiny opening undercount).
+        if tz is None or not points:
+            return sorted(points)
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        # Match the points' tz-awareness so the comparison/sort don't mix
+        # naive and aware datetimes (Influx records are aware in prod).
+        if points[0][0].tzinfo is None:
+            midnight = midnight.replace(tzinfo=None)
+        pts = [(t, v) for (t, v) in points if t != midnight]
+        if any(t.date() == today for (t, _) in pts):
+            pts.append((midnight, 0.0))
+        return sorted(pts)
+
     imp_cost, imp_kwh, imp_drop_b, imp_drop_k = integrate(
-        sorted(series["EnergyToUserToday"]), True)
+        _seed_open_block(series["EnergyToUserToday"]), True)
     exp_rev, exp_kwh, exp_drop_b, exp_drop_k = integrate(
-        sorted(series["EnergyToGridToday"]), False)
+        _seed_open_block(series["EnergyToGridToday"]), False)
 
     return GridEconomicsResult(
         import_cost_czk=imp_cost,
@@ -928,7 +949,11 @@ async def _query_today_power_flows(ctrl) -> Optional[Dict[str, list]]:
     bucket = ctrl.settings.influxdb.bucket_solar
     flux = (
         f'from(bucket: "{bucket}")\n'
-        '  |> range(start: -18h)\n'
+        # -28h to match _today_grid_economics: a -18h window misses today's
+        # early-morning blocks once local time is past ~18:00. Power is not
+        # cumulative, so there is no baseline trap here, but the today-date
+        # filter below still drops yesterday's blocks.
+        '  |> range(start: -28h)\n'
         f'  |> filter(fn: (r) => r._measurement == "solar" and ({field_filter}))\n'
         # Stop-labeled like _today_grid_economics: each window's mean power maps
         # to the block STARTING at t-15min (see that function's comment).
@@ -942,6 +967,7 @@ async def _query_today_power_flows(ctrl) -> Optional[Dict[str, list]]:
         tz = zoneinfo.ZoneInfo("Europe/Prague")
     except Exception:
         tz = None
+    from datetime import timedelta
     now = datetime.now(tz) if tz else datetime.now()
     today = now.date()
     series: Dict[str, list] = {f: [] for f in fields}
@@ -951,7 +977,14 @@ async def _query_today_power_flows(ctrl) -> Optional[Dict[str, list]]:
             if tz is not None and getattr(t, "tzinfo", None) is not None:
                 t = t.astimezone(tz)
             f = rec.get_field(); v = rec.get_value()
-            if v is None or f not in series or t.date() != today:
+            # Filter by the SHIFTED block-start date, not the stop label: a window
+            # stop-labeled at today 00:00 actually covers yesterday 23:45-00:00, so
+            # _aligned_blocks would reindex it to "23:45" and leak yesterday's last
+            # block into today's arbitrage/plan totals (the meter path strips this
+            # same artifact via _seed_open_block). Keep only blocks that START today.
+            if v is None or f not in series:
+                continue
+            if (t - timedelta(minutes=15)).date() != today:
                 continue
             series[f].append((t, float(v)))
     for f in series:
@@ -1042,7 +1075,14 @@ def _battery_arbitrage_from_flows(ctrl, blocks: Dict[str, Dict[str, float]]
 
         # Discharge valuation: split by export vs self-consumption.
         if discharge > 0:
-            export_frac = min(1.0, grid_export / discharge) if grid_export > 0 else 0.0
+            # Only the export that could NOT have come from solar is the
+            # battery's. PV surplus left after charging the battery is exported
+            # as solar; attributing it to the battery would over-count the
+            # cheap-export share and understate net arbitrage. (15-min mean
+            # blocks routinely show PV surplus and discharge co-occurring.)
+            solar_export = max(0.0, pv_surplus - solar_to_batt)
+            batt_export = max(0.0, grid_export - solar_export)
+            export_frac = min(1.0, batt_export / discharge) if batt_export > 0 else 0.0
             d_exp = discharge * export_frac
             d_self = discharge - d_exp
             dis_export = d_exp
@@ -1143,6 +1183,7 @@ async def _period_economics(ctrl, days: int) -> Optional[Dict[str, Any]]:
         return hit[1]
 
     from .decision_engine import GrowattDecisionEngine
+    from datetime import timedelta
     import zoneinfo
     try:
         tz = zoneinfo.ZoneInfo("Europe/Prague")
@@ -1151,7 +1192,23 @@ async def _period_economics(ctrl, days: int) -> Optional[Dict[str, Any]]:
     th = _make_price_thresholds(ctrl)
     sell_fee = getattr(ctrl.config, "sell_fee_czk", 0.5)
     bucket = ctrl.settings.influxdb.bucket_solar
-    rng = f"-{days}d"
+    # Align the window to LOCAL midnight, not a relative -Nd. The meters are
+    # daily-reset CUMULATIVE, and the per-day loop seeds prev=0; a relative
+    # window makes the OLDEST day partial (its first seen hour already holds the
+    # whole pre-window morning's accumulation), dumping that energy into one hour
+    # at one tariff and inflating the week/month cards. Starting at midnight of
+    # (today-(days-1)) gives `days` FULL calendar days (today is correct: it
+    # starts at hour 0 and differences cleanly from the 0 baseline).
+    if tz is not None:
+        now_local = datetime.now(tz)
+        start_local = now_local.replace(
+            hour=0, minute=0, second=0, microsecond=0
+        ) - timedelta(days=days - 1)
+        rng = start_local.astimezone(zoneinfo.ZoneInfo("UTC")).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+    else:
+        rng = f"-{days}d"
 
     def _local(t):
         if tz is not None and getattr(t, "tzinfo", None) is not None:
@@ -1223,38 +1280,70 @@ async def _period_economics(ctrl, days: int) -> Optional[Dict[str, Any]]:
         by_day.setdefault(d, []).append(h)
     for d, hours in by_day.items():
         prev = {"EnergyToUserToday": 0.0, "EnergyToGridToday": 0.0}
+        # Track contiguity PER FIELD, not with one shared cursor: the meters are
+        # cumulative, so a delta is only valid against the immediately-preceding
+        # hour's reading OF THE SAME FIELD. A single cursor would let one field's
+        # baseline go stale (advancing past a gap) while the other persists — on
+        # partial telemetry that lumps a whole gap's accumulation into one hour at
+        # one VT/NT tariff. seen_h[fld] = last hour that field was observed.
+        seen_h = {"EnergyToUserToday": None, "EnergyToGridToday": None}
         for h in sorted(hours):
             m = meters.get((d, h), {})
             price = price_map.get((d, h))
-            if price is None:
-                # keep meter continuity but skip unpriceable hour
-                for fld in prev:
-                    if fld in m:
-                        prev[fld] = m[fld]
-                continue
-            dist = GrowattDecisionEngine._get_distribution_tariff(h, th)
-            buy = price + dist
-            sell = max(0.0, price - sell_fee)
-            imp = m.get("EnergyToUserToday")
-            exp = m.get("EnergyToGridToday")
-            d_imp = max(0.0, imp - prev["EnergyToUserToday"]) if imp is not None else 0.0
-            d_exp = max(0.0, exp - prev["EnergyToGridToday"]) if exp is not None else 0.0
-            if imp is not None:
-                prev["EnergyToUserToday"] = imp
-            if exp is not None:
-                prev["EnergyToGridToday"] = exp
+            priced = price is not None
+            if priced:
+                dist = GrowattDecisionEngine._get_distribution_tariff(h, th)
+                buy = price + dist
+                sell = max(0.0, price - sell_fee)
+            d_imp = d_exp = 0.0
+            imp_counted = False  # was the IMPORT meter delta actually counted?
+            for fld, is_imp in (
+                ("EnergyToUserToday", True), ("EnergyToGridToday", False)
+            ):
+                v = m.get(fld)
+                if v is None:
+                    continue  # field absent this hour — baseline/seen unchanged
+                # Countable only when contiguous for THIS field: either the start
+                # of the day (hour 0, meter just reset to ~0 → difference from 0)
+                # or the field was observed at exactly the previous hour.
+                contiguous = (
+                    seen_h[fld] == h - 1
+                    or (seen_h[fld] is None and h == 0)
+                )
+                if priced and contiguous:
+                    delta = max(0.0, v - prev[fld])
+                    if is_imp:
+                        d_imp = delta
+                        imp_counted = True
+                    else:
+                        d_exp = delta
+                prev[fld] = v
+                seen_h[fld] = h
+            if not priced:
+                continue  # unpriceable hour: baselines advanced, nothing counted
             import_cost += d_imp * buy
             export_rev += d_exp * sell
-            actual_cost = d_imp * buy - d_exp * sell
-            # No-battery baseline from hourly PV/load power (kWh for the hour).
+            days_seen.add(d)
+            # No-battery baseline / saved — only when the IMPORT meter delta was
+            # actually counted this hour. On a meter GAP hour d_imp is dropped to
+            # 0 (un-priceable accumulation), but the baseline comes from a SEPARATE
+            # power query that may still have a row; `saved += base - 0` would then
+            # credit the whole hour's no-battery cost as savings, INFLATING the
+            # week/month figure. And the opposite gap (power telemetry absent while
+            # the meter delta is real) would deflate it. Skip the baseline unless
+            # BOTH the meter delta was counted AND PV/load telemetry exists.
             pw = power.get((d, h), {})
+            if not imp_counted or not any(
+                k in pw for k in
+                ("PV1InputPower", "PV2InputPower", "INVPowerToLocalLoad")):
+                continue
+            actual_cost = d_imp * buy - d_exp * sell
             pv = max(0.0, pw.get("PV1InputPower", 0.0) + pw.get("PV2InputPower", 0.0)) / 1000.0
             load = max(0.0, pw.get("INVPowerToLocalLoad", 0.0)) / 1000.0
             net_solar = pv - load
             base = (-net_solar) * buy if net_solar < 0 else (-net_solar) * sell
             baseline_cost += base
             saved += base - actual_cost
-            days_seen.add(d)
 
     result = {
         "days": days,
@@ -1383,11 +1472,20 @@ def _expected_daily_gain(ctrl, opt, saved_today_czk) -> Optional[float]:
         ts = _to_local_naive(d.timestamp)
         if ts.date() != today:
             continue
-        # Skip blocks already elapsed — they're in saved_today via actuals.
-        if ts + timedelta(minutes=15) <= now_n:
+        # Skip any block that has already STARTED (ts <= now), not just fully-
+        # elapsed ones. The current in-progress block already has partial mean-
+        # power telemetry, so it's counted in saved_today via actuals; including
+        # it here too would double-count it across the actuals and projected
+        # terms. Only strictly-future blocks (ts > now) belong in `remaining`.
+        if ts <= now_n:
             continue
         buy = d.price_czk + d.distribution_czk
-        sell = d.price_czk - sell_fee
+        # Floor the export price at 0 (you don't PAY to export), matching every
+        # other economics fn (_plan_savings_from_flows, _today_grid_economics,
+        # _period_economics). Without it, a negative-spot block prices exports as
+        # a cost, biasing this projected term against the floored saved_today it's
+        # added to.
+        sell = max(0.0, d.price_czk - sell_fee)
         base_net = d.consumption_kwh - d.solar_kwh
         base_cost = base_net * (buy if base_net >= 0 else sell)
         batt_delta = cap * (d.soc_after - d.soc_before) / 100.0
@@ -1485,10 +1583,12 @@ async def _build_economics(ctrl, opt, include_periods: bool = False) -> Dict[str
     if eg is not None:
         acc["expected_daily_gain"] = "plan_projection"
 
-    # --- Deprecated legacy fields (kept null for the old frontend) ---
-    # plan_value_czk summed net_value, which mixes CZK (MILP) and CZK/kWh
-    # (greedy) — dimensionally wrong; arbitrage_czk priced free solar as if
-    # grid-bought. Both replaced by saved_today_czk / batt_net_arbitrage_czk.
+    # --- Deprecated legacy fields for the old frontend ---
+    # plan_value_czk summed net_value, which historically mixed CZK and CZK/kWh
+    # units across engines (dimensionally wrong) — kept null. arbitrage_czk used to
+    # price free solar as if grid-bought; it is now ALIASED to the new meter-
+    # accurate batt_net_arbitrage_czk (or None when that's unavailable) so the old
+    # frontend, which reads arbitrage_czk only as a fallback, gets a correct value.
     econ["plan_value_czk"] = None
     econ["arbitrage_czk"] = econ.get("batt_net_arbitrage_czk")
 
@@ -2209,8 +2309,11 @@ function makeControl(f){
     el = document.createElement('input'); el.type = 'number';
     el.value = fmt(f.value);
     el.step = (f.type === 'int') ? '1' : 'any';
-    if (f.min !== null && f.min !== undefined) el.min = f.min;
-    if (f.max !== null && f.max !== undefined) el.max = f.max;
+    // Exclusive bounds (gt/lt) must not be offered as inclusive: nudge by one
+    // step (int) or a tiny epsilon (float) so the browser min/max stays valid.
+    const eps = (f.type === 'int') ? 1 : 1e-9;
+    if (f.min !== null && f.min !== undefined) el.min = f.exclusive_min ? (f.min + eps) : f.min;
+    if (f.max !== null && f.max !== undefined) el.max = f.exclusive_max ? (f.max - eps) : f.max;
     if (f.name.indexOf('export_czk') >= 0) el.placeholder = '(shared)';
   }
   el.dataset.type = f.type;
@@ -3372,11 +3475,15 @@ function updateUI(d) {
     const scEl = document.getElementById('solcastInfo');
     if (scEl) {
       if (sc && sc.enabled) {
-        const t = (sc.today_kwh != null ? sc.today_kwh : '--');
-        const tm = (sc.tomorrow_kwh != null ? sc.tomorrow_kwh : '--');
-        scEl.innerHTML =
-          '☀️ Solcast (' + sc.sites + ' site' + (sc.sites === 1 ? '' : 's') +
-          ', ' + sc.quantile + '): today ' + t + ' kWh, tomorrow ' + tm + ' kWh' +
+        // Only show per-day kWh when Solcast actually returned it; otherwise just
+        // the source + API budget (a bare "today -- kWh" reads as broken).
+        const head = '☀️ Solcast · ' + sc.sites + ' site' + (sc.sites === 1 ? '' : 's') +
+          ' (' + sc.quantile + ')';
+        const kwh = (sc.today_kwh != null || sc.tomorrow_kwh != null)
+          ? ' · today ' + (sc.today_kwh != null ? sc.today_kwh : '–') +
+            ' kWh, tomorrow ' + (sc.tomorrow_kwh != null ? sc.tomorrow_kwh : '–') + ' kWh'
+          : '';
+        scEl.innerHTML = head + kwh +
           ' <span style="color:var(--muted)">· ' + sc.requests_today + '/' +
           sc.daily_budget + ' API calls today</span>';
       } else {
@@ -4055,15 +4162,24 @@ async function fetchInsights() {
   setText('accSolar', (a == null ? '--' : a + ' kWh') + ' / ' + (f == null ? '--' : f + ' kWh'));
   const errEl = document.getElementById('accSolarErr');
   if (errEl) {
-    if (ac.solar_error_pct == null) { errEl.textContent = '--'; }
-    else {
+    // Early in the day the forecast-so-far denominator is tiny, so the % swings
+    // wildly (e.g. +100% at 09:00). Show it neutral/muted until there's a
+    // meaningful base (≥2 kWh forecast so far) instead of alarming red.
+    const meaningful = ac.solar_forecast_kwh_so_far != null && ac.solar_forecast_kwh_so_far >= 2;
+    if (ac.solar_error_pct == null) { errEl.textContent = '–'; errEl.style.color = 'var(--muted)'; }
+    else if (!meaningful) {
+      errEl.textContent = (ac.solar_error_pct > 0 ? '+' : '') + ac.solar_error_pct + '% (early)';
+      errEl.style.color = 'var(--muted)';
+    } else {
       errEl.textContent = (ac.solar_error_pct > 0 ? '+' : '') + ac.solar_error_pct + '%';
       errEl.style.color = Math.abs(ac.solar_error_pct) <= 15 ? 'var(--green)'
         : Math.abs(ac.solar_error_pct) <= 35 ? '#f59e0b' : 'var(--red)';
     }
   }
-  setText('accCalib', ac.calibration_ratio == null ? '--' : '×' + Number(ac.calibration_ratio).toFixed(2));
-  setText('accConf', ac.solar_confidence == null ? '--' : Math.round(ac.solar_confidence * 100) + '%');
+  setText('accCalib', ac.calibration_ratio == null ? 'warming up' : '×' + Number(ac.calibration_ratio).toFixed(2));
+  const calibEl = document.getElementById('accCalib');
+  if (calibEl && ac.calibration_ratio == null) calibEl.style.color = 'var(--muted)';
+  setText('accConf', ac.solar_confidence == null ? '–' : Math.round(ac.solar_confidence * 100) + '%');
 
   // --- Engines & sources ---
   const en = d.engines || {};
@@ -4088,7 +4204,7 @@ async function fetchInsights() {
     }
   }
   const fr = d.freshness || {};
-  setText('engFresh', fr.prices_age_s == null ? '--'
+  setText('engFresh', fr.prices_age_s == null ? '–'
     : (fr.prices_age_s < 90 ? 'just now' : Math.round(fr.prices_age_s / 60) + ' min ago')
       + (fr.has_tomorrow_prices ? ' · +tomorrow' : ''));
 
