@@ -639,3 +639,16 @@ def test_milp_discharge_rate_independent_of_discharge_power_pct():
     # And it's the FULL rate: batt_to_grid_max=5.0*0.25=1.25 kWh → ~13% of a
     # 10 kWh pack per block; a re-introduced 25% throttle would give only ~3.4%.
     assert drop25 > 10.0, f"discharge drained only {drop25:.1f}% — rate throttled?"
+
+
+async def test_update_profile_with_yesterday_delegates_to_helper():
+    """The controller calls update_profile_with_yesterday on the MILP optimizer at
+    the midnight rollover; the base-load profile lives on the shared helper, so the
+    MILP must delegate (regression: it used to be missing → AttributeError)."""
+    from unittest.mock import AsyncMock
+    opt = MILPBatteryOptimizer()
+    opt._helper.update_profile_with_yesterday = AsyncMock(return_value=None)
+    await opt.update_profile_with_yesterday("influx", "solar", "loxone")
+    opt._helper.update_profile_with_yesterday.assert_awaited_once_with(
+        "influx", "solar", "loxone"
+    )

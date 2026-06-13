@@ -199,6 +199,12 @@ class MILPBatteryOptimizer:
     async def build_base_load_profile(self, *args, **kwargs):
         return await self._helper.build_base_load_profile(*args, **kwargs)
 
+    async def update_profile_with_yesterday(self, *args, **kwargs):
+        # The base-load profile lives on the shared helper; delegate the daily
+        # EMA update there (mirrors build_base_load_profile). The controller calls
+        # this at the midnight rollover.
+        return await self._helper.update_profile_with_yesterday(*args, **kwargs)
+
     def summarize(self, decisions: List[BlockDecision]) -> Dict:
         return self._helper.summarize(decisions)
 
