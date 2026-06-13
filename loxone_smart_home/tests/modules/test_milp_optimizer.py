@@ -193,26 +193,54 @@ def test_no_battery_drain_when_solar_covers_load():
     assert all(d.action != "discharge" for d in decisions)
 
 
-def test_greedy_fallback_returns_full_schedule():
-    # When the MILP solve is non-optimal/infeasible/raises, optimize()
-    # delegates to _greedy_fallback. Exercise that seam directly (it is what
-    # the non-optimal branch calls) so the test is deterministic and not
-    # subject to CBC-subprocess behaviour under pytest output capture.
+def test_safe_fallback_trivial_plan_holds_and_charges_cheapest():
+    # When the MILP can't solve, optimize() delegates to _safe_fallback. With
+    # no prior plan it builds the trivial safe schedule: hold every block and
+    # grid-charge only the cheapest blocks (never discharge, never export).
     blocks = make_blocks([-1.0] * 6 + [10.0] * 6)
     opt = MILPBatteryOptimizer()
-    charge, discharge, sp, decisions = opt._greedy_fallback(
+    charge, discharge, sp, decisions = opt._safe_fallback(
         blocks, {}, {}, flat_dist(1.0),
         battery_capacity_kwh=10.0, current_soc=50.0, min_soc=20.0,
-        max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
-        discharge_power_pct=100.0, efficiency=0.85, sell_fee_czk=0.5,
+        max_soc=100.0, charge_rate_kw=5.0, efficiency=0.85, sell_fee_czk=0.5,
         battery_amortisation_czk=2.0,
     )
-    # Greedy fallback must produce a full decision list, not an empty schedule,
-    # and adopt it as the engine's own last-decisions (the fallback contract).
+    # Full decision list, adopted as last-decisions, flagged as fallback.
     assert len(decisions) == len(blocks)
     assert opt._last_decisions == decisions
-    # It should at least exploit the dirt-cheap (-1 CZK) blocks to charge.
-    assert len(charge) > 0
+    assert opt._last_engine == "fallback"
+    # Never discharges or exports on the degraded path.
+    assert discharge == set() and sp == set()
+    assert all(d.action in ("charge", "hold") for d in decisions)
+    # Any charging must be in the dirt-cheap (-1 CZK) blocks, not the 10 CZK ones.
+    cheap_ts = {b[0] for b in blocks[:6]}
+    assert charge.issubset(cheap_ts)
+
+
+def test_safe_fallback_reuses_last_plan_when_time_valid():
+    # If a prior plan covers the current horizon, the fallback returns it
+    # verbatim rather than rebuilding a trivial one.
+    from modules.growatt.optimizer import BlockDecision
+    blocks = make_blocks([1.0] * 8)
+    opt = MILPBatteryOptimizer()
+    prior = [
+        BlockDecision(
+            timestamp=ts, action=("charge" if i < 3 else "hold"),
+            price_czk=p, distribution_czk=1.0, solar_kwh=0.0,
+            consumption_kwh=0.25, soc_before=50.0, soc_after=50.0, net_value=0.0,
+        )
+        for i, (ts, p) in enumerate(blocks)
+    ]
+    opt._last_decisions = list(prior)
+    charge, discharge, sp, decisions = opt._safe_fallback(
+        blocks, {}, {}, flat_dist(1.0),
+        battery_capacity_kwh=10.0, current_soc=50.0, min_soc=20.0,
+        max_soc=100.0, charge_rate_kw=5.0, efficiency=0.85, sell_fee_czk=0.5,
+        battery_amortisation_czk=2.0,
+    )
+    assert opt._last_engine == "fallback"
+    assert charge == {b[0] for b in blocks[:3]}
+    assert [d.action for d in decisions] == [d.action for d in prior]
 
 
 def test_soc_stays_within_bounds():
@@ -331,20 +359,19 @@ def test_deferrable_partial_when_window_too_narrow():
     assert sched.energy_shortfall_kwh > 0
 
 
-def test_greedy_fallback_still_populates_deferrable_schedules():
-    # If the MILP solve is infeasible/timed-out/raises it delegates to greedy,
-    # which must still pre-schedule deferrable loads (else actuation goes dark).
+def test_safe_fallback_clears_deferrable_schedules():
+    # The minimal safe fallback does NOT co-optimize deferrable loads — it must
+    # clear any schedules so a degraded tick can't leak a stale/partial plan.
     blocks = make_blocks([-1.0] * 6 + [10.0] * 6)
     opt = MILPBatteryOptimizer()
-    opt._greedy_fallback(
+    opt._last_deferrable_schedules = ["stale"]  # pretend a prior solve left one
+    opt._safe_fallback(
         blocks, {}, {}, flat_dist(1.0),
         battery_capacity_kwh=10.0, current_soc=50.0, min_soc=20.0,
-        max_soc=100.0, charge_rate_kw=5.0, discharge_rate_kw=5.0,
-        discharge_power_pct=100.0, efficiency=0.85, sell_fee_czk=0.5,
-        battery_amortisation_czk=2.0, deferrable_loads=[_ev()],
+        max_soc=100.0, charge_rate_kw=5.0, efficiency=0.85, sell_fee_czk=0.5,
+        battery_amortisation_czk=2.0,
     )
-    assert len(opt._last_deferrable_schedules) == 1
-    assert opt._last_deferrable_schedules[0].scheduled_blocks == 2
+    assert opt._last_deferrable_schedules == []
 
 
 def test_deferrable_placement_sticks_to_previous_plan_on_a_tie():

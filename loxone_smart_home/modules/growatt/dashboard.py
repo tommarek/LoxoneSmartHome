@@ -297,12 +297,13 @@ async def api_status(request: web.Request) -> web.Response:
         profile = getattr(ctrl._optimizer, '_base_load_profile', None)
         profile_summary = profile.summary() if profile else "Not built"
         reserve_info = getattr(ctrl._optimizer, '_last_reserve_info', {})
-        # Which engine is actually loaded (reflects real state, not just config:
-        # MILP falls back to greedy if PuLP is missing).
-        engine = "milp" if type(ctrl._optimizer).__name__.startswith("MILP") else "greedy"
+        # MILP is the only engine. _last_engine is "milp" on a real solve or
+        # "fallback" when it used the minimal safe plan.
+        on_fallback = getattr(ctrl._optimizer, "_last_engine", "milp") == "fallback"
         optimizer_info = {
             "enabled": True,
-            "engine": engine,
+            "engine": "milp",
+            "fallback": on_fallback,
             "charge_blocks_today": len(charge_today),
             "discharge_blocks_today": len(discharge_today),
             "sell_production_blocks_today": len(sell_production_today),
@@ -1535,18 +1536,16 @@ async def api_insights(request: web.Request) -> web.Response:
     out: Dict[str, Any] = {"timestamp": now.isoformat()}
 
     # ---- Active engines (real runtime state, not just config) ----
+    # MILP is the only optimizer engine; `optimizer_fallback` is true when the
+    # last solve used the minimal safe plan (PuLP missing / infeasible / timeout).
     opt = getattr(ctrl, "_optimizer", None)
-    engine = None
-    if opt is not None:
-        engine = "milp" if type(opt).__name__.startswith("MILP") else "greedy"
-    opt_cfg = getattr(ctrl.config, "optimizer_engine", "greedy")
+    on_fallback = bool(opt is not None and getattr(opt, "_last_engine", "milp") == "fallback")
     ml = getattr(ctrl, "_ml_consumption_forecast", None)
     ml_active = bool(ml and getattr(ml, "is_trained", False))
     cons_cfg = getattr(ctrl.config, "consumption_forecast_engine", "binned")
     out["engines"] = {
-        "optimizer": engine or "rule-based",
-        "optimizer_configured": opt_cfg,
-        "optimizer_fellback": bool(engine and engine != opt_cfg),
+        "optimizer": "milp" if opt is not None else "disabled",
+        "optimizer_fallback": on_fallback,
         "consumption": "ml" if ml_active else "binned",
         "consumption_configured": cons_cfg,
         "consumption_fellback": bool(cons_cfg == "ml" and not ml_active),
@@ -3413,16 +3412,16 @@ function updateUI(d) {
   // Optimizer
   if (d.optimizer) {
     const opt = d.optimizer;
-    // Engine badge (reflects the live engine, incl. MILP→greedy fallback).
+    // Engine badge: MILP, or MILP (SAFE) when the last solve used the fallback.
     const engEl = document.getElementById('engineBadge');
     if (engEl) {
-      const eng = (opt.engine || 'greedy');
-      engEl.textContent = eng.toUpperCase();
-      engEl.style.background = eng === 'milp' ? 'rgba(74,222,128,0.18)' : 'rgba(148,163,184,0.18)';
-      engEl.style.color = eng === 'milp' ? 'var(--green)' : 'var(--muted)';
-      engEl.title = eng === 'milp'
-        ? 'MILP global optimiser (PuLP/CBC)'
-        : 'Greedy forward-simulation';
+      const fb = !!opt.fallback;
+      engEl.textContent = fb ? 'MILP (SAFE)' : 'MILP';
+      engEl.style.background = fb ? 'rgba(245,158,11,0.18)' : 'rgba(74,222,128,0.18)';
+      engEl.style.color = fb ? 'var(--amber, #f59e0b)' : 'var(--green)';
+      engEl.title = fb
+        ? 'MILP unavailable this solve — minimal safe fallback (reuse last / hold + cheapest charge)'
+        : 'MILP global optimiser (PuLP/CBC)';
     }
     const res = opt.reserve || {};
     let reserveHtml = '';
@@ -4069,7 +4068,7 @@ async function fetchInsights() {
   // --- Engines & sources ---
   const en = d.engines || {};
   const optTxt = (en.optimizer || '--').toUpperCase() +
-    (en.optimizer_fellback ? ' (fell back from ' + en.optimizer_configured + ')' : '');
+    (en.optimizer_fallback ? ' (safe fallback)' : '');
   setText('engOpt', optTxt);
   const consTxt = (en.consumption || '--').toUpperCase() +
     (en.consumption_fellback ? ' (fell back from ml)' : '');
@@ -4113,7 +4112,7 @@ async function fetchInsights() {
   // post-restart conditions (ML still retraining → binned; diagnostic /get
   // reads failing; tiny-denominator morning solar error) must NOT alarm. ---
   const alerts = [];
-  if (en.optimizer_fellback) alerts.push('Optimizer fell back to ' + en.optimizer + ' (PuLP/solver issue)');
+  if (en.optimizer_fallback) alerts.push('MILP using safe fallback (solver infeasible/timeout or PuLP missing)');
   // ML fallback is shown in Engines & Sources; not an alert (it self-resolves
   // a minute after a restart once the ML model retrains).
   // Only a failed CONTROL command (/set) matters — /get reads fail transiently

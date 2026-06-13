@@ -1,9 +1,9 @@
-"""MILP-based battery scheduler.
+"""MILP-based battery scheduler — the system's only dispatch engine.
 
-A drop-in replacement for the greedy `BatteryOptimizer.optimize()`: same
-inputs, same 4-tuple output. Uses PuLP to solve the full-horizon schedule as
-a single mixed-integer linear program instead of block-by-block greedy
-decisions.
+Uses PuLP to solve the full-horizon schedule as a single mixed-integer linear
+program. Returns `(charge_times, discharge_times, sell_production_times,
+decisions)`. Shares base-load profiling and the reserve-SOC floor with the
+controller via the `BatteryOptimizer` helper in `optimizer.py`.
 
 Why bother:
 - True global optimum (greedy can pick a small early gain that locks out a
@@ -14,8 +14,9 @@ Why bother:
 
 Cost:
 - PuLP + CBC adds a few seconds to runtime (run off the event loop by the
-  controller). Falls back to the greedy engine if PuLP is missing or the
-  solve is infeasible/times out.
+  controller). Falls back to a minimal SAFE plan (_safe_fallback: reuse the
+  last good plan, else hold + grid-charge the cheapest blocks to the reserve
+  floor) if PuLP is missing or the solve is infeasible/times out.
 
 THE ENERGY-FLOW MODEL (the important part).
 
@@ -154,8 +155,9 @@ def _sell_now_below_margin(price: float, dist: float, sell_fee: float) -> bool:
 class MILPBatteryOptimizer:
     """Mixed-integer linear program for whole-day battery scheduling.
 
-    Same signature as `BatteryOptimizer.optimize()` so the controller can
-    swap engines via a config flag without other code changes.
+    The controller's only optimizer. When PuLP is missing or a solve is
+    infeasible/times out, optimize() returns a minimal safe plan (_safe_fallback)
+    so the controller always gets a usable 4-tuple.
     """
 
     # The controller checks this to decide whether to hand deferrable loads
@@ -168,12 +170,14 @@ class MILPBatteryOptimizer:
         # Re-use the greedy optimizer's reserve-SOC + bin-state helpers so
         # behaviour is consistent across engines.
         from .optimizer import BatteryOptimizer
+        # BatteryOptimizer is now the shared infrastructure helper (base-load
+        # profile, reserve-SOC, summarize) — the greedy dispatch engine it once
+        # held was removed when the system went MILP-only.
         self._helper = BatteryOptimizer(logger=self.logger)
         self._last_decisions: List[BlockDecision] = []
-        # Which engine produced _last_decisions: 'milp' (sqrt-split η per leg) or
-        # 'greedy' (full η on one leg). The controller/dashboard use this to pick
-        # the correct ΔSOC↔grid-side conversion for adaptive powerRate sizing —
-        # a MILP solve that fell back to greedy carries greedy's SOC convention.
+        # How _last_decisions was produced: 'milp' (a real solve) or 'fallback'
+        # (the minimal safe plan — see _safe_fallback). Surfaced to the
+        # dashboard as a status indicator; no behavioural coupling.
         self._last_engine: str = "milp"
         self._last_reserve_info: Dict = {}
         # Deferrable-load placements from the most recent solve, exposed to
@@ -227,85 +231,113 @@ class MILPBatteryOptimizer:
         except Exception:
             return False
 
-    def _greedy_fallback(self, blocks, solar_hourly, consumption_hourly,
-                         distribution_func, battery_capacity_kwh, current_soc,
-                         min_soc, max_soc, charge_rate_kw, discharge_rate_kw,
-                         discharge_power_pct, efficiency, sell_fee_czk,
-                         battery_amortisation_czk, deferrable_loads=None,
-                         sell_production_min_soc_margin=SP_MIN_SOC_MARGIN_PCT,
-                         battery_amortisation_export_czk=None):
-        """Run the greedy engine and adopt its decisions as our own.
+    def _safe_fallback(self, blocks, solar_hourly, consumption_hourly,
+                       distribution_func, battery_capacity_kwh, current_soc,
+                       min_soc, max_soc, charge_rate_kw, efficiency,
+                       sell_fee_czk, battery_amortisation_czk):
+        """Minimal SAFE schedule when the MILP can't solve (PuLP missing,
+        infeasible, or timed-out without an incumbent).
 
-        Used when the MILP solve is infeasible, times out, or raises, so the
-        controller always receives a usable schedule (the documented
-        greedy-fallback contract). The greedy engine cannot co-optimize
-        deferrable loads, so we pre-schedule them (cheapest in-window blocks)
-        and overlay their draw onto the consumption forecast before solving,
-        preserving deferrable behaviour even on the fallback path.
+        Two tiers, both conservative — never discharge, never export:
+          1. Reuse the last good plan if its blocks still cover the current
+             horizon (what the controller most recently acted on).
+          2. Otherwise hold every block and grid-charge only the cheapest
+             blocks needed to lift SOC to the highest reserve floor in the
+             horizon (overnight protection), using the SAME reserve helper and
+             per-leg sqrt-eta convention as the MILP.
+
+        Deferrable loads are NOT co-optimised on a degraded tick (schedules
+        cleared). Returns the engine-standard 4-tuple. The decision_engine's
+        battery-protection / export / inverter-off safety gates still apply on
+        top of this plan, so a degraded tick stays safe.
         """
-        if deferrable_loads:
-            consumption_hourly = self._overlay_deferrable_for_greedy(
-                deferrable_loads, blocks, distribution_func, consumption_hourly
-            )
-        result = self._helper.optimize(
-            blocks=blocks,
-            solar_hourly=solar_hourly,
-            consumption_hourly=consumption_hourly,
-            distribution_func=distribution_func,
-            battery_capacity_kwh=battery_capacity_kwh,
-            current_soc=current_soc,
-            min_soc=min_soc,
-            max_soc=max_soc,
-            charge_rate_kw=charge_rate_kw,
-            discharge_rate_kw=discharge_rate_kw,
-            discharge_power_pct=discharge_power_pct,
-            efficiency=efficiency,
-            sell_fee_czk=sell_fee_czk,
-            battery_amortisation_czk=battery_amortisation_czk,
-            battery_amortisation_export_czk=battery_amortisation_export_czk,
-            sell_production_min_soc_margin=sell_production_min_soc_margin,
-        )
-        self._last_decisions = result[3]
-        self._last_engine = "greedy"  # decisions now carry greedy's SOC convention
-        # Keep the switch-penalty anchor in sync with what we actually returned,
-        # so the NEXT solve doesn't penalise deviations from a stale MILP plan
-        # that was never applied (the fallback replaced it).
-        self._prev_actions = {d.timestamp: d.action for d in result[3]}
-        return result
+        import math
+        self._last_engine = "fallback"
+        self._last_deferrable_schedules = []
+        self._prev_deferrable_runs = {}
+        if not blocks:
+            self._last_decisions = []
+            self._prev_actions = {}
+            return set(), set(), set(), []
 
-    def _overlay_deferrable_for_greedy(
-        self, deferrable_loads, blocks, distribution_func, consumption_hourly
-    ) -> Dict[Any, float]:
-        """Pre-schedule deferrable loads greedily and overlay onto consumption.
+        horizon_ts = [b[0] for b in blocks]
+        first_ts, last_ts = horizon_ts[0], horizon_ts[-1]
 
-        Returns a COPY of consumption_hourly with the scheduled per-block load
-        added, and stores the resulting schedules in
-        ``self._last_deferrable_schedules`` (same contract as the MILP path).
-        """
-        from .deferrable_loads import DeferrableLoadScheduler
-        scheduler = DeferrableLoadScheduler(self.logger)
-        schedules = scheduler.schedule_all(
-            list(deferrable_loads), blocks, distribution_func
+        # --- Tier 1: reuse the last good plan if it covers the horizon ---
+        if self._last_decisions:
+            have = {d.timestamp for d in self._last_decisions}
+            if all(ts in have for ts in horizon_ts):
+                kept = [d for d in self._last_decisions
+                        if first_ts <= d.timestamp <= last_ts]
+                charge = {d.timestamp for d in kept if d.action == "charge"}
+                disch = {d.timestamp for d in kept if d.action == "discharge"}
+                sp = {d.timestamp for d in kept if d.action == "sell_production"}
+                self._last_decisions = kept
+                self._prev_actions = {d.timestamp: d.action for d in kept}
+                self.logger.warning(
+                    f"MILP safe fallback: reusing the last good plan "
+                    f"({len(kept)} blocks)"
+                )
+                return charge, disch, sp, kept
+
+        # --- Tier 2: trivial safe plan (hold all, grid-charge cheapest N) ---
+        eta = max(1e-3, efficiency) ** 0.5
+        current_soc = max(min_soc, min(max_soc, current_soc))
+        charge_max = charge_rate_kw * 0.25  # stored-side cap per block (pre-eta)
+        prices = [p for _, p in blocks]
+        effective_min_socs = self._helper._compute_reserve_soc_per_block(
+            blocks, prices, solar_hourly, battery_capacity_kwh,
+            min_soc, max_soc, charge_max, efficiency,
         )
-        self._last_deferrable_schedules = schedules
-        loads_by_name = {l.name: l for l in deferrable_loads}
-        overlay = scheduler.consumption_overlay(schedules, loads_by_name)
-        merged = dict(consumption_hourly)
-        for key, extra in overlay.items():
-            if isinstance(key, datetime):
-                # Resolve the existing base with the same key precedence as
-                # _forecast_value, using `is not None` so a real 0.0-kWh block
-                # isn't treated as missing (which `or` would, then wrongly pull
-                # in another day's hourly value).
-                base = merged.get(key)
-                if base is None:
-                    base = merged.get((key.date(), key.hour))
-                if base is None:
-                    base = merged.get(key.hour, 0.0)
-                merged[key] = base + extra
+        target_soc = min(
+            max_soc, max(effective_min_socs) if effective_min_socs else min_soc
+        )
+        start_kwh = battery_capacity_kwh * current_soc / 100.0
+        target_kwh = battery_capacity_kwh * target_soc / 100.0
+        per_block_stored = charge_max * eta  # kWh added to SOC per charge block
+        need_kwh = max(0.0, target_kwh - start_kwh)
+        n_charge = 0 if per_block_stored <= 0 else min(
+            len(blocks), math.ceil(need_kwh / per_block_stored)
+        )
+        import_cost = [prices[i] + distribution_func(blocks[i][0].hour)
+                       for i in range(len(blocks))]
+        charge_idx = set(
+            sorted(range(len(blocks)), key=lambda i: import_cost[i])[:n_charge]
+        )
+
+        charge_times: Set[datetime] = set()
+        decisions: List[BlockDecision] = []
+        battery_kwh = start_kwh
+        max_battery_kwh = battery_capacity_kwh * max_soc / 100.0
+        for i, (ts, price) in enumerate(blocks):
+            soc_before = battery_kwh / battery_capacity_kwh * 100.0
+            if i in charge_idx and battery_kwh < max_battery_kwh - 1e-9:
+                action = "charge"
+                charge_times.add(ts)
+                battery_kwh = min(max_battery_kwh, battery_kwh + per_block_stored)
+                net_value = -charge_max * import_cost[i]
             else:
-                merged[key] = merged.get(key, 0.0) + extra
-        return merged
+                action = "hold"
+                net_value = 0.0
+            soc_after = battery_kwh / battery_capacity_kwh * 100.0
+            decisions.append(BlockDecision(
+                timestamp=ts,
+                action=action,
+                price_czk=price,
+                distribution_czk=distribution_func(ts.hour),
+                solar_kwh=_forecast_value(solar_hourly, ts) / 4.0,
+                consumption_kwh=_forecast_value(consumption_hourly, ts) / 4.0,
+                soc_before=soc_before,
+                soc_after=soc_after,
+                net_value=net_value,
+            ))
+        self._last_decisions = decisions
+        self._prev_actions = {d.timestamp: d.action for d in decisions}
+        self.logger.warning(
+            f"MILP safe fallback: trivial plan — hold all, grid-charge "
+            f"{len(charge_times)} cheapest block(s) toward {target_soc:.0f}% reserve"
+        )
+        return charge_times, set(), set(), decisions
 
     def optimize(
         self,
@@ -349,15 +381,13 @@ class MILPBatteryOptimizer:
 
         if not PULP_AVAILABLE:
             self.logger.warning(
-                "PuLP not installed — MILP unavailable, falling back to greedy"
+                "PuLP not installed — MILP unavailable, using safe fallback"
             )
-            return self._greedy_fallback(
+            return self._safe_fallback(
                 blocks, solar_hourly, consumption_hourly, distribution_func,
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
-                charge_rate_kw, discharge_rate_kw, discharge_power_pct,
-                efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads, sell_production_min_soc_margin,
-                battery_amortisation_export_czk=battery_amortisation_export_czk,
+                charge_rate_kw, efficiency, sell_fee_czk,
+                battery_amortisation_czk,
             )
 
         if not blocks:
@@ -684,15 +714,13 @@ class MILPBatteryOptimizer:
             status_str = pulp.LpStatus[status]
         except Exception as e:
             self.logger.warning(
-                f"MILP solve raised {e} — falling back to greedy engine"
+                f"MILP solve raised {e} — using safe fallback"
             )
-            return self._greedy_fallback(
+            return self._safe_fallback(
                 blocks, solar_hourly, consumption_hourly, distribution_func,
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
-                charge_rate_kw, discharge_rate_kw, discharge_power_pct,
-                efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads, sell_production_min_soc_margin,
-                battery_amortisation_export_czk=battery_amortisation_export_czk,
+                charge_rate_kw, efficiency, sell_fee_czk,
+                battery_amortisation_czk,
             )
         if status_str != "Optimal" and self._has_feasible_incumbent(prob):
             # CBC hit the time limit but left an integer-feasible incumbent
@@ -705,19 +733,16 @@ class MILPBatteryOptimizer:
             )
         elif status_str != "Optimal":
             # Infeasible / Unbounded / Undefined / timed-out without an
-            # incumbent: delegate to greedy so the controller still gets a
-            # usable plan.
+            # incumbent: use the minimal safe fallback so the controller still
+            # gets a usable plan.
             self.logger.warning(
-                f"MILP solver returned status {status_str} — "
-                f"falling back to greedy engine"
+                f"MILP solver returned status {status_str} — using safe fallback"
             )
-            return self._greedy_fallback(
+            return self._safe_fallback(
                 blocks, solar_hourly, consumption_hourly, distribution_func,
                 battery_capacity_kwh, current_soc, min_soc, max_soc,
-                charge_rate_kw, discharge_rate_kw, discharge_power_pct,
-                efficiency, sell_fee_czk, battery_amortisation_czk,
-                deferrable_loads, sell_production_min_soc_margin,
-                battery_amortisation_export_czk=battery_amortisation_export_czk,
+                charge_rate_kw, efficiency, sell_fee_czk,
+                battery_amortisation_czk,
             )
 
         # Materialise results.

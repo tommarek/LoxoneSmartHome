@@ -36,9 +36,11 @@ def test_schema_groups_and_field_metadata(cfg):
     # bool field
     assert by_name["adaptive_charge_rate"]["type"] == "bool"
 
-    # enum choices
-    assert by_name["optimizer_engine"]["choices"] == ["greedy", "milp"]
-    assert by_name["optimizer_engine"]["hot"] is False
+    # optimizer_engine was removed in the MILP-only cleanup — no longer editable.
+    assert "optimizer_engine" not in by_name
+    # consumption_forecast_engine remains an enum choice.
+    assert by_name["consumption_forecast_engine"]["choices"] == ["binned", "ml"]
+    assert by_name["consumption_forecast_engine"]["hot"] is False
 
     # the new optional export amort surfaces as float with no current value
     exp = by_name["battery_amortisation_export_czk"]
@@ -119,9 +121,12 @@ def test_export_amort_override_reduces_export_attractiveness():
     base; with the override unset the result is identical to passing the base."""
     from datetime import datetime, timedelta
 
-    from modules.growatt.optimizer import BatteryOptimizer
+    from modules.growatt.milp_optimizer import MILPBatteryOptimizer, PULP_AVAILABLE
+    if not PULP_AVAILABLE:
+        import pytest
+        pytest.skip("PuLP/CBC not installed")
 
-    opt = BatteryOptimizer()
+    opt = MILPBatteryOptimizer()
     start = datetime(2026, 6, 1, 0, 0)
     # A clear arbitrage day: cheap night, very expensive evening.
     blocks = []

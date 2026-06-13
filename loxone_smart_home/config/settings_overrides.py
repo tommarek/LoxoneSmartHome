@@ -150,7 +150,7 @@ EDITABLE_GROUPS: List[FieldGroup] = [
     FieldGroup(
         "Charge scheduling (rule-based)",
         "Block counts for the rule-based scheduler and the defer-to-tomorrow "
-        "threshold. (The MILP/greedy optimizer ignores fixed block counts.)",
+        "threshold. (The MILP optimizer ignores fixed block counts.)",
         [
             FieldSpec("battery_charge_blocks", "Charge blocks", "×15min"),
             FieldSpec("dynamic_charge_blocks", "Dynamic block count", ""),
@@ -173,13 +173,11 @@ EDITABLE_GROUPS: List[FieldGroup] = [
         ],
     ),
     FieldGroup(
-        "Optimizer engine",
-        "Engine selection takes effect on restart (the optimizer is built once "
-        "at startup). The MILP switch penalty applies live.",
+        "Battery optimizer",
+        "Enabling/disabling the optimizer takes effect on restart (it is built "
+        "once at startup). The MILP switch penalty applies live.",
         [
             FieldSpec("optimizer_enabled", "Optimizer enabled", "", hot=False),
-            FieldSpec("optimizer_engine", "Engine", "", hot=False,
-                      choices=["greedy", "milp"]),
             FieldSpec("milp_switch_penalty_czk", "MILP switch penalty", "CZK"),
         ],
     ),

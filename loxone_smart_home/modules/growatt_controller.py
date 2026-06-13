@@ -38,9 +38,9 @@ from .growatt.decision_engine import (
 from .growatt.inverter_state import InverterState
 from .growatt.solar_forecast import SolarForecast
 from .growatt.consumption_forecast import ConsumptionForecast
-from .growatt.optimizer import BatteryOptimizer, compute_charge_power_rates, compute_rate_ceiling
+from .growatt.optimizer import compute_charge_power_rates, compute_rate_ceiling
 from .growatt.deferrable_loads import DeferrableLoad, DeferrableLoadSchedule
-from utils.schedule_calculator import calculate_optimal_schedule, calculate_dynamic_block_count
+from utils.schedule_calculator import calculate_dynamic_block_count
 from .growatt.command_queue import CommandQueue
 from .growatt.schedule_coordinator import ScheduleCoordinator
 
@@ -287,32 +287,20 @@ class GrowattController(BaseModule):
                     )
             self.logger.info("Consumption forecast enabled (model will build on startup)")
 
-        # Optimizer (Phase 3.2) — engine-switchable: greedy or MILP
-        self._optimizer: Optional[BatteryOptimizer] = None
+        # Battery optimizer — MILP only. Even when PuLP is missing the MILP
+        # instance still loads; its optimize() routes through the minimal safe
+        # fallback, so the controller's dispatch path is identical either way.
+        self._optimizer: Optional["MILPBatteryOptimizer"] = None
         if self.config.optimizer_enabled:
-            engine = getattr(self.config, "optimizer_engine", "greedy")
-            if engine == "milp":
-                try:
-                    from .growatt.milp_optimizer import MILPBatteryOptimizer
-                    milp = MILPBatteryOptimizer(self.logger)
-                    if milp.is_available():
-                        self._optimizer = milp  # type: ignore[assignment]
-                        self.logger.info("Battery optimizer enabled (MILP engine)")
-                    else:
-                        self.logger.warning(
-                            "optimizer_engine=milp but PuLP isn't installed — "
-                            "falling back to greedy"
-                        )
-                        self._optimizer = BatteryOptimizer(self.logger)
-                        self.logger.info("Battery optimizer enabled (greedy fallback)")
-                except Exception as e:
-                    self.logger.warning(
-                        f"MILP optimizer init failed: {e} — falling back to greedy"
-                    )
-                    self._optimizer = BatteryOptimizer(self.logger)
+            from .growatt.milp_optimizer import MILPBatteryOptimizer
+            self._optimizer = MILPBatteryOptimizer(self.logger)
+            if self._optimizer.is_available():
+                self.logger.info("Battery optimizer enabled (MILP engine)")
             else:
-                self._optimizer = BatteryOptimizer(self.logger)
-                self.logger.info("Battery optimizer enabled (greedy engine)")
+                self.logger.warning(
+                    "Battery optimizer enabled (MILP) but PuLP isn't installed "
+                    "— solves will use the minimal safe fallback"
+                )
 
         # Hourly forecast temperatures stashed from the OpenMeteo fetch in
         # _update_solar_forecast: {local_date: {local_hour: °C}}. Used by the
@@ -2640,9 +2628,7 @@ from(bucket: "{bucket}")
                 "☀️ Solar forecast unreliable — skipping adjustment, using default charging"
             )
 
-        discharge_profit_margin = self.config.discharge_profit_margin
-
-        # Use optimizer if enabled, otherwise fall back to rule-based scheduling
+        # Use the MILP optimizer if enabled, otherwise hold (no scheduling)
         if self._optimizer:
             from .growatt.decision_engine import GrowattDecisionEngine
             tomorrow = today + timedelta(days=1)
@@ -3079,25 +3065,22 @@ from(bucket: "{bucket}")
                 f"(avg charge: {summary['avg_charge_price']:.2f}, "
                 f"avg discharge: {summary['avg_discharge_price']:.2f} CZK/kWh)"
             )
-            # Compute thresholds for compatibility
-            charge_threshold_czk = max(
-                (b.price_czk for b in decisions if b.action == "charge"), default=0.0
-            )
+            # Discharge threshold for the log line below (charge threshold was
+            # dead — removed).
             effective_discharge_threshold = min(
                 (b.price_czk for b in decisions if b.action == "discharge"),
                 default=discharge_threshold_czk,
             )
         else:
-            # Rule-based scheduling (default) — no sell_production support
-            charge_times, discharge_times, charge_threshold_czk, effective_discharge_threshold = calculate_optimal_schedule(
-                price_blocks_czk,
-                charge_blocks_count=charge_blocks_count,
-                discharge_threshold_czk=discharge_threshold_czk,
-                discharge_profit_margin=discharge_profit_margin
-            )
+            # Optimizer disabled (optimizer_enabled=False) — no scheduling.
+            # The old rule-based scheduler was removed with the MILP-only
+            # cleanup; "disabled" now means hold (the decision_engine's safety
+            # gates — battery protection, export, inverter-off — still apply).
+            charge_times = set()
+            discharge_times = set()
             sell_production_times = set()
-            # Rule-based engine has no battery-hold concept (holds = load_first).
             hold_idle_times: Set[datetime] = set()
+            effective_discharge_threshold = discharge_threshold_czk
 
         # Rebuild charging schedule in original format for compatibility with existing code
         cheapest_blocks = [
@@ -3175,8 +3158,8 @@ from(bucket: "{bucket}")
                             f"{price_czk:.3f} CZK/kWh"
                         )
 
-        # === STEP 2: Use discharge times from shared function ===
-        # Already calculated above via calculate_optimal_schedule()
+        # === STEP 2: Use discharge times computed above ===
+        # (from the MILP plan, or empty when the optimizer is disabled)
 
         # Rebuild discharge schedule in original format for compatibility
         discharge_blocks = [
@@ -3418,7 +3401,7 @@ from(bucket: "{bucket}")
 
             if not suppress_print:
                 discharge_count = len(self._discharge_periods_today)
-                source = "optimizer" if self._optimizer else "rule-based"
+                source = "MILP" if self._optimizer else "disabled"
                 self.logger.info(
                     f"✅ Cross-day schedule updated ({source}): "
                     f"{len(self._combined_charging_blocks)} charge + "

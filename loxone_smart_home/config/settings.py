@@ -472,19 +472,16 @@ class GrowattConfig(BaseSettings):
         )
     )
 
-    # Optimizer
+    # Optimizer (MILP). When disabled the controller holds (no scheduling);
+    # the decision_engine's safety gates still apply. The MILP is the only
+    # engine — if PuLP is missing or a solve fails it uses a minimal safe
+    # fallback (reuse last plan, else hold + charge cheapest blocks).
     optimizer_enabled: bool = Field(
         default=False,
-        description="Enable greedy optimizer (replaces rule-based scheduling when active)"
-    )
-    optimizer_engine: str = Field(
-        default="greedy",
-        pattern="^(greedy|milp)$",
         description=(
-            "Which optimizer engine to use: 'greedy' (forward simulation, "
-            "default, fast) or 'milp' (PuLP-based global optimum, slower but "
-            "more stable across re-evaluations). Falls back to 'greedy' if "
-            "PuLP isn't installed or the MILP solve is infeasible/times out."
+            "Enable the MILP battery optimizer. When off, the controller holds "
+            "(no charge/discharge scheduling); decision_engine safety gates "
+            "still apply."
         ),
     )
     milp_switch_penalty_czk: float = Field(

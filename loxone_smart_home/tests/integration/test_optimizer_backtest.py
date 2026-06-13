@@ -1,8 +1,11 @@
-"""Integration tests: backtest optimizer vs baseline on realistic price data.
+"""Integration tests: backtest the MILP optimizer vs baselines on realistic
+price data.
 
-Simulates battery operation over multi-day price curves and verifies the
-optimizer produces equal or better economic outcomes than the rule-based
-baseline scheduler.
+Simulates battery operation over multi-day price curves and verifies the MILP
+optimizer produces equal or better economic outcomes than a no-battery / simple
+cheapest-N baseline. (The greedy engine and the rule-based scheduler were
+removed in the MILP-only cleanup; this suite is MILP-only and skips without
+PuLP.)
 """
 
 import pytest
@@ -11,8 +14,22 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Set, Tuple
 from unittest.mock import MagicMock
 
-from utils.schedule_calculator import calculate_optimal_schedule
-from modules.growatt.optimizer import BatteryOptimizer
+from modules.growatt.milp_optimizer import MILPBatteryOptimizer, PULP_AVAILABLE
+
+pytestmark = pytest.mark.skipif(not PULP_AVAILABLE, reason="PuLP/CBC not installed")
+
+
+def _cheapest_n_schedule(blocks, charge_blocks_count=8, discharge_threshold=5.0,
+                         discharge_margin=4.0):
+    """Tiny test-only baseline: charge the N cheapest blocks, discharge blocks
+    priced above max(threshold, cheapest*margin). Stands in for the removed
+    rule-based scheduler purely as a comparison baseline (NOT production code)."""
+    ordered = sorted(blocks, key=lambda b: b[1])
+    charge_times = {ts for ts, _ in ordered[:charge_blocks_count]}
+    cheapest = ordered[0][1] if ordered else 0.0
+    floor = max(discharge_threshold, cheapest * discharge_margin)
+    discharge_times = {ts for ts, p in blocks if p >= floor}
+    return charge_times, discharge_times
 
 
 # ---- Battery Simulator ----
@@ -269,12 +286,9 @@ def run_baseline(
     discharge_margin: float = 4.0,
     **sim_kwargs,
 ) -> SimResult:
-    """Run the baseline rule-based scheduler."""
-    charge_times, discharge_times, _, _ = calculate_optimal_schedule(
-        blocks,
-        charge_blocks_count=charge_blocks_count,
-        discharge_threshold_czk=discharge_threshold,
-        discharge_profit_margin=discharge_margin,
+    """Run a simple cheapest-N baseline (test-only comparison)."""
+    charge_times, discharge_times = _cheapest_n_schedule(
+        blocks, charge_blocks_count, discharge_threshold, discharge_margin,
     )
     return simulate_battery(
         blocks, charge_times, discharge_times,
@@ -289,11 +303,11 @@ def run_optimizer(
     consumption_hourly=None,
     **sim_kwargs,
 ) -> SimResult:
-    """Run the greedy optimizer."""
+    """Run the MILP optimizer."""
     if distribution_func is None:
         distribution_func = lambda h: 1.0
 
-    opt = BatteryOptimizer(logger=MagicMock())
+    opt = MILPBatteryOptimizer(logger=MagicMock())
     # optimize() returns (charge, discharge, sell_production, decisions).
     charge_times, discharge_times, _, _ = opt.optimize(
         blocks=blocks,
@@ -484,7 +498,7 @@ class TestSimResultSanity:
 
     def test_soc_stays_in_bounds(self) -> None:
         blocks = make_two_day_blocks(_extreme_day_prices(), _extreme_day_prices())
-        charge, discharge, _, _ = calculate_optimal_schedule(blocks, charge_blocks_count=8)
+        charge, discharge = _cheapest_n_schedule(blocks, charge_blocks_count=8)
         result = simulate_battery(
             blocks, charge, discharge,
             battery_capacity=10.0, initial_soc=50.0,
@@ -535,14 +549,6 @@ class TestOptimizer15MinResolution:
         efficiency=0.85,
     )
 
-    @pytest.mark.xfail(
-        reason="Pre-existing greedy-engine limitation: in this scenario the "
-        "greedy optimizer makes marginally net-negative battery cycles (wear > "
-        "spread) and ends ~1% worse than no-battery. The MILP engine "
-        "(optimizer_engine=milp) models grid_to_load explicitly and respects "
-        "this invariant. Tracked separately; out of scope for the EMHASS work.",
-        strict=False,
-    )
     def test_15min_spring_day(self) -> None:
         """At 15-min resolution, optimizer still beats no-battery on spring days."""
         blocks = make_15min_two_day_blocks(_spring_day_prices(), _spring_day_prices())
@@ -555,13 +561,6 @@ class TestOptimizer15MinResolution:
         no_batt = run_no_battery(blocks, **self.SIM_PARAMS)
         assert optimized.total_cost <= no_batt.total_cost
 
-    @pytest.mark.xfail(
-        reason="Pre-existing greedy-engine limitation: under an extreme price "
-        "spread the greedy optimizer over-cycles the battery (wear cost exceeds "
-        "the captured spread) and ends worse than no-battery. The MILP engine "
-        "respects the no-worse-than-no-battery invariant. Out of scope here.",
-        strict=False,
-    )
     def test_15min_extreme_spread(self) -> None:
         """Extreme spread at 15-min resolution."""
         blocks = make_15min_two_day_blocks(_extreme_day_prices(), _extreme_day_prices())
@@ -594,111 +593,6 @@ class TestOptimizer15MinResolution:
 
 
 # ---- Greedy ↔ MILP engine parity ----
-
-from modules.growatt.milp_optimizer import (  # noqa: E402
-    MILPBatteryOptimizer,
-    PULP_AVAILABLE,
-)
-
-
-@pytest.mark.skipif(not PULP_AVAILABLE, reason="PuLP/CBC not installed")
-class TestEngineParity:
-    """The greedy fallback and the MILP must stay economically comparable:
-    same realistic day in, simulated total costs within a band and SOC
-    trajectories that don't diverge wildly. Catches a convention drift in
-    either engine (e.g. the per-leg vs round-trip efficiency split)."""
-
-    def test_realistic_day_costs_and_soc_within_band(self) -> None:
-        # One realistic 24h day: cheap night valley, midday solar with
-        # moderate prices, a hard evening peak, a cheap late-night tail.
-        # Starts at LOW SOC with a cheap post-peak recharge so both engines
-        # see the same valley→peak arbitrage (with a big surplus battery the
-        # engines legitimately diverge: the MILP exports excess energy beyond
-        # peak self-consumption needs, which the greedy engine cannot model).
-        prices = (
-            [1.0] * 6      # 0-5: cheap night valley
-            + [3.0] * 4    # 6-9: morning
-            + [2.0] * 6    # 10-15: midday (solar hours)
-            + [3.0] * 1    # 16
-            + [6.0] * 5    # 17-21: evening peak
-            + [1.0] * 2    # 22-23: cheap late tail (recharge opportunity)
-        )
-        blocks = []
-        base = datetime(2026, 4, 11, 0, 0)
-        for i, p in enumerate(prices):
-            for q in range(4):
-                blocks.append((base + timedelta(hours=i, minutes=q * 15), p))
-        solar = {h: 3.0 for h in range(9, 16)}
-        consumption = {h: 1.0 for h in range(24)}
-        dist = lambda h: 1.0  # noqa: E731
-
-        opt_kwargs = dict(
-            blocks=blocks,
-            solar_hourly=solar,
-            consumption_hourly=consumption,
-            distribution_func=dist,
-            battery_capacity_kwh=10.0,
-            current_soc=20.0,
-            min_soc=20.0,
-            max_soc=100.0,
-            charge_rate_kw=2.5,
-            discharge_rate_kw=2.5,
-            discharge_power_pct=25.0,
-            efficiency=0.85,
-            sell_fee_czk=0.5,
-            battery_amortisation_czk=2.0,
-        )
-        sim_kwargs = dict(
-            consumption_hourly=consumption,
-            solar_hourly=solar,
-            distribution_func=dist,
-            battery_capacity=10.0,
-            initial_soc=20.0,
-            min_soc=20.0,
-            max_soc=100.0,
-            charge_rate_kw=2.5,
-            discharge_rate_kw=2.5,
-            discharge_power_pct=100.0,  # rates already grid-actual
-            efficiency=0.85,
-        )
-
-        greedy = BatteryOptimizer(logger=MagicMock())
-        g_charge, g_discharge, _, g_decisions = greedy.optimize(**opt_kwargs)
-        milp = MILPBatteryOptimizer(logger=MagicMock())
-        m_charge, m_discharge, _, m_decisions = milp.optimize(**opt_kwargs)
-        assert milp._last_engine == "milp", "MILP must not have fallen back"
-
-        # Pass the per-block decisions so battery-passive plan blocks
-        # (hold_idle / sell_production) are simulated passively — without
-        # them the harness simulates every hold as load_first self-
-        # consumption, which masks plans that strand the battery in idle.
-        g_cost = simulate_battery(
-            blocks, g_charge, g_discharge, strategy_name="greedy",
-            decisions=g_decisions, **sim_kwargs
-        ).total_cost
-        m_cost = simulate_battery(
-            blocks, m_charge, m_discharge, strategy_name="milp",
-            decisions=m_decisions, **sim_kwargs
-        ).total_cost
-
-        # Costs comparable: within 15% of the larger magnitude (+ a small
-        # absolute floor so near-zero costs don't make the band degenerate).
-        band = 0.15 * max(abs(g_cost), abs(m_cost)) + 5.0
-        assert abs(g_cost - m_cost) <= band, (
-            f"engine costs diverged: greedy={g_cost:.1f} CZK, "
-            f"milp={m_cost:.1f} CZK, band={band:.1f}"
-        )
-
-        # SOC trajectories must not diverge wildly (both engines now use the
-        # same sqrt-split per-leg efficiency convention).
-        diffs = [
-            abs(g.soc_after - m.soc_after)
-            for g, m in zip(g_decisions, m_decisions)
-        ]
-        mean_diff = sum(diffs) / len(diffs)
-        assert mean_diff <= 30.0, f"mean SOC divergence {mean_diff:.1f}%"
-        assert max(diffs) <= 60.0, f"max SOC divergence {max(diffs):.1f}%"
-
 
 # ---- Rolling-horizon re-optimization (battery-stranding regression) ----
 
@@ -740,7 +634,7 @@ def run_rolling_horizon(
     kwh_charge_block = charge_rate_kw * 0.25
     kwh_discharge_block = discharge_rate_kw * (discharge_power_pct / 100) * 0.25
 
-    opt = BatteryOptimizer(logger=MagicMock())
+    opt = MILPBatteryOptimizer(logger=MagicMock())
     soc = initial_soc
     import_cost = 0.0
     export_revenue = 0.0

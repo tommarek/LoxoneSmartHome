@@ -175,11 +175,10 @@ The application uses:
 - Failed builds back off 1h (`needs_rebuild()` won't re-fire every 60s tick); same for the ML engine
 - Tomorrow is predicted with OpenMeteo forecast temps stashed by `_update_solar_forecast` (`_temps_for_date`), falling back to last-24h actuals
 
-### Battery Optimizer (`modules/growatt/optimizer.py`)
-- Greedy forward-simulation over 15-minute blocks
-- Scores charge/discharge/hold per block considering price, solar, consumption, battery state
-- Dynamic reserve calculation: sums base load until next recharge opportunity
-- Base load profile: 48 slots (hour × weekday/weekend), excludes heating + EV hours
+### Battery Optimizer — MILP only (`modules/growatt/milp_optimizer.py`)
+Battery dispatch is **MILP-only**: a PuLP/CBC mixed-integer linear program over the 15-min blocks (`MILPBatteryOptimizer`), run off the event loop via `asyncio.to_thread`. The greedy engine and the rule-based scheduler were removed (see git history); `optimizer.py`'s `BatteryOptimizer` is now just **shared infrastructure** the MILP + controller reuse: the base-load profile (48 slots, hour × weekday/weekend, excludes heating + EV), the dynamic per-block reserve-SOC floor (`_compute_reserve_soc_per_block`), `BlockDecision`, `summarize`, and inverter power-rate sizing (`compute_charge_power_rates`/`compute_rate_ceiling`).
+- **Safe fallback**: when PuLP is missing or a solve is infeasible/times out, `optimize()` returns a minimal safe plan (`_safe_fallback`): reuse the last good plan if it still covers the horizon, else hold every block and grid-charge only the cheapest blocks up to the reserve floor — never discharge, never export. The `decision_engine` safety gates (battery protection, export, inverter-off) still apply on top.
+- `optimizer_enabled=False` means hold (no scheduling); the safety gates still apply. There is no `optimizer_engine` choice anymore.
 
 ### EMHASS-inspired features (opt-in, all default OFF)
 
@@ -187,14 +186,15 @@ Added on the `feature/battery-optimization-v2` branch. Each is gated behind a co
 
 | Feature | Module | Enable via | Falls back to |
 |---|---|---|---|
-| MILP optimizer | `growatt/milp_optimizer.py` | `OPTIMIZER_ENGINE=milp` | greedy (if PuLP missing / infeasible / timeout) |
 | ML consumption forecast | `growatt/ml_consumption_forecast.py` | `CONSUMPTION_FORECAST_ENGINE=ml` | binned model (if skforecast missing / training declines) |
 | Solcast PV forecast | `growatt/solcast_forecast.py` | `SOLCAST_API_KEY` + `SOLCAST_ROOFTOP_ID` | forecast.solar + model consensus |
 | Deferrable loads | `growatt/deferrable_loads.py` | `DEFERRABLE_LOADS_JSON` (JSON array) | none scheduled (empty default) |
 
+(The MILP optimizer used to be an opt-in `OPTIMIZER_ENGINE=milp` feature alongside a greedy engine; it is now the **only** dispatch engine — see the Battery Optimizer section above.)
+
 Notes:
-- `optimizer_engine` / `consumption_forecast_engine` are pattern-validated in `config/settings.py` (`^(greedy|milp)$`, `^(binned|ml)$`) so a typo fails fast at startup instead of silently degrading.
-- **MILP** is a drop-in for the greedy engine (identical signature, same 4-tuple output) using an explicit per-block solar/grid/battery/load energy-flow model; runs off the event loop via `asyncio.to_thread`. Reserve philosophy DIFFERS by design: the greedy engine enforces the dynamic per-block reserve floor; the MILP's reserve is emergent from the objective (its `RESERVE_SHORTFALL_FLOOR` is deliberately 0.0 after a live incident — see the comment in `milp_optimizer.py`; don't make it nonzero). Both engines use the per-leg sqrt efficiency convention (`leg_eta = round_trip ** 0.5` on each conversion), and the greedy engine values terminal SOC with the same capped economics as the MILP.
+- `consumption_forecast_engine` is pattern-validated in `config/settings.py` (`^(binned|ml)$`) so a typo fails fast at startup instead of silently degrading.
+- **MILP** uses an explicit per-block solar/grid/battery/load energy-flow model. Its reserve is emergent from the objective (its `RESERVE_SHORTFALL_FLOOR` is deliberately 0.0 after a live incident — see the comment in `milp_optimizer.py`; don't make it nonzero). Per-leg sqrt efficiency convention (`leg_eta = round_trip ** 0.5` on each conversion); terminal SOC valued with capped economics. The shared reserve helper (`BatteryOptimizer._compute_reserve_soc_per_block`) uses the same convention.
 - **Deferrable loads** are added to the optimizer's `consumption_hourly` as an overlay so the battery plans around them. **Only list loads NOT already present in the consumption history** (`INVPowerToLocalLoad`) — otherwise the forecast already learned them and you double-count, over-charging from grid.
 - **Solcast** free tier is 10 req/day per rooftop; the client throttles to ≤9/day with a UTC-monotonic interval guard. Quota state is persisted to `solcast_quota.json` next to `config_overrides.json` (survives restarts); any received HTTP response counts, and timeouts count too (the request may have reached Solcast's ledger) — only provably-unsent DNS/refused connect errors are refunded.
 - **Deferrable windows** are clamped to the FIRST window instance in the price horizon (`filter_to_current_window_instance`) — the ~32h horizon would otherwise match tomorrow's window too and schedule energy past the current cycle's deadline.
