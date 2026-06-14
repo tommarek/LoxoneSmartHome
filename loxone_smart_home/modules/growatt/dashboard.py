@@ -3063,6 +3063,9 @@ html { scroll-behavior: smooth; }
           <button class="viewtog active" data-view="import" onclick="setPriceView('import')">Import</button>
           <button class="viewtog" data-view="export" onclick="setPriceView('export')">Export</button>
         </div>
+        <div class="viewtog-wrap" aria-label="Distribution fees">
+          <button class="viewtog fees-tog active" onclick="toggleFees()" title="Show or hide the distribution fee in the price bars">Fees</button>
+        </div>
         <div id="homeNow" style="font-size:12px;color:var(--muted)">--</div>
       </div>
     </div>
@@ -3278,9 +3281,14 @@ html { scroll-behavior: smooth; }
   <div class="card" style="margin-bottom:12px">
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">
       <h2 id="priceChartTitle" style="margin:0">Today's Prices &amp; Battery SOC</h2>
-      <div class="viewtog-wrap" role="group" aria-label="Price view">
-        <button class="viewtog active" data-view="import" onclick="setPriceView('import')">Import</button>
-        <button class="viewtog" data-view="export" onclick="setPriceView('export')">Export</button>
+      <div style="display:flex;align-items:center;gap:8px">
+        <div class="viewtog-wrap" role="group" aria-label="Price view">
+          <button class="viewtog active" data-view="import" onclick="setPriceView('import')">Import</button>
+          <button class="viewtog" data-view="export" onclick="setPriceView('export')">Export</button>
+        </div>
+        <div class="viewtog-wrap" aria-label="Distribution fees">
+          <button class="viewtog fees-tog active" onclick="toggleFees()" title="Show or hide the distribution fee in the price bars">Fees</button>
+        </div>
       </div>
     </div>
     <div style="font-size:11px;color:var(--muted);margin:4px 0 2px">
@@ -3608,8 +3616,13 @@ function viewVals(p) {
     const sell = (p.sell_czk != null) ? p.sell_czk : (p.czk_kwh - 0.5);
     return { allin: sell, fee: 0 };
   }
+  // `showFees` off → show the spot price only (no distribution fee floor); the
+  // bar tops at spot and the chart rescales. On → all-in buy (spot + dist).
+  const spot = (p.czk_kwh != null) ? p.czk_kwh
+             : ((p.buy_czk != null ? p.buy_czk : 0) - (p.distribution_czk || 0));
+  if (!showFees) return { allin: spot, fee: 0 };
   const fee = p.distribution_czk || 0;
-  const allin = (p.buy_czk != null) ? p.buy_czk : (p.czk_kwh + fee);
+  const allin = (p.buy_czk != null) ? p.buy_czk : (spot + fee);
   return { allin, fee };
 }
 // Vertical scale for a price chart on a ZERO line: how far the value reaches
@@ -3821,15 +3834,40 @@ function renderCharts() {
 function setPriceView(v) {
   priceView = (v === 'export') ? 'export' : 'import';
   try { localStorage.setItem('priceView', priceView); } catch (e) {}
-  document.querySelectorAll('.viewtog').forEach(btn => {
+  // Scope to [data-view] so the separate Fees toggle (also .viewtog) isn't reset.
+  document.querySelectorAll('.viewtog[data-view]').forEach(btn => {
     btn.classList.toggle('active', btn.dataset.view === priceView);
   });
-  const hint = document.getElementById('viewHint');
-  if (hint) hint.textContent = priceView === 'export'
-    ? 'bars = export revenue (spot − sell fee)'
-    : 'bars = all-in import price (spot + distribution)';
+  // Distribution fees don't apply to export — disable the toggle there.
+  document.querySelectorAll('.fees-tog').forEach(btn => {
+    btn.disabled = (priceView === 'export');
+    btn.style.opacity = (priceView === 'export') ? '0.4' : '';
+  });
+  updateViewHint();
   renderCharts();
 }
+
+function updateViewHint() {
+  const hint = document.getElementById('viewHint');
+  if (!hint) return;
+  hint.textContent = (priceView === 'export')
+    ? 'bars = export revenue (spot − sell fee)'
+    : (showFees ? 'bars = all-in import price (spot + distribution)'
+                : 'bars = spot price only (distribution fee hidden)');
+}
+
+let showFees = (function(){ try { return localStorage.getItem('showFees') !== 'off'; } catch(e){ return true; } })();
+
+function setShowFees(on) {
+  showFees = !!on;
+  try { localStorage.setItem('showFees', showFees ? 'on' : 'off'); } catch (e) {}
+  document.querySelectorAll('.fees-tog').forEach(btn => {
+    btn.classList.toggle('active', showFees);
+  });
+  updateViewHint();
+  renderCharts();
+}
+function toggleFees() { setShowFees(!showFees); }
 
 function renderSocLine(prices, timeline, chartId, svgId, isToday) {
   const svg = document.getElementById(svgId);
@@ -4731,9 +4769,10 @@ document.getElementById('refreshBtn').addEventListener('click', refreshAll);
   }
 })();
 
-// Sync the Import/Export toggle buttons + hint to the persisted view (no
+// Sync the Import/Export + Fees toggle buttons + hint to the persisted state (no
 // re-render yet — lastChartData is null until the first fetchPrices).
 setPriceView(priceView);
+setShowFees(showFees);
 fetchStatus();
 fetchLive();
 fetchPrices();
