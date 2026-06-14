@@ -405,6 +405,7 @@ class GrowattController(BaseModule):
         self._ev_high_load: bool = False
         self._ev_high_load_power: float = 0.0
         self._high_load_poll_task: Optional[asyncio.Task[None]] = None
+        self._inverter_clock_task: Optional[asyncio.Task[None]] = None
         self._home_status_topic = "loxone/status"
         self._current_mode: Optional[str] = None  # Track the currently applied mode
         self._battery_soc: float = 50.0  # Default battery SOC, updated from status
@@ -1296,6 +1297,49 @@ class GrowattController(BaseModule):
             self._clock_drift_seconds = 0
             return False
 
+    async def _measure_inverter_drift(self) -> Optional[float]:
+        """Refresh self._clock_drift_seconds from the inverter clock WITHOUT
+        writing it (cheap read used right before a slot activation so the start
+        can be compensated to real time).
+
+        drift = server_time - inverter_time  (positive => inverter behind).
+        Best-effort: on a read failure (the known transient datetime/get FAILED)
+        the previous value is kept, so start compensation degrades to the last
+        good drift rather than fighting a bad read.
+        """
+        if self._optional_config.get("simulation_mode", False):
+            return self._clock_drift_seconds
+        try:
+            inverter_time = await self._get_inverter_time()
+            if inverter_time is None:
+                return self._clock_drift_seconds
+            drift = (self._get_local_now() - inverter_time).total_seconds()
+            self._clock_drift_seconds = drift
+            return drift
+        except Exception as e:
+            self.logger.debug(f"Inverter drift measure failed (keeping last): {e}")
+            return self._clock_drift_seconds
+
+    async def _inverter_clock_loop(self) -> None:
+        """Periodically re-sync the inverter RTC to server time.
+
+        The inverter only triggers a battery/grid-first slot once its own clock
+        crosses the slot start; a drifted RTC fires modes late or never. Re-syncing
+        on an interval keeps drift << 1 min so boundary-aligned starts land on the
+        intended :00/:15/:30/:45. Per-iteration errors are swallowed by
+        _sync_inverter_time (it logs and returns); the task guard restarts the loop
+        only on an unexpected escape.
+        """
+        interval = max(1, self.config.inverter_clock_resync_minutes) * 60
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._running:
+                break
+            try:
+                await self._sync_inverter_time()
+            except Exception as e:
+                self.logger.warning(f"Periodic inverter clock re-sync failed: {e}")
+
     def _ensure_future_start(
         self,
         start_str: str,
@@ -1369,9 +1413,23 @@ class GrowattController(BaseModule):
 
             total_buffer = buffer_minutes + mqtt_delay_minutes
 
-            # Set start time in the FUTURE (relative to server)
-            adjusted_start_dt = now.replace(microsecond=0, second=0) + timedelta(
-                minutes=total_buffer
+            # Anchor the start to REAL wall-clock time, compensating for the
+            # inverter clock offset. The inverter fires the slot when ITS clock
+            # crosses `start`, and its clock reads (real_time - drift) where
+            # drift = server - inverter. To fire at real (now + buffer) we set
+            #   start = (now + buffer) - drift
+            # then round to the whole minute the slot uses. This keeps the start
+            # exactly `buffer` minutes ahead of the inverter's OWN clock, so it
+            # waits `buffer` real minutes and fires on time regardless of RTC
+            # drift. With periodic re-sync drift is seconds, so this normally
+            # rounds back to now+buffer; it only shifts when the RTC has drifted
+            # across a minute boundary. (round, not floor: keeps fire-time error
+            # within ±30s; the +buffer headroom keeps start in the inverter's
+            # future even after rounding.)
+            drift = timedelta(seconds=self._clock_drift_seconds)
+            raw_start = now + timedelta(minutes=total_buffer) - drift
+            adjusted_start_dt = (raw_start + timedelta(seconds=30)).replace(
+                second=0, microsecond=0
             )
 
             # Keep the original stop time (should be 23:59 for all-day modes).
@@ -1404,8 +1462,9 @@ class GrowattController(BaseModule):
             )
             self.logger.info(
                 f"⏰ Immediate activation scheduled: start={_fmt(adjusted_start_dt)} "
-                f"(now={now.strftime('%H:%M:%S')}, buffer={total_buffer}min) - "
-                f"Mode activates in ~{total_buffer} min | Clock skew: {skew_desc}"
+                f"(now={now.strftime('%H:%M:%S')}, buffer={total_buffer}min, "
+                f"drift-compensated) - Mode activates in ~{total_buffer} min | "
+                f"Clock skew: {skew_desc}"
             )
             return _fmt(adjusted_start_dt), _fmt(adjusted_stop_dt)
 
@@ -1680,6 +1739,14 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
         self._high_load_poll_task.add_done_callback(
             self._make_task_guard("high_load_poll", self._high_load_poll_loop)
         )
+        # Periodically re-sync the inverter RTC to server time so battery/grid-first
+        # slot starts (which fire on the inverter's own clock) land on the intended
+        # real moment. Disabled when inverter_clock_resync_minutes == 0.
+        if self.config.inverter_clock_resync_minutes > 0:
+            self._inverter_clock_task = asyncio.create_task(self._inverter_clock_loop())
+            self._inverter_clock_task.add_done_callback(
+                self._make_task_guard("inverter_clock", self._inverter_clock_loop)
+            )
 
         # Perform initial evaluation (mode decision with available data)
         await self._evaluate_conditions("startup")
@@ -1721,6 +1788,8 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
                     self._periodic_check_task = new_task
                 elif name == "high_load_poll":
                     self._high_load_poll_task = new_task
+                elif name == "inverter_clock":
+                    self._inverter_clock_task = new_task
         return _cb
 
     async def _rebuild_solar_model_background(self) -> None:
@@ -1895,6 +1964,15 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             except asyncio.CancelledError:
                 pass
             self._high_load_poll_task = None
+
+        # Cancel inverter clock re-sync task
+        if self._inverter_clock_task and not self._inverter_clock_task.done():
+            self._inverter_clock_task.cancel()
+            try:
+                await self._inverter_clock_task
+            except asyncio.CancelledError:
+                pass
+            self._inverter_clock_task = None
 
         # Cancel background model-build task (long InfluxDB queries that, if left
         # running, could re-issue a mode evaluation after safe-shutdown).
@@ -4308,6 +4386,17 @@ from(bucket: "{self.settings.influxdb.bucket_solar}")
             immediate_activation = (
                 new_state.time_start == "00:00" and new_state.time_stop == "23:59"
             )
+
+            # On a genuine mode ENTRY (start about to be (re)set), refresh the
+            # inverter clock drift so _ensure_future_start anchors the start to
+            # real time. Cheap read, best-effort; skipped for same-mode param
+            # tweaks (the in-place path inside the setters sets no start).
+            if (
+                immediate_activation
+                and new_state.inverter_mode in ("battery_first", "grid_first")
+                and previous_mode != new_state.inverter_mode
+            ):
+                await self._measure_inverter_drift()
 
             # Raise on a failed mode command so the rollback wrapper fires and
             # _apply_decided_mode does NOT commit desired_state — otherwise the

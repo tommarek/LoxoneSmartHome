@@ -462,3 +462,92 @@ async def test_set_inverter_power_does_not_update_state_on_failure(
     mode_manager._inverter_on = True
     await mode_manager.set_inverter_power(False)
     assert mode_manager._inverter_on is True
+
+
+def _published_topics(mock_controller):
+    """Topics published this call (publish is AsyncMock; topic is arg 0)."""
+    return [c.args[0] for c in mock_controller.mqtt_client.publish.await_args_list]
+
+
+@pytest.mark.asyncio
+async def test_grid_first_inplace_param_update_does_not_resend_timeslot(
+    mode_manager, mock_controller
+):
+    """Already in grid_first: a powerRate change must update params in place and
+    NOT re-send the timeslot (which would bump the start to now+1 and pause the
+    discharge). The cached slot start/stop must be preserved."""
+    mock_controller._wait_for_command_result.return_value = {"success": True, "message": "ok"}
+    # _ensure_future_start must NOT be consulted on the in-place path — if it is,
+    # the start would be bumped. Make it raise to prove it isn't called.
+    mode_manager._ensure_future_start = MagicMock(
+        side_effect=AssertionError("timeslot start must not be recomputed in place")
+    )
+    mode_manager.ensure_exclusive = AsyncMock(
+        side_effect=AssertionError("exclusive must not run when already in mode")
+    )
+    # Seed an already-active grid_first slot (start already in the past).
+    mode_manager._last_applied["grid_first"] = ("grid_first", "22:01", "23:59", 20, 54)
+
+    ok = await mode_manager.set_grid_first(
+        "00:00", "23:59", stop_soc=20, power_rate=25,
+        immediate_activation=True, previous_mode="grid_first",
+    )
+    assert ok is True
+
+    topics = _published_topics(mock_controller)
+    # powerRate changed (54 -> 25) so it is published; stopSOC unchanged (20) is not;
+    # the timeslot topic must NOT be published.
+    assert mock_controller.config.grid_first_powerrate_topic in topics
+    assert mock_controller.config.grid_first_stopsoc_topic not in topics
+    assert mock_controller.config.grid_first_topic not in topics
+    # Cached slot start/stop preserved; only the rate advanced.
+    assert mode_manager._last_applied["grid_first"] == ("grid_first", "22:01", "23:59", 20, 25)
+
+
+@pytest.mark.asyncio
+async def test_grid_first_mode_entry_still_sends_timeslot(mode_manager, mock_controller):
+    """Entering grid_first from another mode must take the full path and send the
+    timeslot (the in-place shortcut only applies when already in grid_first)."""
+    mock_controller._wait_for_command_result.return_value = {"success": True, "message": "ok"}
+    mode_manager._to_device_hhmm = MagicMock(side_effect=lambda x: x)
+    mode_manager._ensure_future_start = MagicMock(return_value=("22:01", "23:59"))
+    mode_manager.ensure_exclusive = AsyncMock(return_value=True)
+    mode_manager._query_inverter_state = AsyncMock(return_value={})
+
+    ok = await mode_manager.set_grid_first(
+        "00:00", "23:59", stop_soc=20, power_rate=54,
+        immediate_activation=True, previous_mode="load_first",
+    )
+    assert ok is True
+    assert mock_controller.config.grid_first_topic in _published_topics(mock_controller)
+
+
+@pytest.mark.asyncio
+async def test_battery_first_inplace_param_update_does_not_resend_timeslot(
+    mode_manager, mock_controller
+):
+    """Already in battery_first (e.g. battery_hold pinning stop_soc to live SOC):
+    a stop_soc change updates params in place without re-sending the timeslot."""
+    mock_controller._wait_for_command_result.return_value = {"success": True, "message": "ok"}
+    mode_manager._ensure_future_start = MagicMock(
+        side_effect=AssertionError("timeslot start must not be recomputed in place")
+    )
+    mode_manager.ensure_exclusive = AsyncMock(
+        side_effect=AssertionError("exclusive must not run when already in mode")
+    )
+    mode_manager._battery_first_slots[1] = {
+        "enabled": True, "start": "22:01", "stop": "23:59", "stop_soc": 96, "power_rate": 54
+    }
+    mode_manager._last_applied["battery_first"] = ("battery_first", "22:01", "23:59", 96, 54)
+
+    ok = await mode_manager.set_battery_first(
+        "00:00", "23:59", stop_soc=95, power_rate=54,
+        immediate_activation=True, previous_mode="battery_first", force_power_rate=True,
+    )
+    assert ok is True
+
+    topics = _published_topics(mock_controller)
+    assert mock_controller.config.battery_first_topic not in topics  # no timeslot resend
+    assert mode_manager._last_applied["battery_first"] == ("battery_first", "22:01", "23:59", 95, 54)
+    # Slot bookkeeping updated in place.
+    assert mode_manager._battery_first_slots[1]["stop_soc"] == 95

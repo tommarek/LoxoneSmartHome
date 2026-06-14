@@ -259,6 +259,68 @@ class ModeManager:
 
         return ok
 
+    async def _update_active_slot_params(
+        self, mode_key: str, *, stopsoc_topic: str, stopsoc_cmd: str,
+        powerrate_topic: str, powerrate_cmd: str, stop_soc: int, power_rate: int,
+        force_power_rate: bool = False,
+    ) -> bool:
+        """Update stop_soc / power_rate of an ALREADY-ACTIVE slot in place.
+
+        The inverter only starts running a battery/grid-first slot once its clock
+        crosses the slot's start time, and we schedule that start at ``now + 1min``
+        for immediate activation. Re-sending the timeslot on a mere parameter
+        change (e.g. an adaptive powerRate tweak, or battery_hold pinning stop_soc
+        to the drifting live SOC every eval) therefore bumps the start back into
+        the future and PAUSES the discharge/charge for ~1 minute each time. When
+        the mode is unchanged we instead push only the changed stop_soc/power_rate
+        topics and leave the live slot's (already-passed) start untouched, so the
+        slot keeps running uninterrupted.
+
+        Returns True if the slot is in the desired state after this call, False if
+        a sub-command failed (caller must not advance tracked state).
+        """
+        prev = self._last_applied.get(mode_key)
+        # prev signature: (mode_key, start, stop, old_soc, old_rate)
+        _, p_start, p_stop, old_soc, old_rate = prev
+        changed = []
+
+        if stop_soc != old_soc:
+            ok, _ = await self._execute_command_with_retry(
+                stopsoc_topic, {"value": stop_soc}, stopsoc_cmd,
+                f"{mode_key} stopSOC set to {stop_soc}%",
+            )
+            if not ok:
+                self.logger.error(f"Failed to update {mode_key} stopSOC in place")
+                return False
+            changed.append(f"stopSOC={stop_soc}%")
+            await asyncio.sleep(self.config.command_delay)
+
+        if power_rate != old_rate or force_power_rate:
+            ok, _ = await self._execute_command_with_retry(
+                powerrate_topic, {"value": power_rate}, powerrate_cmd,
+                f"{mode_key} powerRate set to {power_rate}%",
+            )
+            if not ok:
+                self.logger.error(f"Failed to update {mode_key} powerRate in place")
+                return False
+            changed.append(f"powerRate={power_rate}%")
+
+        # Preserve the live slot's start/stop in the cache; only the params moved.
+        self._last_applied[mode_key] = (mode_key, p_start, p_stop, stop_soc, power_rate)
+        if mode_key == "battery_first" and 1 in self._battery_first_slots:
+            self._battery_first_slots[1]["stop_soc"] = stop_soc
+            self._battery_first_slots[1]["power_rate"] = power_rate
+
+        label = mode_key.upper().replace("_", "-")
+        if changed:
+            self.logger.info(
+                f"🔧 {label} params updated in place ({', '.join(changed)}); "
+                f"slot {p_start}-{p_stop} left ACTIVE (start not bumped)"
+            )
+        else:
+            self.logger.debug(f"{mode_key} params unchanged; slot left active, no-op")
+        return True
+
     async def set_battery_first(
         self, start_hour: str, stop_hour: str, stop_soc: Optional[int] = None,
         power_rate: int = 100, *, preserve_duration: bool = True, pre_scheduled: bool = False,
@@ -280,6 +342,29 @@ class ModeManager:
         """
         if stop_soc is None:
             stop_soc = int(self.config.max_soc)
+
+        # Already in battery_first with a live slot? Update only the changed
+        # params and DON'T re-send the timeslot (which would bump the start to
+        # now+1 and pause the charge/hold for ~1 min). See
+        # _update_active_slot_params. Skipped for pre_scheduled (future slot, not
+        # active yet) and simulation.
+        if (
+            previous_mode == "battery_first"
+            and not pre_scheduled
+            and not self._optional_config.get("simulation_mode", False)
+            and self._last_applied.get("battery_first") is not None
+        ):
+            return await self._update_active_slot_params(
+                "battery_first",
+                stopsoc_topic="energy/solar/command/batteryfirst/set/stopsoc",
+                stopsoc_cmd="batteryfirst/set/stopsoc",
+                powerrate_topic="energy/solar/command/batteryfirst/set/powerrate",
+                powerrate_cmd="batteryfirst/set/powerrate",
+                stop_soc=max(5, min(100, stop_soc)),
+                power_rate=max(1, min(100, power_rate)),
+                force_power_rate=force_power_rate,
+            )
+
         if pre_scheduled:
             adjusted_start, adjusted_stop = start_hour, stop_hour
         else:
@@ -628,6 +713,27 @@ class ModeManager:
         benign skip, simulation, or every sub-command succeeded), False if any
         sub-command failed. Callers must not advance tracked state unless True.
         """
+        # Already in grid_first with a live slot? Update only the changed params
+        # and DON'T re-send the timeslot (which would bump the start to now+1 and
+        # PAUSE the discharge for ~1 min — the inverter only runs a slot once its
+        # clock crosses the start). See _update_active_slot_params. Skipped for
+        # pre_scheduled (future slot, not active yet) and simulation.
+        if (
+            previous_mode == "grid_first"
+            and not pre_scheduled
+            and not self._optional_config.get("simulation_mode", False)
+            and self._last_applied.get("grid_first") is not None
+        ):
+            return await self._update_active_slot_params(
+                "grid_first",
+                stopsoc_topic=self.config.grid_first_stopsoc_topic,
+                stopsoc_cmd="gridfirst/set/stopsoc",
+                powerrate_topic=self.config.grid_first_powerrate_topic,
+                powerrate_cmd="gridfirst/set/powerrate",
+                stop_soc=max(5, min(100, stop_soc)),
+                power_rate=max(1, min(100, power_rate)),
+            )
+
         if pre_scheduled:
             adjusted_start, adjusted_stop = start_hour, stop_hour
         else:

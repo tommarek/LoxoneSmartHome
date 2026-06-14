@@ -331,6 +331,16 @@ class GrowattConfig(BaseSettings):
         default=0, ge=0, le=10,
         description="Base buffer for clock drift (1 min minimum added for MQTT)"
     )
+    inverter_clock_resync_minutes: int = Field(
+        default=60, ge=0, le=1440,
+        description=(
+            "How often to re-sync the inverter RTC to server time. The inverter "
+            "only triggers a battery/grid-first slot when its own clock crosses the "
+            "slot start, so a drifted RTC fires modes late/never. Re-syncing keeps "
+            "drift << 1 min so boundary-aligned starts land on time. 0 = disabled "
+            "(startup sync only)."
+        ),
+    )
 
     # MQTT topics for Growatt control
     battery_first_topic: str = "energy/solar/command/batteryfirst/set/timeslot"

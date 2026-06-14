@@ -458,3 +458,55 @@ async def test_start_stop(
     # Test stop
     await growatt_controller.stop()
     assert growatt_controller._running is False
+
+
+@pytest.mark.asyncio
+async def test_immediate_start_is_drift_compensated(
+    growatt_controller: GrowattController,
+) -> None:
+    """The immediate-activation start must be anchored to REAL time: when the
+    inverter clock is behind, the start is pulled earlier so the slot still fires
+    at the intended real moment (the inverter waits `buffer` of ITS minutes)."""
+    ctrl = growatt_controller
+    ctrl.config.clock_drift_buffer_minutes = 0  # total_buffer == 1 (MQTT minimum)
+    now = datetime(2026, 6, 14, 22, 0, 14, tzinfo=ctrl._local_tz)
+    setattr(ctrl, "_get_local_now", lambda: now)
+
+    # In sync: start = floor-ish(now)+1min -> 22:01
+    ctrl._clock_drift_seconds = 0
+    start, stop = ctrl._ensure_future_start("00:00", "23:59", immediate_activation=True)
+    assert start == "22:01"
+
+    # Inverter 10 min behind (drift = +600s): start pulled ~10 min earlier.
+    ctrl._clock_drift_seconds = 600
+    start_behind, _ = ctrl._ensure_future_start("00:00", "23:59", immediate_activation=True)
+    assert start_behind == "21:51"
+
+    # Inverter 10 min ahead (drift = -600s): start pushed ~10 min later.
+    ctrl._clock_drift_seconds = -600
+    start_ahead, _ = ctrl._ensure_future_start("00:00", "23:59", immediate_activation=True)
+    assert start_ahead == "22:11"
+
+
+@pytest.mark.asyncio
+async def test_measure_inverter_drift_keeps_last_on_read_failure(
+    growatt_controller: GrowattController,
+) -> None:
+    """_measure_inverter_drift updates drift from the inverter clock, and keeps
+    the previous value when the read fails (transient datetime/get)."""
+    ctrl = growatt_controller
+    now = datetime(2026, 6, 14, 22, 0, 0, tzinfo=ctrl._local_tz)
+    setattr(ctrl, "_get_local_now", lambda: now)
+
+    # Inverter reads 30s behind -> drift = +30.
+    inv_time = datetime(2026, 6, 14, 21, 59, 30, tzinfo=ctrl._local_tz)
+    setattr(ctrl, "_get_inverter_time", AsyncMock(return_value=inv_time))
+    drift = await ctrl._measure_inverter_drift()
+    assert drift == pytest.approx(30.0)
+    assert ctrl._clock_drift_seconds == pytest.approx(30.0)
+
+    # Read fails (None) -> keep the last good drift, don't reset to 0.
+    setattr(ctrl, "_get_inverter_time", AsyncMock(return_value=None))
+    drift2 = await ctrl._measure_inverter_drift()
+    assert drift2 == pytest.approx(30.0)
+    assert ctrl._clock_drift_seconds == pytest.approx(30.0)
