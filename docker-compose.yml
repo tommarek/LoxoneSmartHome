@@ -2,15 +2,43 @@ version: "3.8"
 
 services:
   # =============================================================================
-  # Loxone Smart Home - Data collector for Loxone Miniserver
-  # Bridges Loxone UDP, MQTT, weather data, and solar inverter to InfluxDB
+  # Loxone Ingest - data-saving process (no controller).
+  # Built from the SAME image; runs the default entry point (main.py) but with
+  # only the data modules enabled: UDP listener (Loxone -> InfluxDB), weather
+  # scraper, OTE price collector, and the MQTT->Loxone bridge. Kept separate so
+  # the Growatt controller can be swapped/restarted without disrupting data
+  # ingestion. Owns the 2000/udp publish (the Loxone UDP listener lives here).
+  # =============================================================================
+  loxone_ingest:
+    build: ./loxone_smart_home
+    container_name: loxone_ingest
+    restart: unless-stopped
+    ports:
+      - "2000:2000/udp"
+    env_file:
+      - ./loxone_smart_home/.env
+    environment:
+      # Override to use services from selfhosted repo via caddy_net
+      - INFLUXDB_HOST=http://influxdb:8086
+      - MQTT_BROKER=mosquitto
+      # Unique broker client id (must differ from the controller's, or the two
+      # connections evict each other in a reconnect loop).
+      - MQTT_CLIENT_ID=loxone-ingest
+      # Data modules only — controller runs in the loxone_smart_home container.
+      - GROWATT_CONTROLLER_ENABLED=false
+    networks:
+      - caddy_net
+
+  # =============================================================================
+  # Loxone Smart Home - the Growatt battery controller + dashboard API.
+  # Built from the SAME image / default entry point, but with the data modules
+  # disabled (they run in loxone_ingest). Reads telemetry/prices/weather from
+  # the shared InfluxDB + mosquitto broker on caddy_net.
   # =============================================================================
   loxone_smart_home:
     build: ./loxone_smart_home
     container_name: loxone_smart_home
     restart: unless-stopped
-    ports:
-      - "2000:2000/udp"
     # The controller-backed dashboard API listens on 5556 but is NOT published
     # to the host — only the loxone_web container reaches it (by service name
     # on caddy_net). The public pages are served by loxone_web on 5555.
@@ -22,6 +50,13 @@ services:
       # Override to use services from selfhosted repo via caddy_net
       - INFLUXDB_HOST=http://influxdb:8086
       - MQTT_BROKER=mosquitto
+      # Unique broker client id (must differ from loxone_ingest's).
+      - MQTT_CLIENT_ID=loxone-controller
+      # Controller only — the data modules run in loxone_ingest.
+      - UDP_LISTENER_ENABLED=false
+      - WEATHER_SCRAPER_ENABLED=false
+      - OTE_COLLECTOR_ENABLED=false
+      - MQTT_BRIDGE_ENABLED=false
     volumes:
       # Persist dashboard-edited config overrides across rebuilds. A named
       # volume on a *directory* avoids the missing-file-becomes-a-directory

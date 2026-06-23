@@ -855,6 +855,10 @@ class Settings(BaseSettings):
     mqtt_port: int = Field(default=1883, ge=1, le=65535)
     mqtt_username: Optional[str] = None
     mqtt_password: Optional[str] = None
+    # Unique per-process broker client id. Must differ between containers that
+    # share a broker (e.g. the controller vs the data-ingest process) — an MQTT
+    # broker evicts an existing connection when a new one reuses the same id.
+    mqtt_client_id: str = "loxone-smart-home"
 
     influxdb_url: str = Field(default="http://influxdb:8086", alias="INFLUXDB_HOST")
     influxdb_token: str
@@ -899,6 +903,7 @@ class Settings(BaseSettings):
             port=self.mqtt_port,
             username=self.mqtt_username,
             password=self.mqtt_password,
+            client_id=self.mqtt_client_id,
         )
 
     @property
