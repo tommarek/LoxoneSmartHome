@@ -427,6 +427,60 @@ class TestWeatherScraper:
         assert tags["source"] == "test"
 
     @pytest.mark.asyncio
+    async def test_influxdb_writes_full_forward_curve(
+        self,
+        weather_scraper: WeatherScraper,
+        mock_influxdb_client: MagicMock,
+    ) -> None:
+        """OpenMeteo save writes every forecast hour stamped with its own time.
+
+        Regression for the bug where only the current hour was persisted, so a
+        forward [now, now+Nh] query found almost nothing and consumers fell back
+        to flat values.
+        """
+        base = int(
+            datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+        )
+        hourly = [
+            {"time": base, "temperature_2m": 15.5, "shortwave_radiation": 0.0},
+            {"time": base + 3600, "temperature_2m": 16.2, "shortwave_radiation": 120.0},
+            {"time": base + 7200, "temperature_2m": 17.1, "shortwave_radiation": 240.0},
+        ]
+        data = {
+            "source": "openmeteo",
+            "timestamp": base,  # fetch time — must NOT be used as the point time
+            "hourly": hourly,
+            "daily": [{"time": base, "precipitation_sum": 0.1}],
+        }
+
+        await weather_scraper._save_to_influxdb(data)
+
+        # 3 hourly points + 1 daily point — the whole curve, not just "now".
+        assert mock_influxdb_client.write_point.call_count == 4
+
+        hour_calls = [
+            c
+            for c in mock_influxdb_client.write_point.call_args_list
+            if c.kwargs["tags"]["type"] == "hour"
+        ]
+        assert len(hour_calls) == 3
+        # Each hour point is stamped with its OWN forecast time, in order.
+        written_ts = [int(c.kwargs["timestamp"].timestamp()) for c in hour_calls]
+        assert written_ts == [base, base + 3600, base + 7200]
+        # The `time` field is not persisted as a value; tags are correct.
+        for c in hour_calls:
+            assert "time" not in c.kwargs["fields"]
+            assert c.kwargs["tags"]["room"] == "outside"
+            assert c.kwargs["tags"]["source"] == "openmeteo"
+
+        day_calls = [
+            c
+            for c in mock_influxdb_client.write_point.call_args_list
+            if c.kwargs["tags"]["type"] == "day"
+        ]
+        assert len(day_calls) == 1
+
+    @pytest.mark.asyncio
     async def test_no_api_key_openweathermap(
         self,
         weather_scraper: WeatherScraper,

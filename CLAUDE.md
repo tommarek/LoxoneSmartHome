@@ -14,7 +14,7 @@ This is a consolidated Python service that combines multiple smart home automati
 |---|---|
 | **Server** | `ssh -p 2222 tom@192.168.0.201` (SSH key passphrase required) |
 | **Repo on server** | `/volume1/homes/tom/git/loxone-db-grafana/` |
-| **Containers** | **TWO**, both built from `./loxone_smart_home/` (same Dockerfile, **separate image tags**): `loxone_smart_home` (the controller + async modules + the API on internal port 5556) and `loxone_web` (the public dashboard pages on 5555, proxies `/api/*` to `loxone_smart_home:5556`). See "Web/controller split" below. |
+| **Containers** | **THREE**, all built from `./loxone_smart_home/` (same Dockerfile/context, **separate image tags**): `loxone_ingest` (the data-saving process — UDP listener + weather + OTE + MQTT bridge; owns the `2000/udp` publish), `loxone_smart_home` (the Growatt controller + the API on internal port 5556), and `loxone_web` (the public dashboard pages on 5555, proxies `/api/*` to `loxone_smart_home:5556`). Ingest and controller run the **same default entry point** (`main.py`) and are differentiated only by per-container `*_ENABLED` + `MQTT_CLIENT_ID` `environment:` overrides. See "Web/controller split" below. |
 | **Network** | `caddy_net` (external) — shares `influxdb`, `mosquitto`, Grafana with the `selfhosted` stack. The compose `environment:` block overrides `INFLUXDB_HOST=http://influxdb:8086` and `MQTT_BROKER=mosquitto` to reach them by container name. |
 | **Local repo** | `/Users/tom/git/LoxoneSmartHome` |
 | **selfhosted repo** | `/Users/tom/git/selfhosted` (local) / `/volume1/homes/tom/git/selfhosted` (server) — holds the Caddy config; the energy upstream points at `loxone_web:5555`. |
@@ -36,13 +36,13 @@ tar cf - \
 | ssh -p 2222 tom@192.168.0.201 \
   "cd /volume1/homes/tom/git/loxone-db-grafana/loxone_smart_home && tar xf - -v"
 
-# 2. Rebuild + restart. BOTH containers build from the same context but have
+# 2. Rebuild + restart. ALL THREE containers build from the same context but have
 #    SEPARATE image tags, so rebuild whichever the change affects (see the
-#    "which container" rule below). When in doubt, build both.
+#    "which container" rule below). When in doubt, build all three.
 ssh -p 2222 tom@192.168.0.201 bash -l << 'ENDSSH'
 cd /volume1/homes/tom/git/loxone-db-grafana
-docker-compose build loxone_smart_home loxone_web
-docker-compose up -d loxone_smart_home loxone_web
+docker-compose build loxone_ingest loxone_smart_home loxone_web
+docker-compose up -d loxone_ingest loxone_smart_home loxone_web
 ENDSSH
 
 # 3. Verify — tail logs (there is no healthcheck, so inspect Status, not Health)
@@ -53,9 +53,11 @@ ENDSSH
 ```
 
 **Which container to rebuild** (the file decides):
-- Controller / async modules / the `/api/*` JSON+control handlers (`modules/growatt_controller.py`, `modules/growatt/*.py`, `config/*`, `main.py`, the `api_*` functions in `dashboard.py`) → **`loxone_smart_home`**. Recreating it restarts the controller (~30–40s: model rebuild, inverter re-actuation).
+- Data-saving modules (`modules/udp_listener.py`, `modules/weather_scraper.py`, `modules/ote_price_collector.py`, `modules/mqtt_bridge.py`) → **`loxone_ingest`**. Restarting it does NOT touch the controller (no model rebuild / re-actuation). The Loxone `2000/udp` listener lives here.
+- Controller / Growatt async modules / the `/api/*` JSON+control handlers (`modules/growatt_controller.py`, `modules/growatt/*.py`, the `api_*` functions in `dashboard.py`) → **`loxone_smart_home`**. Recreating it restarts the controller (~30–40s: model rebuild, inverter re-actuation).
+- Shared code (`config/*`, `main.py`, `utils/*`, `requirements.txt`) affects BOTH `loxone_ingest` and `loxone_smart_home` (same image/entry point) — rebuild both.
 - The dashboard **pages/HTML/JS** (`DASHBOARD_HTML`/`SETTINGS_HTML` and page handlers in `dashboard.py`, `run_web_apps.py`) → **`loxone_web`** only (restart is cheap; controller untouched). This is the whole point of the split — iterate on UI without bouncing the controller.
-- `modules/growatt/dashboard.py` contains BOTH the API handlers (main) and the page strings (web), so a change there usually means **rebuild both**.
+- `modules/growatt/dashboard.py` contains BOTH the API handlers (main) and the page strings (web), so a change there usually means **rebuild both** `loxone_smart_home` + `loxone_web`.
 
 Notes:
 - After recreating `loxone_smart_home`, the new container gets a fresh IP; the proxy in `loxone_web` resolves it by service name each request, so no action needed there. But `caddy` caches DNS — if you change the Caddy upstream, **restart the `caddy` container** (`sed -i` on a bind-mounted file changes the inode and the container keeps the old one — see git history / memory).
@@ -63,11 +65,15 @@ Notes:
 - The `.profile` warning (`/opt/etc/profile: No such file or directory`) is harmless — ignore it.
 - **InfluxDB queries from the server**: the auto-mode classifier blocks inlining the token literal. Run a `python3 -c`/heredoc **inside a container** and read `os.environ["INFLUXDB_TOKEN"]` (org `loxone`); the container has no `curl`. Flux quoting in a single-quoted `-c '...'` is fiddly — use `q("""from(bucket:\"solar\") ...""")` triple-quoted form (proven to work).
 
-### Web/controller split, entry points & ports
+### Data/controller/web split, entry points & ports
 
-The monitoring dashboard (`modules/growatt/dashboard.py`) is split across the two containers so the **UI can be iterated without restarting the controller** (which would retrain models + re-actuate the inverter):
+Three containers, separated so each tier can be restarted independently:
+- **data ingestion** keeps filling InfluxDB even while the controller is bounced or swapped,
+- the **controller** can be replaced with a different one in the future without touching ingestion, and
+- the **UI** can be iterated without restarting the controller (which would retrain models + re-actuate the inverter).
 
-- **`loxone_smart_home`** (image default CMD `run_integrated.py` → `main.py`): the controller + async modules, and the **controller-backed API app on internal port 5556** (`create_api_app` / `start_api_dashboard`). 5556 is `expose`d, NOT published. (`run_integrated.py` also *can* launch the `web/` FastAPI on 8080 when `WEB_SERVICE_ENABLED=true`, but it's **off in prod**.)
+- **`loxone_ingest`** (image default CMD `run_integrated.py` → `main.py`, but with `GROWATT_CONTROLLER_ENABLED=false`): the data-saving modules only — UDP listener (Loxone → `loxone` bucket, owns `2000/udp`), weather scraper (→ `weather_forecast`), OTE price collector (→ `ote_prices`), and the MQTT→Loxone bridge. Writes nothing controller-derived. A future replacement controller reuses this unchanged. **Must have a distinct `MQTT_CLIENT_ID`** (`loxone-ingest`) — sharing the controller's id would make the two broker connections evict each other in a reconnect loop. All controller↔ingest coupling is via the shared mosquitto broker + InfluxDB (e.g. ingest publishes `loxone/status`; the controller's high-load detection subscribes), so they work fine in separate processes.
+- **`loxone_smart_home`** (same image default CMD, with the data modules disabled via `UDP_LISTENER_ENABLED=false`/`WEATHER_SCRAPER_ENABLED=false`/`OTE_COLLECTOR_ENABLED=false`/`MQTT_BRIDGE_ENABLED=false` and `MQTT_CLIENT_ID=loxone-controller`): the controller + Growatt async modules, and the **controller-backed API app on internal port 5556** (`create_api_app` / `start_api_dashboard`). 5556 is `expose`d, NOT published. (`run_integrated.py` also *can* launch the `web/` FastAPI on 8080 when `WEB_SERVICE_ENABLED=true`, but it's **off in prod**.)
 - **`loxone_web`** (compose `command: ["python","run_web_apps.py"]`): serves the dashboard **pages** on **5555** (`create_pages_app`) and **reverse-proxies `/api/*`** (incl. the SSE log stream, via the streaming `_proxy_to_api`) to `DASHBOARD_API_UPSTREAM` (default `http://loxone_smart_home:5556`). Stateless — settings POSTs proxy to main, which persists.
 
 Single-process dev: `create_dashboard_app` / `start_dashboard` still serve pages + API in one process. `_add_api_routes` / `_add_page_routes` are the shared route groups.
