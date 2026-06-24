@@ -345,15 +345,28 @@ class WeatherScraper(BaseModule):
         timestamp = data["timestamp"]
         source = data["source"]
 
-        # Save current/now data
-        if source == "openmeteo" and "now" in data and data["now"]:
-            await self._write_influx_point(data["now"], timestamp, source, "hour")
+        # OpenMeteo: persist the FULL forward curve, one point per forecast hour
+        # (and per day), each stamped with its OWN forecast time — not the fetch
+        # time. Writing only the current hour (the old behaviour) left a forward
+        # [now, now+Nh] query with almost nothing to read, so consumers fell back
+        # to flat values. Re-writing on every fetch overwrites each hour's point
+        # in place (same measurement+tags+timestamp) with the latest forecast.
+        if source == "openmeteo":
+            for record in data.get("hourly", []):
+                point_ts = record.get("time")
+                if point_ts is None:
+                    continue
+                await self._write_influx_point(record, int(point_ts), source, "hour")
+            for record in data.get("daily", []):
+                point_ts = record.get("time")
+                if point_ts is None:
+                    continue
+                await self._write_influx_point(record, int(point_ts), source, "day")
+            return
 
-        # Save daily data
-        if source == "openmeteo" and "today" in data and data["today"]:
-            await self._write_influx_point(data["today"], timestamp, source, "day")
-
-        # For other sources, save first hourly as "now"
+        # Aladin / OpenWeatherMap hourly entries carry no per-hour timestamp and
+        # lack the rich fields (radiation, cloud layers) the forecast consumers
+        # query, so keep the existing "current hour" write for these sources.
         if source in ["aladin", "openweathermap"] and data.get("hourly"):
             await self._write_influx_point(data["hourly"][0], timestamp, source, "hour")
 
