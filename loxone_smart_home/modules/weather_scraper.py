@@ -200,42 +200,28 @@ class WeatherScraper(BaseModule):
             datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
         )
 
-        # Build hourly data
+        # Build hourly data (forward curve from the current hour onward)
         hourly_records: List[Dict[str, Any]] = []
-        hourly_now: Dict[str, Any] = {}
 
         if "time" in js["hourly"]:
             for i, time_val in enumerate(js["hourly"]["time"]):
                 record = {k: js["hourly"][k][i] for k in js["hourly"].keys()}
                 if time_val >= hour_now:
                     hourly_records.append(record)
-                if time_val == hour_now:
-                    hourly_now = record
-
-        day_now = int(
-            datetime.now(timezone.utc)
-            .replace(hour=0, minute=0, second=0, microsecond=0)
-            .timestamp()
-        )
 
         # Build daily data
         daily_records: List[Dict[str, Any]] = []
-        today_data: Dict[str, Any] = {}
 
         if "time" in js["daily"]:
             for i, time_val in enumerate(js["daily"]["time"]):
                 record = {k: js["daily"][k][i] for k in js["daily"].keys()}
                 daily_records.append(record)
-                if time_val == day_now:
-                    today_data = record
 
         now = int(datetime.now(timezone.utc).replace(microsecond=0).timestamp())
 
         return {
             "source": "openmeteo",
             "timestamp": now,
-            "now": hourly_now,
-            "today": today_data,
             "hourly": hourly_records,
             "daily": daily_records,
         }
