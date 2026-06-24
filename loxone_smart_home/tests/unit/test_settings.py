@@ -40,6 +40,27 @@ class TestSettings:
             assert settings.influxdb_token == "my-token"
             assert settings.udp_listener_enabled is False
 
+    def test_mqtt_client_id_propagates(self) -> None:
+        """MQTT_CLIENT_ID must reach settings.mqtt.client_id.
+
+        The data/controller container split relies on each process presenting a
+        distinct broker client id (sharing one makes the two MQTT connections
+        evict each other), so lock in the env -> field -> property wiring.
+        """
+        env_vars = {"MQTT_CLIENT_ID": "loxone-ingest", "INFLUXDB_TOKEN": "tok"}
+        with patch.dict("os.environ", env_vars):
+            settings = Settings(influxdb_token="tok")
+
+            assert settings.mqtt_client_id == "loxone-ingest"
+            assert settings.mqtt.client_id == "loxone-ingest"
+
+    def test_mqtt_client_id_default(self) -> None:
+        """Without an override the client id keeps the historical default."""
+        with patch.dict("os.environ", {"INFLUXDB_TOKEN": "tok"}, clear=True):
+            settings = Settings(influxdb_token="tok")
+
+            assert settings.mqtt.client_id == "loxone-smart-home"
+
     def test_invalid_log_level(self) -> None:
         """Test invalid log level validation."""
         with patch.dict("os.environ", {"LOG_LEVEL": "INVALID", "INFLUXDB_TOKEN": "test"}):

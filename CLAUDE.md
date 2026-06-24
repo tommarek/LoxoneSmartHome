@@ -41,8 +41,8 @@ tar cf - \
 #    "which container" rule below). When in doubt, build all three.
 ssh -p 2222 tom@192.168.0.201 bash -l << 'ENDSSH'
 cd /volume1/homes/tom/git/loxone-db-grafana
-docker-compose build loxone_smart_home loxone_web
-docker-compose up -d loxone_smart_home loxone_web
+docker-compose build loxone_ingest loxone_smart_home loxone_web
+docker-compose up -d loxone_ingest loxone_smart_home loxone_web
 ENDSSH
 
 # 3. Verify — tail logs (there is no healthcheck, so inspect Status, not Health)
