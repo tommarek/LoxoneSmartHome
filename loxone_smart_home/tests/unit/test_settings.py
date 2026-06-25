@@ -47,12 +47,12 @@ class TestSettings:
         distinct broker client id (sharing one makes the two MQTT connections
         evict each other), so lock in the env -> field -> property wiring.
         """
-        env_vars = {"MQTT_CLIENT_ID": "loxone-ingest", "INFLUXDB_TOKEN": "tok"}
+        env_vars = {"MQTT_CLIENT_ID": "data-ingest", "INFLUXDB_TOKEN": "tok"}
         with patch.dict("os.environ", env_vars):
             settings = Settings(influxdb_token="tok")
 
-            assert settings.mqtt_client_id == "loxone-ingest"
-            assert settings.mqtt.client_id == "loxone-ingest"
+            assert settings.mqtt_client_id == "data-ingest"
+            assert settings.mqtt.client_id == "data-ingest"
 
     def test_mqtt_client_id_default(self) -> None:
         """Without an override the client id keeps the historical default."""

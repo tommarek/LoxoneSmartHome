@@ -2,16 +2,16 @@ version: "3.8"
 
 services:
   # =============================================================================
-  # Loxone Ingest - data-saving process (no controller).
-  # Built from the SAME image; runs the default entry point (main.py) but with
-  # only the data modules enabled: UDP listener (Loxone -> InfluxDB), weather
-  # scraper, OTE price collector, and the MQTT->Loxone bridge. Kept separate so
-  # the Growatt controller can be swapped/restarted without disrupting data
-  # ingestion. Owns the 2000/udp publish (the Loxone UDP listener lives here).
+  # Data Ingest - data-saving process (no controller).
+  # Runs the default entry point (main.py) but with only the data modules
+  # enabled: UDP listener (Loxone -> InfluxDB), weather scraper, OTE price
+  # collector, and the MQTT->Loxone bridge. Kept separate so a controller can be
+  # swapped/restarted without disrupting data ingestion. Owns the 2000/udp
+  # publish (the Loxone UDP listener lives here).
   # =============================================================================
-  loxone_ingest:
+  data_ingest:
     build: ./loxone_smart_home
-    container_name: loxone_ingest
+    container_name: data_ingest
     restart: unless-stopped
     ports:
       - "2000:2000/udp"
@@ -21,73 +21,69 @@ services:
       # Override to use services from selfhosted repo via caddy_net
       - INFLUXDB_HOST=http://influxdb:8086
       - MQTT_BROKER=mosquitto
-      # Unique broker client id (must differ from the controller's, or the two
+      # Unique broker client id (must differ from any controller's, or the two
       # connections evict each other in a reconnect loop).
-      - MQTT_CLIENT_ID=loxone-ingest
-      # Data modules only — controller runs in the loxone_smart_home container.
+      - MQTT_CLIENT_ID=data-ingest
+      # Data modules only — no controller runs in this process.
       - GROWATT_CONTROLLER_ENABLED=false
     networks:
       - caddy_net
 
   # =============================================================================
-  # Loxone Smart Home - the Growatt battery controller + dashboard API.
-  # Built from the SAME image / default entry point, but with the data modules
-  # disabled (they run in loxone_ingest). Reads telemetry/prices/weather from
-  # the shared InfluxDB + mosquitto broker on caddy_net.
+  # DISABLED — the Growatt controller (loxone_smart_home) and the dashboard web
+  # tier (loxone_web) are commented out: the controller is being REPLACED by a
+  # separate MPC. data_ingest above keeps all data flowing into InfluxDB in the
+  # meantime. To revive the old controller + dashboard, uncomment both blocks
+  # and run `docker-compose up -d`.
   # =============================================================================
-  loxone_smart_home:
-    build: ./loxone_smart_home
-    container_name: loxone_smart_home
-    restart: unless-stopped
-    # The controller-backed dashboard API listens on 5556 but is NOT published
-    # to the host — only the loxone_web container reaches it (by service name
-    # on caddy_net). The public pages are served by loxone_web on 5555.
-    expose:
-      - "5556"
-    env_file:
-      - ./loxone_smart_home/.env
-    environment:
-      # Override to use services from selfhosted repo via caddy_net
-      - INFLUXDB_HOST=http://influxdb:8086
-      - MQTT_BROKER=mosquitto
-      # Unique broker client id (must differ from loxone_ingest's).
-      - MQTT_CLIENT_ID=loxone-controller
-      # Controller only — the data modules run in loxone_ingest.
-      - UDP_LISTENER_ENABLED=false
-      - WEATHER_SCRAPER_ENABLED=false
-      - OTE_COLLECTOR_ENABLED=false
-      - MQTT_BRIDGE_ENABLED=false
-    volumes:
-      # Persist dashboard-edited config overrides across rebuilds. A named
-      # volume on a *directory* avoids the missing-file-becomes-a-directory
-      # bind-mount trap; the app writes config_overrides.json inside it.
-      - loxone_config_state:/app/config_state
-    networks:
-      - caddy_net
+  # loxone_smart_home:
+  #   build: ./loxone_smart_home
+  #   container_name: loxone_smart_home
+  #   restart: unless-stopped
+  #   # The controller-backed dashboard API listens on 5556 but is NOT published
+  #   # to the host — only the loxone_web container reaches it (by service name
+  #   # on caddy_net). The public pages are served by loxone_web on 5555.
+  #   expose:
+  #     - "5556"
+  #   env_file:
+  #     - ./loxone_smart_home/.env
+  #   environment:
+  #     # Override to use services from selfhosted repo via caddy_net
+  #     - INFLUXDB_HOST=http://influxdb:8086
+  #     - MQTT_BROKER=mosquitto
+  #     # Unique broker client id (must differ from data_ingest's).
+  #     - MQTT_CLIENT_ID=loxone-controller
+  #     # Controller only — the data modules run in data_ingest.
+  #     - UDP_LISTENER_ENABLED=false
+  #     - WEATHER_SCRAPER_ENABLED=false
+  #     - OTE_COLLECTOR_ENABLED=false
+  #     - MQTT_BRIDGE_ENABLED=false
+  #   volumes:
+  #     # Persist dashboard-edited config overrides across rebuilds. A named
+  #     # volume on a *directory* avoids the missing-file-becomes-a-directory
+  #     # bind-mount trap; the app writes config_overrides.json inside it.
+  #     - loxone_config_state:/app/config_state
+  #   networks:
+  #     - caddy_net
 
-  # =============================================================================
-  # Loxone Web - standalone web UI (dashboard pages + settings editor).
-  # Built from the SAME image; runs run_web_apps.py instead of the controller.
-  # Serves pages on 5555 and reverse-proxies /api/* to loxone_smart_home:5556,
-  # so the UI can be rebuilt/restarted without bouncing the controller (no
-  # model retraining / inverter re-actuation).
-  # =============================================================================
-  loxone_web:
-    build: ./loxone_smart_home
-    container_name: loxone_web
-    restart: unless-stopped
-    command: ["python", "run_web_apps.py"]
-    depends_on:
-      - loxone_smart_home
-    ports:
-      - "5555:5555"  # public dashboard pages (Caddy proxies here)
-    env_file:
-      - ./loxone_smart_home/.env
-    environment:
-      - DASHBOARD_API_UPSTREAM=http://loxone_smart_home:5556
-    networks:
-      - caddy_net
+  # loxone_web:
+  #   build: ./loxone_smart_home
+  #   container_name: loxone_web
+  #   restart: unless-stopped
+  #   command: ["python", "run_web_apps.py"]
+  #   depends_on:
+  #     - loxone_smart_home
+  #   ports:
+  #     - "5555:5555"  # public dashboard pages (Caddy proxies here)
+  #   env_file:
+  #     - ./loxone_smart_home/.env
+  #   environment:
+  #     - DASHBOARD_API_UPSTREAM=http://loxone_smart_home:5556
+  #   networks:
+  #     - caddy_net
 
+# Kept for when the controller (loxone_smart_home) above is revived — it persists
+# the dashboard-edited config overrides. Unused while only data_ingest runs.
 volumes:
   loxone_config_state:
 
