@@ -2,4 +2,4 @@
 venv
 .venv
 __pycache__/
-*.pyc
+*.pycsolcast_writer_data/

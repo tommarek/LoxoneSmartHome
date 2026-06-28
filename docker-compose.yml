@@ -30,6 +30,34 @@ services:
       - caddy_net
 
   # =============================================================================
+  # Solcast Writer - fetches the Solcast PV forecast and writes it to InfluxDB
+  # (bucket=solar, measurement=solar_forecast_history, source=solcast) so the Rust
+  # mpc-brain can read PV forecasts. With the Growatt controller disabled, the only
+  # Solcast producer was gone and the brain fell back to its clear-sky model; this
+  # restores it. Reuses the same image (SolcastForecast client + deps) via a custom
+  # entrypoint; touches NO control/MQTT path. Runs a 6h loop and respects the
+  # Solcast free-tier 10/day cap (quota state persisted in /app/data).
+  # =============================================================================
+  solcast_writer:
+    build: ./loxone_smart_home
+    container_name: solcast_writer
+    restart: unless-stopped
+    command: ["python", "solcast_writer.py"]
+    env_file:
+      - ./loxone_smart_home/.env
+    environment:
+      - PYTHONUNBUFFERED=1
+      - INFLUXDB_HOST=http://influxdb:8086
+      - SOLCAST_BUCKET=solar
+      - SOLCAST_INTERVAL_HOURS=6
+      - TZ=Europe/Prague
+      - SOLCAST_QUOTA_PATH=/app/data/solcast_quota.json
+    volumes:
+      - ./solcast_writer_data:/app/data
+    networks:
+      - caddy_net
+
+  # =============================================================================
   # DISABLED — the Growatt controller (loxone_smart_home) and the dashboard web
   # tier (loxone_web) are commented out: the controller is being REPLACED by a
   # separate MPC. data_ingest above keeps all data flowing into InfluxDB in the
