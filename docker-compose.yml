@@ -26,36 +26,42 @@ services:
       - MQTT_CLIENT_ID=data-ingest
       # Data modules only — no controller runs in this process.
       - GROWATT_CONTROLLER_ENABLED=false
+      # Weather scraping RETIRED (2026-07) — mpc-scraper-openmeteo (MPCHomeControl)
+      # now writes the full weather_forecast series. Nothing consumes this repo's
+      # MQTT `weather` topic (telegraf subscribes to teplomer/*, energy/solar,
+      # loxone/+ only). data_ingest still runs the UDP listener, OTE collector,
+      # and the MQTT->Loxone bridge.
+      - WEATHER_SCRAPER_ENABLED=false
     networks:
       - caddy_net
 
   # =============================================================================
-  # Solcast Writer - fetches the Solcast PV forecast and writes it to InfluxDB
-  # (bucket=solar, measurement=solar_forecast_history, source=solcast) so the Rust
-  # mpc-brain can read PV forecasts. With the Growatt controller disabled, the only
-  # Solcast producer was gone and the brain fell back to its clear-sky model; this
-  # restores it. Reuses the same image (SolcastForecast client + deps) via a custom
-  # entrypoint; touches NO control/MQTT path. Runs a 6h loop and respects the
-  # Solcast free-tier 10/day cap (quota state persisted in /app/data).
+  # DISABLED / RETIRED (2026-07) — Solcast Writer.
+  # mpc-scraper-solcast (MPCHomeControl) now writes solar_forecast_history
+  # (source=solcast, both sites summed) for the mpc-brain. This repo's writer
+  # spent ~8 Solcast calls/day; running both risked exceeding the free-tier
+  # ~10/day budget, so it's retired and the MPC scraper raises its own schedule.
+  # The Solcast API key stays in .env (the MPC scraper reads it). To revive,
+  # uncomment this block and drop the MPC scraper's schedule back to avoid the cap.
   # =============================================================================
-  solcast_writer:
-    build: ./loxone_smart_home
-    container_name: solcast_writer
-    restart: unless-stopped
-    command: ["python", "solcast_writer.py"]
-    env_file:
-      - ./loxone_smart_home/.env
-    environment:
-      - PYTHONUNBUFFERED=1
-      - INFLUXDB_HOST=http://influxdb:8086
-      - SOLCAST_BUCKET=solar
-      - SOLCAST_INTERVAL_HOURS=6
-      - TZ=Europe/Prague
-      - SOLCAST_QUOTA_PATH=/app/data/solcast_quota.json
-    volumes:
-      - ./solcast_writer_data:/app/data
-    networks:
-      - caddy_net
+  # solcast_writer:
+  #   build: ./loxone_smart_home
+  #   container_name: solcast_writer
+  #   restart: unless-stopped
+  #   command: ["python", "solcast_writer.py"]
+  #   env_file:
+  #     - ./loxone_smart_home/.env
+  #   environment:
+  #     - PYTHONUNBUFFERED=1
+  #     - INFLUXDB_HOST=http://influxdb:8086
+  #     - SOLCAST_BUCKET=solar
+  #     - SOLCAST_INTERVAL_HOURS=6
+  #     - TZ=Europe/Prague
+  #     - SOLCAST_QUOTA_PATH=/app/data/solcast_quota.json
+  #   volumes:
+  #     - ./solcast_writer_data:/app/data
+  #   networks:
+  #     - caddy_net
 
   # =============================================================================
   # DISABLED — the Growatt controller (loxone_smart_home) and the dashboard web
