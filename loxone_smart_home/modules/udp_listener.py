@@ -59,6 +59,12 @@ class UDPListener(BaseModule):
             "storm_warning": {},
             "sunshine": {},
             "wind_speed": {},
+            # Loxone config Domecek_Cekyne_cleanup (2026-09): house-wide MPC flags
+            # and the garage CO2 sensor. Both mpc_* series are change-only, so
+            # the cached last value IS the current state until the next change.
+            "mpc_control_on": {},
+            "mpc_over_temp": {},
+            "co2": {},
             "default": {},  # For uncategorized measurements
         }
         self._cache_lock = asyncio.Lock()
@@ -252,7 +258,10 @@ from(bucket: "{self.settings.influxdb.bucket_loxone}")
       r._measurement == "rain" or
       r._measurement == "storm_warning" or
       r._measurement == "sunshine" or
-      r._measurement == "wind_speed"
+      r._measurement == "wind_speed" or
+      r._measurement == "mpc_control_on" or
+      r._measurement == "mpc_over_temp" or
+      r._measurement == "co2"
   )
   |> group(columns: ["_measurement", "_field", "room", "tag1", "tag2"])
   |> last()
