@@ -2,7 +2,6 @@
 
 import json
 import socket
-from typing import Generator
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,12 +37,9 @@ def mock_mqtt_client() -> MagicMock:
 
 
 @pytest.fixture
-def mock_socket() -> Generator[MagicMock, None, None]:
-    """Create mock UDP socket."""
-    with patch("socket.socket") as mock_socket_class:
-        mock_socket_instance = MagicMock()
-        mock_socket_class.return_value = mock_socket_instance
-        yield mock_socket_instance
+def mock_socket() -> MagicMock:
+    """UDP socket stand-in returned to MQTTBridge."""
+    return MagicMock()
 
 
 @pytest.fixture
@@ -52,14 +48,20 @@ def mqtt_bridge(
     mock_settings: Settings,
     mock_socket: MagicMock,
 ) -> MQTTBridge:
-    """Create MQTT bridge instance."""
-    return MQTTBridge(mock_mqtt_client, mock_settings)
+    """Create MQTT bridge instance.
+
+    Patch only while constructing the bridge. Leaving socket.socket patched
+    for the whole test breaks pytest-asyncio: it builds the event loop's
+    self-pipe with a MagicMock fd.
+    """
+    with patch("modules.mqtt_bridge.socket.socket", return_value=mock_socket):
+        return MQTTBridge(mock_mqtt_client, mock_settings)
 
 
 @pytest.mark.asyncio
 async def test_mqtt_bridge_init(mock_mqtt_client: MagicMock, mock_settings: Settings) -> None:
     """Test MQTT bridge initialization."""
-    with patch("socket.socket") as mock_socket_class:
+    with patch("modules.mqtt_bridge.socket.socket") as mock_socket_class:
         mock_socket_instance = MagicMock()
         mock_socket_class.return_value = mock_socket_instance
 

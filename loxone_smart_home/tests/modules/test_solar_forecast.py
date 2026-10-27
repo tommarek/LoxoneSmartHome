@@ -746,13 +746,26 @@ class TestTemperatureDerating:
         assert day.total_kwh == pytest.approx(3.18, abs=0.1)
 
 
+def _upcoming(month: int, day: int) -> date:
+    """A month/day that is today or later.
+
+    has_reliable_forecast() skips consensus entries dated before today, so a
+    hard-coded June fixture becomes a stale past date every autumn and the
+    summer reliability cases fail for the wrong reason.
+    """
+    today = date.today()
+    year = today.year if (today.month, today.day) <= (month, day) else today.year + 1
+    return date(year, month, day)
+
+
 class TestReliableForecast:
 
     def test_winter_low_forecast_is_reliable(self, forecast) -> None:
         """3 kWh in December is reliable for a 13.5 kWp system."""
+        winter = _upcoming(12, 15)
         forecast._consensus = {
-            "2026-12-15": DailyForecast(
-                date=date(2026, 12, 15), total_kwh=3.0,
+            winter.isoformat(): DailyForecast(
+                date=winter, total_kwh=3.0,
                 hourly={12: 2.0, 13: 1.0}, source="consensus",
             )
         }
@@ -760,9 +773,10 @@ class TestReliableForecast:
 
     def test_winter_very_low_forecast_unreliable(self, forecast) -> None:
         """0.5 kWh in December is unreliable even in winter."""
+        winter = _upcoming(12, 15)
         forecast._consensus = {
-            "2026-12-15": DailyForecast(
-                date=date(2026, 12, 15), total_kwh=0.5,
+            winter.isoformat(): DailyForecast(
+                date=winter, total_kwh=0.5,
                 hourly={12: 0.5}, source="consensus",
             )
         }
@@ -770,9 +784,10 @@ class TestReliableForecast:
 
     def test_summer_low_forecast_unreliable(self, forecast) -> None:
         """3 kWh in June is unreliable for a 13.5 kWp system."""
+        summer = _upcoming(6, 15)
         forecast._consensus = {
-            "2026-06-15": DailyForecast(
-                date=date(2026, 6, 15), total_kwh=3.0,
+            summer.isoformat(): DailyForecast(
+                date=summer, total_kwh=3.0,
                 hourly={12: 2.0, 13: 1.0}, source="consensus",
             )
         }
@@ -781,13 +796,15 @@ class TestReliableForecast:
 
     def test_summer_normal_forecast_reliable(self, forecast) -> None:
         """25 kWh in June is reliable."""
+        summer = _upcoming(6, 15)
         forecast._consensus = {
-            "2026-06-15": DailyForecast(
-                date=date(2026, 6, 15), total_kwh=25.0,
+            summer.isoformat(): DailyForecast(
+                date=summer, total_kwh=25.0,
                 hourly={10: 3.0, 11: 5.0, 12: 7.0, 13: 6.0, 14: 4.0},
                 source="consensus",
             )
         }
+        assert summer >= date.today()
         assert forecast.has_reliable_forecast() is True
 
     def test_empty_consensus_unreliable(self, forecast) -> None:

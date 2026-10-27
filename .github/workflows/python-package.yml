@@ -1,0 +1,59 @@
+# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
+# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
+
+name: Python package
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # README and the Makefile require Python 3.11+. 3.9/3.10 cannot install
+        # the pinned NumPy/pandas line and are not a supported runtime.
+        python-version: ["3.11"]
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v3
+      with:
+        python-version: ${{ matrix.python-version }}
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        # requirements.txt lives in the package dir, not the repo root.
+        # It already includes pytest and pytest-asyncio.
+        python -m pip install -r loxone_smart_home/requirements.txt
+        # fastapi TestClient imports starlette.testclient, which needs httpx
+        # (or httpx2). Neither is a runtime dependency of the service.
+        python -m pip install "httpx==0.28.1"
+    - name: Lint with flake8
+      run: |
+        # stop the build if there are Python syntax errors or undefined names
+        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+        # exit-zero treats all errors as warnings. The GitHub editor is 127 chars wide
+        flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+    - name: Test with pytest
+      working-directory: loxone_smart_home
+      env:
+        PYTHONPATH: .
+        PYTHONWARNINGS: ignore::RuntimeWarning
+        # Settings.influxdb_token is required. The committed .env cannot supply
+        # it in CI (see the step below), so tests get an explicit dummy token.
+        INFLUXDB_TOKEN: ci-test-token
+      run: |
+        # loxone_smart_home/.env is git-crypt ciphertext in a fresh checkout.
+        # pydantic-settings and python-dotenv decode it as UTF-8 and abort
+        # collection/setup if it is left in place.
+        if [ -f .env ] && ! python -c "open('.env', encoding='utf-8').read()" >/dev/null 2>&1; then
+          mv .env .env.gitcrypt
+        fi
+        pytest
